@@ -168,15 +168,14 @@ ids: the relay translates between the two protocols).
 
 ## mini-agent v12 notes (2026-10-25)
 
-- sa_term_epoll_* cannot be called from SLA as declared:
-  term.sai declares sa_term_epoll_create(flags) -> ^ptr!, but
-  the Zig export is (flags, out_handle) -> i32. Calling it in
-  the declared style returns null or segfaults (the hidden
-  out slot lands in the wrong register); the out-param style
-  is rejected by the SLA checker (InvalidArgsCount). Until
-  the declaration or the export is aligned, epoll is unusable
-  from SLA; run_host drains stderr via a file redirect
-  instead (see architecture v12).
+- sa_term_epoll_* could not be called from SLA as declared
+  (term.sai used a ^ptr!/i32! value-return style against the
+  Zig out-param exports). FIXED in sci 28ad4cd2: term.sai and
+  the matching io.sai declarations (sa_io_read_line) were
+  rewritten in the house out-param + i32 style and verified
+  end to end from SLA (epoll over both spawn pipes,
+  EPOLL_OK). run_host keeps the file-redirect drain (working
+  and verified); epoll is available for future poll loops.
 - The std HTTP server lets several instances bind the same
   127.0.0.1 port at once (observed twice: two LISTEN sockets
   on 18086 with different pids, requests load-balanced

@@ -56,6 +56,9 @@ document.getElementById('send').addEventListener('click', async () => {
         } else if (ev.method === 'item/agentMessage/delta') {
           if (!agentBlocks[p.itemId]) agentBlocks[p.itemId] = addItem('agent', '');
           agentBlocks[p.itemId].textContent += p.delta || '';
+        } else if (ev.method === 'thread/tokenUsage/updated') {
+          const u = p.usage || {};
+          addItem('usage', 'tokens: in ' + (u.inputTokens || 0) + ' / out ' + (u.outputTokens || 0) + ' / total ' + (u.totalTokens || 0));
         } else if (ev.method === 'turn/completed') {
           status.textContent = 'completed';
         } else if (ev.method === 'turn/failed') {
