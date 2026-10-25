@@ -91,6 +91,22 @@ without a read (reading for it deadlocks the session).
 placeholder env key — no OpenAI login) answered initialize through
 the SLA bridge (`userAgent: codex-tui/0.164.0`), accepted the
 notification, and answered `thread/list`; the bridge printed
-`cxu-bridge pump ok`, exit 0. Next: slice 5, a full turn —
-thread/start, thread-id extraction, turn/start, and reading the
-notification stream through turn/completed.
+`cxu-bridge pump ok`, exit 0.
+
+Slice 5 (landed): the chained turn phase. The receive path was
+rebuilt around a persistent line buffer (bytes read past a newline
+belong to the next line — agent CLIs emit notifications back to
+back, and the per-round accumulator silently dropped them). When
+`CXU_REQ3` is set, the bridge sends thread/start, reads until the
+`"id":3` result, extracts the thread id after
+`"thread":{"id":"`, splices it between `CXU_REQ4_PRE` /
+`CXU_REQ4_POST` as turn/start, and reads the stream through
+`turn/completed`. A protocol double (fake_codex.sh) completes the
+turn only when the spliced id matches, and run.sh asserts the full
+session round (`cxu-bridge turn ok`). Direct protocol recon
+measured the live shapes: thread id at
+`result.thread.id`; notifications thread/status/changed,
+turn/started, item/started, item/completed. The live turn's model
+call currently meets the free channel's 429 (FreeUsageLimitError
+on direct probes; codex retries 5x with backoff) — completion
+depends on the shared free quota, not on the bridge.

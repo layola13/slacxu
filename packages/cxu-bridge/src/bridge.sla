@@ -1,6 +1,9 @@
 // cxu-bridge pump kernel: spawn a child agent over bidirectional
-// stdio and run a multi-round line protocol — write one JSON-RPC
-// line, read exactly one reply line (stdin stays open), repeat.
+// stdio and run a JSON-RPC session: request rounds (write one line,
+// read one reply line; stdin stays open), write-only notifications,
+// and the chained turn phase (slice 5): thread/start, thread-id
+// extraction from the result line, turn/start with the id spliced
+// in, then reading the notification stream until turn/completed.
 // Child selection (slice 3): CXU_AGENT_CMDLINE carries a full
 // command line, tokenized on spaces (no quoting — agent CLI paths
 // and flags do not contain spaces in practice); otherwise
@@ -11,13 +14,6 @@
 @import "argv1.sa"
 @import "argvfill.sa"
 @import "ptradd.sa"
-
-struct PumpAcc {
-    buf: [u8; 256],
-    total: u64,
-    last: u8,
-    got: u64,
-}
 
 struct CmdLine {
     buf: [u8; 256],
@@ -30,6 +26,30 @@ struct CmdLine {
 struct ReqLine {
     buf: [u8; 256],
     len: u64,
+}
+
+// Persistent receive buffer: bytes read past a newline belong to
+// the next line and must survive between calls (agent CLIs emit
+// notifications back to back; the slice-4 per-round accumulator
+// silently dropped those bytes).
+struct LineBuf {
+    buf: [u8; 4096],
+    len: u64,
+}
+
+struct LineOut {
+    buf: [u8; 4096],
+    len: u64,
+}
+
+struct IdBuf {
+    buf: [u8; 96],
+    len: u64,
+}
+
+struct FindPos {
+    at: u64,
+    found: bool,
 }
 
 // Fills req from a literal byte string, appending a newline when the
@@ -63,6 +83,50 @@ fn req_from_env(req: &ReqLine, key_ptr: ptr, key_len: u64) -> bool {
     req_from_literal(req, p, l);
     sa_env_buffer_free(h);
     return true;
+}
+
+// Copies an env value into req verbatim (no newline handling), for
+// request assembly parts. Returns true when present and fit.
+fn env_copy_raw(req: &ReqLine, key_ptr: ptr, key_len: u64) -> bool {
+    let h = sa_env_get(key_ptr, key_len);
+    if h == 0 { return false; };
+    let p: ptr = sa_env_buffer_data(h);
+    let l = sa_env_buffer_len(h);
+    if l > 255 {
+        sa_env_buffer_free(h);
+        return false;
+    };
+    let i: u64 = 0;
+    let byte: u8 = 0;
+    while i < l {
+        BYTE_AT_OUT(byte, p, i);
+        req.buf[i] = byte;
+        i = i + 1;
+    }
+    req.len = l;
+    sa_env_buffer_free(h);
+    return true;
+}
+
+// Appends another ReqLine's bytes to req (assembly). Caller
+// guarantees capacity. Takes the source by reference: &struct.buf
+// is a capability and cannot cross a plain ptr parameter.
+fn req_append_req(req: &ReqLine, src: &ReqLine) -> void {
+    let i: u64 = 0;
+    while i < src.len {
+        req.buf[req.len] = src.buf[i];
+        req.len = req.len + 1;
+        i = i + 1;
+    }
+}
+
+fn req_append_id(req: &ReqLine, id: &IdBuf) -> void {
+    let i: u64 = 0;
+    while i < id.len {
+        req.buf[req.len] = id.buf[i];
+        req.len = req.len + 1;
+        i = i + 1;
+    }
 }
 
 // Splits cl.buf[0..len] on spaces into at most 4 tokens.
@@ -119,39 +183,105 @@ fn cmdline_from_env(cl: &CmdLine, key_ptr: ptr, key_len: u64) -> bool {
     return true;
 }
 
-// Reads chunks from hout into acc until a newline has been consumed
-// (one full reply line) or the stream ends. Returns 0 on a complete
-// line, 20 on EOF before any newline, 8 on a read error.
-fn pump_read_line(acc: &PumpAcc, hout: u64) -> i32 {
-    let chunk = [0u8; 64];
-    let n: u64 = 0;
-    let done = false;
-    while done != true {
-        let rst = sa_io_read(hout, &chunk, 64, &n);
+// Extracts the next complete line from lb into out, reading more
+// from hout as needed. Returns 0 on a line, 8 on read error, 20 on
+// EOF before a newline, 21 when a single line exceeds the buffer.
+fn lb_next_line(lb: &LineBuf, hout: u64, out: &LineOut) -> i32 {
+    let chunk = [0u8; 256];
+    while true {
+        let k: u64 = 0;
+        let found = false;
+        while k < lb.len {
+            if lb.buf[k] == 10 { found = true; break; };
+            k = k + 1;
+        }
+        if found {
+            let linelen = k + 1;
+            let i: u64 = 0;
+            while i < linelen {
+                out.buf[i] = lb.buf[i];
+                i = i + 1;
+            }
+            out.len = linelen;
+            let rest = lb.len - linelen;
+            let j: u64 = 0;
+            while j < rest {
+                lb.buf[j] = lb.buf[linelen + j];
+                j = j + 1;
+            }
+            lb.len = rest;
+            return 0;
+        };
+        if lb.len >= 4096 { return 21; };
+        let n: u64 = 0;
+        let rst = sa_io_read(hout, &chunk, 256, &n);
         if rst != 0 { return 8; };
         if n == 0 { return 20; };
         let i: u64 = 0;
         while i < n {
-            if acc.total < 256 {
-                acc.buf[acc.total] = chunk[i];
+            if lb.len < 4096 {
+                lb.buf[lb.len] = chunk[i];
+                lb.len = lb.len + 1;
             };
-            acc.total = acc.total + 1;
-            acc.got = acc.got + 1;
-            acc.last = chunk[i];
             i = i + 1;
         }
-        if acc.last == 10 {
-            done = true;
-        };
     }
-    return 0;
+    return 20;
 }
 
-// One round: write req, then pump one reply line into a fresh
-// accumulator. Returns 0 when the reply is a non-empty JSON-framed
-// line ('{' .. '\n'); otherwise the failing stage number.
+// Naive substring search over a copied line.
+fn find_sub(line: &LineOut, n_ptr: ptr, n_len: u64, pos: &FindPos) -> void {
+    pos.found = false;
+    pos.at = 0;
+    if n_len == 0 || line.len < n_len { return; };
+    let nb: u8 = 0;
+    BYTE_AT_OUT(nb, n_ptr, 0);
+    let i: u64 = 0;
+    let last_start = line.len - n_len;
+    while i <= last_start {
+        if line.buf[i] == nb {
+            let j: u64 = 1;
+            let ok = true;
+            while j < n_len {
+                let cb: u8 = 0;
+                BYTE_AT_OUT(cb, n_ptr, j);
+                if line.buf[i + j] != cb { ok = false; break; };
+                j = j + 1;
+            }
+            if ok {
+                pos.found = true;
+                pos.at = i;
+                return;
+            };
+        };
+        i = i + 1;
+    }
+}
+
+// Extracts the value after marker in line (up to the next '"')
+// into id. Returns false when the marker or closing quote is
+// missing or the value does not fit.
+fn extract_after(line: &LineOut, m_ptr: ptr, m_len: u64, id: &IdBuf) -> bool {
+    let pos = FindPos { at: 0, found: false };
+    find_sub(line, m_ptr, m_len, &pos);
+    if !pos.found { return false; };
+    let start = pos.at + m_len;
+    let i: u64 = 0;
+    while start + i < line.len {
+        if line.buf[start + i] == 34 {
+            id.len = i;
+            return i > 0;
+        };
+        if i >= 96 { return false; };
+        id.buf[i] = line.buf[start + i];
+        i = i + 1;
+    }
+    return false;
+}
+
 // Writes one request line without reading (JSON-RPC notifications
-// have no reply; reading for one would deadlock the session).
+// have no reply; reading for one would deadlock the session). Also
+// used for requests whose replies are consumed by pump_until.
 fn pump_notify(hin: u64, line: &ReqLine) -> i32 {
     let written: u64 = 0;
     let wst = sa_io_write(hin, &line.buf, line.len, &written);
@@ -160,22 +290,43 @@ fn pump_notify(hin: u64, line: &ReqLine) -> i32 {
     return 0;
 }
 
-fn pump_round(hin: u64, hout: u64, req: &ReqLine) -> i32 {
-    let written: u64 = 0;
-    let wst = sa_io_write(hin, &req.buf, req.len, &written);
-    if wst != 0 { return 5; };
-    if written != req.len { return 6; };
-    let acc = PumpAcc { buf: [0u8; 256], total: 0, last: 0, got: 0 };
-    let rst = pump_read_line(&acc, hout);
+// One round: write req, then read exactly one reply line. Returns
+// 0 when the reply is a non-empty JSON-framed line ('{' .. '\n');
+// otherwise the failing stage number.
+fn pump_round(hin: u64, lb: &LineBuf, hout: u64, req: &ReqLine) -> i32 {
+    let wst = pump_notify(hin, req);
+    if wst != 0 { return wst; };
+    let line = LineOut { buf: [0u8; 4096], len: 0 };
+    let rst = lb_next_line(lb, hout, &line);
     if rst != 0 { return rst; };
-    if acc.got == 0 { return 9; };
-    if acc.buf[0] != 123 { return 10; };
-    if acc.last != 10 { return 11; };
+    if line.len == 0 { return 9; };
+    if line.buf[0] != 123 { return 10; };
+    if line.buf[line.len - 1] != 10 { return 11; };
     return 0;
 }
 
-// Full session: resolve the child command line, spawn it, run two
-// rounds (ids 1 and 2), close stdin, reap.
+// Reads lines until one contains the needle; the matching line is
+// left in out. Returns lb_next_line errors, or 22 when max_lines
+// is exhausted first.
+fn pump_until(lb: &LineBuf, hout: u64, n_ptr: ptr, n_len: u64, max_lines: u64, out: &LineOut) -> i32 {
+    let pos = FindPos { at: 0, found: false };
+    let count: u64 = 0;
+    while count < max_lines {
+        let rst = lb_next_line(lb, hout, out);
+        if rst != 0 { return rst; };
+        find_sub(out, n_ptr, n_len, &pos);
+        if pos.found { return 0; };
+        count = count + 1;
+    }
+    return 22;
+}
+
+// Full session: resolve the child command line, spawn it, run the
+// handshake rounds (ids 1 and 2, optional notification between),
+// then the optional turn phase (slice 5) when CXU_REQ3 is set:
+// thread/start, extract the thread id, splice it into
+// CXU_REQ4_PRE/POST as turn/start, and read the stream through
+// turn/completed. Finally close stdin and reap.
 fn bridge_pump() -> i32 {
     let cl = CmdLine { buf: [0u8; 256], len: 0, t_off: [0u64; 4], t_len: [0u64; 4], count: 0 };
     let have = cmdline_from_env(&cl, STR_PTR("CXU_AGENT_CMDLINE"), STR_LEN("CXU_AGENT_CMDLINE"));
@@ -222,12 +373,13 @@ fn bridge_pump() -> i32 {
     if st != 0 { return 2; };
     if proc == 0 { return 3; };
     if hin == 0 { return 4; };
+    let lb = LineBuf { buf: [0u8; 4096], len: 0 };
     let req1 = ReqLine { buf: [0u8; 256], len: 0 };
     if !req_from_env(&req1, STR_PTR("CXU_REQ1"), STR_LEN("CXU_REQ1")) {
         let d1 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
         req_from_literal(&req1, STR_PTR(d1), STR_LEN(d1));
     };
-    let r1 = pump_round(hin, hout, &req1);
+    let r1 = pump_round(hin, &lb, hout, &req1);
     if r1 != 0 { return 30 + r1; };
     let note = ReqLine { buf: [0u8; 256], len: 0 };
     if req_from_env(&note, STR_PTR("CXU_NOTIFY"), STR_LEN("CXU_NOTIFY")) {
@@ -239,8 +391,39 @@ fn bridge_pump() -> i32 {
         let d2 = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}";
         req_from_literal(&req2, STR_PTR(d2), STR_LEN(d2));
     };
-    let r2 = pump_round(hin, hout, &req2);
+    let r2 = pump_round(hin, &lb, hout, &req2);
     if r2 != 0 { return 60 + r2; };
+    let req3 = ReqLine { buf: [0u8; 256], len: 0 };
+    if env_copy_raw(&req3, STR_PTR("CXU_REQ3"), STR_LEN("CXU_REQ3")) {
+        if req3.len == 0 || req3.buf[req3.len - 1] != 10 {
+            req3.buf[req3.len] = 10;
+            req3.len = req3.len + 1;
+        };
+        let w3 = pump_notify(hin, &req3);
+        if w3 != 0 { return 70 + w3; };
+        let line3 = LineOut { buf: [0u8; 4096], len: 0 };
+        let u3 = pump_until(&lb, hout, STR_PTR("\"id\":3"), STR_LEN("\"id\":3"), 64, &line3);
+        if u3 != 0 { return 72; };
+        let id = IdBuf { buf: [0u8; 96], len: 0 };
+        let marker = "\"thread\":{\"id\":\"";
+        if !extract_after(&line3, STR_PTR(marker), STR_LEN(marker), &id) { return 73; };
+        let req4 = ReqLine { buf: [0u8; 256], len: 0 };
+        let pre = ReqLine { buf: [0u8; 256], len: 0 };
+        let post = ReqLine { buf: [0u8; 256], len: 0 };
+        if !env_copy_raw(&pre, STR_PTR("CXU_REQ4_PRE"), STR_LEN("CXU_REQ4_PRE")) { return 74; };
+        if !env_copy_raw(&post, STR_PTR("CXU_REQ4_POST"), STR_LEN("CXU_REQ4_POST")) { return 74; };
+        req_append_req(&req4, &pre);
+        req_append_id(&req4, &id);
+        req_append_req(&req4, &post);
+        req4.buf[req4.len] = 10;
+        req4.len = req4.len + 1;
+        let w4 = pump_notify(hin, &req4);
+        if w4 != 0 { return 75 + w4; };
+        let linedone = LineOut { buf: [0u8; 4096], len: 0 };
+        let needle = "\"turn/completed\"";
+        let u4 = pump_until(&lb, hout, STR_PTR(needle), STR_LEN(needle), 4000, &linedone);
+        if u4 != 0 { return 76; };
+    };
     if sa_std_close(hin) != 0 { return 7; };
     let code: u32 = 99;
     if sa_std_process_wait(proc, &code) != 0 { return 12; };

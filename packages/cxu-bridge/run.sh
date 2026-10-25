@@ -22,4 +22,17 @@ CXU_AGENT_CMDLINE="/bin/cat -u" \
 CXU_REQ1='{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-tui","title":"Codex TUI","version":"0.1.0"},"capabilities":{"experimentalApi":true,"mcpServerOpenaiFormElicitation":true}}}' \
 CXU_REQ2='{"method":"initialized","params":{}}' \
 timeout 30 ./src/main || { echo "CODEX SHAPE ROUND FAILED rc=$?"; exit 1; }
+# Slice 5 session phase against the protocol double: the turn only
+# completes when the bridge splices the issued thread id into
+# turn/start, so a green run proves extraction + splicing + stream
+# reading (including bytes buffered past a newline).
+CXU_AGENT_CMD="$PWD/fake_codex.sh" \
+CXU_REQ1='{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-tui","title":"Codex TUI","version":"0.1.0"},"capabilities":{"experimentalApi":true}}}' \
+CXU_NOTIFY='{"method":"initialized","params":{}}' \
+CXU_REQ2='{"id":2,"method":"thread/list","params":{}}' \
+CXU_REQ3='{"id":3,"method":"thread/start","params":{}}' \
+CXU_REQ4_PRE='{"id":4,"method":"turn/start","params":{"threadId":"' \
+CXU_REQ4_POST='","input":[{"type":"text","text":"Reply with exactly: ok"}]}}' \
+timeout 30 ./src/main || { echo "SESSION ROUND FAILED rc=$?"; exit 1; }
+echo "cxu-bridge turn ok"
 echo "cxu-bridge smoke ok"
