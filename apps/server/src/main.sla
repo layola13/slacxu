@@ -1,27 +1,19 @@
-// mini-agent server: the SLA rebuild of CXU's Mini Agent surface,
-// minimal end to end. Serves the chat page and one API route:
-//   GET  /         -> www/index.html (the frontend page)
-//   POST /api/chat -> {"prompt": "..."}; calls the Kilo gateway
-//                     free channel (chat completions, stream:true)
-//                     through the std SSE client and relays the
-//                     upstream SSE stream verbatim to the browser.
-// Single-threaded accept loop: one request at a time (v1 scope).
-@import "sa_std/http_server.sai"
-@import "sa_std/http_client.sai"
-@import "sa_std/encoding/json.sai"
-@import "sa_std/string.sa"
-@import "sa_std/ptr.sa"
-@import "sa_std/fs.sai"
+// mini-agent server v2: HTTP surface for the SLA Mini Agent.
+// Mirrors the CXU server's role: it owns the bridge instance and
+// exposes the thread/turn/item surface to the web page.
+//   GET  /         -> www/index.html (the waterfall page)
+//   POST /api/chat -> {"prompt": "...", "threadId": optional}
+//                     streams bridge item events as SSE lines.
+// One thread lives in server memory (v2); file-per-thread
+// persistence is the next slice (CXU 0.1.18 shape).
+// Only the module files are imported here: the shared sa_std
+// declarations come in transitively through mini_bridge.sla and
+// sa_vm.sla.
 @import "byteseq.sa"
-@import "ptradd.sa"
+@import "mini_bridge.sla"
 
-struct ByteBuf {
+struct PageBuf {
     bytes: [u8; 8192],
-    len: u64,
-}
-
-struct ChunkBuf {
-    bytes: [u8; 4096],
     len: u64,
 }
 
@@ -31,43 +23,16 @@ fn bytes_is(p_ptr: ptr, p_len: u64, lit_ptr: ptr, lit_len: u64) -> bool {
     return slot[0] == 1;
 }
 
-fn buf_append_lit(b: &ByteBuf, src_ptr: ptr, src_len: u64) -> void {
+fn thread_id_is(th: &Thread, id_ptr: ptr, id_len: u64) -> bool {
+    if th.id_len != id_len { return false; };
     let i: u64 = 0;
     let byte: u8 = 0;
-    while i < src_len {
-        BYTE_AT_OUT(byte, src_ptr, i);
-        if b.len < 8192 {
-            b.bytes[b.len] = byte;
-            b.len = b.len + 1;
-        };
+    while i < id_len {
+        BYTE_AT_OUT(byte, id_ptr, i);
+        if th.id[i] != byte { return false; };
         i = i + 1;
     }
-}
-
-// Appends a JSON-escaped copy of the prompt bytes.
-fn buf_append_escaped(b: &ByteBuf, src_ptr: ptr, src_len: u64) -> void {
-    let i: u64 = 0;
-    let byte: u8 = 0;
-    while i < src_len {
-        BYTE_AT_OUT(byte, src_ptr, i);
-        if byte == 34 {
-            buf_append_lit(b, STR_PTR("\\\""), STR_LEN("\\\""));
-        } else if byte == 92 {
-            buf_append_lit(b, STR_PTR("\\\\"), STR_LEN("\\\\"));
-        } else if byte == 10 {
-            buf_append_lit(b, STR_PTR("\\n"), STR_LEN("\\n"));
-        } else if byte == 13 {
-            buf_append_lit(b, STR_PTR("\\r"), STR_LEN("\\r"));
-        } else if byte == 9 {
-            buf_append_lit(b, STR_PTR("\\t"), STR_LEN("\\t"));
-        } else {
-            if b.len < 8192 {
-                b.bytes[b.len] = byte;
-                b.len = b.len + 1;
-            };
-        };
-        i = i + 1;
-    }
+    return true;
 }
 
 fn send_json(req: ptr, status: u64, body_ptr: ptr, body_len: u64) -> i32 {
@@ -81,13 +46,13 @@ fn send_json(req: ptr, status: u64, body_ptr: ptr, body_len: u64) -> i32 {
 }
 
 fn serve_page(req: ptr) -> i32 {
-    let path = "www/index.html";
+    let path = "../web/index.html";
     let total: u64 = 0;
     if sa_std_fs_len(STR_PTR(path), STR_LEN(path), &total) != 0 { return 20; };
     if total > 8192 { return 21; };
     let fh: u64 = 0;
     if sa_std_fs_open_read(STR_PTR(path), STR_LEN(path), &fh) != 0 { return 22; };
-    let page = ByteBuf { bytes: [0u8; 8192], len: 0 };
+    let page = PageBuf { bytes: [0u8; 8192], len: 0 };
     let read_n: u64 = 0;
     let rst = sa_std_fs_file_read(fh, &page.bytes, 8192, &read_n);
     sa_fs_file_close(fh);
@@ -103,7 +68,7 @@ fn serve_page(req: ptr) -> i32 {
     return 0;
 }
 
-fn handle_chat(req: ptr) -> i32 {
+fn handle_chat(req: ptr, th: &Thread, ev: &ByteBuf, scratch: &ByteBuf, body: &ByteBuf, res: &ByteBuf) -> i32 {
     let b_ptr: ptr = PTR_NULL();
     let b_len: u64 = 0;
     if sa_http_server_req_get_body(req, &b_ptr, &b_len) != 0 { return 30; };
@@ -118,41 +83,21 @@ fn handle_chat(req: ptr) -> i32 {
         let e = "{\"error\":\"missing prompt\"}";
         return send_json(req, 400, STR_PTR(e), STR_LEN(e));
     };
-    let ub = ByteBuf { bytes: [0u8; 8192], len: 0 };
-    let pre = "{\"model\":\"kilo-auto/free\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"";
-    buf_append_lit(&ub, STR_PTR(pre), STR_LEN(pre));
-    buf_append_escaped(&ub, p_ptr, p_len);
-    let post = "\"}],\"max_tokens\":1024}";
-    buf_append_lit(&ub, STR_PTR(post), STR_LEN(post));
-    let url = "https://api.kilo.ai/api/gateway/chat/completions";
-    let h: ptr = PTR_NULL();
-    let key = "";
-    if sa_http_client_sse_post(STR_PTR(url), STR_LEN(url), &ub.bytes, ub.len, STR_PTR(key), STR_LEN(key), &h) != 0 {
-        let e = "{\"error\":\"upstream connect failed\"}";
-        return send_json(req, 502, STR_PTR(e), STR_LEN(e));
+    let tid_ptr: ptr = PTR_NULL();
+    let tid_len: u64 = 0;
+    if sa_json_object_get_string(doc, STR_PTR("threadId"), STR_LEN("threadId"), &tid_ptr, &tid_len) == 0 {
+        if !thread_id_is(th, tid_ptr, tid_len) {
+            thread_reset(th, tid_ptr, tid_len);
+        };
+    };
+    if th.id_len == 0 {
+        thread_reset(th, STR_PTR("mini-1"), STR_LEN("mini-1"));
     };
     let sresp: ptr = PTR_NULL();
-    if sa_http_server_resp_stream_new_v2(req, 200, &sresp) != 0 {
-        sa_http_client_sse_free(h);
-        return 31;
-    };
+    if sa_http_server_resp_stream_new_v2(req, 200, &sresp) != 0 { return 31; };
     sa_http_server_resp_stream_add_header_v2(sresp, STR_PTR("content-type"), STR_LEN("content-type"), STR_PTR("text/event-stream"), STR_LEN("text/event-stream"));
     sa_http_server_resp_stream_add_header_v2(sresp, STR_PTR("cache-control"), STR_LEN("cache-control"), STR_PTR("no-cache"), STR_LEN("no-cache"));
-    let chunk = ChunkBuf { bytes: [0u8; 4096], len: 0 };
-    let done: u64 = 0;
-    let guard: u64 = 0;
-    while done == 0 && guard < 5000000 {
-        sa_http_client_sse_poll(h, &done);
-        let n: u64 = 0;
-        if sa_http_client_sse_read(h, &chunk.bytes, 4096, &n) == 0 {
-            if n > 0 {
-                sa_http_server_resp_stream_write_v2(sresp, &chunk.bytes, n, 30000);
-                sa_http_server_resp_stream_flush_v2(sresp);
-            };
-        };
-        guard = guard + 1;
-    }
-    sa_http_client_sse_free(h);
+    bridge_run_turn(sresp, th, ev, scratch, body, res, p_ptr, p_len);
     sa_http_server_resp_stream_end_v2(sresp, 5000);
     sa_http_server_resp_stream_free_v2(sresp);
     return 0;
@@ -162,6 +107,11 @@ fn main() -> i32 {
     let srv: ptr = PTR_NULL();
     if sa_http_server_new_v2(&srv) != 0 { return 2; };
     if sa_http_server_start_v2(srv, STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"), 18086) != 0 { return 3; };
+    let th = Thread { msgs: [0u8; 40960], msgs_len: 0, id: [0u8; 64], id_len: 0, turn_seq: 0 };
+    let ev = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let scratch = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let body = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let res = ByteBuf { bytes: [0u8; 40960], len: 0 };
     let failures: u64 = 0;
     while failures < 1000 {
         let req: ptr = PTR_NULL();
@@ -177,7 +127,7 @@ fn main() -> i32 {
         let m_len: u64 = 0;
         sa_http_server_req_get_method(req, &m_ptr, &m_len);
         if bytes_is(p_ptr, p_len, STR_PTR("/api/chat"), STR_LEN("/api/chat")) && bytes_is(m_ptr, m_len, STR_PTR("POST"), STR_LEN("POST")) {
-            handle_chat(req);
+            handle_chat(req, &th, &ev, &scratch, &body, &res);
         } else if bytes_is(p_ptr, p_len, STR_PTR("/"), STR_LEN("/")) || bytes_is(p_ptr, p_len, STR_PTR("/index.html"), STR_LEN("/index.html")) {
             serve_page(req);
         } else {

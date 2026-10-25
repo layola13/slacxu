@@ -1,0 +1,308 @@
+// mini_bridge: the SLA mirror of CXU's miniBridge.ts. Owns the
+// thread state and the turn loop:
+//   user item -> relay gateway turn (std sse_turn, chat mode)
+//   -> tool_calls execute via sa_vm and results go back into the
+//      thread -> next round; a text-only turn completes the turn.
+// Events emitted to the client stream use the CXU vocabulary:
+// turn/started, item/started, item/agentMessage/delta,
+// item/completed, turn/completed, turn/failed.
+@import "sa_std/http_server.sai"
+@import "sa_std/http_client.sai"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "helpers.sla"
+@import "sa_vm.sla"
+
+struct Thread {
+    msgs: [u8; 40960],
+    msgs_len: u64,
+    id: [u8; 64],
+    id_len: u64,
+    turn_seq: u64,
+}
+
+fn thread_reset(th: &Thread, id_ptr: ptr, id_len: u64) -> void {
+    th.msgs_len = 0;
+    th.turn_seq = 0;
+    th.id_len = 0;
+    let i: u64 = 0;
+    let byte: u8 = 0;
+    while i < id_len && i < 64 {
+        BYTE_AT_OUT(byte, id_ptr, i);
+        th.id[i] = byte;
+        th.id_len = th.id_len + 1;
+        i = i + 1;
+    }
+}
+
+// Appends one JSON fragment to the thread's message list,
+// comma-separated. The fragment arrives as a built ByteBuf.
+fn msgs_append_buf(th: &Thread, frag: &ByteBuf) -> void {
+    if th.msgs_len > 0 {
+        if th.msgs_len < 40960 {
+            th.msgs[th.msgs_len] = 44;
+            th.msgs_len = th.msgs_len + 1;
+        };
+    };
+    let i: u64 = 0;
+    while i < frag.len {
+        if th.msgs_len < 40960 {
+            th.msgs[th.msgs_len] = frag.bytes[i];
+            th.msgs_len = th.msgs_len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+// Writes one SSE event line ("data: <json>\n\n") to the stream.
+fn emit_ev(sresp: ptr, ev: &ByteBuf) -> bool {
+    if sa_http_server_resp_stream_write_v2(sresp, STR_PTR("data: "), STR_LEN("data: "), 5000) != 0 { return false; };
+    if sa_http_server_resp_stream_write_v2(sresp, &ev.bytes, ev.len, 5000) != 0 { return false; };
+    if sa_http_server_resp_stream_write_v2(sresp, STR_PTR("\n\n"), STR_LEN("\n\n"), 5000) != 0 { return false; };
+    sa_http_server_resp_stream_flush_v2(sresp);
+    return true;
+}
+
+// CXU MINI_ACTION_HINT_RE at pilot scope: an action-intent first
+// turn is sent with tool_choice "required".
+fn has_action_intent(p_ptr: ptr, p_len: u64) -> bool {
+    if bytes_contains(p_ptr, p_len, STR_PTR("list"), STR_LEN("list")) { return true; };
+    if bytes_contains(p_ptr, p_len, STR_PTR("read"), STR_LEN("read")) { return true; };
+    if bytes_contains(p_ptr, p_len, STR_PTR("file"), STR_LEN("file")) { return true; };
+    if bytes_contains(p_ptr, p_len, STR_PTR("director"), STR_LEN("director")) { return true; };
+    if bytes_contains(p_ptr, p_len, STR_PTR("open"), STR_LEN("open")) { return true; };
+    if bytes_contains(p_ptr, p_len, STR_PTR("inspect"), STR_LEN("inspect")) { return true; };
+    if bytes_contains(p_ptr, p_len, STR_PTR("列出"), STR_LEN("列出")) { return true; };
+    if bytes_contains(p_ptr, p_len, STR_PTR("读取"), STR_LEN("读取")) { return true; };
+    if bytes_contains(p_ptr, p_len, STR_PTR("文件"), STR_LEN("文件")) { return true; };
+    if bytes_contains(p_ptr, p_len, STR_PTR("目录"), STR_LEN("目录")) { return true; };
+    if bytes_contains(p_ptr, p_len, STR_PTR("打开"), STR_LEN("打开")) { return true; };
+    if bytes_contains(p_ptr, p_len, STR_PTR("查看"), STR_LEN("查看")) { return true; };
+    return false;
+}
+
+fn ev_thread_prefix(ev: &ByteBuf, th: &Thread, method_ptr: ptr, method_len: u64) -> void {
+    buf_reset(ev);
+    buf_append_lit(ev, STR_PTR("{\"method\":\""), STR_LEN("{\"method\":\""));
+    buf_append_lit(ev, method_ptr, method_len);
+    buf_append_lit(ev, STR_PTR("\",\"params\":{\"threadId\":\""), STR_LEN("\",\"params\":{\"threadId\":\""));
+    let ii: u64 = 0;
+    while ii < th.id_len {
+        let ib = th.id[ii];
+        if ib == 34 {
+            buf_append_lit(ev, STR_PTR("\\\""), STR_LEN("\\\""));
+        } else if ib == 92 {
+            buf_append_lit(ev, STR_PTR("\\\\"), STR_LEN("\\\\"));
+        } else {
+            if ev.len < 40960 {
+                ev.bytes[ev.len] = ib;
+                ev.len = ev.len + 1;
+            };
+        };
+        ii = ii + 1;
+    }
+    buf_append_lit(ev, STR_PTR("\",\"turnId\":"), STR_LEN("\",\"turnId\":"));
+    buf_append_u64(ev, th.turn_seq);
+}
+
+// Runs one user turn to completion, streaming item events.
+// Returns 0 on turn/completed; 99 when the client went away;
+// other codes mark bridge/upstream failures (turn/failed sent).
+fn bridge_run_turn(sresp: ptr, th: &Thread, ev: &ByteBuf, scratch: &ByteBuf, body: &ByteBuf, res: &ByteBuf, prompt_ptr: ptr, prompt_len: u64) -> i32 {
+    // Scratch buffers are caller-owned: an imported function may
+    // not declare locals with very large arrays (the import
+    // expander rejects them), so the server allocates these once.
+    th.turn_seq = th.turn_seq + 1;
+    buf_reset(ev);
+    buf_reset(scratch);
+    buf_reset(body);
+    buf_reset(res);
+
+    ev_thread_prefix(ev, th, STR_PTR("turn/started"), STR_LEN("turn/started"));
+    buf_append_lit(ev, STR_PTR("}}"), STR_LEN("}}"));
+    if !emit_ev(sresp, ev) { return 99; };
+
+    if th.msgs_len == 0 {
+        buf_reset(scratch);
+        let sys = "{\"role\":\"system\",\"content\":\"You are Mini Agent, a workspace agent. Use the sa_vm tool to inspect real files when a task needs real data. Never invent file contents. When you have enough information, answer directly without calling tools.\"}";
+        buf_append_lit(scratch, STR_PTR(sys), STR_LEN(sys));
+        msgs_append_buf(th, scratch);
+    };
+    buf_reset(scratch);
+    buf_append_lit(scratch, STR_PTR("{\"role\":\"user\",\"content\":\""), STR_LEN("{\"role\":\"user\",\"content\":\""));
+    buf_append_escaped(scratch, prompt_ptr, prompt_len);
+    buf_append_lit(scratch, STR_PTR("\"}"), STR_LEN("\"}"));
+    msgs_append_buf(th, scratch);
+
+    let force = has_action_intent(prompt_ptr, prompt_len);
+    let url = "https://api.kilo.ai/api/gateway/chat/completions";
+    let key = "";
+    let schema = "{\"type\":\"function\",\"function\":{\"name\":\"sa_vm\",\"description\":\"Native workspace tool. action=list_dir lists a directory as JSON. action=read_file reads a text file. Always pass path.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"list_dir\",\"read_file\"]},\"path\":{\"type\":\"string\"}},\"required\":[\"action\",\"path\"]}}}";
+    while 1 == 1 {
+        if th.msgs_len > 40000 {
+            ev_thread_prefix(ev, th, STR_PTR("turn/failed"), STR_LEN("turn/failed"));
+            buf_append_lit(ev, STR_PTR(",\"error\":\"thread too long for the v2 in-memory cap. Start a new thread\"}}"), STR_LEN(",\"error\":\"thread too long for the v2 in-memory cap. Start a new thread\"}}"));
+            emit_ev(sresp, ev);
+            return 42;
+        };
+        buf_reset(body);
+        buf_append_lit(body, STR_PTR("{\"model\":\"kilo-auto/free\",\"stream\":true,\"messages\":["), STR_LEN("{\"model\":\"kilo-auto/free\",\"stream\":true,\"messages\":["));
+        let mi: u64 = 0;
+        while mi < th.msgs_len {
+            if body.len < 40960 {
+                body.bytes[body.len] = th.msgs[mi];
+                body.len = body.len + 1;
+            };
+            mi = mi + 1;
+        }
+        buf_append_lit(body, STR_PTR("],\"tools\":["), STR_LEN("],\"tools\":["));
+        buf_append_lit(body, STR_PTR(schema), STR_LEN(schema));
+        buf_append_lit(body, STR_PTR("],\"tool_choice\":\""), STR_LEN("],\"tool_choice\":\""));
+        if force {
+            buf_append_lit(body, STR_PTR("required"), STR_LEN("required"));
+        } else {
+            buf_append_lit(body, STR_PTR("auto"), STR_LEN("auto"));
+        };
+        buf_append_lit(body, STR_PTR("\",\"max_tokens\":1024}"), STR_LEN("\",\"max_tokens\":1024}"));
+
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        let c_ptr: ptr = PTR_NULL();
+        let c_len: u64 = 0;
+        let st = sa_http_client_sse_turn(STR_PTR(url), STR_LEN(url), &body.bytes, body.len, STR_PTR(key), STR_LEN(key), 1, &t_ptr, &t_len, &c_ptr, &c_len);
+        if st == 2 {
+            ev_thread_prefix(ev, th, STR_PTR("turn/failed"), STR_LEN("turn/failed"));
+            buf_append_lit(ev, STR_PTR(",\"error\":\"upstream error\"}}"), STR_LEN(",\"error\":\"upstream error\"}}"));
+            emit_ev(sresp, ev);
+            return 40;
+        };
+        if st == 1 {
+            let doc = sa_json_parse(c_ptr, c_len);
+            if doc == 0 {
+                ev_thread_prefix(ev, th, STR_PTR("turn/failed"), STR_LEN("turn/failed"));
+                buf_append_lit(ev, STR_PTR(",\"error\":\"bad tool call payload\"}}"), STR_LEN(",\"error\":\"bad tool call payload\"}}"));
+                emit_ev(sresp, ev);
+                return 41;
+            };
+            // Pass A: append the assistant tool_calls message and
+            // emit a toolCall item/started per call.
+            buf_reset(scratch);
+            buf_append_lit(scratch, STR_PTR("{\"role\":\"assistant\",\"content\":null,\"tool_calls\":["), STR_LEN("{\"role\":\"assistant\",\"content\":null,\"tool_calls\":["));
+            let idx: u64 = 0;
+            let first = true;
+            while 1 == 1 {
+                let el: u64 = 0;
+                if sa_json_array_get(doc, idx, &el) != 0 { break; };
+                let cid_ptr: ptr = PTR_NULL();
+                let cid_len: u64 = 0;
+                let nm_ptr: ptr = PTR_NULL();
+                let nm_len: u64 = 0;
+                let ar_ptr: ptr = PTR_NULL();
+                let ar_len: u64 = 0;
+                sa_json_object_get_string(el, STR_PTR("call_id"), STR_LEN("call_id"), &cid_ptr, &cid_len);
+                sa_json_object_get_string(el, STR_PTR("name"), STR_LEN("name"), &nm_ptr, &nm_len);
+                sa_json_object_get_string(el, STR_PTR("args"), STR_LEN("args"), &ar_ptr, &ar_len);
+                if !first {
+                    buf_append_lit(scratch, STR_PTR(","), STR_LEN(","));
+                };
+                buf_append_lit(scratch, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+                buf_append_escaped(scratch, cid_ptr, cid_len);
+                buf_append_lit(scratch, STR_PTR("\",\"type\":\"function\",\"function\":{\"name\":\""), STR_LEN("\",\"type\":\"function\",\"function\":{\"name\":\""));
+                buf_append_escaped(scratch, nm_ptr, nm_len);
+                buf_append_lit(scratch, STR_PTR("\",\"arguments\":\""), STR_LEN("\",\"arguments\":\""));
+                buf_append_escaped(scratch, ar_ptr, ar_len);
+                buf_append_lit(scratch, STR_PTR("\"}}"), STR_LEN("\"}}"));
+                buf_reset(ev);
+                buf_append_lit(ev, STR_PTR("{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"toolCall\",\"id\":\""), STR_LEN("{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"toolCall\",\"id\":\""));
+                buf_append_escaped(ev, cid_ptr, cid_len);
+                buf_append_lit(ev, STR_PTR("\",\"name\":\""), STR_LEN("\",\"name\":\""));
+                buf_append_escaped(ev, nm_ptr, nm_len);
+                buf_append_lit(ev, STR_PTR("\",\"status\":\"inProgress\"}}}"), STR_LEN("\",\"status\":\"inProgress\"}}}"));
+                if !emit_ev(sresp, ev) { return 99; };
+                first = false;
+                idx = idx + 1;
+            }
+            buf_append_lit(scratch, STR_PTR("]}"), STR_LEN("]}"));
+            msgs_append_buf(th, scratch);
+            // Pass B: execute each call, append its tool result,
+            // emit the toolCall item/completed.
+            idx = 0;
+            while 1 == 1 {
+                let el: u64 = 0;
+                if sa_json_array_get(doc, idx, &el) != 0 { break; };
+                let cid_ptr: ptr = PTR_NULL();
+                let cid_len: u64 = 0;
+                let ar_ptr: ptr = PTR_NULL();
+                let ar_len: u64 = 0;
+                sa_json_object_get_string(el, STR_PTR("call_id"), STR_LEN("call_id"), &cid_ptr, &cid_len);
+                sa_json_object_get_string(el, STR_PTR("args"), STR_LEN("args"), &ar_ptr, &ar_len);
+                let action_ptr: ptr = PTR_NULL();
+                let action_len: u64 = 0;
+                let path_ptr: ptr = PTR_NULL();
+                let path_len: u64 = 0;
+                let adoc = sa_json_parse(ar_ptr, ar_len);
+                if adoc != 0 {
+                    sa_json_object_get_string(adoc, STR_PTR("action"), STR_LEN("action"), &action_ptr, &action_len);
+                    sa_json_object_get_string(adoc, STR_PTR("path"), STR_LEN("path"), &path_ptr, &path_len);
+                };
+                if path_len == 0 {
+                    path_ptr = STR_PTR(".");
+                    path_len = 1;
+                };
+                sa_vm_execute(action_ptr, action_len, path_ptr, path_len, res);
+                buf_reset(scratch);
+                buf_append_lit(scratch, STR_PTR("{\"role\":\"tool\",\"tool_call_id\":\""), STR_LEN("{\"role\":\"tool\",\"tool_call_id\":\""));
+                buf_append_escaped(scratch, cid_ptr, cid_len);
+                buf_append_lit(scratch, STR_PTR("\",\"content\":\""), STR_LEN("\",\"content\":\""));
+                buf_append_escaped_buf(scratch, res);
+                buf_append_lit(scratch, STR_PTR("\"}"), STR_LEN("\"}"));
+                msgs_append_buf(th, scratch);
+                buf_reset(ev);
+                buf_append_lit(ev, STR_PTR("{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"toolCall\",\"id\":\""), STR_LEN("{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"toolCall\",\"id\":\""));
+                buf_append_escaped(ev, cid_ptr, cid_len);
+                buf_append_lit(ev, STR_PTR("\",\"name\":\"sa_vm\",\"action\":\""), STR_LEN("\",\"name\":\"sa_vm\",\"action\":\""));
+                buf_append_escaped(ev, action_ptr, action_len);
+                buf_append_lit(ev, STR_PTR("\",\"path\":\""), STR_LEN("\",\"path\":\""));
+                buf_append_escaped(ev, path_ptr, path_len);
+                buf_append_lit(ev, STR_PTR("\",\"status\":\"completed\"}}}"), STR_LEN("\",\"status\":\"completed\"}}}"));
+                if !emit_ev(sresp, ev) { return 99; };
+                idx = idx + 1;
+            }
+            force = false;
+            continue;
+        };
+        // Text turn: one agentMessage segment with the full text
+        // (std sse_turn aggregates; token-level deltas are a
+        // documented divergence in docs/architecture-cxu-mini.md).
+        buf_reset(ev);
+        buf_append_lit(ev, STR_PTR("{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"mini-msg-"), STR_LEN("{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"mini-msg-"));
+        buf_append_u64(ev, th.turn_seq);
+        buf_append_lit(ev, STR_PTR("-s1\",\"status\":\"inProgress\"}}}"), STR_LEN("-s1\",\"status\":\"inProgress\"}}}"));
+        if !emit_ev(sresp, ev) { return 99; };
+        buf_reset(ev);
+        buf_append_lit(ev, STR_PTR("{\"method\":\"item/agentMessage/delta\",\"params\":{\"itemId\":\"mini-msg-"), STR_LEN("{\"method\":\"item/agentMessage/delta\",\"params\":{\"itemId\":\"mini-msg-"));
+        buf_append_u64(ev, th.turn_seq);
+        buf_append_lit(ev, STR_PTR("-s1\",\"delta\":\""), STR_LEN("-s1\",\"delta\":\""));
+        buf_append_escaped(ev, t_ptr, t_len);
+        buf_append_lit(ev, STR_PTR("\"}}"), STR_LEN("\"}}"));
+        if !emit_ev(sresp, ev) { return 99; };
+        buf_reset(ev);
+        buf_append_lit(ev, STR_PTR("{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"mini-msg-"), STR_LEN("{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"mini-msg-"));
+        buf_append_u64(ev, th.turn_seq);
+        buf_append_lit(ev, STR_PTR("-s1\",\"text\":\""), STR_LEN("-s1\",\"text\":\""));
+        buf_append_escaped(ev, t_ptr, t_len);
+        buf_append_lit(ev, STR_PTR("\",\"status\":\"completed\"}}}"), STR_LEN("\",\"status\":\"completed\"}}}"));
+        if !emit_ev(sresp, ev) { return 99; };
+        buf_reset(scratch);
+        buf_append_lit(scratch, STR_PTR("{\"role\":\"assistant\",\"content\":\""), STR_LEN("{\"role\":\"assistant\",\"content\":\""));
+        buf_append_escaped(scratch, t_ptr, t_len);
+        buf_append_lit(scratch, STR_PTR("\"}"), STR_LEN("\"}"));
+        msgs_append_buf(th, scratch);
+        ev_thread_prefix(ev, th, STR_PTR("turn/completed"), STR_LEN("turn/completed"));
+        buf_append_lit(ev, STR_PTR(",\"status\":\"completed\"}}"), STR_LEN(",\"status\":\"completed\"}}"));
+        emit_ev(sresp, ev);
+        return 0;
+    }
+    return 0;
+}

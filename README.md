@@ -121,7 +121,7 @@ thread/start, id extraction, turn/start, stream through
 turn/completed — in ~11 s, exit 0. That is the P1 acceptance: a
 real codex turn through the SLA backend.
 
-## packages/mini-agent — Mini Agent, front and back (P2 focus)
+## apps/server + apps/web — Mini Agent, front and back (CXU layout)
 
 The SLA rebuild of CXU's Mini Agent as one runnable service
 (`packages/mini-agent/`, port 18086):
@@ -137,9 +137,16 @@ The SLA rebuild of CXU's Mini Agent as one runnable service
 - **Frontend** (`www/index.html`): a single page that posts the
   prompt and renders streamed `delta.content` tokens live.
 
-`run.sh` is the end-to-end check: build, serve, page contains
-"Mini Agent", and a real prompt streams back `content:"ok"` plus
-`[DONE]` — `mini-agent e2e ok`. v1 limits, stated plainly: one
-request at a time (single-threaded accept loop), single-turn (no
-history yet), no tool calls yet; the thread of work is making
-this surface grow toward the TS Mini Agent's shape.
+`run.sh` is the end-to-end check: build, serve the page, run a
+text turn (item events stream, agentMessage completes with
+"ok") and a tool turn (an `sa_vm` `list_dir` toolCall item
+executes, and the final agentMessage names a real directory
+entry) — `mini-agent e2e ok`. The v2 shape mirrors CXU's
+miniBridge (see docs/architecture-cxu-mini.md): thread state
+with message history across turns, the turn loop, tool_choice
+"required" on action-intent first turns, and the codex item
+event vocabulary over SSE. Stated limits: one request at a
+time (single-threaded accept loop), threads in memory (file
+persistence is the next slice), sa_vm subset (list_dir,
+read_file), and text arrives as one delta per turn because the
+std sse_turn call aggregates the upstream stream.
