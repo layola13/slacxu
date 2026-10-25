@@ -147,6 +147,6 @@ with message history across turns, the turn loop, tool_choice
 "required" on action-intent first turns, and the codex item
 event vocabulary over SSE. Stated limits: one request at a
 time (single-threaded accept loop), threads in memory (file
-persistence is the next slice), sa_vm subset (list_dir,
+now landed: agent_runtime/thread_store.sla), sa_vm subset (list_dir,
 read_file), and text arrives as one delta per turn because the
 std sse_turn call aggregates the upstream stream.

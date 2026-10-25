@@ -1,0 +1,215 @@
+// thread_store: file-per-thread history, mirroring CXU's
+// MiniFileHistory (mini_agent 0.1.18): one file per thread under
+// the history dir (env MINI_HISTORY_DIR, default "threads"),
+// frontmatter plus the raw message list between markers. The
+// file is the recovery source of truth: on a thread switch the
+// server restores messages and turn count from it, so a thread
+// survives process restarts.
+// Divergence from CXU, stated: CXU embeds a JSON state comment;
+// here the message list is stored verbatim between begin/end
+// markers (the live thread caps it at the same size, so restore
+// is lossless by construction).
+@import "sa_std/fs.sai"
+@import "sa_std/env.sai"
+@import "sa_std/string.sa"
+@import "../helpers.sla"
+@import "../mini_bridge.sla"
+@import "../ptradd.sa"
+
+struct FileBuf {
+    bytes: [u8; 163840],
+    len: u64,
+}
+
+struct ChunkBuf {
+    bytes: [u8; 4096],
+    len: u64,
+}
+
+fn hist_dir(out: &ByteBuf) -> void {
+    buf_reset(out);
+    let h = sa_env_get(STR_PTR("MINI_HISTORY_DIR"), STR_LEN("MINI_HISTORY_DIR"));
+    if h != 0 {
+        let dp: ptr = sa_env_buffer_data(h);
+        let dl = sa_env_buffer_len(h);
+        if dl > 0 {
+            buf_append_lit(out, dp, dl);
+            return;
+        };
+    };
+    buf_append_lit(out, STR_PTR("threads"), STR_LEN("threads"));
+}
+
+// Builds <dir>/<sanitized id>.md into `out`. Sanitization keeps
+// [A-Za-z0-9._-] and maps everything else to '_', so a hostile
+// thread id cannot escape the history dir.
+fn thread_path(th: &Thread, out: &ByteBuf) -> void {
+    hist_dir(out);
+    buf_append_lit(out, STR_PTR("/"), STR_LEN("/"));
+    let i: u64 = 0;
+    while i < th.id_len {
+        let b = th.id[i];
+        let ok = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 46 || b == 95 || b == 45;
+        if out.len < 40960 {
+            if ok {
+                out.bytes[out.len] = b;
+            } else {
+                out.bytes[out.len] = 95;
+            };
+            out.len = out.len + 1;
+        };
+        i = i + 1;
+    }
+    buf_append_lit(out, STR_PTR(".md"), STR_LEN(".md"));
+}
+
+fn fb_append_msgs(fb: &FileBuf, th: &Thread) -> void {
+    let i: u64 = 0;
+    while i < th.msgs_len {
+        if fb.len < 163840 {
+            fb.bytes[fb.len] = th.msgs[i];
+            fb.len = fb.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn fb_append_lit(fb: &FileBuf, src_ptr: ptr, src_len: u64) -> void {
+    let i: u64 = 0;
+    let byte: u8 = 0;
+    while i < src_len {
+        BYTE_AT_OUT(byte, src_ptr, i);
+        if fb.len < 163840 {
+            fb.bytes[fb.len] = byte;
+            fb.len = fb.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn fb_append_u64(fb: &FileBuf, v: u64) -> void {
+    let digits = [0u8; 20];
+    let n: u64 = 0;
+    let x = v;
+    if x == 0 {
+        digits[0] = 48;
+        n = 1;
+    };
+    while x > 0 {
+        digits[n] = 48 + (x % 10) as u8;
+        n = n + 1;
+        x = x / 10;
+    }
+    let i = n;
+    while i > 0 {
+        i = i - 1;
+        if fb.len < 163840 {
+            fb.bytes[fb.len] = digits[i];
+            fb.len = fb.len + 1;
+        };
+    }
+}
+
+// Finds needle in fb starting at `from`; returns its index or
+// 4294967295 when absent.
+fn fb_find(fb: &FileBuf, from: u64, needle_ptr: ptr, needle_len: u64) -> u64 {
+    let i = from;
+    let nb: u8 = 0;
+    while i + needle_len <= fb.len {
+        let j: u64 = 0;
+        let ok = true;
+        while j < needle_len {
+            BYTE_AT_OUT(nb, needle_ptr, j);
+            if fb.bytes[i + j] != nb { ok = false; };
+            j = j + 1;
+        }
+        if ok { return i; };
+        i = i + 1;
+    }
+    return 4294967295;
+}
+
+fn thread_save(th: &Thread, fb: &FileBuf, pathb: &ByteBuf) -> i32 {
+    thread_path(th, pathb);
+    fb.len = 0;
+    fb_append_lit(fb, STR_PTR("---\nthread: "), STR_LEN("---\nthread: "));
+    let i: u64 = 0;
+    while i < th.id_len {
+        if fb.len < 163840 {
+            fb.bytes[fb.len] = th.id[i];
+            fb.len = fb.len + 1;
+        };
+        i = i + 1;
+    }
+    fb_append_lit(fb, STR_PTR("\nturns: "), STR_LEN("\nturns: "));
+    fb_append_u64(fb, th.turn_seq);
+    fb_append_lit(fb, STR_PTR("\n---\n<!--mini-msgs-begin-->\n"), STR_LEN("\n---\n<!--mini-msgs-begin-->\n"));
+    fb_append_msgs(fb, th);
+    fb_append_lit(fb, STR_PTR("\n<!--mini-msgs-end-->\n"), STR_LEN("\n<!--mini-msgs-end-->\n"));
+    let wst = sa_fs_write_file(&pathb.bytes, pathb.len, &fb.bytes, fb.len);
+    if wst != 0 { return 6; };
+    return 0;
+}
+
+// Restores msgs + turn_seq for the thread id already set on th.
+// Returns 0 restored, 3 no file yet (fresh thread), 6 io error,
+// 7 malformed file.
+fn thread_load(th: &Thread, fb: &FileBuf, pathb: &ByteBuf) -> i32 {
+    thread_path(th, pathb);
+    let total: u64 = 0;
+    if sa_std_fs_len(&pathb.bytes, pathb.len, &total) != 0 { return 3; };
+    if total > 163840 { return 6; };
+    let fh: u64 = 0;
+    if sa_std_fs_open_read(&pathb.bytes, pathb.len, &fh) != 0 { return 6; };
+    fb.len = 0;
+    let chunk = ChunkBuf { bytes: [0u8; 4096], len: 0 };
+    let guard: u64 = 0;
+    while guard < 64 {
+        let read_n: u64 = 0;
+        let rst = sa_std_fs_file_read(fh, &chunk.bytes, 4096, &read_n);
+        if rst != 0 {
+            sa_fs_file_close(fh);
+            return 6;
+        };
+        if read_n == 0 { break; };
+        let ci: u64 = 0;
+        while ci < read_n {
+            if fb.len < 163840 {
+                fb.bytes[fb.len] = chunk.bytes[ci];
+                fb.len = fb.len + 1;
+            };
+            ci = ci + 1;
+        }
+        guard = guard + 1;
+    }
+    sa_fs_file_close(fh);
+    let begin_marker = "<!--mini-msgs-begin-->\n";
+    let bp = fb_find(fb, 0, STR_PTR(begin_marker), STR_LEN(begin_marker));
+    if bp == 4294967295 { return 7; };
+    let start = bp + STR_LEN(begin_marker);
+    let end_marker = "\n<!--mini-msgs-end-->";
+    let ep = fb_find(fb, start, STR_PTR(end_marker), STR_LEN(end_marker));
+    if ep == 4294967295 { return 7; };
+    th.msgs_len = 0;
+    let i = start;
+    while i < ep {
+        if th.msgs_len < 40960 {
+            th.msgs[th.msgs_len] = fb.bytes[i];
+            th.msgs_len = th.msgs_len + 1;
+        };
+        i = i + 1;
+    }
+    // turn count from the frontmatter "turns: N" line.
+    let tp = fb_find(fb, 0, STR_PTR("turns: "), STR_LEN("turns: "));
+    th.turn_seq = 0;
+    if tp != 4294967295 {
+        let k = tp + STR_LEN("turns: ");
+        while k < fb.len {
+            let b = fb.bytes[k];
+            if b < 48 || b > 57 { break; };
+            th.turn_seq = th.turn_seq * 10 + (b - 48) as u64;
+            k = k + 1;
+        }
+    };
+    return 0;
+}
