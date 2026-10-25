@@ -53,3 +53,9 @@ cd packages/cxu-bridge && bash run.sh
 The bridge child defaults to `/bin/cat` (echo smoke). Point
 `CXU_AGENT_CMD` at a real agent CLI for the live slice; the command is
 a single executable path in this slice (no argument splitting yet).
+
+Slice 2 (landed): the pump is multi-round — stdin stays open while
+replies are read line by line (two rounds, ids 1 and 2, per-round
+framing checks; EOF mid-round is a hard failure). Next: argument
+vectors for the child (a real agent CLI needs flags), then the live
+codex round.
