@@ -66,6 +66,19 @@ this list to be complete when the live codex turn lands.
    import resolution, not the code just written.
 
 
+## Imported-file limits (found by mini-agent v2, 2026-10-25)
+
+- The SLA import expander rejects functions in @imported files
+  that declare very large array locals (a 40960-byte array
+  local fails with an unlocated error.SyntaxError; 4096 works;
+  root files are exempt). Large scratch buffers must be
+  caller-allocated and passed as &Struct parameters. Concatenating
+  the imported file plus its caller into one root file restores
+  located parse errors and is the reliable bisect method.
+- A `while` block followed by `;` (notably inside if/else
+  branches) trips "Unexpected prefix token: semicolon" in the
+  same expansion path; `if` blocks may keep their `;`.
+
 ## mini-agent v3/v4 notes (2026-10-25)
 
 - An SLA user function named `str_eq` collides with a checker
