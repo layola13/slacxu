@@ -88,4 +88,13 @@ echo "$OUT7" | grep -q '"name":"read_skill"' || { echo "SKILL TURN FAILED (no re
 echo "$OUT7" | grep -qi 'haiku' || { echo "SKILL TURN FAILED (no haiku)"; echo "$OUT7" | tail -3; exit 1; }
 echo "$OUT7" | grep -q '"method":"turn/completed"' || { echo "SKILL TURN FAILED (no turn/completed)"; echo "$OUT7" | tail -3; exit 1; }
 echo "mini-agent read_skill ok"
+
+OUT8=$(timeout 180 curl -sN -X POST http://127.0.0.1:18086/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"First call update_plan with a 2-step plan: step 1 list the files here, step 2 summarize them. Then do step 1 with the list_dir tool and give a one-line summary.","threadId":"t-plan"}')
+echo "$OUT8" | grep -q '"method":"turn/plan/updated"' || { echo "PLAN TURN FAILED (no plan event)"; echo "$OUT8" | tail -3; exit 1; }
+echo "$OUT8" | grep -q '"step"' || { echo "PLAN TURN FAILED (no steps)"; echo "$OUT8" | tail -3; exit 1; }
+echo "$OUT8" | grep -q '"action":"list_dir"' || { echo "PLAN TURN FAILED (plan not executed)"; echo "$OUT8" | tail -3; exit 1; }
+echo "$OUT8" | grep -q '"method":"turn/completed"' || { echo "PLAN TURN FAILED (no turn/completed)"; echo "$OUT8" | tail -3; exit 1; }
+echo "mini-agent update_plan ok"
 echo "mini-agent e2e ok"

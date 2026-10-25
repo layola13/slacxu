@@ -71,3 +71,4 @@ agentRuntime/*`, `apps/web` waterfall item rendering.
 - One process, threads in memory; file persistence is slice B.
 - Tool subset: list_dir + read_file only; run_host and the rest
   follow as their own slices.
+| update_plan tool | apps/server/src/mini_bridge.sla (dispatch) + apps/web plan rendering | done: turn/plan/updated carries the plan array verbatim plus optional explanation; the page renders steps with status marks |
