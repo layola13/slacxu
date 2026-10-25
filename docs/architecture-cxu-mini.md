@@ -219,3 +219,22 @@ the pipeline itself was re-verified the same evening with a
 local capture double (a canned Responses stream containing a
 reasoning summary delta produces item/reasoning/textDelta
 through the bridge) — see wall-list for the full evidence.
+
+## v13 MCP persistent sessions (2026-10-25)
+
+Supersedes the v11 session-per-call design: discovery now
+keeps the first four servers' sessions open for the whole
+top-level turn, and mcp_call reuses them (request ids from a
+per-turn counter starting at 100). A session that fails
+mid-call is closed and the call retries once on a fresh
+session; servers beyond the fourth use a fresh session per
+call, as before. handle_chat closes all sessions when the
+turn ends (mcp_close_all); discovery also closes any
+leftovers defensively. scripts/mcpSmoke proves persistence:
+across discover + two calls the fake server sees exactly
+one initialize.
+
+The change flushed out a std deadlock (fixed in sci, see
+wall-list): sse turns now coexist with long-lived child
+processes, which the CXU shape requires anyway (an MCP
+server outlives many relay rounds by design).

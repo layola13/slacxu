@@ -9,13 +9,17 @@
 //            tools/list, record {full, server, tool, desc, schema}
 //   defs     mcp_append_defs renders the records as relay tool
 //            definitions (chat wrapped / responses flat)
-//   call     session-per-call: spawn, initialize, tools/call,
-//            flatten result.content text into the tool result
+//   call     the persistent session kept from discovery
+//            (slots 0..3), tools/call, flatten result.content
+//            text into the tool result
 //
-// Sessions are per operation (no persistent process table): MCP
-// stdio servers are spawned per session by design, and a fresh
-// initialize+call is spec-legal; the cost is one spawn per call,
-// stated in docs/wall-list.md rather than hidden. Every failure
+// Sessions live for one top-level turn: discovery spawns each
+// server once (initialize + tools/list) and keeps the first
+// four sessions open; calls reuse them (a dead session is
+// closed and the call retries once on a fresh session;
+// servers beyond the fourth use a fresh session per call).
+// handle_chat closes all sessions when the turn ends
+// (mcp_close_all). Every failure
 // writes an explicit "error: mcp ..." tool result or discovery
 // error (surfaced by the bridge as thread/mcpFailed); nothing is
 // silently skipped except the normal no-config case.
@@ -50,6 +54,24 @@ struct McpState {
     err: [u8; 512],
     err_len: u64,
     n_tools: u64,
+    s0_proc: u64,
+    s0_hin: u64,
+    s0_hout: u64,
+    s0_herr: u64,
+    s1_proc: u64,
+    s1_hin: u64,
+    s1_hout: u64,
+    s1_herr: u64,
+    s2_proc: u64,
+    s2_hin: u64,
+    s2_hout: u64,
+    s2_herr: u64,
+    s3_proc: u64,
+    s3_hin: u64,
+    s3_hout: u64,
+    s3_herr: u64,
+    next_req: u64,
+    lb_owner: u64,
 }
 
 struct McpProc {
@@ -244,6 +266,78 @@ fn mcp_close(pr: &McpProc) -> void {
     pr.herr = 0;
 }
 
+fn mcp_sess_get(state: &McpState, slot: u64, pr: &McpProc) -> void {
+    pr.proc = 0;
+    pr.hin = 0;
+    pr.hout = 0;
+    pr.herr = 0;
+    if slot == 0 { pr.proc = state.s0_proc; pr.hin = state.s0_hin; pr.hout = state.s0_hout; pr.herr = state.s0_herr; };
+    if slot == 1 { pr.proc = state.s1_proc; pr.hin = state.s1_hin; pr.hout = state.s1_hout; pr.herr = state.s1_herr; };
+    if slot == 2 { pr.proc = state.s2_proc; pr.hin = state.s2_hin; pr.hout = state.s2_hout; pr.herr = state.s2_herr; };
+    if slot == 3 { pr.proc = state.s3_proc; pr.hin = state.s3_hin; pr.hout = state.s3_hout; pr.herr = state.s3_herr; };
+}
+
+fn mcp_sess_set(state: &McpState, slot: u64, pr: &McpProc) -> void {
+    if slot == 0 { state.s0_proc = pr.proc; state.s0_hin = pr.hin; state.s0_hout = pr.hout; state.s0_herr = pr.herr; };
+    if slot == 1 { state.s1_proc = pr.proc; state.s1_hin = pr.hin; state.s1_hout = pr.hout; state.s1_herr = pr.herr; };
+    if slot == 2 { state.s2_proc = pr.proc; state.s2_hin = pr.hin; state.s2_hout = pr.hout; state.s2_herr = pr.herr; };
+    if slot == 3 { state.s3_proc = pr.proc; state.s3_hin = pr.hin; state.s3_hout = pr.hout; state.s3_herr = pr.herr; };
+}
+
+fn mcp_sess_clear(state: &McpState, slot: u64) -> void {
+    let z = McpProc { proc: 0, hin: 0, hout: 0, herr: 0 };
+    mcp_sess_set(state, slot, &z);
+}
+
+// Closes every persistent session (turn end; also run at the
+// start of discovery as a defensive cleanup).
+fn mcp_close_all(state: &McpState) -> void {
+    for slot in 0..4 {
+        let pr = McpProc { proc: 0, hin: 0, hout: 0, herr: 0 };
+        mcp_sess_get(state, slot, &pr);
+        if pr.proc != 0 { mcp_close(&pr); };
+        mcp_sess_clear(state, slot);
+    }
+    state.lb_owner = 0;
+}
+
+fn mcp_req_append_u64(state: &McpState, v: u64) -> void {
+    let digits = [0u8; 20];
+    let dn: u64 = 0;
+    let dx = v;
+    if dx == 0 { digits[0] = 48; dn = 1; };
+    while dx > 0 {
+        digits[dn] = 48 + (dx % 10) as u8;
+        dn = dn + 1;
+        dx = dx / 10;
+    }
+    let di = dn;
+    while di > 0 {
+        di = di - 1;
+        if state.req_len < 8192 {
+            state.req_bytes[state.req_len] = digits[di];
+            state.req_len = state.req_len + 1;
+        };
+    }
+}
+
+// Builds and sends one tools/call request with the given id.
+fn mcp_send_call(state: &McpState, pr: &McpProc, tool_ptr: ptr, tool_len: u64, args_ptr: ptr, args_len: u64, req_id: u64) -> bool {
+    state.req_len = 0;
+    mcp_req_append(state, STR_PTR("{\"jsonrpc\":\"2.0\",\"id\":"), STR_LEN("{\"jsonrpc\":\"2.0\",\"id\":"));
+    mcp_req_append_u64(state, req_id);
+    mcp_req_append(state, STR_PTR(",\"method\":\"tools/call\",\"params\":{\"name\":\""), STR_LEN(",\"method\":\"tools/call\",\"params\":{\"name\":\""));
+    mcp_req_append(state, tool_ptr, tool_len);
+    mcp_req_append(state, STR_PTR("\",\"arguments\":"), STR_LEN("\",\"arguments\":"));
+    if args_len > 0 {
+        mcp_req_append(state, args_ptr, args_len);
+    } else {
+        mcp_req_append(state, STR_PTR("{}"), STR_LEN("{}"));
+    };
+    mcp_req_append(state, STR_PTR("}}\n"), STR_LEN("}}\n"));
+    return mcp_send(state, pr.hin);
+}
+
 // Reads lines from the server until one carries "id" == want_id;
 // that line lands in state.resp_*. Notifications and stale replies
 // are skipped. Blocking reads (wall-list #2 discipline): a server
@@ -307,7 +401,7 @@ fn mcp_open_session(state: &McpState, cmd_ptr: ptr, cmd_len: u64, pr: &McpProc) 
     state.lb_len = 0;
     if !mcp_spawn(cmd_ptr, cmd_len, pr) { return false; };
     state.req_len = 0;
-    let init = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"slacxu-mini\",\"version\":\"0.11.0\"}}}\n";
+    let init = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"slacxu-mini\",\"version\":\"0.13.0\"}}}\n";
     mcp_req_append(state, STR_PTR(init), STR_LEN(init));
     if !mcp_send(state, pr.hin) {
         mcp_close(pr);
@@ -379,7 +473,7 @@ fn mcp_record_tool(state: &McpState, srv_ptr: ptr, srv_len: u64, tool_node: u64)
 // Runs tools/list against one server and records its tools.
 // Failures append to state.err (the bridge surfaces them as
 // thread/mcpFailed) and discovery continues with other servers.
-fn mcp_discover_server(state: &McpState, srv_ptr: ptr, srv_len: u64, cmd_ptr: ptr, cmd_len: u64) -> void {
+fn mcp_discover_server(state: &McpState, slot: u64, srv_ptr: ptr, srv_len: u64, cmd_ptr: ptr, cmd_len: u64) -> void {
     let pr = McpProc { proc: 0, hin: 0, hout: 0, herr: 0 };
     if !mcp_open_session(state, cmd_ptr, cmd_len, &pr) {
         if state.err_len > 0 { mcp_err_append(state, STR_PTR("; "), STR_LEN("; ")); };
@@ -399,7 +493,15 @@ fn mcp_discover_server(state: &McpState, srv_ptr: ptr, srv_len: u64, cmd_ptr: pt
         mcp_close(&pr);
         return;
     };
-    mcp_close(&pr);
+    // Keep the session for this turn's calls when it fits a
+    // persistent slot; handle_chat closes all sessions when
+    // the top-level turn ends.
+    if slot < 4 {
+        mcp_sess_set(state, slot, &pr);
+        state.lb_owner = slot + 1;
+    } else {
+        mcp_close(&pr);
+    };
     let doc = sa_json_parse(&state.resp_bytes, state.resp_len);
     if doc == 0 { return; };
     let res_node: u64 = 0;
@@ -419,6 +521,8 @@ fn mcp_discover_server(state: &McpState, srv_ptr: ptr, srv_len: u64, cmd_ptr: pt
 // No config file is the normal unconfigured case (zero tools, no
 // error). A config that exists but cannot be parsed is an error.
 fn mcp_discover(state: &McpState) -> void {
+    mcp_close_all(state);
+    state.next_req = 100;
     state.rec_len = 0;
     mcp_rec_append(state, STR_PTR("["), STR_LEN("["));
     state.n_tools = 0;
@@ -485,7 +589,7 @@ fn mcp_discover(state: &McpState) -> void {
             if state.err_len > 0 { mcp_err_append(state, STR_PTR("; "), STR_LEN("; ")); };
             mcp_err_append(state, STR_PTR("mcp config: server entry missing name/cmdline"), STR_LEN("mcp config: server entry missing name/cmdline"));
         } else {
-            mcp_discover_server(state, nm_ptr, nm_len, cm_ptr, cm_len);
+            mcp_discover_server(state, idx, nm_ptr, nm_len, cm_ptr, cm_len);
         };
         idx = idx + 1;
     }
@@ -544,106 +648,9 @@ fn mcp_append_defs(state: &McpState, body: &ByteBuf, wire_responses: bool) -> vo
     }
 }
 
-fn mcp_name_is(name_ptr: ptr, name_len: u64) -> bool {
-    if name_len < 6 { return false; };
-    let b0: u8 = 0;
-    let b1: u8 = 0;
-    let b2: u8 = 0;
-    let b3: u8 = 0;
-    let b4: u8 = 0;
-    PTR_BYTE_AT(b0, name_ptr, 0);
-    PTR_BYTE_AT(b1, name_ptr, 1);
-    PTR_BYTE_AT(b2, name_ptr, 2);
-    PTR_BYTE_AT(b3, name_ptr, 3);
-    PTR_BYTE_AT(b4, name_ptr, 4);
-    return b0 == 109 && b1 == 99 && b2 == 112 && b3 == 95 && b4 == 95;
-}
-
-// Executes one mcp__<server>__<tool> call. out always receives a
-// result: flattened content text, or an explicit "error: mcp ...".
-fn mcp_call(state: &McpState, name_ptr: ptr, name_len: u64, args_ptr: ptr, args_len: u64, out: &ByteBuf) -> void {
-    buf_reset(out);
-    // Route: find the record for this full tool name.
-    let srv_ptr: ptr = PTR_NULL();
-    let srv_len: u64 = 0;
-    let tool_ptr: ptr = PTR_NULL();
-    let tool_len: u64 = 0;
-    let rdoc = sa_json_parse(&state.rec_bytes, state.rec_len);
-    if rdoc != 0 {
-        let idx: u64 = 0;
-        while 1 == 1 {
-            let el: u64 = 0;
-            if sa_json_array_get(rdoc, idx, &el) != 0 { break; };
-            let f_ptr: ptr = PTR_NULL();
-            let f_len: u64 = 0;
-            sa_json_object_get_string(el, STR_PTR("full"), STR_LEN("full"), &f_ptr, &f_len);
-            if mcp_str_eq(f_ptr, f_len, name_ptr, name_len) {
-                sa_json_object_get_string(el, STR_PTR("server"), STR_LEN("server"), &srv_ptr, &srv_len);
-                sa_json_object_get_string(el, STR_PTR("tool"), STR_LEN("tool"), &tool_ptr, &tool_len);
-                break;
-            };
-            idx = idx + 1;
-        }
-    };
-    if srv_len == 0 || tool_len == 0 {
-        buf_append_lit(out, STR_PTR("error: mcp unknown tool "), STR_LEN("error: mcp unknown tool "));
-        buf_append_lit(out, name_ptr, name_len);
-        return;
-    };
-    // Find the server's cmdline in the config.
-    let cm_ptr: ptr = PTR_NULL();
-    let cm_len: u64 = 0;
-    let cdoc = sa_json_parse(&state.cfg_bytes, state.cfg_len);
-    if cdoc != 0 {
-        let servers: u64 = 0;
-        if sa_json_object_get(cdoc, STR_PTR("servers"), STR_LEN("servers"), &servers) == 0 {
-            let idx2: u64 = 0;
-            while 1 == 1 {
-                let el2: u64 = 0;
-                if sa_json_array_get(servers, idx2, &el2) != 0 { break; };
-                let n2_ptr: ptr = PTR_NULL();
-                let n2_len: u64 = 0;
-                sa_json_object_get_string(el2, STR_PTR("name"), STR_LEN("name"), &n2_ptr, &n2_len);
-                if mcp_str_eq(n2_ptr, n2_len, srv_ptr, srv_len) {
-                    sa_json_object_get_string(el2, STR_PTR("cmdline"), STR_LEN("cmdline"), &cm_ptr, &cm_len);
-                    break;
-                };
-                idx2 = idx2 + 1;
-            }
-        };
-    };
-    if cm_len == 0 {
-        buf_append_lit(out, STR_PTR("error: mcp server not in config: "), STR_LEN("error: mcp server not in config: "));
-        buf_append_lit(out, srv_ptr, srv_len);
-        return;
-    };
-    let pr = McpProc { proc: 0, hin: 0, hout: 0, herr: 0 };
-    if !mcp_open_session(state, cm_ptr, cm_len, &pr) {
-        buf_append_lit(out, STR_PTR("error: mcp server "), STR_LEN("error: mcp server "));
-        buf_append_lit(out, srv_ptr, srv_len);
-        buf_append_lit(out, STR_PTR(": initialize failed"), STR_LEN(": initialize failed"));
-        return;
-    };
-    state.req_len = 0;
-    mcp_req_append(state, STR_PTR("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\""), STR_LEN("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\""));
-    // Tool names are identifier-shaped values from our own
-    // records; append the raw bytes.
-    mcp_req_append(state, tool_ptr, tool_len);
-    mcp_req_append(state, STR_PTR("\",\"arguments\":"), STR_LEN("\",\"arguments\":"));
-    if args_len > 0 {
-        mcp_req_append(state, args_ptr, args_len);
-    } else {
-        mcp_req_append(state, STR_PTR("{}"), STR_LEN("{}"));
-    };
-    mcp_req_append(state, STR_PTR("}}\n"), STR_LEN("}}\n"));
-    if !mcp_send(state, pr.hin) || !mcp_read_until_id(state, pr.hout, 3) {
-        mcp_close(&pr);
-        buf_append_lit(out, STR_PTR("error: mcp server "), STR_LEN("error: mcp server "));
-        buf_append_lit(out, srv_ptr, srv_len);
-        buf_append_lit(out, STR_PTR(": tools/call failed"), STR_LEN(": tools/call failed"));
-        return;
-    };
-    mcp_close(&pr);
+// Renders the tools/call response currently in state.resp_*
+// into out: flattened content text, or an explicit error.
+fn mcp_emit_result(state: &McpState, srv_ptr: ptr, srv_len: u64, name_ptr: ptr, name_len: u64, out: &ByteBuf) -> void {
     let doc = sa_json_parse(&state.resp_bytes, state.resp_len);
     if doc == 0 {
         buf_append_lit(out, STR_PTR("error: mcp server "), STR_LEN("error: mcp server "));
@@ -716,5 +723,126 @@ fn mcp_call(state: &McpState, name_ptr: ptr, name_len: u64, args_ptr: ptr, args_
     };
     if out.len == 0 {
         buf_append_lit(out, STR_PTR("(empty mcp result)"), STR_LEN("(empty mcp result)"));
+    };
+}
+
+fn mcp_name_is(name_ptr: ptr, name_len: u64) -> bool {
+    if name_len < 6 { return false; };
+    let b0: u8 = 0;
+    let b1: u8 = 0;
+    let b2: u8 = 0;
+    let b3: u8 = 0;
+    let b4: u8 = 0;
+    PTR_BYTE_AT(b0, name_ptr, 0);
+    PTR_BYTE_AT(b1, name_ptr, 1);
+    PTR_BYTE_AT(b2, name_ptr, 2);
+    PTR_BYTE_AT(b3, name_ptr, 3);
+    PTR_BYTE_AT(b4, name_ptr, 4);
+    return b0 == 109 && b1 == 99 && b2 == 112 && b3 == 95 && b4 == 95;
+}
+
+// Executes one mcp__<server>__<tool> call. out always receives a
+// result: flattened content text, or an explicit "error: mcp ...".
+fn mcp_call(state: &McpState, name_ptr: ptr, name_len: u64, args_ptr: ptr, args_len: u64, out: &ByteBuf) -> void {
+    buf_reset(out);
+    // Route: find the record for this full tool name.
+    let srv_ptr: ptr = PTR_NULL();
+    let srv_len: u64 = 0;
+    let tool_ptr: ptr = PTR_NULL();
+    let tool_len: u64 = 0;
+    let rdoc = sa_json_parse(&state.rec_bytes, state.rec_len);
+    if rdoc != 0 {
+        let idx: u64 = 0;
+        while 1 == 1 {
+            let el: u64 = 0;
+            if sa_json_array_get(rdoc, idx, &el) != 0 { break; };
+            let f_ptr: ptr = PTR_NULL();
+            let f_len: u64 = 0;
+            sa_json_object_get_string(el, STR_PTR("full"), STR_LEN("full"), &f_ptr, &f_len);
+            if mcp_str_eq(f_ptr, f_len, name_ptr, name_len) {
+                sa_json_object_get_string(el, STR_PTR("server"), STR_LEN("server"), &srv_ptr, &srv_len);
+                sa_json_object_get_string(el, STR_PTR("tool"), STR_LEN("tool"), &tool_ptr, &tool_len);
+                break;
+            };
+            idx = idx + 1;
+        }
+    };
+    if srv_len == 0 || tool_len == 0 {
+        buf_append_lit(out, STR_PTR("error: mcp unknown tool "), STR_LEN("error: mcp unknown tool "));
+        buf_append_lit(out, name_ptr, name_len);
+        return;
+    };
+    // Find the server's cmdline in the config.
+    let cm_ptr: ptr = PTR_NULL();
+    let cm_len: u64 = 0;
+    let srv_ord: u64 = 4294967295;
+    let cdoc = sa_json_parse(&state.cfg_bytes, state.cfg_len);
+    if cdoc != 0 {
+        let servers: u64 = 0;
+        if sa_json_object_get(cdoc, STR_PTR("servers"), STR_LEN("servers"), &servers) == 0 {
+            let idx2: u64 = 0;
+            while 1 == 1 {
+                let el2: u64 = 0;
+                if sa_json_array_get(servers, idx2, &el2) != 0 { break; };
+                let n2_ptr: ptr = PTR_NULL();
+                let n2_len: u64 = 0;
+                sa_json_object_get_string(el2, STR_PTR("name"), STR_LEN("name"), &n2_ptr, &n2_len);
+                if mcp_str_eq(n2_ptr, n2_len, srv_ptr, srv_len) {
+                    sa_json_object_get_string(el2, STR_PTR("cmdline"), STR_LEN("cmdline"), &cm_ptr, &cm_len);
+                    srv_ord = idx2;
+                    break;
+                };
+                idx2 = idx2 + 1;
+            }
+        };
+    };
+    if cm_len == 0 {
+        buf_append_lit(out, STR_PTR("error: mcp server not in config: "), STR_LEN("error: mcp server not in config: "));
+        buf_append_lit(out, srv_ptr, srv_len);
+        return;
+    };
+    // Execute on the persistent session kept from discovery
+    // when this server has one; a dead session is closed and
+    // the call retries once on a fresh session. Servers with
+    // no live slot session use a fresh session directly.
+    let req_id = state.next_req;
+    state.next_req = state.next_req + 1;
+    let done = false;
+    if srv_ord < 4 {
+        let spr = McpProc { proc: 0, hin: 0, hout: 0, herr: 0 };
+        mcp_sess_get(state, srv_ord, &spr);
+        if spr.proc != 0 {
+            if state.lb_owner != srv_ord + 1 {
+                state.lb_len = 0;
+                state.lb_owner = srv_ord + 1;
+            };
+            if mcp_send_call(state, &spr, tool_ptr, tool_len, args_ptr, args_len, req_id) && mcp_read_until_id(state, spr.hout, req_id) {
+                mcp_emit_result(state, srv_ptr, srv_len, name_ptr, name_len, out);
+                done = true;
+            } else {
+                mcp_close(&spr);
+                mcp_sess_clear(state, srv_ord);
+                state.lb_owner = 0;
+            };
+        };
+    };
+    if !done {
+        let pr = McpProc { proc: 0, hin: 0, hout: 0, herr: 0 };
+        if !mcp_open_session(state, cm_ptr, cm_len, &pr) {
+            buf_append_lit(out, STR_PTR("error: mcp server "), STR_LEN("error: mcp server "));
+            buf_append_lit(out, srv_ptr, srv_len);
+            buf_append_lit(out, STR_PTR(": initialize failed"), STR_LEN(": initialize failed"));
+            return;
+        };
+        state.lb_owner = 0;
+        if !mcp_send_call(state, &pr, tool_ptr, tool_len, args_ptr, args_len, req_id) || !mcp_read_until_id(state, pr.hout, req_id) {
+            mcp_close(&pr);
+            buf_append_lit(out, STR_PTR("error: mcp server "), STR_LEN("error: mcp server "));
+            buf_append_lit(out, srv_ptr, srv_len);
+            buf_append_lit(out, STR_PTR(": tools/call failed"), STR_LEN(": tools/call failed"));
+            return;
+        };
+        mcp_close(&pr);
+        mcp_emit_result(state, srv_ptr, srv_len, name_ptr, name_len, out);
     };
 }

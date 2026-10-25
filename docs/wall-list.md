@@ -192,3 +192,25 @@ ids: the relay translates between the two protocols).
   each hit in isolation at least once). Counted as relay-side
   stochastic delivery; the suite reasoning round stays a
   lottery ticket, not a code signal.
+
+## mini-agent v13 notes (2026-10-25)
+
+- std SSE double-reap deadlock (root-caused and FIXED in
+  sci): the SSE client polls its curl child with a raw
+  waitpid(pid, WNOHANG) — reaping it — while sse_free also
+  called std.process.Child.wait(). When the stream had
+  already ended (or the poll won the race), Child.wait()
+  blocked in the Zig 0.17 Io reaper's waitpid(-1) until ANY
+  other child of the process exited. Harmless with no other
+  children (ECHLD error, swallowed), a hard deadlock with a
+  long-lived child alive — v13's persistent MCP sessions
+  were the first long-lived children to coexist with SSE
+  turns, and the MCP round hung forever. Reproduction: an
+  SLA probe spawning a 25 s sleeper, then an SSE turn,
+  returned only when the sleeper exited (3 s sleeper: 3.02 s
+  total). Fix: both Child.wait() call sites in the SSE path
+  now use a blocking waitpid on the child's own pid
+  (sseWaitSioChild); probe after the fix: 0.055 s.
+- MCP config format divergence is unchanged (JSON, not
+  CXU's config.toml [mcp_servers]); sessions are per-turn,
+  not cross-turn persistent processes.
