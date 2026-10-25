@@ -6,14 +6,22 @@ this list to be complete when the live codex turn lands.
 
 ## Protocol / bridge shape
 
-1. **Request chaining is data-dependent.** A real turn is not two
-   fixed lines: `thread/start` returns a thread id that
-   `turn/start` must embed, and `turn/start` streams many
-   notification lines before its result. The fixed two-round pump
-   (slices 1–4) proves transport only. Next slice needs: read a
-   response, extract a JSON string field, splice it into the next
-   request, and read until a result id matches (not just one line).
-   Cost: one slice. Owner: cxu-bridge.
+1. **Request chaining is data-dependent.** RESOLVED in slice 5:
+   the bridge reads until the `"id":3` result, extracts the id
+   after `"thread":{"id":"`, splices it between CXU_REQ4_PRE /
+   CXU_REQ4_POST, and reads the stream through turn/completed.
+   Two corollaries fell out of the live work:
+   (a) JSON-RPC notifications have no reply — reading for one
+   deadlocks (fixed with the CXU_NOTIFY write-only step);
+   (b) a per-round receive accumulator silently drops bytes read
+   past a newline — notifications arrive back to back, so the
+   receive path is now a persistent line buffer.
+   (c) The Zen free tier's exhaustion surfaces through codex as
+   a 429 with 5 internal retries (~2 min of error notifications,
+   no turn/completed until retries lapse); the Kilo gateway free
+   channel (kilo-auto/free, keyless) completes the same turn in
+   seconds — channel choice is a runtime property, not a bridge
+   property.
 2. **Blocking reads only.** The pump reads reply lines with blocking
    `sa_io_read`; a child that never answers hangs the bridge until
    the outer `timeout` kills it. sa_std has poll/epoll surfaces

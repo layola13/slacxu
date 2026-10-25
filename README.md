@@ -106,7 +106,17 @@ turn only when the spliced id matches, and run.sh asserts the full
 session round (`cxu-bridge turn ok`). Direct protocol recon
 measured the live shapes: thread id at
 `result.thread.id`; notifications thread/status/changed,
-turn/started, item/started, item/completed. The live turn's model
-call currently meets the free channel's 429 (FreeUsageLimitError
-on direct probes; codex retries 5x with backoff) — completion
-depends on the shared free quota, not on the bridge.
+turn/started, item/started, item/completed.
+
+**Live full turn (2026-10-25): PASS.** Channel correction: the
+free channel that answers is the **Kilo gateway**
+(`https://api.kilo.ai/api/gateway`, model `kilo-auto/free`,
+keyless, serves both chat completions and the Responses API) —
+not OpenCode Zen, whose free tier was exhausted from both egresses
+at test time (FreeUsageLimitError; codex surfaced it as a 429 with
+5 retries). With `model_provider = "kilo"` in
+`~/.codex/config.toml` (placeholder env key, no login), the bridge
+ran the whole session — initialize, initialized, thread/list,
+thread/start, id extraction, turn/start, stream through
+turn/completed — in ~11 s, exit 0. That is the P1 acceptance: a
+real codex turn through the SLA backend.
