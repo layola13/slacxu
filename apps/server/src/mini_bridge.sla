@@ -188,10 +188,68 @@ fn find_span_for_key(ar_ptr: ptr, ar_len: u64, key_ptr: ptr, key_len: u64, span:
     return false;
 }
 
+// Appends "<thread id>-" to an item id under construction, so
+// parent and sub-agent items never collide in the page's map.
+fn buf_append_idpart(ev: &ByteBuf, th: &Thread) -> void {
+    let i: u64 = 0;
+    while i < th.id_len {
+        if ev.len < 40960 {
+            ev.bytes[ev.len] = th.id[i];
+            ev.len = ev.len + 1;
+        };
+        i = i + 1;
+    }
+    buf_append_lit(ev, STR_PTR("-"), STR_LEN("-"));
+}
+
+// Copies the text of the thread's LAST assistant message into
+// out (unescaping the JSON string escapes the bridge itself
+// wrote). False when the thread has no assistant message.
+fn extract_last_assistant(th: &Thread, out: &ByteBuf) -> bool {
+    let marker = "\"role\":\"assistant\",\"content\":\"";
+    let mlen = STR_LEN(marker);
+    // find the last occurrence of the marker in th.msgs
+    let last: u64 = 4294967295;
+    let i: u64 = 0;
+    let mb: u8 = 0;
+    while i + mlen <= th.msgs_len {
+        let j: u64 = 0;
+        let ok = true;
+        while j < mlen {
+            BYTE_AT_OUT(mb, STR_PTR(marker), j);
+            if th.msgs[i + j] != mb { ok = false; };
+            j = j + 1;
+        }
+        if ok { last = i; };
+        i = i + 1;
+    }
+    if last == 4294967295 { return false; };
+    buf_reset(out);
+    let k = last + mlen;
+    while k < th.msgs_len {
+        let b = th.msgs[k];
+        if b == 34 { break; };
+        if b == 92 && k + 1 < th.msgs_len {
+            let nb = th.msgs[k + 1];
+            if nb == 110 {
+                if out.len < 40960 { out.bytes[out.len] = 10; out.len = out.len + 1; };
+                k = k + 2;
+            } else {
+                if out.len < 40960 { out.bytes[out.len] = nb; out.len = out.len + 1; };
+                k = k + 2;
+            };
+        } else {
+            if out.len < 40960 { out.bytes[out.len] = b; out.len = out.len + 1; };
+            k = k + 1;
+        };
+    }
+    return out.len > 0;
+}
+
 // Runs one user turn to completion, streaming item events.
 // Returns 0 on turn/completed; 99 when the client went away;
 // other codes mark bridge/upstream failures (turn/failed sent).
-fn bridge_run_turn(sresp: ptr, th: &Thread, ev: &ByteBuf, scratch: &ByteBuf, body: &ByteBuf, res: &ByteBuf, prompt_ptr: ptr, prompt_len: u64) -> i32 {
+fn bridge_run_turn(sresp: ptr, th: &Thread, ev: &ByteBuf, scratch: &ByteBuf, body: &ByteBuf, res: &ByteBuf, child_th: &Thread, c_ev: &ByteBuf, c_scratch: &ByteBuf, c_body: &ByteBuf, c_res: &ByteBuf, depth: u64, prompt_ptr: ptr, prompt_len: u64) -> i32 {
     // Scratch buffers are caller-owned: an imported function may
     // not declare locals with very large arrays (the import
     // expander rejects them), so the server allocates these once.
@@ -207,7 +265,7 @@ fn bridge_run_turn(sresp: ptr, th: &Thread, ev: &ByteBuf, scratch: &ByteBuf, bod
 
     if th.msgs_len == 0 {
         buf_reset(scratch);
-        let sys = "{\"role\":\"system\",\"content\":\"You are Mini Agent, a workspace agent. Use the sa_vm tool to inspect real files when a task needs real data. Never invent file contents. When you have enough information, answer directly without calling tools.\"}";
+        let sys = "{\"role\":\"system\",\"content\":\"You are Mini Agent, a workspace agent. Use the sa_vm tool to inspect real files when a task needs real data. Never invent file contents. When you have enough information, answer directly without calling tools. For a self-contained sub-task you may call spawn_agent with a clear prompt and use its final answer.\"}";
         buf_append_lit(scratch, STR_PTR(sys), STR_LEN(sys));
         msgs_append_buf(th, scratch);
     };
@@ -218,16 +276,43 @@ fn bridge_run_turn(sresp: ptr, th: &Thread, ev: &ByteBuf, scratch: &ByteBuf, bod
     msgs_append_buf(th, scratch);
 
     let force = has_action_intent(prompt_ptr, prompt_len);
-    let url = "https://api.kilo.ai/api/gateway/chat/completions";
-    let key = "";
+    // Relay channel: defaults are the keyless Kilo gateway;
+    // MINI_RELAY_URL / MINI_RELAY_KEY / MINI_MODEL override it
+    // (CXU likewise takes its relay from configuration).
+    let relay_url_ptr: ptr = STR_PTR("https://api.kilo.ai/api/gateway/chat/completions");
+    let relay_url_len: u64 = STR_LEN("https://api.kilo.ai/api/gateway/chat/completions");
+    let relay_key_ptr: ptr = STR_PTR("");
+    let relay_key_len: u64 = 0;
+    let relay_model_ptr: ptr = STR_PTR("kilo-auto/free");
+    let relay_model_len: u64 = STR_LEN("kilo-auto/free");
+    let e_url = sa_env_get(STR_PTR("MINI_RELAY_URL"), STR_LEN("MINI_RELAY_URL"));
+    if e_url != 0 {
+        let uvp: ptr = sa_env_buffer_data(e_url);
+        let uvl = sa_env_buffer_len(e_url);
+        if uvl > 0 { relay_url_ptr = uvp; relay_url_len = uvl; };
+    };
+    let e_key = sa_env_get(STR_PTR("MINI_RELAY_KEY"), STR_LEN("MINI_RELAY_KEY"));
+    if e_key != 0 {
+        let kvp: ptr = sa_env_buffer_data(e_key);
+        let kvl = sa_env_buffer_len(e_key);
+        if kvl > 0 { relay_key_ptr = kvp; relay_key_len = kvl; };
+    };
+    let e_model = sa_env_get(STR_PTR("MINI_MODEL"), STR_LEN("MINI_MODEL"));
+    if e_model != 0 {
+        let mvp: ptr = sa_env_buffer_data(e_model);
+        let mvl = sa_env_buffer_len(e_model);
+        if mvl > 0 { relay_model_ptr = mvp; relay_model_len = mvl; };
+    };
     let schema = "{\"type\":\"function\",\"function\":{\"name\":\"sa_vm\",\"description\":\"Native workspace tool. action=list_dir lists a directory as JSON. action=read_file reads a text file. action=find_files searches file names recursively under path matching pattern. action=run_host runs exe with args (structured, no shell).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"list_dir\",\"read_file\",\"find_files\",\"run_host\"]},\"path\":{\"type\":\"string\"},\"pattern\":{\"type\":\"string\"},\"exe\":{\"type\":\"string\"},\"args\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"action\"]}}}";
     let schema2 = "{\"type\":\"function\",\"function\":{\"name\":\"read_skill\",\"description\":\"Reads a skill file (SKILL.md) by skill name from the workspace skill roots.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"]}}}";
     let schema3 = "{\"type\":\"function\",\"function\":{\"name\":\"update_plan\",\"description\":\"Records or updates the task plan. Call this first for multi-step tasks, and again whenever step statuses change.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"explanation\":{\"type\":\"string\"},\"plan\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"step\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"pending\",\"in_progress\",\"completed\"]}},\"required\":[\"step\",\"status\"]}}},\"required\":[\"plan\"]}}}";
+    let schema4 = "{\"type\":\"function\",\"function\":{\"name\":\"spawn_agent\",\"description\":\"Delegates a self-contained sub-task to a sub-agent with its own thread. The sub-agent final answer returns as the tool result. Use for independent pieces of work.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\"}},\"required\":[\"prompt\"]}}}";
     let usage_in: u64 = 0;
     let usage_out: u64 = 0;
     let usage_total: u64 = 0;
     let usage_seen = false;
     let rounds: u64 = 0;
+    let sub_seq: u64 = 0;
     while 1 == 1 {
         if th.msgs_len > 40000 {
             ev_thread_prefix(ev, th, STR_PTR("turn/failed"), STR_LEN("turn/failed"));
@@ -236,7 +321,9 @@ fn bridge_run_turn(sresp: ptr, th: &Thread, ev: &ByteBuf, scratch: &ByteBuf, bod
             return 42;
         };
         buf_reset(body);
-        buf_append_lit(body, STR_PTR("{\"model\":\"kilo-auto/free\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":["), STR_LEN("{\"model\":\"kilo-auto/free\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":["));
+        buf_append_lit(body, STR_PTR("{\"model\":\""), STR_LEN("{\"model\":\""));
+        buf_append_lit(body, relay_model_ptr, relay_model_len);
+        buf_append_lit(body, STR_PTR("\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":["), STR_LEN("\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":["));
         let mi: u64 = 0;
         while mi < th.msgs_len {
             if body.len < 40960 {
@@ -251,6 +338,10 @@ fn bridge_run_turn(sresp: ptr, th: &Thread, ev: &ByteBuf, scratch: &ByteBuf, bod
         buf_append_lit(body, STR_PTR(schema2), STR_LEN(schema2));
         buf_append_lit(body, STR_PTR(","), STR_LEN(","));
         buf_append_lit(body, STR_PTR(schema3), STR_LEN(schema3));
+        if depth == 0 {
+            buf_append_lit(body, STR_PTR(","), STR_LEN(","));
+            buf_append_lit(body, STR_PTR(schema4), STR_LEN(schema4));
+        };
         buf_append_lit(body, STR_PTR("],\"tool_choice\":\""), STR_LEN("],\"tool_choice\":\""));
         if force {
             buf_append_lit(body, STR_PTR("required"), STR_LEN("required"));
@@ -268,7 +359,7 @@ fn bridge_run_turn(sresp: ptr, th: &Thread, ev: &ByteBuf, scratch: &ByteBuf, bod
         let r_ptr: ptr = PTR_NULL();
         let r_len: u64 = 0;
         rounds = rounds + 1;
-        let st = sa_http_client_sse_turn_ex(STR_PTR(url), STR_LEN(url), &body.bytes, body.len, STR_PTR(key), STR_LEN(key), 1, &t_ptr, &t_len, &c_ptr, &c_len, &u_ptr, &u_len, &r_ptr, &r_len);
+        let st = sa_http_client_sse_turn_ex(relay_url_ptr, relay_url_len, &body.bytes, body.len, relay_key_ptr, relay_key_len, 1, &t_ptr, &t_len, &c_ptr, &c_len, &u_ptr, &u_len, &r_ptr, &r_len);
         if st != 2 && u_len > 0 {
             let udoc = sa_json_parse(u_ptr, u_len);
             if udoc != 0 {
@@ -291,6 +382,7 @@ fn bridge_run_turn(sresp: ptr, th: &Thread, ev: &ByteBuf, scratch: &ByteBuf, bod
         if r_len > 0 {
             buf_reset(ev);
             buf_append_lit(ev, STR_PTR("{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"reasoning\",\"id\":\"mini-rsn-"), STR_LEN("{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"reasoning\",\"id\":\"mini-rsn-"));
+            buf_append_idpart(ev, th);
             buf_append_u64(ev, th.turn_seq);
             buf_append_lit(ev, STR_PTR("-"), STR_LEN("-"));
             buf_append_u64(ev, rounds);
@@ -298,6 +390,7 @@ fn bridge_run_turn(sresp: ptr, th: &Thread, ev: &ByteBuf, scratch: &ByteBuf, bod
             if !emit_ev(sresp, ev) { return 99; };
             buf_reset(ev);
             buf_append_lit(ev, STR_PTR("{\"method\":\"item/reasoning/textDelta\",\"params\":{\"itemId\":\"mini-rsn-"), STR_LEN("{\"method\":\"item/reasoning/textDelta\",\"params\":{\"itemId\":\"mini-rsn-"));
+            buf_append_idpart(ev, th);
             buf_append_u64(ev, th.turn_seq);
             buf_append_lit(ev, STR_PTR("-"), STR_LEN("-"));
             buf_append_u64(ev, rounds);
@@ -307,6 +400,7 @@ fn bridge_run_turn(sresp: ptr, th: &Thread, ev: &ByteBuf, scratch: &ByteBuf, bod
             if !emit_ev(sresp, ev) { return 99; };
             buf_reset(ev);
             buf_append_lit(ev, STR_PTR("{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"reasoning\",\"id\":\"mini-rsn-"), STR_LEN("{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"reasoning\",\"id\":\"mini-rsn-"));
+            buf_append_idpart(ev, th);
             buf_append_u64(ev, th.turn_seq);
             buf_append_lit(ev, STR_PTR("-"), STR_LEN("-"));
             buf_append_u64(ev, rounds);
@@ -395,7 +489,73 @@ fn bridge_run_turn(sresp: ptr, th: &Thread, ev: &ByteBuf, scratch: &ByteBuf, bod
                 let disp_path_ptr: ptr = PTR_NULL();
                 let disp_path_len: u64 = 0;
                 let adoc = sa_json_parse(ar_ptr, ar_len);
-                if bytes_eq_str(nm_ptr, nm_len, STR_PTR("update_plan"), STR_LEN("update_plan")) {
+                if bytes_eq_str(nm_ptr, nm_len, STR_PTR("spawn_agent"), STR_LEN("spawn_agent")) {
+                    let sp_ptr: ptr = PTR_NULL();
+                    let sp_len: u64 = 0;
+                    if adoc != 0 {
+                        sa_json_object_get_string(adoc, STR_PTR("prompt"), STR_LEN("prompt"), &sp_ptr, &sp_len);
+                    };
+                    if depth >= 1 {
+                        buf_reset(res);
+                        buf_append_lit(res, STR_PTR("error: spawn_agent is not available inside a sub-agent (depth limit 1)"), STR_LEN("error: spawn_agent is not available inside a sub-agent (depth limit 1)"));
+                    } else if sp_len == 0 {
+                        buf_reset(res);
+                        buf_append_lit(res, STR_PTR("error: spawn_agent needs a prompt"), STR_LEN("error: spawn_agent needs a prompt"));
+                    } else {
+                        sub_seq = sub_seq + 1;
+                        child_th.msgs_len = 0;
+                        child_th.turn_seq = 0;
+                        let ci: u64 = 0;
+                        while ci < th.id_len {
+                            child_th.id[ci] = th.id[ci];
+                            ci = ci + 1;
+                        }
+                        child_th.id_len = th.id_len;
+                        let tail = "-sub-";
+                        let ti: u64 = 0;
+                        let tb: u8 = 0;
+                        while ti < STR_LEN(tail) {
+                            BYTE_AT_OUT(tb, STR_PTR(tail), ti);
+                            if child_th.id_len < 64 {
+                                child_th.id[child_th.id_len] = tb;
+                                child_th.id_len = child_th.id_len + 1;
+                            };
+                            ti = ti + 1;
+                        }
+                        let digits = [0u8; 20];
+                        let dn: u64 = 0;
+                        let dx = sub_seq;
+                        if dx == 0 { digits[0] = 48; dn = 1; };
+                        while dx > 0 {
+                            digits[dn] = 48 + (dx % 10) as u8;
+                            dn = dn + 1;
+                            dx = dx / 10;
+                        }
+                        let di = dn;
+                        while di > 0 {
+                            di = di - 1;
+                            if child_th.id_len < 64 {
+                                child_th.id[child_th.id_len] = digits[di];
+                                child_th.id_len = child_th.id_len + 1;
+                            };
+                        }
+                        let crc = bridge_run_turn(sresp, child_th, c_ev, c_scratch, c_body, c_res, child_th, c_ev, c_scratch, c_body, c_res, depth + 1, sp_ptr, sp_len);
+                        if crc == 0 {
+                            if !extract_last_assistant(child_th, res) {
+                                buf_reset(res);
+                                buf_append_lit(res, STR_PTR("error: sub-agent produced no final text"), STR_LEN("error: sub-agent produced no final text"));
+                            };
+                        } else {
+                            buf_reset(res);
+                            buf_append_lit(res, STR_PTR("error: sub-agent turn failed, code "), STR_LEN("error: sub-agent turn failed, code "));
+                            buf_append_u64(res, crc as u64);
+                        };
+                    };
+                    disp_action_ptr = STR_PTR("spawn_agent");
+                    disp_action_len = STR_LEN("spawn_agent");
+                    disp_path_ptr = STR_PTR("");
+                    disp_path_len = 0;
+                } else if bytes_eq_str(nm_ptr, nm_len, STR_PTR("update_plan"), STR_LEN("update_plan")) {
                     let pspan = Span { ptr: PTR_NULL(), len: 0 };
                     let has_plan = find_span_for_key(ar_ptr, ar_len, STR_PTR("\"plan\""), STR_LEN("\"plan\""), &pspan);
                     buf_reset(res);
@@ -504,11 +664,13 @@ fn bridge_run_turn(sresp: ptr, th: &Thread, ev: &ByteBuf, scratch: &ByteBuf, bod
         // documented divergence in docs/architecture-cxu-mini.md).
         buf_reset(ev);
         buf_append_lit(ev, STR_PTR("{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"mini-msg-"), STR_LEN("{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"mini-msg-"));
+        buf_append_idpart(ev, th);
         buf_append_u64(ev, th.turn_seq);
         buf_append_lit(ev, STR_PTR("-s1\",\"status\":\"inProgress\"}}}"), STR_LEN("-s1\",\"status\":\"inProgress\"}}}"));
         if !emit_ev(sresp, ev) { return 99; };
         buf_reset(ev);
         buf_append_lit(ev, STR_PTR("{\"method\":\"item/agentMessage/delta\",\"params\":{\"itemId\":\"mini-msg-"), STR_LEN("{\"method\":\"item/agentMessage/delta\",\"params\":{\"itemId\":\"mini-msg-"));
+        buf_append_idpart(ev, th);
         buf_append_u64(ev, th.turn_seq);
         buf_append_lit(ev, STR_PTR("-s1\",\"delta\":\""), STR_LEN("-s1\",\"delta\":\""));
         buf_append_escaped(ev, t_ptr, t_len);
@@ -516,6 +678,7 @@ fn bridge_run_turn(sresp: ptr, th: &Thread, ev: &ByteBuf, scratch: &ByteBuf, bod
         if !emit_ev(sresp, ev) { return 99; };
         buf_reset(ev);
         buf_append_lit(ev, STR_PTR("{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"mini-msg-"), STR_LEN("{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"mini-msg-"));
+        buf_append_idpart(ev, th);
         buf_append_u64(ev, th.turn_seq);
         buf_append_lit(ev, STR_PTR("-s1\",\"text\":\""), STR_LEN("-s1\",\"text\":\""));
         buf_append_escaped(ev, t_ptr, t_len);

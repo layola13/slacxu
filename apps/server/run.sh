@@ -114,4 +114,12 @@ echo "$OUT10" | grep -q '"type":"reasoning"' || { echo "REASON TURN FAILED (no r
 echo "$OUT10" | grep -q 'item/reasoning/textDelta' || { echo "REASON TURN FAILED (no reasoning delta)"; echo "$OUT10" | tail -3; exit 1; }
 echo "$OUT10" | grep -q '"method":"turn/completed"' || { echo "REASON TURN FAILED (no turn/completed)"; echo "$OUT10" | tail -3; exit 1; }
 echo "mini-agent reasoning ok"
+
+OUT11=$(timeout 240 curl -sN -X POST http://127.0.0.1:18086/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Delegate with spawn_agent: ask the sub-agent to list the files in the current directory and report one entry name. Then tell me exactly what the sub-agent reported.","threadId":"t-spawn"}')
+echo "$OUT11" | grep -q '"action":"spawn_agent"' || { echo "SPAWN TURN FAILED (no spawn_agent)"; echo "$OUT11" | tail -3; exit 1; }
+echo "$OUT11" | grep -q '"threadId":"t-spawn-sub-' || { echo "SPAWN TURN FAILED (no child thread)"; echo "$OUT11" | tail -3; exit 1; }
+echo "$OUT11" | grep -q '"method":"turn/completed"' || { echo "SPAWN TURN FAILED (no turn/completed)"; echo "$OUT11" | tail -3; exit 1; }
+echo "mini-agent spawn_agent ok"
 echo "mini-agent e2e ok"

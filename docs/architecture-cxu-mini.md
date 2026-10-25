@@ -72,3 +72,21 @@ agentRuntime/*`, `apps/web` waterfall item rendering.
 - Tool subset: list_dir + read_file only; run_host and the rest
   follow as their own slices.
 | reasoning items | apps/server/src/mini_bridge.sla + std sse_turn_ex reasoning accumulation | done: item/started + item/reasoning/textDelta + item/completed per round when the channel streamed reasoning; the page renders reasoning blocks dimmed |
+
+
+## v8 landing notes (2026-10-25)
+
+| CXU | slacxu | status |
+|---|---|---|
+| spawn_agent family | apps/server/src/mini_bridge.sla - spawn_agent tool, depth <= 1, child thread <parent>-sub-<n> with its own turn loop and item stream, final answer returned as the tool result | done: verified live on the deepkey grok-4.7 channel (child thread t-spawn-sub-1 ran list_dir and reported run.sh; the parent completed with the child answer). Child threads are not persisted (stated divergence); CXU concurrency <= 5 is not replicated - sub-agents run sequentially |
+| relay gateway configuration | apps/server/src/mini_bridge.sla - MINI_RELAY_URL / MINI_RELAY_KEY / MINI_MODEL env vars override the channel; defaults unchanged (keyless Kilo gateway, kilo-auto/free) | done: the whole verification suite ran through the env-configured deepkey channel |
+| sa_vm find_files pattern | apps/server/src/sa_vm.sla - surrounding '*' of glob-style patterns are stripped before the substring match | done: grok sends "*bridge*"; Kilo-era models sent the bare substring |
+
+Verification note (2026-10-25): in one clean run.sh run on
+grok-4.7 the suite passed page, text, tool, thread file,
+persistence recall, find_files, run_host, read_skill,
+update_plan and token usage. The reasoning round cannot pass
+on that channel because grok streams no reasoning deltas
+there (its thinking is inline in the answer text); reasoning
+items were verified on Kilo in v7. The spawn round passed
+standalone with the complete child-thread event stream.

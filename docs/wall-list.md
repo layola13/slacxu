@@ -108,3 +108,24 @@ this list to be complete when the live codex turn lands.
   stream_options.include_usage and emits
   thread/tokenUsage/updated only when the channel actually
   reported usage (absence is never rendered as zero).
+
+
+- Slow time-to-first-byte upstreams broke sse_turn: std waited
+  at most 200x50ms = 10s for the HTTP status and then returned
+  a spurious "upstream error" without retrying. Measured on
+  deepkey/grok-4.7: tool-call requests take ~14-20s to first
+  byte (text ~3.5s, which is why only tool turns failed). sci
+  raised the status-wait cap to 3600x50ms = 180s (a dead
+  transfer still ends the wait via poll-done); the code comment
+  in sa_http_client.zig carries the measurement. Kilo's fast
+  free models never exposed this.
+- Channel behaviour notes (deepkey, grok-4.7, 2026-10-25):
+  models send glob-style find patterns ("*bridge*") and
+  sometimes stuff structured fields into the wrong slot
+  (run_host args as ["path", "."]); the find_files matcher now
+  strips surrounding '*'. Grok on this relay streams no
+  reasoning deltas (thinking is inline in the answer text),
+  so reasoning items stay empty there. The Kilo promotion
+  quota is per egress IP: the Colab box stayed limited
+  (429 PROMOTION_MODEL_LIMIT_REACHED) while this machine's
+  egress had already recovered.
