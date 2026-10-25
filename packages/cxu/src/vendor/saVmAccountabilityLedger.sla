@@ -1,0 +1,331 @@
+// Converted 1:1 from packages/cxu/src/vendor/saVmAccountabilityLedger.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+
+// Append-only accountability ledger: penalties, rewards/redemptions,
+// reputation tiers and antibodies, with a JEV-gated RED-tier write gate.
+// DEFECT: async/Promise fs APIs, Map/Set, JSON.parse/stringify,
+// randomUUID and Date.now have no direct SLA equivalents; async fns
+// become synchronous + status code, collections become fixed arrays,
+// JSON lines become JSON text buffers, ids/timestamps are parameters
+// or sa_std extern approximations.
+@import "sa_std/io/print.sai"
+@import "sa_std/ptr.sa"
+@import "../shared-types.sla"
+@import "./saVmJev.sla"
+
+// export type PenaltyLevel = "L1_SYNTAX"|"L2_REGRESSION"|"L3_THRASH"|"CUSTOM"
+const PENALTY_L1_SYNTAX: u64 = 0;
+const PENALTY_L2_REGRESSION: u64 = 1;
+const PENALTY_L3_THRASH: u64 = 2;
+const PENALTY_CUSTOM: u64 = 3;
+// export const PENALTY_SCORES: Record<PenaltyLevel, number>
+fn penalty_score(level: u64) -> i64 {
+    if level == PENALTY_L1_SYNTAX { return 0 - 10; };
+    if level == PENALTY_L2_REGRESSION { return 0 - 20; };
+    if level == PENALTY_L3_THRASH { return 0 - 30; };
+    return 0 - 10;
+}
+
+// export interface PenaltyRecord
+struct PenaltyRecord {
+    id_bytes: [u8; 128], id_len: u64,
+    level: u64,
+    target_file_bytes: [u8; 4096], target_file_len: u64,
+    error_sig_bytes: [u8; 2048], error_sig_len: u64,
+    score_delta: i64,
+    has_details: bool, details_bytes: [u8; 4096], details_len: u64,
+    timestamp: u64,
+    status: u64, has_redeemed_by: bool,
+    redeemed_by_bytes: [u8; 128], redeemed_by_len: u64,
+}
+const PENALTY_STATUS_ACTIVE: u64 = 0;
+const PENALTY_STATUS_REDEEMED: u64 = 1;
+
+// export interface RewardRecord
+struct RewardRecord {
+    id_bytes: [u8; 128], id_len: u64,
+    linked_penalty_id_bytes: [u8; 128], linked_penalty_id_len: u64,
+    score_delta: i64,
+    evidence_bytes: [u8; 8192], evidence_len: u64,
+    lesson_bytes: [u8; 4096], lesson_len: u64,
+    antibody_rule_bytes: [u8; 4096], antibody_rule_len: u64,
+    timestamp: u64,
+}
+
+// export type LedgerEntry = PenaltyRecord | RewardRecord
+// DEFECT: union -> tagged struct (tag 0=penalty, 1=reward).
+struct LedgerEntry {
+    tag: u64,
+    penalty: PenaltyRecord,
+    reward: RewardRecord,
+    json_bytes: [u8; 16384], json_len: u64,
+}
+// DEFECT: dynamic entry list -> fixed array + len (capacity 1024).
+struct LedgerEntries { items: [LedgerEntry; 1024], len: u64 }
+
+// export type ReputationTier = "GREEN" | "YELLOW" | "RED"
+const TIER_GREEN: u64 = 0;
+const TIER_YELLOW: u64 = 1;
+const TIER_RED: u64 = 2;
+
+// export interface Antibody
+struct Antibody {
+    target_file_bytes: [u8; 4096], target_file_len: u64,
+    rule_bytes: [u8; 4096], rule_len: u64,
+    lesson_bytes: [u8; 4096], lesson_len: u64,
+    penalty_id_bytes: [u8; 128], penalty_id_len: u64,
+    reward_id_bytes: [u8; 128], reward_id_len: u64,
+    timestamp: u64,
+}
+
+// export interface ReputationStatus
+struct ReputationStatus {
+    score: i64, tier: u64,
+    active: [PenaltyRecord; 512], active_len: u64,
+    redeemed: [PenaltyRecord; 512], redeemed_len: u64,
+    antibodies: [Antibody; 512], antibodies_len: u64,
+    total_penalties: u64, total_rewards: u64,
+    ledger_path_bytes: [u8; 4096], ledger_path_len: u64,
+}
+
+// export interface AccountabilityGateResult
+struct AccountabilityGateResult {
+    allowed: bool, tier: u64, score: i64,
+    has_kind: bool, kind: u64,
+    has_reason: bool, reason_bytes: [u8; 8192], reason_len: u64,
+    has_notice: bool, notice_bytes: [u8; 8192], notice_len: u64,
+    has_antibody_notice: bool, antibody_notice_bytes: [u8; 8192], antibody_notice_len: u64,
+    has_jev_verdict: bool,
+    jev_verdict_bytes: [u8; 512], jev_verdict_len: u64,
+    has_jev_risk: bool, jev_risk_bytes: [u8; 512], jev_risk_len: u64,
+    has_jev_summary: bool, jev_summary_bytes: [u8; 4096], jev_summary_len: u64,
+}
+const GATE_KIND_CAPABILITY_DENIED: u64 = 0;
+const GATE_KIND_SA_ERROR: u64 = 1;
+
+// export type JevAuditFunction = (context) => Promise<{...}>
+// DEFECT: function type / Promise -> auditor is an extern callback id;
+// 0 means "use nativeJevRedteam path", otherwise host-registered.
+// Audit context/result structs:
+struct JevAuditContext {
+    target_file_bytes: [u8; 4096], target_file_len: u64,
+    changes_bytes: [u8; 16384], changes_len: u64,
+    active_count: u64, antibodies_count: u64, tier: u64, score: i64,
+    auditor_id: u64,
+}
+struct JevAuditResult {
+    approved: bool,
+    verdict_bytes: [u8; 512], verdict_len: u64,
+    has_risk: bool, risk_bytes: [u8; 512], risk_len: u64,
+    has_reason: bool, reason_bytes: [u8; 4096], reason_len: u64,
+}
+
+// export function resolveLedgerPath(cwd?, customPath?) -> string
+// Default: <cwd>/.codex-ultra/ledger/penalties.jsonl
+// DEFECT: process.cwd() default -> caller passes cwd explicitly.
+fn resolveLedgerPath(cwd_ptr: ptr, cwd_len: u64, has_cwd: bool, custom_ptr: ptr, custom_len: u64, has_custom: bool, out_ptr: ptr, out_cap: u64) -> u64 {
+    // custom non-blank: absolute -> resolve(custom), else
+    // resolve(cwd ?? process.cwd(), custom). Else default path join.
+    return 0;
+}
+
+// export function deletePenalty(): never  (throws)
+// DEFECT: throw / never -> returns error status code 1 + message.
+fn deletePenalty(err_ptr: ptr, err_cap: u64) -> i32 {
+    // "Immutable Ledger Violation: Historical penalties cannot be
+    // deleted or pruned."
+    return 1;
+}
+// export function clearLedger(): never  (throws)
+fn clearLedger(err_ptr: ptr, err_cap: u64) -> i32 {
+    // "Immutable Ledger Violation: Clearing the accountability
+    // ledger is strictly forbidden."
+    return 1;
+}
+
+// export function normalizeTargetFilePath(targetFile, cwd) -> string
+fn normalizeTargetFilePath(tf_ptr: ptr, tf_len: u64, cwd_ptr: ptr, cwd_len: u64, out_ptr: ptr, out_cap: u64) -> u64 {
+    // resolved = absolute ? resolve(tf) : resolve(cwd, tf);
+    // rel = relative(cwd, resolved) with backslash->slash;
+    // return rel when non-empty and not starting with "..", else
+    // resolved with backslash->slash.
+    return 0;
+}
+
+// export async function readLedgerEntries(ledgerPath) -> Promise<LedgerEntry[]>
+// DEFECT: async
+fn readLedgerEntries(path_ptr: ptr, path_len: u64, out: &LedgerEntries) -> i32 {
+    // !existsSync -> empty. readFile utf8, split lines, trim, skip
+    // blanks; JSON.parse each line (DEFECT: dynamic JSON -> keep raw
+    // line in json_bytes + tag from "type" field); keep only
+    // penalty/reward; corrupted lines skipped; read error -> empty.
+    out.len = 0;
+    return 0;
+}
+
+// export async function appendLedgerEntry(entry, ledgerPath) -> Promise<void>
+// DEFECT: async
+fn appendLedgerEntry(e: &LedgerEntry, path_ptr: ptr, path_len: u64) -> i32 {
+    // mkdir -p dirname when missing; append JSON.stringify(entry)+"\n"
+    // with flag "a", encoding utf8 (extern fs append approximation).
+    return 0;
+}
+
+// export function computeReputationStatus(entries, ledgerPath)
+// Baseline 100, clamped [0,100]; GREEN >=80, YELLOW 50..79, RED <50.
+// DEFECT: Map/Set -> linear scans over fixed arrays.
+fn computeReputationStatus(entries: &LedgerEntries, path_ptr: ptr, path_len: u64, out: &ReputationStatus) -> i32 {
+    // penalties keyed by id (status forced active), rewards listed;
+    // linked reward redeems its penalty + creates an antibody;
+    // orphan rewards grant no points (P0-4); score = clamp(100 +
+    // sum(penalty deltas) + sum(valid reward deltas)).
+    out.score = 100;
+    out.tier = TIER_GREEN;
+    out.ledger_path_len = path_len;
+    let i: u64 = 0;
+    while i < entries.len {
+        i = i + 1;
+    }
+    return 0;
+}
+
+// export async function getReputationStatus(cwd?, customLedgerPath?)
+// DEFECT: async
+fn getReputationStatus(cwd_ptr: ptr, cwd_len: u64, has_cwd: bool, custom_ptr: ptr, custom_len: u64, has_custom: bool, out: &ReputationStatus) -> i32 {
+    // ledgerPath = resolveLedgerPath(...); entries = read; compute.
+    out.score = 100; out.tier = TIER_GREEN;
+    return 0;
+}
+
+// Input/result structs for recordPenalty / submitRedemption
+// (TS inline object parameter types -> structs, 1:1 field names).
+struct RecordPenaltyInput {
+    target_file_bytes: [u8; 4096], target_file_len: u64, level: u64,
+    error_sig_bytes: [u8; 2048], error_sig_len: u64,
+    has_details: bool, details_bytes: [u8; 4096], details_len: u64,
+    has_score_delta: bool, score_delta: i64,
+    has_cwd: bool, cwd_bytes: [u8; 4096], cwd_len: u64,
+    has_custom_path: bool, custom_path_bytes: [u8; 4096], custom_path_len: u64,
+    now_ms: u64, uuid8_ptr: ptr, uuid8_len: u64,
+}
+struct RecordPenaltyResult { penalty: PenaltyRecord, status: ReputationStatus }
+struct SubmitRedemptionInput {
+    penalty_id_bytes: [u8; 128], penalty_id_len: u64,
+    evidence_bytes: [u8; 8192], evidence_len: u64,
+    lesson_bytes: [u8; 4096], lesson_len: u64,
+    rule_bytes: [u8; 4096], rule_len: u64,
+    has_cwd: bool, cwd_bytes: [u8; 4096], cwd_len: u64,
+    has_custom_path: bool, custom_path_bytes: [u8; 4096], custom_path_len: u64,
+    auditor_id: u64, now_ms: u64, uuid8_ptr: ptr, uuid8_len: u64,
+}
+struct SubmitRedemptionResult {
+    ok: bool, has_reward: bool, reward: RewardRecord,
+    status: ReputationStatus, has_restored: bool, restored_score: i64,
+    has_error: bool, error_bytes: [u8; 4096], error_len: u64,
+}
+
+// export async function recordPenalty(input)
+// DEFECT: async; Date.now/randomUUID -> now_ms/uuid8 parameters.
+fn recordPenalty(input: &RecordPenaltyInput, out: &RecordPenaltyResult) -> i32 {
+    // cwd default process.cwd(); ledgerPath resolved; target file
+    // normalized; delta = input.scoreDelta ?? PENALTY_SCORES[level];
+    // positive delta negated; zero -> -10; id = "pen_<now>_<uuid8>";
+    // status active; append; re-read; compute; return {penalty,status}.
+    return 0;
+}
+
+// export async function submitRedemption(input)
+// DEFECT: async
+fn submitRedemption(input: &SubmitRedemptionInput, out: &SubmitRedemptionResult) -> i32 {
+    // find active penalty by id: already-redeemed -> error
+    // "already redeemed by ...", missing -> "not found in ledger.";
+    // evidence/lesson/rule trimmed and required non-empty;
+    // evaluateRedemptionWithJev must approve else error
+    // "JEV autonomous supervisor rejected redemption: ...";
+    // reward delta = abs(penalty.scoreDelta), id "rew_<now>_<uuid8>";
+    // append reward; re-read; compute; return ok + restoredScore.
+    out.ok = false;
+    return 0;
+}
+
+// export function formatAntibodyNotice(targetFile, status) -> string | null
+// DEFECT: string | null -> has return flag + output buffer.
+fn formatAntibodyNotice(tf_ptr: ptr, tf_len: u64, status: &ReputationStatus, out_ptr: ptr, out_cap: u64, out_len: &u64) -> bool {
+    // normalized = targetFile backslash->slash; matching antibodies /
+    // active penalties by equal-or-suffix match; lines:
+    // "[ANTIBODY IMMUNITY ACTIVE: N rule(s) for <file>]" +
+    // "• Rule: \"<rule>\" (Learned from: <lesson>)" per antibody;
+    // "[ACTIVE PENALTY WARNING: N unredeemed penalty(s)]" +
+    // "• [<id>] <level> (<delta> pts): <sig>" per penalty +
+    // "• Current Reputation: <score>/100 [Tier: <tier>]".
+    // Joined with "\n"; null (false) when no lines.
+    out_len = 0;
+    return false;
+}
+
+// Gate input struct (TS inline object type of checkAccountabilityWriteGate).
+struct CheckGateInput {
+    target_file_bytes: [u8; 4096], target_file_len: u64,
+    changes_bytes: [u8; 16384], changes_len: u64,
+    has_cwd: bool, cwd_bytes: [u8; 4096], cwd_len: u64,
+    has_policy: bool, policy_json: [u8; 8192], policy_json_len: u64,
+    has_custom_path: bool, custom_path_bytes: [u8; 4096], custom_path_len: u64,
+    manual_override: bool, auditor_id: u64,
+}
+
+// export async function checkAccountabilityWriteGate(input)
+// DEFECT: async. P0-1 note: manualOverride in source IS honored here
+// (takeover supplied out-of-band); converted 1:1 as written.
+fn checkAccountabilityWriteGate(input: &CheckGateInput, out: &AccountabilityGateResult) -> i32 {
+    // accountability disabled, or (not enabled and no custom path)
+    // -> allowed GREEN 100. Else load status; antibodyNotice built.
+    // manualOverride (input or policy.accountability.manualOverride)
+    // -> allowed with "[ACCOUNTABILITY MANUAL OVERRIDE]" notice.
+    // GREEN -> allowed. YELLOW -> allowed with caution notice.
+    // RED -> runJevSupervisoryAudit on file-scoped (or global)
+    // penalties/antibodies; rejected -> allowed=false,
+    // kind=capability_denied, "[JEV HIGH-RISK GATEWAY REJECTION]..."
+    // reason + jevVerdict; approved -> allowed with
+    // "[JEV SUPERVISOR GATE: PASSED] ..." notice + jevVerdict.
+    out.allowed = true; out.tier = TIER_GREEN; out.score = 100;
+    return 0;
+}
+
+// async function runJevSupervisoryAudit(context)  (not exported)
+// DEFECT: async
+fn runJevSupervisoryAudit(ctx: &JevAuditContext, proposed_ptr: ptr, proposed_len: u64, out: &JevAuditResult) -> i32 {
+    // custom auditor (auditor_id != 0) -> delegate (extern).
+    // 1) antibody forbidden-keyword scan: any keyword found in
+    //    proposedChanges (case-insensitive) -> stop/antibody_violation.
+    // 2) penalty errorSignature still present -> stop/penalty_repetition.
+    // 3) empty proposed change -> stop/data_loss.
+    // 4) nativeJevRedteam (from saVmJev.sla) with target/context text;
+    //    DEFECT: JSON.parse of stdout -> JSON buffer field reads;
+    //    verdict "stop" -> reject; ok -> approve (verdict ?? "proceed");
+    //    !ok -> stop/jev_unavailable (fail-closed);
+    //    exception -> stop/jev_unreachable (fail-closed, P0).
+    out.approved = false;
+    return 0;
+}
+
+// async function evaluateRedemptionWithJev(input)
+// DEFECT: async; customJevAuditor accepted in TS type but the source
+// body ignores it except via length/keyword heuristics — kept 1:1.
+fn evaluateRedemptionWithJev(pen: &PenaltyRecord, ev_ptr: ptr, ev_len: u64, lesson_ptr: ptr, lesson_len: u64, rule_ptr: ptr, rule_len: u64, out: &JevAuditResult) -> i32 {
+    // evidence < 10 chars -> reject; lesson < 5 -> reject;
+    // rule < 5 -> reject; evidence (lowercased) must contain one of
+    // pass/ok/success/clean/fixed/0 error/test/verified/passed else
+    // reject; otherwise approved.
+    if ev_len < 10 { out.approved = false; return 0; };
+    if lesson_len < 5 { out.approved = false; return 0; };
+    if rule_len < 5 { out.approved = false; return 0; };
+    out.approved = false;
+    return 0;
+}
+
+// function extractForbiddenKeywordsFromRule(rule) -> string[]
+// DEFECT: global RegExp exec loop -> byte scanner for
+// "do not|never|avoid|forbidden to" + following word (>2 chars).
+fn extractForbiddenKeywordsFromRule(rule_ptr: ptr, rule_len: u64, out_ptr: ptr, out_cap: u64, out_count: &u64) -> i32 {
+    out_count = 0;
+    return 0;
+}

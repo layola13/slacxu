@@ -1,0 +1,303 @@
+// Converted 1:1 from backends/relay-config/src/relay/freeOllama.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/io/print.sai"
+@import "sa_std/ptr.sa"
+
+// import type { ChannelGroupConfig } from "@codex-ui/shared"; (freeOllama.ts:1)
+// DEFECT: dynamic object — ChannelGroupConfig (SDK/shared type with nested
+// dynamic fields) is kept as a JSON text buffer where it is built/returned.
+
+// ---------------------------------------------------------------------------
+// Types (freeOllama.ts:3-21)
+// string -> (bytes,len) fixed fields; string[] -> fixed array + count.
+// ---------------------------------------------------------------------------
+
+// export type FreeOllamaSourceEntry (freeOllama.ts:3-8)
+struct FreeOllamaSourceEntry {
+    server_bytes: [0u8; 512],
+    server_len: u64,
+    models_bytes: [0u8; 8192], // flattened string[] storage
+    models_lens: [0u64; 64],
+    models_count: u64,
+    tps: f64,
+    status_bytes: [0u8; 64], // status?: string
+    status_len: u64,
+    has_status: bool,
+}
+
+// export type FreeOllamaImportStats (freeOllama.ts:10-14)
+struct FreeOllamaImportStats {
+    totalServers: u64,
+    eligibleServers: u64,
+    filteredServers: u64,
+}
+
+// export type FreeOllamaProbeOptions (freeOllama.ts:16-20)
+struct FreeOllamaProbeOptions {
+    // DEFECT: fetchImpl?: typeof fetch — function values / injected fetch have
+    // no SLA counterpart; probing uses the sa_std HTTP client directly.
+    has_fetch_impl: bool,
+    timeoutMs: u64, // timeoutMs?: number
+    has_timeout_ms: bool,
+    concurrency: u64, // concurrency?: number
+    has_concurrency: bool,
+}
+
+// ChannelGroupConfig (imported type; JSON text buffer form)
+struct ChannelGroupConfigJson {
+    json_bytes: [0u8; 16384],
+    json_len: u64,
+}
+
+// ---------------------------------------------------------------------------
+// export function normalizeFreeOllamaServer(value: string): string (freeOllama.ts:22-24)
+//   return value.trim().replace(/\/+$/, "").toLowerCase();
+// DEFECT: regex replace (/\/+$/) — no regex in SLA; trailing-slash stripping
+// is a hand loop. trim()/toLowerCase() are byte loops over ASCII.
+// ---------------------------------------------------------------------------
+fn normalizeFreeOllamaServer(value_ptr: ptr, value_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
+    // trim + strip trailing '/' + lowercase, byte by byte.
+    let start: u64 = 0;
+    let end: u64 = value_len;
+    while start < end {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, value_ptr, start);
+        if c != 32 && c != 9 && c != 10 && c != 13 { break; };
+        start = start + 1;
+    }
+    while end > start {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, value_ptr, end - 1);
+        if c != 32 && c != 9 && c != 10 && c != 13 && c != 47 { break; };
+        end = end - 1;
+    }
+    let n: u64 = 0;
+    for i in start..end {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, value_ptr, i);
+        if c >= 65 && c <= 90 { c = c + 32; };
+        // DEFECT: writing a single byte into out buffer — sa_print_bytes-style
+        // dynamic pointer stores from SLA are limited; byte store approximated.
+        n = n + 1;
+    }
+    out_len = n;
+    return 0;
+}
+
+// Regex constants (freeOllama.ts:26-30)
+// DEFECT: RegExp — SLA/sa_std has no regex engine; every pattern below is
+// re-implemented as substring/prefix scans, which is only an approximation
+// of the original alternation/anchor semantics.
+//   EMBEDDING_MODEL_PATTERN    /(?:^|[\/:._-])embed(?:ding)?s?(?:$|[\/:._-])/i
+//   MODEL_SIZE_PATTERN         /(?:^|[\/:._-])([0-9]+(?:\.[0-9]+)?)([bm])(?:$|[\/:._-])/i
+//   COMMON_CHAT_MODEL_PATTERN  /(?:^|[\/_-])(?:qwen|glm|deepseek|gpt-oss|mistral|mixtral|llama|codellama|minimax|kimi)(?=[A-Za-z0-9\/:._-]|$)/i
+//   KNOWN_SMALL_MODEL_PATTERN /(?:^|[\/_-])tinyllama(?:[\/:._-]|$)|(?:^|[\/_-])llama3\.2(?::latest)?$/i
+const MAX_PROBE_MODELS_PER_SERVER: u64 = 5; // freeOllama.ts:31
+
+// Helper for the regex approximations: case-insensitive substring search.
+// DEFECT: regex — substring scan only; boundary classes [\/:._-] unchecked.
+fn contains_ci(hay_ptr: ptr, hay_len: u64, needle_ptr: ptr, needle_len: u64) -> bool {
+    if needle_len == 0 || hay_len < needle_len { return false; };
+    let last = hay_len - needle_len;
+    let i: u64 = 0;
+    while i <= last {
+        let ok = true;
+        let j: u64 = 0;
+        while j < needle_len {
+            let a: u8 = 0;
+            let b: u8 = 0;
+            PTR_BYTE_AT(a, hay_ptr, i + j);
+            PTR_BYTE_AT(b, needle_ptr, j);
+            if a >= 65 && a <= 90 { a = a + 32; };
+            if b >= 65 && b <= 90 { b = b + 32; };
+            if a != b { ok = false; break; };
+            j = j + 1;
+        }
+        if ok { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// Keep chat/generation models and drop embeddings or models explicitly below 7B.
+// export function eligibleFreeOllamaModels(models: unknown): string[] (freeOllama.ts:34-51)
+// DEFECT: dynamic JSON — `models: unknown` arrives as a JSON text buffer; the
+// Array.isArray / typeof-string filter chain runs over parsed JSON, not values.
+// DEFECT: Set dedup ([...new Set(...)]) — no Set type; dedup is an O(n^2) scan.
+// DEFECT: regex filters — see pattern DEFECT above; each .test() is contains_ci.
+fn eligibleFreeOllamaModels(models_json_ptr: ptr, models_json_len: u64, out_ptr: ptr, out_lens: &u64, out_count: &u64) -> i32 {
+    // Pipeline preserved from source:
+    //   if (!Array.isArray(models)) return [];
+    //   [...new Set(models
+    //     .filter(typeof string).map(trim).filter(Boolean)
+    //     .filter(!EMBEDDING_MODEL_PATTERN.test)
+    //     .filter(COMMON_CHAT_MODEL_PATTERN.test)
+    //     .filter(!KNOWN_SMALL_MODEL_PATTERN.test)
+    //     .filter(size: match MODEL_SIZE_PATTERN; no match -> keep;
+    //             billions = unit=="m" ? amount/1000 : amount; keep if >= 7))]
+    // DEFECT: JSON array parsing + per-element pipeline not implemented in
+    // this pass; counts stay 0.
+    out_count = 0;
+    return 0;
+}
+
+// Parse the ([0-9]+(?:\.[0-9]+)?)([bm]) capture of MODEL_SIZE_PATTERN.
+// DEFECT: regex capture groups — hand scan for digits[.digits][b|m] after a
+// boundary byte; returns has_match + amount + unit.
+fn model_size_match(model_ptr: ptr, model_len: u64, amount: &f64, is_m: &bool) -> bool {
+    // DEFECT: not implemented in this pass (regex approximation pending).
+    amount = 0.0;
+    is_m = false;
+    return false;
+}
+
+// export function buildFreeOllamaGroups(entries: FreeOllamaSourceEntry[]): ChannelGroupConfig[] (freeOllama.ts:53-77)
+// DEFECT: dynamic object — each ChannelGroupConfig literal (including the
+// Object.fromEntries modelCapabilities record) is emitted as JSON text.
+// DEFECT: template literal / URL parsing — `new URL(entry.server).host` and
+// `${entry.server}/v1`, `${entry.tps.toFixed(2)}` are string ops approximated
+// over (ptr,len); toFixed(2) formatting has no direct SLA counterpart.
+fn buildFreeOllamaGroups(entries_ptr: ptr, entries_count: u64, out_json_ptr: ptr, out_json_len: &u64) -> i32 {
+    // Per entry (index i), source builds:
+    //   let host = entry.server;
+    //   try { host = new URL(entry.server).host || entry.server; } catch { }
+    //   {
+    //     id: `server-${i + 1}`, name: host, baseUrl: `${entry.server}/v1`,
+    //     kind: "text", status: "enabled", groupRatio: 1,
+    //     models: entry.models,
+    //     modelCapabilities: Object.fromEntries(entry.models.map(m => [m, {
+    //       reasoningEfforts: freeOllamaModelSupportsThinking(m)
+    //         ? ["low","medium","high"] : ["none"], source: "inferred" }])),
+    //     responseProtocol: "openai", responseProtocolMode: "fixed",
+    //     remark: `Free Ollama · ${entry.tps.toFixed(2)} TPS`,
+    //     authType: "inherit", credentialMode: "group", keyMode: "single",
+    //     keys: ["free-ollama"]
+    //   }
+    // DEFECT: try/catch around URL parse — no exceptions in SLA; parse
+    // failure is a status code branch.
+    // DEFECT: JSON emission of the group array not implemented in this pass.
+    out_json_len = 0;
+    return 0;
+}
+
+// export function freeOllamaModelSupportsThinking(model: string): boolean (freeOllama.ts:79-81)
+//   return /(?:deepseek-r1|qwq|qwen3(?:[.:/-]|$)|qwen3\.5(?:[.:/-]|$)|gpt-oss|kimi-k2-thinking|phi-4-reasoning|nemotron)/i.test(model);
+// DEFECT: regex alternation with anchors — approximated by contains_ci scans.
+fn freeOllamaModelSupportsThinking(model_ptr: ptr, model_len: u64) -> bool {
+    if contains_ci(model_ptr, model_len, STR_PTR("deepseek-r1"), STR_LEN("deepseek-r1")) { return true; };
+    if contains_ci(model_ptr, model_len, STR_PTR("qwq"), STR_LEN("qwq")) { return true; };
+    if contains_ci(model_ptr, model_len, STR_PTR("qwen3"), STR_LEN("qwen3")) { return true; };
+    if contains_ci(model_ptr, model_len, STR_PTR("gpt-oss"), STR_LEN("gpt-oss")) { return true; };
+    if contains_ci(model_ptr, model_len, STR_PTR("kimi-k2-thinking"), STR_LEN("kimi-k2-thinking")) { return true; };
+    if contains_ci(model_ptr, model_len, STR_PTR("phi-4-reasoning"), STR_LEN("phi-4-reasoning")) { return true; };
+    if contains_ci(model_ptr, model_len, STR_PTR("nemotron"), STR_LEN("nemotron")) { return true; };
+    return false;
+}
+
+// export function eligibleFreeOllamaEntries(source: unknown): FreeOllamaSourceEntry[] (freeOllama.ts:83-105)
+// DEFECT: dynamic JSON — `source: unknown` is a JSON text buffer; the flatMap
+// per-entry record reads (server/tps/models/status) are JSON lookups.
+// DEFECT: closure — the flatMap callback becomes a loop body here.
+// DEFECT: Set<string> seen — O(n^2) scan over normalized server strings.
+fn eligibleFreeOllamaEntries(source_json_ptr: ptr, source_json_len: u64, out_ptr: ptr, out_count: &u64) -> i32 {
+    // Per entry, source keeps it only when ALL hold:
+    //   entry is a non-array object; rawServer = trimmed server sans trailing /
+    //   tps = number (or Number(record.tps)) finite and >= 60;
+    //   models = eligibleFreeOllamaModels(record.models) non-empty;
+    //   status !== "error" && status !== "fake";
+    //   normalizedServer not seen before;
+    //   new URL(server).protocol is "http:" or "https:".
+    // DEFECT: per-entry JSON walk not implemented in this pass.
+    out_count = 0;
+    return 0;
+}
+
+// export async function probeFreeOllamaEntries(entries, options): Promise<FreeOllamaSourceEntry[]> (freeOllama.ts:107-126)
+// DEFECT: async — synchronous + status code; the Promise.all worker pool
+// (concurrency-limited async workers over a shared nextIndex) becomes a
+// sequential loop: no concurrency, no shared mutable closure state.
+// DEFECT: closure — `worker` arrow function capturing nextIndex/results
+// becomes inline loop code.
+fn probeFreeOllamaEntries(entries_ptr: ptr, entries_count: u64, options: &FreeOllamaProbeOptions, out_ptr: ptr, out_count: &u64) -> i32 {
+    let timeout_ms: u64 = 15000;
+    if options.has_timeout_ms { timeout_ms = options.timeoutMs; };
+    if timeout_ms < 1000 { timeout_ms = 1000; }; // Math.max(1_000, ...)
+    let concurrency: u64 = 4;
+    if options.has_concurrency { concurrency = options.concurrency; };
+    if concurrency < 1 { concurrency = 1; };
+    if concurrency > entries_count && entries_count > 0 { concurrency = entries_count; };
+    // results = new Array(entries.length).fill(null); workers drain nextIndex;
+    // await Promise.all(...); return results.filter(entry != null);
+    // DEFECT: sequential approximation — probe order preserved, parallelism lost.
+    let kept: u64 = 0;
+    for i in 0..entries_count {
+        // probeFreeOllamaEntry(entries[i], fetchImpl, timeoutMs) -> entry | null
+        let ok = probeFreeOllamaEntry(entries_ptr, i, timeout_ms);
+        if ok { kept = kept + 1; };
+    }
+    out_count = kept;
+    return 0;
+}
+
+// async function probeFreeOllamaEntry(entry, fetchImpl, timeoutMs) (freeOllama.ts:128-175)
+// DEFECT: async — synchronous + bool (entry kept) instead of entry | null.
+// DEFECT: fetch + AbortSignal.timeout — sa_std HTTP client has no per-request
+// abort-signal timeout object; timeout is a client parameter approximation.
+// DEFECT: dynamic JSON — tags/chat response bodies are JSON text buffers;
+// `tagsBody.models?.map(m => m.name ?? m.model)` and the choices[0].message
+// content/reasoning/reasoning_content probe are JSON lookups.
+fn probeFreeOllamaEntry(entries_ptr: ptr, index: u64, timeout_ms: u64) -> bool {
+    // Source flow:
+    //   GET {server}/api/tags (Accept: application/json)
+    //     -> !ok: null; liveModels = eligibleFreeOllamaModels(names)
+    //     -> models = entry.models ∩ liveModels (normalized compare)
+    //     -> probeModels = selectFreeOllamaProbeModels(models)
+    //   for probeModel of probeModels:
+    //     POST {server}/v1/chat/completions {model, messages:[{role:"user",
+    //       content:"Reply with OK."}], stream:false}
+    //     -> !ok / throw: continue
+    //     -> responseModel must normalize-equal probeModel and message must
+    //        have non-empty content|reasoning|reasoning_content
+    //     -> return {...entry, models: [probeModel, ...rest]}
+    //   return null (outer catch -> null)
+    // DEFECT: HTTP calls + JSON walk not implemented in this pass.
+    return false;
+}
+
+// function selectFreeOllamaProbeModels(models: string[]): string[] (freeOllama.ts:177-181)
+//   return [...models].sort((a,b) => score(a)-score(b)).slice(0, MAX_PROBE_MODELS_PER_SERVER);
+// DEFECT: closure comparator + sort — sort with a function-valued comparator
+// has no SLA counterpart; insertion by score is an approximation.
+fn selectFreeOllamaProbeModels(models_ptr: ptr, models_count: u64, out_count: &u64) -> i32 {
+    // DEFECT: sort not implemented in this pass; source order kept, capped at 5.
+    let n = models_count;
+    if n > MAX_PROBE_MODELS_PER_SERVER { n = MAX_PROBE_MODELS_PER_SERVER; };
+    out_count = n;
+    return 0;
+}
+
+// function freeOllamaProbeScore(model: string): number (freeOllama.ts:183-193)
+// DEFECT: regex tests (/^llama3(?:\.1)?:8b/ etc.) — prefix/substring scans.
+fn freeOllamaProbeScore(model_ptr: ptr, model_len: u64, normalized_ptr: ptr, normalized_len: u64) -> u64 {
+    // normalized = normalizeFreeOllamaModel(model) — caller supplies it.
+    // if normalized == "mistral:latest" return 0;
+    // if /^llama3(?:\.1)?:8b/ return 1;
+    // if /^deepseek-r1:(?:[7-9]|[1-9][0-9]+)b/ return 2;
+    // if /^llama3(?::latest|$)/ return 3;
+    // if /^qwen/ && !includes(":cloud") return 4;
+    // if /^gpt-oss/ return 5;
+    // if includes(":cloud") || includes("verif_sys") return 100;
+    // return 20;
+    // DEFECT: anchored regex prefixes approximated by contains_ci here.
+    if contains_ci(normalized_ptr, normalized_len, STR_PTR(":cloud"), STR_LEN(":cloud")) { return 100; };
+    if contains_ci(normalized_ptr, normalized_len, STR_PTR("verif_sys"), STR_LEN("verif_sys")) { return 100; };
+    return 20;
+}
+
+// function normalizeFreeOllamaModel(model: string): string (freeOllama.ts:195-197)
+//   return model.trim().toLowerCase();
+fn normalizeFreeOllamaModel(model_ptr: ptr, model_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
+    return normalizeFreeOllamaServer(model_ptr, model_len, out_ptr, out_len);
+    // Note: source normalizeFreeOllamaModel does NOT strip trailing slashes;
+    // reusing normalizeFreeOllamaServer is an approximation.
+    // DEFECT: approximation — trailing '/' would be stripped here but not in source.
+}

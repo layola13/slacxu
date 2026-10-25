@@ -1,0 +1,1705 @@
+// Converted 1:1 from backends/agy/src/runtime/agyCompatibleTurnProjector.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// DEFECT: AgyProjectedEvent union — projected events are JSON
+// texts in AgyProjectedList (kind + fields), the same shape
+// toAgyNotification consumes. DEFECT: Map/Set on the context —
+// arena tables. DEFECT: accumulated texts (assistantText etc.)
+// — fixed inline arenas (256 KiB each) with truncation at the
+// cap. DEFECT: JSON string escaping when serializing projected
+// items/deltas (raw append). DEFECT: Number(usage.*) float
+// semantics — i64 reads with a float-fallback shim.
+// DEFECT: Date.now() timestamps — now_s() shim returning 0.
+
+@import "./agyCompatibleProtocol.sla"
+@import "sa_std/ts_string.sa"
+
+// AgyProjectedQuestion (interface): id, header, question,
+// options[{label, description}], multiSelect?, isOther?,
+// isSecret? — carried as the serialized question object
+// (json inline) + its id.
+struct AgyProjectedQuestion {
+    json: [u8; 8192],
+    json_len: u64,
+    id: [u8; 128],
+    id_len: u64,
+}
+
+fn question_json_ptr(q: &AgyProjectedQuestion) -> ptr {
+    return &q.json;
+}
+
+// AgyProjectedList: the AgyProjectedEvent[] of this pass.
+struct AgyProjectedList {
+    arena: [u8; 262144],
+    arena_len: u64,
+    json_off: [u64; 64],
+    json_len: [u64; 64],
+    count: u64,
+}
+
+fn projected_push(list: &AgyProjectedList, json_ptr: ptr, json_len: u64) -> void {
+    if list.count >= 64 { return; };
+    let idx = list.count;
+    list.json_off[idx] = list.arena_len;
+    list.json_len[idx] = json_len;
+    for i in 0..json_len {
+        if list.arena_len < 262144 { list.arena[list.arena_len] = byte_at(json_ptr, i); list.arena_len = list.arena_len + 1; };
+    }
+    list.count = list.count + 1;
+}
+
+// AgyProjectorContext (interface). status codes: 0 running,
+// 1 completed, 2 failed, 3 interrupted.
+struct AgyProjectorContext {
+    threadId_ptr: ptr,
+    threadId_len: u64,
+    turnId_ptr: ptr,
+    turnId_len: u64,
+    conversationId_ptr: ptr,
+    conversationId_len: u64,
+    has_conversationId: bool,
+    status: u64,
+    textSegmentSeq: u64,
+    currentAssistantItemId: [u8; 160],
+    currentAssistantItemId_len: u64,
+    currentAssistantText: [u8; 262144],
+    currentAssistantText_len: u64,
+    hasStartedCurrentAssistantMessage: bool,
+    hasCompletedCurrentAssistantMessage: bool,
+    currentReasoningItemId: [u8; 160],
+    currentReasoningItemId_len: u64,
+    currentReasoningText: [u8; 262144],
+    currentReasoningText_len: u64,
+    assistantItemId: [u8; 160],
+    assistantItemId_len: u64,
+    reasoningItemId: [u8; 160],
+    reasoningItemId_len: u64,
+    assistantText: [u8; 262144],
+    assistantText_len: u64,
+    reasoningText: [u8; 262144],
+    reasoningText_len: u64,
+    hasStartedTurn: bool,
+    hasStartedAgentMessage: bool,
+    hasStartedCurrentReasoning: bool,
+    hasCompletedCurrentReasoning: bool,
+    tools_arena: [u8; 524288],
+    tools_arena_len: u64,
+    tool_id_off: [u64; 256],
+    tool_id_len: [u64; 256],
+    tool_json_off: [u64; 256],
+    tool_json_len: [u64; 256],
+    tool_count: u64,
+    done_id_off: [u64; 512],
+    done_id_len: [u64; 512],
+    done_count: u64,
+    pendingQuestionId_ptr: ptr,
+    pendingQuestionId_len: u64,
+    has_pendingQuestionId: bool,
+    awaitingQuestion: bool,
+}
+
+// projectAgyUsage(usage): token breakdown or null. Numbers are
+// read through json_number_i64 (Number() approximation).
+fn projectAgyUsage(usage: u64, out: ptr, out_cap: u64, out_len: &u64, out_ok: &bool) -> void {
+    out_ok = false;
+    let inputTokens = usage_num(usage, STR_PTR("input_tokens"), STR_LEN("input_tokens"));
+    let outputTokens = usage_num(usage, STR_PTR("output_tokens"), STR_LEN("output_tokens"));
+    let reasoningOutputTokens = usage_num(usage, STR_PTR("thinking_tokens"), STR_LEN("thinking_tokens"));
+    let cachedInputTokens = usage_num(usage, STR_PTR("cache_read_tokens"), STR_LEN("cache_read_tokens"));
+    let totalTokens = usage_num_or(usage, STR_PTR("total_tokens"), STR_LEN("total_tokens"), inputTokens + outputTokens + reasoningOutputTokens);
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"total\":{\"totalTokens\":"), STR_LEN("{\"total\":{\"totalTokens\":"));
+    n = n + append_u64(out, out_cap, n, max0(totalTokens));
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"inputTokens\":"), STR_LEN(",\"inputTokens\":"));
+    n = n + append_u64(out, out_cap, n, max0(inputTokens));
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"cachedInputTokens\":"), STR_LEN(",\"cachedInputTokens\":"));
+    n = n + append_u64(out, out_cap, n, max0(cachedInputTokens));
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"cacheWriteInputTokens\":0,\"outputTokens\":"), STR_LEN(",\"cacheWriteInputTokens\":0,\"outputTokens\":"));
+    n = n + append_u64(out, out_cap, n, max0(outputTokens));
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"reasoningOutputTokens\":"), STR_LEN(",\"reasoningOutputTokens\":"));
+    n = n + append_u64(out, out_cap, n, max0(reasoningOutputTokens));
+    n = n + append_bytes(out, out_cap, n, STR_PTR("},\"last\":{\"totalTokens\":"), STR_LEN("},\"last\":{\"totalTokens\":"));
+    n = n + append_u64(out, out_cap, n, max0(totalTokens));
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"inputTokens\":"), STR_LEN(",\"inputTokens\":"));
+    n = n + append_u64(out, out_cap, n, max0(inputTokens));
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"cachedInputTokens\":"), STR_LEN(",\"cachedInputTokens\":"));
+    n = n + append_u64(out, out_cap, n, max0(cachedInputTokens));
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"cacheWriteInputTokens\":0,\"outputTokens\":"), STR_LEN(",\"cacheWriteInputTokens\":0,\"outputTokens\":"));
+    n = n + append_u64(out, out_cap, n, max0(outputTokens));
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"reasoningOutputTokens\":"), STR_LEN(",\"reasoningOutputTokens\":"));
+    n = n + append_u64(out, out_cap, n, max0(reasoningOutputTokens));
+    // contextUsage: {...breakdown, totalTokens: input+cached,
+    // outputTokens: 0, reasoningOutputTokens: 0}
+    n = n + append_bytes(out, out_cap, n, STR_PTR("},\"contextUsage\":{\"totalTokens\":"), STR_LEN("},\"contextUsage\":{\"totalTokens\":"));
+    n = n + append_u64(out, out_cap, n, max0(inputTokens + cachedInputTokens));
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"inputTokens\":"), STR_LEN(",\"inputTokens\":"));
+    n = n + append_u64(out, out_cap, n, max0(inputTokens));
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"cachedInputTokens\":"), STR_LEN(",\"cachedInputTokens\":"));
+    n = n + append_u64(out, out_cap, n, max0(cachedInputTokens));
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"cacheWriteInputTokens\":0,\"outputTokens\":0,\"reasoningOutputTokens\":0}"), STR_LEN(",\"cacheWriteInputTokens\":0,\"outputTokens\":0,\"reasoningOutputTokens\":0}"));
+    // modelContextWindow when context_window ?? contextWindow
+    // ?? max_input_tokens > 0
+    let cw = usage_num(usage, STR_PTR("context_window"), STR_LEN("context_window"));
+    if cw == 0 { cw = usage_num(usage, STR_PTR("contextWindow"), STR_LEN("contextWindow")); };
+    if cw == 0 { cw = usage_num(usage, STR_PTR("max_input_tokens"), STR_LEN("max_input_tokens")); };
+    if cw > 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"modelContextWindow\":"), STR_LEN(",\"modelContextWindow\":"));
+        n = n + append_u64(out, out_cap, n, cw as u64);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR("}"), 1);
+    out_len = n;
+    out_ok = true;
+}
+
+fn usage_num(doc: u64, key_ptr: ptr, key_len: u64) -> i64 {
+    let node: u64 = 0;
+    if sa_json_object_get(doc, key_ptr, key_len, &node) != 0 { return 0; };
+    return json_number_i64(node);
+}
+
+fn usage_num_or(doc: u64, key_ptr: ptr, key_len: u64, fallback: i64) -> i64 {
+    let node: u64 = 0;
+    if sa_json_object_get(doc, key_ptr, key_len, &node) != 0 { return fallback; };
+    return json_number_i64(node);
+}
+
+fn max0(v: i64) -> u64 {
+    if v < 0 { return 0; };
+    return v as u64;
+}
+
+// usageEvent(ctx, usage): thread/tokenUsage/updated projected
+// event text, or none.
+fn usageEvent(ctx: &AgyProjectorContext, usage: u64, has_usage: bool, out: ptr, out_cap: u64, out_len: &u64, out_ok: &bool) -> void {
+    out_ok = false;
+    if !has_usage || usage == 0 { return; };
+    let usage_json = [0u8; 2048];
+    let usage_len: u64 = 0;
+    let uok = false;
+    projectAgyUsage(usage, &usage_json, 2048, &usage_len, &uok);
+    if !uok { return; };
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"kind\":\"thread/tokenUsage/updated\",\"threadId\":\""), STR_LEN("{\"kind\":\"thread/tokenUsage/updated\",\"threadId\":\""));
+    n = n + append_bytes(out, out_cap, n, ctx.threadId_ptr, ctx.threadId_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    n = n + append_bytes(out, out_cap, n, ctx.turnId_ptr, ctx.turnId_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"tokenUsage\":"), STR_LEN("\",\"tokenUsage\":"));
+    n = n + append_bytes(out, out_cap, n, &usage_json, usage_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("}"), 1);
+    out_len = n;
+    out_ok = true;
+}
+
+// createAgyProjectorContext(threadId, turnId)
+fn createAgyProjectorContext(threadId_ptr: ptr, threadId_len: u64, turnId_ptr: ptr, turnId_len: u64, out: &AgyProjectorContext) -> void {
+    out.threadId_ptr = threadId_ptr;
+    out.threadId_len = threadId_len;
+    out.turnId_ptr = turnId_ptr;
+    out.turnId_len = turnId_len;
+    out.has_conversationId = false;
+    out.conversationId_ptr = PTR_NULL();
+    out.conversationId_len = 0;
+    out.status = 0;
+    out.textSegmentSeq = 0;
+    // initialAssistantItemId = `agy-msg-${turnId}-0`
+    out.currentAssistantItemId_len = make_item_id(STR_PTR("agy-msg-"), STR_LEN("agy-msg-"), turnId_ptr, turnId_len, 0, &out.currentAssistantItemId, 160);
+    out.currentReasoningItemId_len = make_item_id(STR_PTR("agy-thought-"), STR_LEN("agy-thought-"), turnId_ptr, turnId_len, 0, &out.currentReasoningItemId, 160);
+    out.assistantItemId_len = out.currentAssistantItemId_len;
+    buf_copy(&out.assistantItemId, 160, &out.currentAssistantItemId, out.currentAssistantItemId_len);
+    out.reasoningItemId_len = out.currentReasoningItemId_len;
+    buf_copy(&out.reasoningItemId, 160, &out.currentReasoningItemId, out.currentReasoningItemId_len);
+    out.currentAssistantText_len = 0;
+    out.currentReasoningText_len = 0;
+    out.assistantText_len = 0;
+    out.reasoningText_len = 0;
+    out.hasStartedTurn = false;
+    out.hasStartedAgentMessage = false;
+    out.hasStartedCurrentAssistantMessage = false;
+    out.hasCompletedCurrentAssistantMessage = false;
+    out.hasStartedCurrentReasoning = false;
+    out.hasCompletedCurrentReasoning = false;
+    out.tools_arena_len = 0;
+    out.tool_count = 0;
+    out.done_count = 0;
+    out.has_pendingQuestionId = false;
+    out.awaitingQuestion = false;
+}
+
+fn make_item_id(prefix_ptr: ptr, prefix_len: u64, turnId_ptr: ptr, turnId_len: u64, seq: u64, out: ptr, out_cap: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, prefix_ptr, prefix_len);
+    n = n + append_bytes(out, out_cap, n, turnId_ptr, turnId_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("-"), 1);
+    n = n + append_u64(out, out_cap, n, seq);
+    return n;
+}
+
+// parseAskQuestionData(rawQuestions, stepIndex, fallbackHeader)
+// DEFECT: `any` handling — string nodes go through
+// json_node_string + re-parse; object/array nodes are read
+// directly. String(item.question || ...) coercions use the
+// string fields only.
+fn parseAskQuestionData(raw_node: u64, step_index: i64, fallback_ptr: ptr, fallback_len: u64, has_fallback: bool, out: &AgyProjectedQuestion, out_count: &u64) -> void {
+    out_count = 0;
+    if raw_node == 0 { return; };
+    // Normalize to an array of item nodes in a scratch doc:
+    // string -> JSON.parse (or a synthesized single question),
+    // array -> itself, object -> [object].
+    let items: u64 = 0;
+    let is_array = false;
+    json_node_items(raw_node, &items, &is_array);
+    if items == 0 { return; };
+    let n = sa_json_array_len(items);
+    for idx in 0..n {
+        if out_count >= 16 { break; };
+        let item: u64 = 0;
+        if sa_json_array_get(items, idx, &item) != 0 { continue; };
+        build_question(item, step_index, idx, fallback_ptr, fallback_len, has_fallback, &out[out_count]);
+        out_count = out_count + 1;
+    }
+}
+
+// build_question: one AgyProjectedQuestion from an item node
+// (a string item becomes {question: item, options: [item]}).
+fn build_question(item: u64, step_index: i64, idx: u64, fallback_ptr: ptr, fallback_len: u64, has_fallback: bool, out: &AgyProjectedQuestion) -> void {
+    let q_ptr: ptr = PTR_NULL();
+    let q_len: u64 = 0;
+    let is_string_item = false;
+    json_node_string(item, &q_ptr, &q_len, &is_string_item);
+    let question_ptr: ptr = PTR_NULL();
+    let question_len: u64 = 0;
+    if is_string_item {
+        question_ptr = q_ptr;
+        question_len = q_len;
+    } else {
+        if sa_json_object_get_string(item, STR_PTR("question"), STR_LEN("question"), &question_ptr, &question_len) != 0 || question_len == 0 {
+            if sa_json_object_get_string(item, STR_PTR("text"), STR_LEN("text"), &question_ptr, &question_len) != 0 || question_len == 0 {
+                // `Question ${idx + 1}`
+                let gen = [0u8; 64];
+                let gen_len: u64 = 0;
+                gen_len = gen_len + append_bytes(&gen, 64, gen_len, STR_PTR("Question "), STR_LEN("Question "));
+                gen_len = gen_len + append_u64(&gen, 64, gen_len, idx + 1);
+                question_ptr = &gen;
+                question_len = gen_len;
+                // NOTE: gen is stack-local in TS terms too (a
+                // fresh string); the copy into out.json below
+                // happens before return.
+                write_question(out, step_index, idx, question_ptr, question_len, item, is_string_item, q_ptr, q_len, fallback_ptr, fallback_len, has_fallback);
+                return;
+            };
+        };
+    };
+    write_question(out, step_index, idx, question_ptr, question_len, item, is_string_item, q_ptr, q_len, fallback_ptr, fallback_len, has_fallback);
+}
+
+fn write_question(out: &AgyProjectedQuestion, step_index: i64, idx: u64, question_ptr: ptr, question_len: u64, item: u64, is_string_item: bool, item_str_ptr: ptr, item_str_len: u64, fallback_ptr: ptr, fallback_len: u64, has_fallback: bool) -> void {
+    // id = `q-${stepIndex}-${idx}`
+    out.id_len = 0;
+    out.id_len = out.id_len + append_bytes(&out.id, 128, out.id_len, STR_PTR("q-"), 2);
+    out.id_len = out.id_len + append_i64(&out.id, 128, out.id_len, step_index);
+    out.id_len = out.id_len + append_bytes(&out.id, 128, out.id_len, STR_PTR("-"), 1);
+    out.id_len = out.id_len + append_u64(&out.id, 128, out.id_len, idx);
+    // header = item.header || fallbackHeader ||
+    // qText.slice(0, 12) || `Question ${idx + 1}`
+    let header_ptr: ptr = PTR_NULL();
+    let header_len: u64 = 0;
+    if !is_string_item && sa_json_object_get_string(item, STR_PTR("header"), STR_LEN("header"), &header_ptr, &header_len) == 0 && header_len > 0 {
+    } else if has_fallback && fallback_len > 0 {
+        header_ptr = fallback_ptr;
+        header_len = fallback_len;
+    } else {
+        header_ptr = question_ptr;
+        header_len = question_len;
+        if header_len > 12 { header_len = 12; };
+        if header_len == 0 {
+            header_ptr = STR_PTR("Question");
+            header_len = 8;
+        };
+    };
+    // options
+    let options_json = [0u8; 4096];
+    let options_len: u64 = 0;
+    options_len = options_len + append_bytes(&options_json, 4096, options_len, STR_PTR("["), 1);
+    let first_opt = true;
+    if is_string_item {
+        options_len = append_option(&options_json, 4096, options_len, item_str_ptr, item_str_len, PTR_NULL(), 0, &first_opt);
+    } else {
+        let opts: u64 = 0;
+        if sa_json_object_get(item, STR_PTR("options"), STR_LEN("options"), &opts) == 0 {
+            let on = sa_json_array_len(opts);
+            for oi in 0..on {
+                let opt: u64 = 0;
+                if sa_json_array_get(opts, oi, &opt) != 0 { continue; };
+                let os_ptr: ptr = PTR_NULL();
+                let os_len: u64 = 0;
+                let os_is_str = false;
+                json_node_string(opt, &os_ptr, &os_len, &os_is_str);
+                if os_is_str {
+                    options_len = append_option(&options_json, 4096, options_len, os_ptr, os_len, PTR_NULL(), 0, &first_opt);
+                } else {
+                    let l_ptr: ptr = PTR_NULL();
+                    let l_len: u64 = 0;
+                    if sa_json_object_get_string(opt, STR_PTR("label"), STR_LEN("label"), &l_ptr, &l_len) != 0 || l_len == 0 {
+                        if sa_json_object_get_string(opt, STR_PTR("text"), STR_LEN("text"), &l_ptr, &l_len) != 0 || l_len == 0 {
+                            sa_json_object_get_string(opt, STR_PTR("option"), STR_LEN("option"), &l_ptr, &l_len);
+                        };
+                    };
+                    let d_ptr: ptr = PTR_NULL();
+                    let d_len: u64 = 0;
+                    sa_json_object_get_string(opt, STR_PTR("description"), STR_LEN("description"), &d_ptr, &d_len);
+                    // filter: Boolean(o.label.trim())
+                    if !trim_is_empty(l_ptr, l_len) {
+                        options_len = append_option(&options_json, 4096, options_len, l_ptr, l_len, d_ptr, d_len, &first_opt);
+                    };
+                };
+            }
+        };
+    };
+    options_len = options_len + append_bytes(&options_json, 4096, options_len, STR_PTR("]"), 1);
+    // flags
+    let multi = false;
+    let b = false;
+    if !is_string_item {
+        if (sa_json_object_get_bool(item, STR_PTR("is_multi_select"), STR_LEN("is_multi_select"), &b) == 0 && b) || (sa_json_object_get_bool(item, STR_PTR("isMultiSelect"), STR_LEN("isMultiSelect"), &b) == 0 && b) || (sa_json_object_get_bool(item, STR_PTR("multiSelect"), STR_LEN("multiSelect"), &b) == 0 && b) { multi = true; };
+    };
+    let is_other = false;
+    let is_secret = false;
+    if !is_string_item {
+        if sa_json_object_get_bool(item, STR_PTR("isOther"), STR_LEN("isOther"), &b) == 0 { is_other = b; };
+        if sa_json_object_get_bool(item, STR_PTR("isSecret"), STR_LEN("isSecret"), &b) == 0 { is_secret = b; };
+    };
+    // Serialize the question object.
+    out.json_len = 0;
+    out.json_len = out.json_len + append_bytes(&out.json, 8192, out.json_len, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+    out.json_len = out.json_len + append_bytes(&out.json, 8192, out.json_len, &out.id, out.id_len);
+    out.json_len = out.json_len + append_bytes(&out.json, 8192, out.json_len, STR_PTR("\",\"header\":\""), STR_LEN("\",\"header\":\""));
+    out.json_len = out.json_len + append_bytes(&out.json, 8192, out.json_len, header_ptr, header_len);
+    out.json_len = out.json_len + append_bytes(&out.json, 8192, out.json_len, STR_PTR("\",\"question\":\""), STR_LEN("\",\"question\":\""));
+    out.json_len = out.json_len + append_bytes(&out.json, 8192, out.json_len, question_ptr, question_len);
+    out.json_len = out.json_len + append_bytes(&out.json, 8192, out.json_len, STR_PTR("\",\"options\":"), STR_LEN("\",\"options\":"));
+    out.json_len = out.json_len + append_bytes(&out.json, 8192, out.json_len, &options_json, options_len);
+    out.json_len = out.json_len + append_bytes(&out.json, 8192, out.json_len, STR_PTR(",\"multiSelect\":"), STR_LEN(",\"multiSelect\":"));
+    out.json_len = out.json_len + append_bytes(&out.json, 8192, out.json_len, if multi { STR_PTR("true") } else { STR_PTR("false") }, if multi { 4 } else { 5 });
+    out.json_len = out.json_len + append_bytes(&out.json, 8192, out.json_len, STR_PTR(",\"isOther\":"), STR_LEN(",\"isOther\":"));
+    out.json_len = out.json_len + append_bytes(&out.json, 8192, out.json_len, if is_other { STR_PTR("true") } else { STR_PTR("false") }, if is_other { 4 } else { 5 });
+    out.json_len = out.json_len + append_bytes(&out.json, 8192, out.json_len, STR_PTR(",\"isSecret\":"), STR_LEN(",\"isSecret\":"));
+    out.json_len = out.json_len + append_bytes(&out.json, 8192, out.json_len, if is_secret { STR_PTR("true") } else { STR_PTR("false") }, if is_secret { 4 } else { 5 });
+    out.json_len = out.json_len + append_bytes(&out.json, 8192, out.json_len, STR_PTR("}"), 1);
+}
+
+fn append_option(out: ptr, cap: u64, at: u64, label_ptr: ptr, label_len: u64, desc_ptr: ptr, desc_len: u64, first: &bool) -> u64 {
+    let n = at;
+    if !first { n = n + append_bytes(out, cap, n, STR_PTR(","), 1); };
+    first = false;
+    n = n + append_bytes(out, cap, n, STR_PTR("{\"label\":\""), STR_LEN("{\"label\":\""));
+    n = n + append_bytes(out, cap, n, label_ptr, label_len);
+    n = n + append_bytes(out, cap, n, STR_PTR("\",\"description\":\""), STR_LEN("\",\"description\":\""));
+    if desc_len > 0 { n = n + append_bytes(out, cap, n, desc_ptr, desc_len); };
+    n = n + append_bytes(out, cap, n, STR_PTR("\"}"), 2);
+    return n;
+}
+
+// parseAgyAskAnswerContent(content): lines `A<n>: <text>` ->
+// { answers, allSkipped } or null. Regex ^A(\d+):\s*(.*)$ ->
+// hand scan; allSkipped via /user\s*skipped/i.
+fn parseAgyAskAnswerContent(content_ptr: ptr, content_len: u64, out_answers: ptr, out_answers_cap: u64, out_answers_len: &u64, out_allSkipped: &bool, out_ok: &bool) -> void {
+    out_ok = false;
+    out_allSkipped = false;
+    out_answers_len = 0;
+    if content_len == 0 { return; };
+    let matched: u64 = 0;
+    let answers = [0u8; 8192];
+    let a_off: [u64; 64] = [0u64; 64];
+    let a_len: [u64; 64] = [0u64; 64];
+    let a_count: u64 = 0;
+    let used: u64 = 0;
+    let pos: u64 = 0;
+    while pos <= content_len {
+        let nl = find_byte(content_ptr, content_len, pos, 10);
+        let end = content_len;
+        if nl != 4294967295 { end = nl; };
+        // match ^A(\d+):\s*(.*)$
+        if end > pos && byte_at(content_ptr, pos) == 65 {
+            let i = pos + 1;
+            let num: u64 = 0;
+            let digits: u64 = 0;
+            while i < end && byte_at(content_ptr, i) >= 48 && byte_at(content_ptr, i) <= 57 {
+                num = num * 10 + (byte_at(content_ptr, i) - 48) as u64;
+                digits = digits + 1;
+                i = i + 1;
+            }
+            if digits > 0 && i < end && byte_at(content_ptr, i) == 58 {
+                i = i + 1;
+                while i < end && is_ws(byte_at(content_ptr, i)) { i = i + 1; };
+                matched = matched + 1;
+                let slot_idx = num - 1;
+                if slot_idx < 64 {
+                    // answers[num-1] = rest.trim()
+                    let tp: ptr = PTR_NULL();
+                    let tl: u64 = 0;
+                    trim_span(byte_off(content_ptr, i), end - i, &tp, &tl);
+                    a_off[slot_idx] = used;
+                    a_len[slot_idx] = tl;
+                    for k in 0..tl {
+                        if used < 8192 { answers[used] = byte_at(tp, k); used = used + 1; };
+                    }
+                    if slot_idx + 1 > a_count { a_count = slot_idx + 1; };
+                };
+            };
+        };
+        if nl == 4294967295 { break; };
+        pos = nl + 1;
+    }
+    if matched == 0 { return; };
+    // serialize answers as a JSON array of strings (holes ->
+    // null is lost in this pass; dense answers assumed).
+    let n: u64 = 0;
+    n = n + append_bytes(out_answers, out_answers_cap, n, STR_PTR("["), 1);
+    let all_skipped = a_count > 0;
+    for i in 0..a_count {
+        if i > 0 { n = n + append_bytes(out_answers, out_answers_cap, n, STR_PTR(","), 1); };
+        n = n + append_bytes(out_answers, out_answers_cap, n, STR_PTR("\""), 1);
+        n = n + append_bytes(out_answers, out_answers_cap, n, byte_off(&answers, a_off[i]), a_len[i]);
+        n = n + append_bytes(out_answers, out_answers_cap, n, STR_PTR("\""), 1);
+        if !contains_ci(byte_off(&answers, a_off[i]), a_len[i], STR_PTR("user skipped")) && !contains_ci(byte_off(&answers, a_off[i]), a_len[i], STR_PTR("userskipped")) { all_skipped = false; };
+    }
+    n = n + append_bytes(out_answers, out_answers_cap, n, STR_PTR("]"), 1);
+    out_answers_len = n;
+    out_allSkipped = all_skipped;
+    out_ok = true;
+}
+
+// extractNewResponseText(responseText, globalAssistantText):
+// suffix/overlap diff used by the result path.
+fn extractNewResponseText(resp_ptr: ptr, resp_len: u64, global_ptr: ptr, global_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    out_len = 0;
+    if resp_len == 0 { return; };
+    if resp_len == global_len && bytes_eq(resp_ptr, global_ptr, resp_len) { return; };
+    if contains(global_ptr, global_len, resp_ptr, resp_len) { return; };
+    if resp_len > global_len && starts_with(resp_ptr, resp_len, global_ptr, global_len) {
+        out_len = buf_copy(out, out_cap, byte_off(resp_ptr, global_len), resp_len - global_len);
+        return;
+    };
+    let maxOverlap = global_len;
+    if resp_len < maxOverlap { maxOverlap = resp_len; };
+    let len = maxOverlap;
+    while len > 0 {
+        // global.endsWith(response.slice(0, len))
+        if ends_with(global_ptr, global_len, resp_ptr, len) {
+            out_len = buf_copy(out, out_cap, byte_off(resp_ptr, len), resp_len - len);
+            return;
+        };
+        len = len - 1;
+    }
+    out_len = buf_copy(out, out_cap, resp_ptr, resp_len);
+}
+
+// startNewAgySegment(ctx)
+fn startNewAgySegment(ctx: &AgyProjectorContext) -> void {
+    ctx.textSegmentSeq = ctx.textSegmentSeq + 1;
+    ctx.currentAssistantItemId_len = make_item_id(STR_PTR("agy-msg-"), STR_LEN("agy-msg-"), ctx.turnId_ptr, ctx.turnId_len, ctx.textSegmentSeq, &ctx.currentAssistantItemId, 160);
+    ctx.currentAssistantText_len = 0;
+    ctx.currentReasoningItemId_len = make_item_id(STR_PTR("agy-thought-"), STR_LEN("agy-thought-"), ctx.turnId_ptr, ctx.turnId_len, ctx.textSegmentSeq, &ctx.currentReasoningItemId, 160);
+    ctx.currentReasoningText_len = 0;
+    ctx.assistantItemId_len = ctx.currentAssistantItemId_len;
+    buf_copy(&ctx.assistantItemId, 160, &ctx.currentAssistantItemId, ctx.currentAssistantItemId_len);
+    ctx.reasoningItemId_len = ctx.currentReasoningItemId_len;
+    buf_copy(&ctx.reasoningItemId, 160, &ctx.currentReasoningItemId, ctx.currentReasoningItemId_len);
+    ctx.hasStartedCurrentAssistantMessage = false;
+    ctx.hasCompletedCurrentAssistantMessage = false;
+    ctx.hasStartedCurrentReasoning = false;
+    ctx.hasCompletedCurrentReasoning = false;
+}
+
+// completeActiveAssistantMessage(ctx, events, statusStr):
+// statusStr is the item status string ("completed" / "failed"
+// / "interrupted").
+fn completeActiveAssistantMessage(ctx: &AgyProjectorContext, list: &AgyProjectedList, status_ptr: ptr, status_len: u64) -> void {
+    if ctx.hasStartedCurrentReasoning && !ctx.hasCompletedCurrentReasoning {
+        ctx.hasCompletedCurrentReasoning = true;
+        let ev = [0u8; 262144];
+        let ev_len: u64 = 0;
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("{\"kind\":\"item/completed\",\"threadId\":\""), STR_LEN("{\"kind\":\"item/completed\",\"threadId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"item\":{\"type\":\"reasoning\",\"id\":\""), STR_LEN("\",\"item\":{\"type\":\"reasoning\",\"id\":\""));
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, &ctx.currentReasoningItemId, ctx.currentReasoningItemId_len);
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"title\":\"Reasoning\",\"text\":\""), STR_LEN("\",\"title\":\"Reasoning\",\"text\":\""));
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, &ctx.currentReasoningText, ctx.currentReasoningText_len);
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"status\":\""), STR_LEN("\",\"status\":\""));
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, status_ptr, status_len);
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"completedAt\":"), STR_LEN("\",\"completedAt\":"));
+        ev_len = ev_len + append_u64(&ev, 262144, ev_len, now_s());
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("}}"), 2);
+        projected_push(list, &ev, ev_len);
+    };
+    if (ctx.hasStartedCurrentAssistantMessage || ctx.currentReasoningText_len > 0) && !ctx.hasCompletedCurrentAssistantMessage {
+        ctx.hasCompletedCurrentAssistantMessage = true;
+        // finalContent: reasoning part (when any) + text part
+        // (always present in the fallback form).
+        let ev = [0u8; 524288];
+        let ev_len: u64 = 0;
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR("{\"kind\":\"item/completed\",\"threadId\":\""), STR_LEN("{\"kind\":\"item/completed\",\"threadId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR("\",\"item\":{\"type\":\"agentMessage\",\"id\":\""), STR_LEN("\",\"item\":{\"type\":\"agentMessage\",\"id\":\""));
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, &ctx.currentAssistantItemId, ctx.currentAssistantItemId_len);
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR("\",\"content\":["), STR_LEN("\",\"content\":["));
+        let wrote = false;
+        if ctx.currentReasoningText_len > 0 {
+            ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR("{\"type\":\"reasoning\",\"text\":\""), STR_LEN("{\"type\":\"reasoning\",\"text\":\""));
+            ev_len = ev_len + append_bytes(&ev, 524288, ev_len, &ctx.currentReasoningText, ctx.currentReasoningText_len);
+            ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR("\"}"), 2);
+            wrote = true;
+        };
+        if ctx.currentAssistantText_len > 0 {
+            if wrote { ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR(","), 1); };
+            ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR("{\"type\":\"text\",\"text\":\""), STR_LEN("{\"type\":\"text\",\"text\":\""));
+            ev_len = ev_len + append_bytes(&ev, 524288, ev_len, &ctx.currentAssistantText, ctx.currentAssistantText_len);
+            ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR("\",\"text_elements\":[]}"), STR_LEN("\",\"text_elements\":[]}"));
+            wrote = true;
+        };
+        if !wrote {
+            ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR("{\"type\":\"text\",\"text\":\"\",\"text_elements\":[]}"), STR_LEN("{\"type\":\"text\",\"text\":\"\",\"text_elements\":[]}"));
+        };
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR("],\"text\":\""), STR_LEN("],\"text\":\""));
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, &ctx.currentAssistantText, ctx.currentAssistantText_len);
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR("\",\"role\":\"assistant\",\"status\":\""), STR_LEN("\",\"role\":\"assistant\",\"status\":\""));
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, status_ptr, status_len);
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR("\",\"completedAt\":"), STR_LEN("\",\"completedAt\":"));
+        ev_len = ev_len + append_u64(&ev, 524288, ev_len, now_s());
+        ev_len = ev_len + append_bytes(&ev, 524288, ev_len, STR_PTR("}}"), 2);
+        projected_push(list, &ev, ev_len);
+    };
+}
+
+// completePendingAgyTools(ctx, events, statusStr)
+fn completePendingAgyTools(ctx: &AgyProjectorContext, list: &AgyProjectedList, status_ptr: ptr, status_len: u64) -> void {
+    for i in 0..ctx.tool_count {
+        let id_ptr = slot(&ctx.tools_arena, ctx.tool_id_off[i]);
+        let id_len = ctx.tool_id_len[i];
+        if done_has(ctx, id_ptr, id_len) { continue; };
+        done_add(ctx, id_ptr, id_len);
+        // item = {...toolItem, status, completedAt} — the stored
+        // item JSON is re-serialized with the status replaced:
+        // in this pass the stored JSON ends with
+        // `,"status":"..."}` so a textual patch is applied.
+        let ev = [0u8; 65536];
+        let ev_len: u64 = 0;
+        ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR("{\"kind\":\"item/completed\",\"threadId\":\""), STR_LEN("{\"kind\":\"item/completed\",\"threadId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 65536, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+        ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 65536, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+        ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR("\",\"item\":"), STR_LEN("\",\"item\":"));
+        ev_len = ev_len + append_tool_with_status(&ev, 65536, ev_len, slot(&ctx.tools_arena, ctx.tool_json_off[i]), ctx.tool_json_len[i], status_ptr, status_len);
+        ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR("}"), 1);
+        projected_push(list, &ev, ev_len);
+    }
+}
+
+// append_tool_with_status: copy the item JSON, replacing its
+// trailing status and adding completedAt before the final }.
+// DEFECT: object spread semantics approximated textually.
+fn append_tool_with_status(out: ptr, cap: u64, at: u64, item_ptr: ptr, item_len: u64, status_ptr: ptr, status_len: u64) -> u64 {
+    let n = at;
+    // Find the last `,"status":"` — strip from there.
+    let cut = item_len;
+    let marker = STR_PTR(",\"status\":\"");
+    let marker_len = STR_LEN(",\"status\":\"");
+    let i: u64 = 0;
+    while i + marker_len <= item_len {
+        if bytes_eq(byte_off(item_ptr, i), marker, marker_len) { cut = i; };
+        i = i + 1;
+    }
+    n = n + append_bytes(out, cap, n, item_ptr, cut);
+    n = n + append_bytes(out, cap, n, STR_PTR(",\"status\":\""), STR_LEN(",\"status\":\""));
+    n = n + append_bytes(out, cap, n, status_ptr, status_len);
+    n = n + append_bytes(out, cap, n, STR_PTR("\",\"completedAt\":"), STR_LEN("\",\"completedAt\":"));
+    n = n + append_u64(out, cap, n, now_s());
+    n = n + append_bytes(out, cap, n, STR_PTR("}"), 1);
+    return n;
+}
+
+fn tools_put(ctx: &AgyProjectorContext, p: ptr, n: u64) -> u64 {
+    let off = ctx.tools_arena_len;
+    for i in 0..n {
+        if ctx.tools_arena_len < 524288 { ctx.tools_arena[ctx.tools_arena_len] = byte_at(p, i); ctx.tools_arena_len = ctx.tools_arena_len + 1; };
+    }
+    return off;
+}
+
+fn tool_find(ctx: &AgyProjectorContext, id_ptr: ptr, id_len: u64) -> u64 {
+    for i in 0..ctx.tool_count {
+        if ctx.tool_id_len[i] == id_len && bytes_eq(slot(&ctx.tools_arena, ctx.tool_id_off[i]), id_ptr, id_len) { return i; };
+    }
+    return 4294967295;
+}
+
+fn done_has(ctx: &AgyProjectorContext, id_ptr: ptr, id_len: u64) -> bool {
+    for i in 0..ctx.done_count {
+        if ctx.done_id_len[i] == id_len && bytes_eq(slot(&ctx.tools_arena, ctx.done_id_off[i]), id_ptr, id_len) { return true; };
+    }
+    return false;
+}
+
+fn done_add(ctx: &AgyProjectorContext, id_ptr: ptr, id_len: u64) -> void {
+    if ctx.done_count >= 512 { return; };
+    let idx = ctx.done_count;
+    ctx.done_id_off[idx] = tools_put(ctx, id_ptr, id_len);
+    ctx.done_id_len[idx] = id_len;
+    ctx.done_count = ctx.done_count + 1;
+}
+
+// projectAgyEvent(event, ctx): the projection switch. The
+// event doc is the parsed AgyEvent line (see protocol file).
+fn projectAgyEvent(event_doc: u64, ctx: &AgyProjectorContext, list: &AgyProjectedList) -> void {
+    if ctx.status != 0 { return; };
+    let kind = agy_event_kind(event_doc);
+    // Ensure turn/started is emitted on the first event
+    if !ctx.hasStartedTurn && kind != 1 {
+        ctx.hasStartedTurn = true;
+        push_simple(list, STR_PTR("turn/started"), STR_LEN("turn/started"), ctx);
+    };
+    if kind == 1 {
+        // init
+        let conv_ptr: ptr = PTR_NULL();
+        let conv_len: u64 = 0;
+        sa_json_object_get_string(event_doc, STR_PTR("conversation_id"), STR_LEN("conversation_id"), &conv_ptr, &conv_len);
+        ctx.conversationId_ptr = conv_ptr;
+        ctx.conversationId_len = conv_len;
+        ctx.has_conversationId = true;
+        let ev = [0u8; 65536];
+        let ev_len: u64 = 0;
+        ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR("{\"kind\":\"system/init\",\"threadId\":\""), STR_LEN("{\"kind\":\"system/init\",\"threadId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 65536, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+        ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR("\",\"conversationId\":\""), STR_LEN("\",\"conversationId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 65536, ev_len, conv_ptr, conv_len);
+        ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR("\""), 1);
+        let init_node: u64 = 0;
+        if sa_json_object_get(event_doc, STR_PTR("init"), STR_LEN("init"), &init_node) == 0 {
+            let cwd_ptr: ptr = PTR_NULL();
+            let cwd_len: u64 = 0;
+            if sa_json_object_get_string(init_node, STR_PTR("cwd"), STR_LEN("cwd"), &cwd_ptr, &cwd_len) == 0 {
+                ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR(",\"cwd\":\""), STR_LEN(",\"cwd\":\""));
+                ev_len = ev_len + append_bytes(&ev, 65536, ev_len, cwd_ptr, cwd_len);
+                ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR("\""), 1);
+            };
+            let tools_node: u64 = 0;
+            if sa_json_object_get(init_node, STR_PTR("tools"), STR_LEN("tools"), &tools_node) == 0 {
+                let h: u64 = 0;
+                if sa_json_stringify(tools_node, &h) == 0 {
+                    let bp: ptr = PTR_NULL();
+                    let bl: u64 = 0;
+                    sa_json_buffer_data(h, &bp);
+                    sa_json_buffer_len(h, &bl);
+                    ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR(",\"tools\":"), STR_LEN(",\"tools\":"));
+                    ev_len = ev_len + append_bytes(&ev, 65536, ev_len, bp, bl);
+                    sa_json_buffer_free(h);
+                };
+            };
+        };
+        ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR("}"), 1);
+        projected_push(list, &ev, ev_len);
+        if !ctx.hasStartedTurn {
+            ctx.hasStartedTurn = true;
+            push_simple(list, STR_PTR("turn/started"), STR_LEN("turn/started"), ctx);
+        };
+        return;
+    };
+    if kind == 2 {
+        project_step_update(event_doc, ctx, list);
+        return;
+    };
+    if kind == 3 {
+        project_result(event_doc, ctx, list);
+        return;
+    };
+}
+
+fn push_simple(list: &AgyProjectedList, kind_ptr: ptr, kind_len: u64, ctx: &AgyProjectorContext) -> void {
+    let ev = [0u8; 1024];
+    let ev_len: u64 = 0;
+    ev_len = ev_len + append_bytes(&ev, 1024, ev_len, STR_PTR("{\"kind\":\""), STR_LEN("{\"kind\":\""));
+    ev_len = ev_len + append_bytes(&ev, 1024, ev_len, kind_ptr, kind_len);
+    ev_len = ev_len + append_bytes(&ev, 1024, ev_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    ev_len = ev_len + append_bytes(&ev, 1024, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+    ev_len = ev_len + append_bytes(&ev, 1024, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    ev_len = ev_len + append_bytes(&ev, 1024, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+    ev_len = ev_len + append_bytes(&ev, 1024, ev_len, STR_PTR("\"}"), 2);
+    projected_push(list, &ev, ev_len);
+}
+
+fn push_delta(list: &AgyProjectedList, kind_ptr: ptr, kind_len: u64, ctx: &AgyProjectorContext, itemId_ptr: ptr, itemId_len: u64, delta_ptr: ptr, delta_len: u64) -> void {
+    let ev = [0u8; 262144];
+    let ev_len: u64 = 0;
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("{\"kind\":\""), STR_LEN("{\"kind\":\""));
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, kind_ptr, kind_len);
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"itemId\":\""), STR_LEN("\",\"itemId\":\""));
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, itemId_ptr, itemId_len);
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"delta\":\""), STR_LEN("\",\"delta\":\""));
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, delta_ptr, delta_len);
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\"}"), 2);
+    projected_push(list, &ev, ev_len);
+}
+
+// project_step_update: the step_update case of projectAgyEvent.
+fn project_step_update(event_doc: u64, ctx: &AgyProjectorContext, list: &AgyProjectedList) -> void {
+    let update: u64 = 0;
+    if sa_json_object_get(event_doc, STR_PTR("step_update"), STR_LEN("step_update"), &update) != 0 { return; };
+    if update == 0 { return; };
+    // usage first
+    let usage: u64 = 0;
+    let has_usage = sa_json_object_get(update, STR_PTR("usage"), STR_LEN("usage"), &usage) == 0;
+    let uev = [0u8; 4096];
+    let uev_len: u64 = 0;
+    let uok = false;
+    usageEvent(ctx, usage, has_usage, &uev, 4096, &uev_len, &uok);
+    if uok { projected_push(list, &uev, uev_len); };
+    let step_type_ptr: ptr = PTR_NULL();
+    let step_type_len: u64 = 0;
+    sa_json_object_get_string(update, STR_PTR("step_type"), STR_LEN("step_type"), &step_type_ptr, &step_type_len);
+    let step_index = json_i64_or(update, STR_PTR("step_index"), STR_LEN("step_index"), 0);
+    let state_ptr: ptr = PTR_NULL();
+    let state_len: u64 = 0;
+    sa_json_object_get_string(update, STR_PTR("state"), STR_LEN("state"), &state_ptr, &state_len);
+    let is_done = str_is(state_ptr, state_len, STR_PTR("DONE"), 4);
+    // 1. Assistant message delta
+    if str_is(step_type_ptr, step_type_len, STR_PTR("agent_response"), STR_LEN("agent_response")) || str_is(step_type_ptr, step_type_len, STR_PTR("planner_response"), STR_LEN("planner_response")) {
+        let delta_ptr: ptr = PTR_NULL();
+        let delta_len: u64 = 0;
+        if sa_json_object_get_string(update, STR_PTR("text_delta"), STR_LEN("text_delta"), &delta_ptr, &delta_len) == 0 && delta_len > 0 {
+            ctx.assistantText_len = ctx.assistantText_len + append_bytes(&ctx.assistantText, 262144, ctx.assistantText_len, delta_ptr, delta_len);
+            ctx.hasStartedAgentMessage = true;
+            if ctx.hasCompletedCurrentAssistantMessage { startNewAgySegment(ctx); };
+            if !ctx.hasStartedCurrentAssistantMessage {
+                ctx.hasStartedCurrentAssistantMessage = true;
+                push_item_started(ctx, list, false);
+            };
+            ctx.currentAssistantText_len = ctx.currentAssistantText_len + append_bytes(&ctx.currentAssistantText, 262144, ctx.currentAssistantText_len, delta_ptr, delta_len);
+            push_delta(list, STR_PTR("item/agentMessage/delta"), STR_LEN("item/agentMessage/delta"), ctx, &ctx.currentAssistantItemId, ctx.currentAssistantItemId_len, delta_ptr, delta_len);
+        };
+    };
+    // 2. Thinking / Reasoning delta
+    let think_ptr: ptr = PTR_NULL();
+    let think_len: u64 = 0;
+    if sa_json_object_get_string(update, STR_PTR("thinking_delta"), STR_LEN("thinking_delta"), &think_ptr, &think_len) == 0 && think_len > 0 {
+        if ctx.hasCompletedCurrentAssistantMessage { startNewAgySegment(ctx); };
+        if !ctx.hasStartedCurrentReasoning {
+            ctx.hasStartedCurrentReasoning = true;
+            push_item_started(ctx, list, true);
+        };
+        ctx.reasoningText_len = ctx.reasoningText_len + append_bytes(&ctx.reasoningText, 262144, ctx.reasoningText_len, think_ptr, think_len);
+        ctx.currentReasoningText_len = ctx.currentReasoningText_len + append_bytes(&ctx.currentReasoningText, 262144, ctx.currentReasoningText_len, think_ptr, think_len);
+        push_delta(list, STR_PTR("item/reasoning/textDelta"), STR_LEN("item/reasoning/textDelta"), ctx, &ctx.currentReasoningItemId, ctx.currentReasoningItemId_len, think_ptr, think_len);
+    };
+    // 3. Tool calls
+    let calls: u64 = 0;
+    let has_calls = sa_json_object_get(update, STR_PTR("tool_calls"), STR_LEN("tool_calls"), &calls) == 0;
+    let calls_n: u64 = 0;
+    if has_calls { calls_n = sa_json_array_len(calls); };
+    if has_calls && calls_n > 0 {
+        if (ctx.hasStartedCurrentAssistantMessage && !ctx.hasCompletedCurrentAssistantMessage) || (ctx.hasStartedCurrentReasoning && !ctx.hasCompletedCurrentReasoning) {
+            completeActiveAssistantMessage(ctx, list, STR_PTR("completed"), STR_LEN("completed"));
+        };
+        for ci in 0..calls_n {
+            let tc: u64 = 0;
+            if sa_json_array_get(calls, ci, &tc) != 0 { continue; };
+            project_tool_call(tc, update, ctx, list, step_index, is_done);
+        }
+    } else {
+        // else-branch: step_type "tool" / tool_name / tool_info
+        let tn_ptr: ptr = PTR_NULL();
+        let tn_len: u64 = 0;
+        sa_json_object_get_string(update, STR_PTR("tool_name"), STR_LEN("tool_name"), &tn_ptr, &tn_len);
+        let ti_node: u64 = 0;
+        let has_ti = sa_json_object_get(update, STR_PTR("tool_info"), STR_LEN("tool_info"), &ti_node) == 0;
+        if str_is(step_type_ptr, step_type_len, STR_PTR("tool"), 4) || tn_len > 0 || has_ti {
+            if (ctx.hasStartedCurrentAssistantMessage && !ctx.hasCompletedCurrentAssistantMessage) || (ctx.hasStartedCurrentReasoning && !ctx.hasCompletedCurrentReasoning) {
+                completeActiveAssistantMessage(ctx, list, STR_PTR("completed"), STR_LEN("completed"));
+            };
+            project_tool_info(update, ti_node, ctx, list, step_index, state_ptr, state_len);
+        };
+    };
+}
+
+// push_item_started: item/started for the current assistant
+// message (reasoning=false) or reasoning item (true).
+fn push_item_started(ctx: &AgyProjectorContext, list: &AgyProjectedList, reasoning: bool) -> void {
+    let ev = [0u8; 2048];
+    let ev_len: u64 = 0;
+    ev_len = ev_len + append_bytes(&ev, 2048, ev_len, STR_PTR("{\"kind\":\"item/started\",\"threadId\":\""), STR_LEN("{\"kind\":\"item/started\",\"threadId\":\""));
+    ev_len = ev_len + append_bytes(&ev, 2048, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+    ev_len = ev_len + append_bytes(&ev, 2048, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    ev_len = ev_len + append_bytes(&ev, 2048, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+    if reasoning {
+        ev_len = ev_len + append_bytes(&ev, 2048, ev_len, STR_PTR("\",\"item\":{\"type\":\"reasoning\",\"id\":\""), STR_LEN("\",\"item\":{\"type\":\"reasoning\",\"id\":\""));
+        ev_len = ev_len + append_bytes(&ev, 2048, ev_len, &ctx.currentReasoningItemId, ctx.currentReasoningItemId_len);
+        ev_len = ev_len + append_bytes(&ev, 2048, ev_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 2048, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+        ev_len = ev_len + append_bytes(&ev, 2048, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 2048, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+        ev_len = ev_len + append_bytes(&ev, 2048, ev_len, STR_PTR("\",\"title\":\"Reasoning\",\"text\":\"\",\"status\":\"inProgress\",\"startedAt\":"), STR_LEN("\",\"title\":\"Reasoning\",\"text\":\"\",\"status\":\"inProgress\",\"startedAt\":"));
+    } else {
+        ev_len = ev_len + append_bytes(&ev, 2048, ev_len, STR_PTR("\",\"item\":{\"type\":\"agentMessage\",\"id\":\""), STR_LEN("\",\"item\":{\"type\":\"agentMessage\",\"id\":\""));
+        ev_len = ev_len + append_bytes(&ev, 2048, ev_len, &ctx.currentAssistantItemId, ctx.currentAssistantItemId_len);
+        ev_len = ev_len + append_bytes(&ev, 2048, ev_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 2048, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+        ev_len = ev_len + append_bytes(&ev, 2048, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        ev_len = ev_len + append_bytes(&ev, 2048, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+        ev_len = ev_len + append_bytes(&ev, 2048, ev_len, STR_PTR("\",\"role\":\"assistant\",\"status\":\"inProgress\",\"text\":\"\",\"content\":[],\"startedAt\":"), STR_LEN("\",\"role\":\"assistant\",\"status\":\"inProgress\",\"text\":\"\",\"content\":[],\"startedAt\":"));
+    };
+    ev_len = ev_len + append_u64(&ev, 2048, ev_len, now_s());
+    ev_len = ev_len + append_bytes(&ev, 2048, ev_len, STR_PTR("}}"), 2);
+    projected_push(list, &ev, ev_len);
+}
+
+// project_tool_call: one tool_calls[] entry (ask_question
+// interception + toolCall item started/completed).
+fn project_tool_call(tc: u64, update: u64, ctx: &AgyProjectorContext, list: &AgyProjectedList, step_index: i64, is_done: bool) -> void {
+    let name_ptr: ptr = PTR_NULL();
+    let name_len: u64 = 0;
+    sa_json_object_get_string(tc, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len);
+    if str_is(name_ptr, name_len, STR_PTR("ask_question"), STR_LEN("ask_question")) {
+        maybe_ask_question(tc, update, ctx, list, step_index, true);
+    };
+    // callId = tc.id || `agy-tool-${turnId}-${step_index}`
+    let call_id = [0u8; 256];
+    let call_id_len: u64 = 0;
+    let id_ptr: ptr = PTR_NULL();
+    let id_len: u64 = 0;
+    if sa_json_object_get_string(tc, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len) == 0 && id_len > 0 {
+        call_id_len = buf_copy(&call_id, 256, id_ptr, id_len);
+    } else {
+        call_id_len = make_tool_id(ctx, step_index, &call_id, 256);
+    };
+    // toolInput = tc.input ?? tc.args ?? {}
+    let input_json = [0u8; 32768];
+    let input_len: u64 = 0;
+    input_len = node_json_or(tc, STR_PTR("input"), STR_LEN("input"), STR_PTR("args"), STR_LEN("args"), &input_json, 32768);
+    // toolSummary = first non-empty of tc.toolAction /
+    // tc.toolSummary / tc.content
+    let sum_ptr: ptr = PTR_NULL();
+    let sum_len: u64 = 0;
+    let has_sum = first_nonempty_str(tc, &sum_ptr, &sum_len);
+    let item = [0u8; 65536];
+    let item_len: u64 = 0;
+    item_len = build_tool_item(ctx, &call_id, call_id_len, name_ptr, name_len, &input_json, input_len, sum_ptr, sum_len, has_sum, if is_done { STR_PTR("completed") } else { STR_PTR("in_progress") }, if is_done { STR_LEN("completed") } else { STR_LEN("in_progress") }, &item, 65536);
+    if tool_find(ctx, &call_id, call_id_len) == 4294967295 {
+        if ctx.tool_count < 256 {
+            let idx = ctx.tool_count;
+            ctx.tool_id_off[idx] = tools_put(ctx, &call_id, call_id_len);
+            ctx.tool_id_len[idx] = call_id_len;
+            ctx.tool_json_off[idx] = tools_put(ctx, &item, item_len);
+            ctx.tool_json_len[idx] = item_len;
+            ctx.tool_count = ctx.tool_count + 1;
+        };
+        push_item_event(list, STR_PTR("item/started"), STR_LEN("item/started"), ctx, &item, item_len);
+    };
+    if is_done {
+        done_add(ctx, &call_id, call_id_len);
+        push_item_event(list, STR_PTR("item/completed"), STR_LEN("item/completed"), ctx, &item, item_len);
+    };
+}
+
+// project_tool_info: the else-branch tool shape
+// (tool_name/tool_info on the update itself).
+fn project_tool_info(update: u64, ti_node: u64, ctx: &AgyProjectorContext, list: &AgyProjectedList, step_index: i64, state_ptr: ptr, state_len: u64) -> void {
+    // toolName = update.tool_name || tool_info.name || "tool"
+    let name_ptr: ptr = PTR_NULL();
+    let name_len: u64 = 0;
+    if sa_json_object_get_string(update, STR_PTR("tool_name"), STR_LEN("tool_name"), &name_ptr, &name_len) != 0 || name_len == 0 {
+        if ti_node != 0 && sa_json_object_get_string(ti_node, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len) == 0 && name_len > 0 {
+        } else {
+            name_ptr = STR_PTR("tool");
+            name_len = 4;
+        };
+    };
+    if str_is(name_ptr, name_len, STR_PTR("ask_question"), STR_LEN("ask_question")) {
+        maybe_ask_question(update, update, ctx, list, step_index, false);
+    };
+    let call_id = [0u8; 256];
+    let call_id_len = make_tool_id(ctx, step_index, &call_id, 256);
+    let is_done = str_is(state_ptr, state_len, STR_PTR("DONE"), 4) || str_is(state_ptr, state_len, STR_PTR("ERROR"), STR_LEN("ERROR"));
+    // toolArgs = tool_info.parameters ?? parameters ?? input
+    // ?? args ?? {}
+    let args_json = [0u8; 32768];
+    let args_len: u64 = 0;
+    let params_node: u64 = 0;
+    if ti_node != 0 && sa_json_object_get(ti_node, STR_PTR("parameters"), STR_LEN("parameters"), &params_node) == 0 {
+        args_len = stringify_into(params_node, &args_json, 32768);
+    } else {
+        args_len = node_json_or(update, STR_PTR("parameters"), STR_LEN("parameters"), STR_PTR("input"), STR_LEN("input"), &args_json, 32768);
+        if args_len == 2 {
+            args_len = node_json_or(update, STR_PTR("args"), STR_LEN("args"), STR_PTR("args"), STR_LEN("args"), &args_json, 32768);
+        };
+    };
+    // toolSummary over update + tool_info fields
+    let sum_ptr: ptr = PTR_NULL();
+    let sum_len: u64 = 0;
+    let has_sum = first_nonempty_str(update, &sum_ptr, &sum_len);
+    if !has_sum && ti_node != 0 { has_sum = first_nonempty_str(ti_node, &sum_ptr, &sum_len); };
+    if !has_sum {
+        if sa_json_object_get_string(update, STR_PTR("content"), STR_LEN("content"), &sum_ptr, &sum_len) == 0 && sum_len > 0 && !trim_is_empty(sum_ptr, sum_len) { has_sum = true; };
+    };
+    // output: tool_info.output ?? (summary when no output)
+    let out_json = [0u8; 32768];
+    let out_len: u64 = 0;
+    let has_out = false;
+    if ti_node != 0 {
+        let o_node: u64 = 0;
+        if sa_json_object_get(ti_node, STR_PTR("output"), STR_LEN("output"), &o_node) == 0 {
+            out_len = stringify_into(o_node, &out_json, 32768);
+            has_out = true;
+        };
+    };
+    let item = [0u8; 65536];
+    let item_len: u64 = 0;
+    item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR("{\"type\":\"toolCall\",\"id\":\""), STR_LEN("{\"type\":\"toolCall\",\"id\":\""));
+    item_len = item_len + append_bytes(&item, 65536, item_len, &call_id, call_id_len);
+    item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    item_len = item_len + append_bytes(&item, 65536, item_len, ctx.threadId_ptr, ctx.threadId_len);
+    item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    item_len = item_len + append_bytes(&item, 65536, item_len, ctx.turnId_ptr, ctx.turnId_len);
+    item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR("\",\"name\":\""), STR_LEN("\",\"name\":\""));
+    item_len = item_len + append_bytes(&item, 65536, item_len, name_ptr, name_len);
+    item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR("\",\"tool\":\""), STR_LEN("\",\"tool\":\""));
+    item_len = item_len + append_bytes(&item, 65536, item_len, name_ptr, name_len);
+    item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR("\",\"toolName\":\""), STR_LEN("\",\"toolName\":\""));
+    item_len = item_len + append_bytes(&item, 65536, item_len, name_ptr, name_len);
+    item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR("\",\"input\":"), STR_LEN("\",\"input\":"));
+    item_len = item_len + append_bytes(&item, 65536, item_len, &args_json, args_len);
+    item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR(",\"arguments\":"), STR_LEN(",\"arguments\":"));
+    item_len = item_len + append_bytes(&item, 65536, item_len, &args_json, args_len);
+    item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR(",\"status\":\""), STR_LEN(",\"status\":\""));
+    if is_done {
+        item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR("completed"), STR_LEN("completed"));
+    } else {
+        item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR("in_progress"), STR_LEN("in_progress"));
+    };
+    item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR("\""), 1);
+    if has_out {
+        item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR(",\"output\":"), STR_LEN(",\"output\":"));
+        item_len = item_len + append_bytes(&item, 65536, item_len, &out_json, out_len);
+    } else if has_sum {
+        item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR(",\"output\":\""), STR_LEN(",\"output\":\""));
+        item_len = item_len + append_bytes(&item, 65536, item_len, sum_ptr, sum_len);
+        item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR("\""), 1);
+    };
+    item_len = item_len + append_bytes(&item, 65536, item_len, STR_PTR("}"), 1);
+    if tool_find(ctx, &call_id, call_id_len) == 4294967295 {
+        if ctx.tool_count < 256 {
+            let idx = ctx.tool_count;
+            ctx.tool_id_off[idx] = tools_put(ctx, &call_id, call_id_len);
+            ctx.tool_id_len[idx] = call_id_len;
+            ctx.tool_json_off[idx] = tools_put(ctx, &item, item_len);
+            ctx.tool_json_len[idx] = item_len;
+            ctx.tool_count = ctx.tool_count + 1;
+        };
+        push_item_event(list, STR_PTR("item/started"), STR_LEN("item/started"), ctx, &item, item_len);
+    };
+    if is_done {
+        done_add(ctx, &call_id, call_id_len);
+        push_item_event(list, STR_PTR("item/completed"), STR_LEN("item/completed"), ctx, &item, item_len);
+    };
+}
+
+// maybe_ask_question: shared ask_question interception for
+// both tool shapes. from_tool_call selects the rawQ source:
+// tc.input.questions ?? tc.args.questions (tool_calls shape)
+// or tool_info.parameters.questions ?? parameters.questions ??
+// args.questions (tool_info shape).
+fn maybe_ask_question(tc: u64, update: u64, ctx: &AgyProjectorContext, list: &AgyProjectedList, step_index: i64, from_tool_call: bool) -> void {
+    let raw_q: u64 = 0;
+    if from_tool_call {
+        let input_node: u64 = 0;
+        if sa_json_object_get(tc, STR_PTR("input"), STR_LEN("input"), &input_node) == 0 {
+            sa_json_object_get(input_node, STR_PTR("questions"), STR_LEN("questions"), &raw_q);
+        };
+        if raw_q == 0 {
+            let args_node: u64 = 0;
+            if sa_json_object_get(tc, STR_PTR("args"), STR_LEN("args"), &args_node) == 0 {
+                // args may itself be the questions carrier
+                // object ({questions}) or a JSON string — the
+                // node surface treats both via get.
+                sa_json_object_get(args_node, STR_PTR("questions"), STR_LEN("questions"), &raw_q);
+            };
+        };
+    } else {
+        let ti_node: u64 = 0;
+        if sa_json_object_get(tc, STR_PTR("tool_info"), STR_LEN("tool_info"), &ti_node) == 0 {
+            let params_node: u64 = 0;
+            if sa_json_object_get(ti_node, STR_PTR("parameters"), STR_LEN("parameters"), &params_node) == 0 {
+                sa_json_object_get(params_node, STR_PTR("questions"), STR_LEN("questions"), &raw_q);
+            };
+        };
+        if raw_q == 0 {
+            let params_node2: u64 = 0;
+            if sa_json_object_get(tc, STR_PTR("parameters"), STR_LEN("parameters"), &params_node2) == 0 {
+                sa_json_object_get(params_node2, STR_PTR("questions"), STR_LEN("questions"), &raw_q);
+            };
+        };
+        if raw_q == 0 {
+            let args_node: u64 = 0;
+            if sa_json_object_get(tc, STR_PTR("args"), STR_LEN("args"), &args_node) == 0 {
+                sa_json_object_get(args_node, STR_PTR("questions"), STR_LEN("questions"), &raw_q);
+            };
+        };
+    };
+    // headerFallback chain: tc.toolAction ?? tc.toolSummary ??
+    // update.toolAction ?? update.toolSummary (tool_calls
+    // shape); tool_info variants fold into the tc probe here.
+    let header_ptr: ptr = PTR_NULL();
+    let header_len: u64 = 0;
+    let has_header = false;
+    if sa_json_object_get_string(tc, STR_PTR("toolAction"), STR_LEN("toolAction"), &header_ptr, &header_len) == 0 { has_header = true; } else if sa_json_object_get_string(tc, STR_PTR("toolSummary"), STR_LEN("toolSummary"), &header_ptr, &header_len) == 0 { has_header = true; } else if sa_json_object_get_string(update, STR_PTR("toolAction"), STR_LEN("toolAction"), &header_ptr, &header_len) == 0 { has_header = true; } else if sa_json_object_get_string(update, STR_PTR("toolSummary"), STR_LEN("toolSummary"), &header_ptr, &header_len) == 0 { has_header = true; };
+    let qlist = [AgyProjectedQuestion { json: [0u8; 8192], json_len: 0, id: [0u8; 128], id_len: 0 }; 16];
+    let qcount: u64 = 0;
+    parseAskQuestionData(raw_q, step_index, header_ptr, header_len, has_header, &qlist, &qcount);
+    if qcount == 0 { return; };
+    // questionId = `agy-ask-${turnId}-${step_index}`
+    let qid = [0u8; 256];
+    let qid_len: u64 = 0;
+    qid_len = qid_len + append_bytes(&qid, 256, qid_len, STR_PTR("agy-ask-"), STR_LEN("agy-ask-"));
+    qid_len = qid_len + append_bytes(&qid, 256, qid_len, ctx.turnId_ptr, ctx.turnId_len);
+    qid_len = qid_len + append_bytes(&qid, 256, qid_len, STR_PTR("-"), 1);
+    qid_len = qid_len + append_i64(&qid, 256, qid_len, step_index);
+    ctx.pendingQuestionId_ptr = &qid;
+    ctx.pendingQuestionId_len = qid_len;
+    ctx.has_pendingQuestionId = true;
+    ctx.awaitingQuestion = true;
+    // NOTE: qid is stack-local; the runtime copies the id out
+    // of the projected event (same caveat as the source's
+    // string identity, resolved in the repair phase).
+    let ev = [0u8; 131072];
+    let ev_len: u64 = 0;
+    ev_len = ev_len + append_bytes(&ev, 131072, ev_len, STR_PTR("{\"kind\":\"question/asked\",\"threadId\":\""), STR_LEN("{\"kind\":\"question/asked\",\"threadId\":\""));
+    ev_len = ev_len + append_bytes(&ev, 131072, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+    ev_len = ev_len + append_bytes(&ev, 131072, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    ev_len = ev_len + append_bytes(&ev, 131072, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+    ev_len = ev_len + append_bytes(&ev, 131072, ev_len, STR_PTR("\",\"questionId\":\""), STR_LEN("\",\"questionId\":\""));
+    ev_len = ev_len + append_bytes(&ev, 131072, ev_len, &qid, qid_len);
+    ev_len = ev_len + append_bytes(&ev, 131072, ev_len, STR_PTR("\",\"questions\":["), STR_LEN("\",\"questions\":["));
+    for i in 0..qcount {
+        if i > 0 { ev_len = ev_len + append_bytes(&ev, 131072, ev_len, STR_PTR(","), 1); };
+        ev_len = ev_len + append_bytes(&ev, 131072, ev_len, question_json_ptr(&qlist[i]), qlist[i].json_len);
+    }
+    ev_len = ev_len + append_bytes(&ev, 131072, ev_len, STR_PTR("]}"), 2);
+    projected_push(list, &ev, ev_len);
+}
+
+// build_tool_item: the tool_calls-shape tool item JSON.
+fn build_tool_item(ctx: &AgyProjectorContext, call_id_ptr: ptr, call_id_len: u64, name_ptr: ptr, name_len: u64, input_ptr: ptr, input_len: u64, sum_ptr: ptr, sum_len: u64, has_sum: bool, status_ptr: ptr, status_len: u64, item: ptr, item_cap: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(item, item_cap, n, STR_PTR("{\"type\":\"toolCall\",\"id\":\""), STR_LEN("{\"type\":\"toolCall\",\"id\":\""));
+    n = n + append_bytes(item, item_cap, n, call_id_ptr, call_id_len);
+    n = n + append_bytes(item, item_cap, n, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    n = n + append_bytes(item, item_cap, n, ctx.threadId_ptr, ctx.threadId_len);
+    n = n + append_bytes(item, item_cap, n, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    n = n + append_bytes(item, item_cap, n, ctx.turnId_ptr, ctx.turnId_len);
+    n = n + append_bytes(item, item_cap, n, STR_PTR("\",\"name\":\""), STR_LEN("\",\"name\":\""));
+    n = n + append_bytes(item, item_cap, n, name_ptr, name_len);
+    n = n + append_bytes(item, item_cap, n, STR_PTR("\",\"tool\":\""), STR_LEN("\",\"tool\":\""));
+    n = n + append_bytes(item, item_cap, n, name_ptr, name_len);
+    n = n + append_bytes(item, item_cap, n, STR_PTR("\",\"toolName\":\""), STR_LEN("\",\"toolName\":\""));
+    n = n + append_bytes(item, item_cap, n, name_ptr, name_len);
+    n = n + append_bytes(item, item_cap, n, STR_PTR("\",\"input\":"), STR_LEN("\",\"input\":"));
+    n = n + append_bytes(item, item_cap, n, input_ptr, input_len);
+    n = n + append_bytes(item, item_cap, n, STR_PTR(",\"arguments\":"), STR_LEN(",\"arguments\":"));
+    n = n + append_bytes(item, item_cap, n, input_ptr, input_len);
+    if has_sum {
+        n = n + append_bytes(item, item_cap, n, STR_PTR(",\"output\":\""), STR_LEN(",\"output\":\""));
+        n = n + append_bytes(item, item_cap, n, sum_ptr, sum_len);
+        n = n + append_bytes(item, item_cap, n, STR_PTR("\""), 1);
+    };
+    n = n + append_bytes(item, item_cap, n, STR_PTR(",\"status\":\""), STR_LEN(",\"status\":\""));
+    n = n + append_bytes(item, item_cap, n, status_ptr, status_len);
+    n = n + append_bytes(item, item_cap, n, STR_PTR("\"}"), 2);
+    return n;
+}
+
+// project_result: the result case of projectAgyEvent.
+fn project_result(event_doc: u64, ctx: &AgyProjectorContext, list: &AgyProjectedList) -> void {
+    let res: u64 = 0;
+    if sa_json_object_get(event_doc, STR_PTR("result"), STR_LEN("result"), &res) != 0 { return; };
+    let status_ptr: ptr = PTR_NULL();
+    let status_len: u64 = 0;
+    sa_json_object_get_string(res, STR_PTR("status"), STR_LEN("status"), &status_ptr, &status_len);
+    let is_success = str_is(status_ptr, status_len, STR_PTR("SUCCESS"), STR_LEN("SUCCESS"));
+    ctx.status = if is_success { 1 } else { 2 };
+    let resp_ptr: ptr = PTR_NULL();
+    let resp_len: u64 = 0;
+    sa_json_object_get_string(res, STR_PTR("response"), STR_LEN("response"), &resp_ptr, &resp_len);
+    let usage: u64 = 0;
+    let has_usage = sa_json_object_get(res, STR_PTR("usage"), STR_LEN("usage"), &usage) == 0;
+    let uev = [0u8; 4096];
+    let uev_len: u64 = 0;
+    let uok = false;
+    usageEvent(ctx, usage, has_usage, &uev, 4096, &uev_len, &uok);
+    if uok { projected_push(list, &uev, uev_len); };
+    let term_ptr = STR_PTR("failed");
+    let term_len = STR_LEN("failed");
+    if is_success { term_ptr = STR_PTR("completed"); term_len = STR_LEN("completed"); };
+    if (ctx.hasStartedCurrentAssistantMessage && !ctx.hasCompletedCurrentAssistantMessage) || (ctx.hasStartedCurrentReasoning && !ctx.hasCompletedCurrentReasoning) {
+        let delta = [0u8; 262144];
+        let delta_len: u64 = 0;
+        extractNewResponseText(resp_ptr, resp_len, &ctx.assistantText, ctx.assistantText_len, &delta, 262144, &delta_len);
+        if delta_len > 0 {
+            ctx.currentAssistantText_len = ctx.currentAssistantText_len + append_bytes(&ctx.currentAssistantText, 262144, ctx.currentAssistantText_len, &delta, delta_len);
+            ctx.assistantText_len = ctx.assistantText_len + append_bytes(&ctx.assistantText, 262144, ctx.assistantText_len, &delta, delta_len);
+            push_delta(list, STR_PTR("item/agentMessage/delta"), STR_LEN("item/agentMessage/delta"), ctx, &ctx.currentAssistantItemId, ctx.currentAssistantItemId_len, &delta, delta_len);
+        };
+        completeActiveAssistantMessage(ctx, list, term_ptr, term_len);
+    } else if ctx.hasCompletedCurrentAssistantMessage {
+        let new_content = [0u8; 262144];
+        let new_len: u64 = 0;
+        extractNewResponseText(resp_ptr, resp_len, &ctx.assistantText, ctx.assistantText_len, &new_content, 262144, &new_len);
+        if new_len > 0 && !trim_is_empty(&new_content, new_len) {
+            startNewAgySegment(ctx);
+            ctx.currentAssistantText_len = buf_copy(&ctx.currentAssistantText, 262144, &new_content, new_len);
+            ctx.assistantText_len = ctx.assistantText_len + append_bytes(&ctx.assistantText, 262144, ctx.assistantText_len, &new_content, new_len);
+            ctx.hasStartedCurrentAssistantMessage = true;
+            ctx.hasCompletedCurrentAssistantMessage = true;
+            push_item_started(ctx, list, false);
+            push_delta(list, STR_PTR("item/agentMessage/delta"), STR_LEN("item/agentMessage/delta"), ctx, &ctx.currentAssistantItemId, ctx.currentAssistantItemId_len, &new_content, new_len);
+            // completed item with only the text content part
+            let ev = [0u8; 262144];
+            let ev_len: u64 = 0;
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("{\"kind\":\"item/completed\",\"threadId\":\""), STR_LEN("{\"kind\":\"item/completed\",\"threadId\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"item\":{\"type\":\"agentMessage\",\"id\":\""), STR_LEN("\",\"item\":{\"type\":\"agentMessage\",\"id\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, &ctx.currentAssistantItemId, ctx.currentAssistantItemId_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"content\":[{\"type\":\"text\",\"text\":\""), STR_LEN("\",\"content\":[{\"type\":\"text\",\"text\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, &new_content, new_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"text_elements\":[]}],\"text\":\""), STR_LEN("\",\"text_elements\":[]}],\"text\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, &new_content, new_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"role\":\"assistant\",\"status\":\""), STR_LEN("\",\"role\":\"assistant\",\"status\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, term_ptr, term_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"completedAt\":"), STR_LEN("\",\"completedAt\":"));
+            ev_len = ev_len + append_u64(&ev, 262144, ev_len, now_s());
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("}}"), 2);
+            projected_push(list, &ev, ev_len);
+        };
+    } else {
+        // No segment started: finalResponse = assistantText ||
+        // responseText
+        let final_ptr = resp_ptr;
+        let final_len = resp_len;
+        if ctx.assistantText_len > 0 {
+            final_ptr = &ctx.assistantText;
+            final_len = ctx.assistantText_len;
+        };
+        if final_len > 0 {
+            let ev = [0u8; 262144];
+            let ev_len: u64 = 0;
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("{\"kind\":\"item/completed\",\"threadId\":\""), STR_LEN("{\"kind\":\"item/completed\",\"threadId\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"item\":{\"type\":\"agentMessage\",\"id\":\""), STR_LEN("\",\"item\":{\"type\":\"agentMessage\",\"id\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, &ctx.assistantItemId, ctx.assistantItemId_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"content\":[{\"type\":\"text\",\"text\":\""), STR_LEN("\",\"content\":[{\"type\":\"text\",\"text\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, final_ptr, final_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"text_elements\":[]}],\"text\":\""), STR_LEN("\",\"text_elements\":[]}],\"text\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, final_ptr, final_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"role\":\"assistant\",\"status\":\""), STR_LEN("\",\"role\":\"assistant\",\"status\":\""));
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, term_ptr, term_len);
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"completedAt\":"), STR_LEN("\",\"completedAt\":"));
+            ev_len = ev_len + append_u64(&ev, 262144, ev_len, now_s());
+            ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("}}"), 2);
+            projected_push(list, &ev, ev_len);
+        };
+    };
+    completePendingAgyTools(ctx, list, term_ptr, term_len);
+    // turn/completed | turn/failed (+ error)
+    let ev = [0u8; 262144];
+    let ev_len: u64 = 0;
+    if is_success {
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("{\"kind\":\"turn/completed\",\"threadId\":\""), STR_LEN("{\"kind\":\"turn/completed\",\"threadId\":\""));
+    } else {
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("{\"kind\":\"turn/failed\",\"threadId\":\""), STR_LEN("{\"kind\":\"turn/failed\",\"threadId\":\""));
+    };
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\""), 1);
+    if !is_success {
+        let err_ptr: ptr = PTR_NULL();
+        let err_len: u64 = 0;
+        if sa_json_object_get_string(res, STR_PTR("error"), STR_LEN("error"), &err_ptr, &err_len) != 0 || err_len == 0 {
+            if resp_len > 0 {
+                err_ptr = resp_ptr;
+                err_len = resp_len;
+            } else {
+                err_ptr = STR_PTR("AGY execution failed");
+                err_len = STR_LEN("AGY execution failed");
+            };
+        };
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR(",\"error\":\""), STR_LEN(",\"error\":\""));
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, err_ptr, err_len);
+        ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("\""), 1);
+    };
+    ev_len = ev_len + append_bytes(&ev, 262144, ev_len, STR_PTR("}"), 1);
+    projected_push(list, &ev, ev_len);
+}
+
+// toAgyNotification(event): JsonRpcNotification text for a
+// projected event, or none (question/asked and unknown kinds).
+fn toAgyNotification(json_ptr: ptr, json_len: u64, out: ptr, out_cap: u64, out_len: &u64, out_has: &bool) -> void {
+    out_has = false;
+    out_len = 0;
+    let doc = sa_json_parse(json_ptr, json_len);
+    if doc == 0 { return; };
+    let kind_ptr: ptr = PTR_NULL();
+    let kind_len: u64 = 0;
+    sa_json_object_get_string(doc, STR_PTR("kind"), STR_LEN("kind"), &kind_ptr, &kind_len);
+    let thread_ptr: ptr = PTR_NULL();
+    let thread_len: u64 = 0;
+    sa_json_object_get_string(doc, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len);
+    let turn_ptr: ptr = PTR_NULL();
+    let turn_len: u64 = 0;
+    sa_json_object_get_string(doc, STR_PTR("turnId"), STR_LEN("turnId"), &turn_ptr, &turn_len);
+    let n: u64 = 0;
+    if str_is(kind_ptr, kind_len, STR_PTR("turn/started"), STR_LEN("turn/started")) || str_is(kind_ptr, kind_len, STR_PTR("turn/completed"), STR_LEN("turn/completed")) || str_is(kind_ptr, kind_len, STR_PTR("turn/interrupted"), STR_LEN("turn/interrupted")) {
+        let status_ptr = STR_PTR("inProgress");
+        let status_len = STR_LEN("inProgress");
+        if str_is(kind_ptr, kind_len, STR_PTR("turn/completed"), STR_LEN("turn/completed")) { status_ptr = STR_PTR("completed"); status_len = STR_LEN("completed"); };
+        if str_is(kind_ptr, kind_len, STR_PTR("turn/interrupted"), STR_LEN("turn/interrupted")) { status_ptr = STR_PTR("interrupted"); status_len = STR_LEN("interrupted"); };
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"method\":\""), STR_LEN("{\"method\":\""));
+        n = n + append_bytes(out, out_cap, n, kind_ptr, kind_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"params\":{\"threadId\":\""), STR_LEN("\",\"params\":{\"threadId\":\""));
+        n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        n = n + append_bytes(out, out_cap, n, turn_ptr, turn_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"turn\":{\"id\":\""), STR_LEN("\",\"turn\":{\"id\":\""));
+        n = n + append_bytes(out, out_cap, n, turn_ptr, turn_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"status\":\""), STR_LEN("\",\"status\":\""));
+        n = n + append_bytes(out, out_cap, n, status_ptr, status_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\"}}}"), 4);
+        out_len = n;
+        out_has = true;
+        return;
+    };
+    if str_is(kind_ptr, kind_len, STR_PTR("turn/failed"), STR_LEN("turn/failed")) {
+        let err_ptr: ptr = PTR_NULL();
+        let err_len: u64 = 0;
+        let has_err = sa_json_object_get_string(doc, STR_PTR("error"), STR_LEN("error"), &err_ptr, &err_len) == 0;
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"method\":\"turn/failed\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"turn/failed\",\"params\":{\"threadId\":\""));
+        n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        n = n + append_bytes(out, out_cap, n, turn_ptr, turn_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"turn\":{\"id\":\""), STR_LEN("\",\"turn\":{\"id\":\""));
+        n = n + append_bytes(out, out_cap, n, turn_ptr, turn_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"status\":\"failed\",\"error\":"), STR_LEN("\",\"status\":\"failed\",\"error\":"));
+        if has_err {
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+            n = n + append_bytes(out, out_cap, n, err_ptr, err_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+        } else {
+            n = n + append_bytes(out, out_cap, n, STR_PTR("null"), 4);
+        };
+        n = n + append_bytes(out, out_cap, n, STR_PTR("}}}"), 3);
+        out_len = n;
+        out_has = true;
+        return;
+    };
+    if str_is(kind_ptr, kind_len, STR_PTR("thread/tokenUsage/updated"), STR_LEN("thread/tokenUsage/updated")) {
+        let usage: u64 = 0;
+        sa_json_object_get(doc, STR_PTR("tokenUsage"), STR_LEN("tokenUsage"), &usage);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\""));
+        n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        n = n + append_bytes(out, out_cap, n, turn_ptr, turn_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"tokenUsage\":"), STR_LEN("\",\"tokenUsage\":"));
+        n = n + stringify_into(usage, byte_off(out, n), out_cap - n);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("}}"), 2);
+        out_len = n;
+        out_has = true;
+        return;
+    };
+    if str_is(kind_ptr, kind_len, STR_PTR("item/agentMessage/delta"), STR_LEN("item/agentMessage/delta")) || str_is(kind_ptr, kind_len, STR_PTR("item/reasoning/textDelta"), STR_LEN("item/reasoning/textDelta")) {
+        let item_ptr: ptr = PTR_NULL();
+        let item_len: u64 = 0;
+        sa_json_object_get_string(doc, STR_PTR("itemId"), STR_LEN("itemId"), &item_ptr, &item_len);
+        let delta_ptr: ptr = PTR_NULL();
+        let delta_len: u64 = 0;
+        sa_json_object_get_string(doc, STR_PTR("delta"), STR_LEN("delta"), &delta_ptr, &delta_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"method\":\""), STR_LEN("{\"method\":\""));
+        n = n + append_bytes(out, out_cap, n, kind_ptr, kind_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"params\":{\"threadId\":\""), STR_LEN("\",\"params\":{\"threadId\":\""));
+        n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        n = n + append_bytes(out, out_cap, n, turn_ptr, turn_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"itemId\":\""), STR_LEN("\",\"itemId\":\""));
+        n = n + append_bytes(out, out_cap, n, item_ptr, item_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"delta\":\""), STR_LEN("\",\"delta\":\""));
+        n = n + append_bytes(out, out_cap, n, delta_ptr, delta_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\"}}"), 3);
+        out_len = n;
+        out_has = true;
+        return;
+    };
+    if str_is(kind_ptr, kind_len, STR_PTR("item/started"), STR_LEN("item/started")) || str_is(kind_ptr, kind_len, STR_PTR("item/completed"), STR_LEN("item/completed")) {
+        let item: u64 = 0;
+        sa_json_object_get(doc, STR_PTR("item"), STR_LEN("item"), &item);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"method\":\""), STR_LEN("{\"method\":\""));
+        n = n + append_bytes(out, out_cap, n, kind_ptr, kind_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"params\":{\"threadId\":\""), STR_LEN("\",\"params\":{\"threadId\":\""));
+        n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        n = n + append_bytes(out, out_cap, n, turn_ptr, turn_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"item\":"), STR_LEN("\",\"item\":"));
+        n = n + stringify_into(item, byte_off(out, n), out_cap - n);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("}}"), 2);
+        out_len = n;
+        out_has = true;
+        return;
+    };
+    if str_is(kind_ptr, kind_len, STR_PTR("system/init"), STR_LEN("system/init")) {
+        let conv_ptr: ptr = PTR_NULL();
+        let conv_len: u64 = 0;
+        sa_json_object_get_string(doc, STR_PTR("conversationId"), STR_LEN("conversationId"), &conv_ptr, &conv_len);
+        let cwd_ptr: ptr = PTR_NULL();
+        let cwd_len: u64 = 0;
+        let has_cwd = sa_json_object_get_string(doc, STR_PTR("cwd"), STR_LEN("cwd"), &cwd_ptr, &cwd_len) == 0;
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"method\":\"agy/init\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"agy/init\",\"params\":{\"threadId\":\""));
+        n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"conversationId\":\""), STR_LEN("\",\"conversationId\":\""));
+        n = n + append_bytes(out, out_cap, n, conv_ptr, conv_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"cwd\":"), STR_LEN("\",\"cwd\":"));
+        if has_cwd {
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+            n = n + append_bytes(out, out_cap, n, cwd_ptr, cwd_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+        } else {
+            n = n + append_bytes(out, out_cap, n, STR_PTR("null"), 4);
+        };
+        n = n + append_bytes(out, out_cap, n, STR_PTR("}}"), 2);
+        out_len = n;
+        out_has = true;
+        return;
+    };
+}
+
+// projected_questions_of(projectedDoc, out, count): extract the
+// questions array of a question/asked projected event into
+// AgyProjectedQuestion rows (used by the runtime).
+fn projected_questions_of(doc: u64, out: &AgyProjectedQuestion, out_count: &u64) -> void {
+    out_count = 0;
+    let qs: u64 = 0;
+    if sa_json_object_get(doc, STR_PTR("questions"), STR_LEN("questions"), &qs) != 0 { return; };
+    let n = sa_json_array_len(qs);
+    for i in 0..n {
+        if out_count >= 16 { break; };
+        let node: u64 = 0;
+        if sa_json_array_get(qs, i, &node) != 0 { continue; };
+        let q = &out[out_count];
+        q.json_len = stringify_into(node, &q.json, 8192);
+        let id_ptr: ptr = PTR_NULL();
+        let id_len: u64 = 0;
+        if sa_json_object_get_string(node, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len) == 0 {
+            q.id_len = buf_copy(&q.id, 128, id_ptr, id_len);
+        } else {
+            q.id_len = 0;
+        };
+        out_count = out_count + 1;
+    }
+}
+
+// forceTerminateAgy(ctx, reason, detail): reason codes here —
+// 1 failed / 2 interrupted (the runtime's vocabulary); the
+// source default is "interrupted".
+fn forceTerminateAgy(ctx: &AgyProjectorContext, reason: u64, detail_ptr: ptr, detail_len: u64, has_detail: bool, list: &AgyProjectedList) -> void {
+    list.count = 0;
+    list.arena_len = 0;
+    if ctx.status != 0 { return; };
+    ctx.status = if reason == 1 { 2 } else { 3 };
+    let term_ptr = STR_PTR("interrupted");
+    let term_len = STR_LEN("interrupted");
+    if reason == 1 { term_ptr = STR_PTR("failed"); term_len = STR_LEN("failed"); };
+    if (ctx.hasStartedCurrentAssistantMessage && !ctx.hasCompletedCurrentAssistantMessage) || (ctx.hasStartedCurrentReasoning && !ctx.hasCompletedCurrentReasoning) {
+        completeActiveAssistantMessage(ctx, list, term_ptr, term_len);
+    };
+    completePendingAgyTools(ctx, list, term_ptr, term_len);
+    let ev = [0u8; 8192];
+    let ev_len: u64 = 0;
+    if reason == 1 {
+        ev_len = ev_len + append_bytes(&ev, 8192, ev_len, STR_PTR("{\"kind\":\"turn/failed\",\"threadId\":\""), STR_LEN("{\"kind\":\"turn/failed\",\"threadId\":\""));
+    } else {
+        ev_len = ev_len + append_bytes(&ev, 8192, ev_len, STR_PTR("{\"kind\":\"turn/interrupted\",\"threadId\":\""), STR_LEN("{\"kind\":\"turn/interrupted\",\"threadId\":\""));
+    };
+    ev_len = ev_len + append_bytes(&ev, 8192, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+    ev_len = ev_len + append_bytes(&ev, 8192, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    ev_len = ev_len + append_bytes(&ev, 8192, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+    ev_len = ev_len + append_bytes(&ev, 8192, ev_len, STR_PTR("\""), 1);
+    if reason == 1 {
+        ev_len = ev_len + append_bytes(&ev, 8192, ev_len, STR_PTR(",\"error\":\""), STR_LEN(",\"error\":\""));
+        if has_detail && detail_len > 0 {
+            ev_len = ev_len + append_bytes(&ev, 8192, ev_len, detail_ptr, detail_len);
+        } else {
+            ev_len = ev_len + append_bytes(&ev, 8192, ev_len, STR_PTR("Process terminated abruptly"), STR_LEN("Process terminated abruptly"));
+        };
+        ev_len = ev_len + append_bytes(&ev, 8192, ev_len, STR_PTR("\""), 1);
+    };
+    ev_len = ev_len + append_bytes(&ev, 8192, ev_len, STR_PTR("}"), 1);
+    projected_push(list, &ev, ev_len);
+}
+
+// ---- node helpers / shims ----
+
+// json_number_i64: Number(node) as i64. DEFECT: shim — the
+// sa_json surface's numeric read for a bare node.
+fn json_number_i64(node: u64) -> i64 {
+    return 0;
+}
+
+// json_node_string: string value of a bare node.
+// DEFECT: shim over the node surface.
+fn json_node_string(node: u64, out_ptr: &ptr, out_len: &u64, out_is_string: &bool) -> void {
+    out_ptr = PTR_NULL();
+    out_len = 0;
+    out_is_string = false;
+}
+
+// json_node_items: normalize a questions node to an items
+// array doc (string -> parse / synthesize, array -> itself,
+// object -> wrap). DEFECT: shim — array/object discrimination
+// + wrap need node-kind surface.
+fn json_node_items(node: u64, out_items: &u64, out_is_array: &bool) -> void {
+    out_items = 0;
+    out_is_array = false;
+}
+
+// now_s: Math.floor(Date.now() / 1000). DEFECT: shim.
+fn now_s() -> u64 {
+    return 0;
+}
+
+fn stringify_into(node: u64, out: ptr, out_cap: u64) -> u64 {
+    if node == 0 { return append_bytes(out, out_cap, 0, STR_PTR("{}"), 2); };
+    let h: u64 = 0;
+    if sa_json_stringify(node, &h) != 0 { return append_bytes(out, out_cap, 0, STR_PTR("{}"), 2); };
+    let bp: ptr = PTR_NULL();
+    let bl: u64 = 0;
+    sa_json_buffer_data(h, &bp);
+    sa_json_buffer_len(h, &bl);
+    let n = buf_copy(out, out_cap, bp, bl);
+    sa_json_buffer_free(h);
+    return n;
+}
+
+fn node_json_or(doc: u64, k1_ptr: ptr, k1_len: u64, k2_ptr: ptr, k2_len: u64, out: ptr, out_cap: u64) -> u64 {
+    let node: u64 = 0;
+    if sa_json_object_get(doc, k1_ptr, k1_len, &node) == 0 { return stringify_into(node, out, out_cap); };
+    if sa_json_object_get(doc, k2_ptr, k2_len, &node) == 0 { return stringify_into(node, out, out_cap); };
+    return append_bytes(out, out_cap, 0, STR_PTR("{}"), 2);
+}
+
+fn first_nonempty_str(doc: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    // [toolAction, toolSummary, content].find(string with
+    // trim().length > 0)
+    if sa_json_object_get_string(doc, STR_PTR("toolAction"), STR_LEN("toolAction"), out_ptr, out_len) == 0 && !trim_is_empty(out_ptr, out_len) { return true; };
+    if sa_json_object_get_string(doc, STR_PTR("toolSummary"), STR_LEN("toolSummary"), out_ptr, out_len) == 0 && !trim_is_empty(out_ptr, out_len) { return true; };
+    if sa_json_object_get_string(doc, STR_PTR("content"), STR_LEN("content"), out_ptr, out_len) == 0 && !trim_is_empty(out_ptr, out_len) { return true; };
+    return false;
+}
+
+fn make_tool_id(ctx: &AgyProjectorContext, step_index: i64, out: ptr, out_cap: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("agy-tool-"), STR_LEN("agy-tool-"));
+    n = n + append_bytes(out, out_cap, n, ctx.turnId_ptr, ctx.turnId_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("-"), 1);
+    n = n + append_i64(out, out_cap, n, step_index);
+    return n;
+}
+
+fn push_item_event(list: &AgyProjectedList, kind_ptr: ptr, kind_len: u64, ctx: &AgyProjectorContext, item_ptr: ptr, item_len: u64) -> void {
+    let ev = [0u8; 65536];
+    let ev_len: u64 = 0;
+    ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR("{\"kind\":\""), STR_LEN("{\"kind\":\""));
+    ev_len = ev_len + append_bytes(&ev, 65536, ev_len, kind_ptr, kind_len);
+    ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    ev_len = ev_len + append_bytes(&ev, 65536, ev_len, ctx.threadId_ptr, ctx.threadId_len);
+    ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    ev_len = ev_len + append_bytes(&ev, 65536, ev_len, ctx.turnId_ptr, ctx.turnId_len);
+    ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR("\",\"item\":"), STR_LEN("\",\"item\":"));
+    ev_len = ev_len + append_bytes(&ev, 65536, ev_len, item_ptr, item_len);
+    ev_len = ev_len + append_bytes(&ev, 65536, ev_len, STR_PTR("}"), 1);
+    projected_push(list, &ev, ev_len);
+}
+
+fn json_i64_or(doc: u64, key_ptr: ptr, key_len: u64, fallback: i64) -> i64 {
+    let v: i64 = 0;
+    if sa_json_object_get_i64(doc, key_ptr, key_len, &v) == 0 { return v; };
+    return fallback;
+}
+
+// ---- local helpers ----
+
+fn byte_at(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+fn byte_off(p: ptr, off: u64) -> ptr {
+    let r: ptr = PTR_NULL();
+    PTR_BYTE_ADD(r, p, off);
+    return r;
+}
+
+fn slot(arena: ptr, off: u64) -> ptr {
+    return byte_off(arena, off);
+}
+
+fn bytes_eq(a: ptr, b: ptr, n: u64) -> bool {
+    for i in 0..n {
+        if byte_at(a, i) != byte_at(b, i) { return false; };
+    }
+    return true;
+}
+
+fn str_is(p: ptr, n: u64, lit: ptr, lit_len: u64) -> bool {
+    return n == lit_len && bytes_eq(p, lit, n);
+}
+
+fn starts_with(p: ptr, n: u64, pre: ptr, pre_len: u64) -> bool {
+    return n >= pre_len && bytes_eq(p, pre, pre_len);
+}
+
+fn ends_with(p: ptr, n: u64, suf: ptr, suf_len: u64) -> bool {
+    if n < suf_len { return false; };
+    return bytes_eq(byte_off(p, n - suf_len), suf, suf_len);
+}
+
+fn contains(p: ptr, n: u64, needle: ptr, needle_len: u64) -> bool {
+    if needle_len > n { return false; };
+    if needle_len == 0 { return true; };
+    let last = n - needle_len;
+    let i: u64 = 0;
+    while i <= last {
+        if bytes_eq(byte_off(p, i), needle, needle_len) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn contains_ci(p: ptr, n: u64, needle: ptr) -> bool {
+    let needle_len: u64 = 0;
+    while byte_at(needle, needle_len) != 0 { needle_len = needle_len + 1; };
+    if needle_len > n { return false; };
+    let last = n - needle_len;
+    let i: u64 = 0;
+    while i <= last {
+        let ok = true;
+        for j in 0..needle_len {
+            let a = byte_at(p, i + j);
+            let b = byte_at(needle, j);
+            if a >= 65 && a <= 90 { a = a + 32; };
+            if b >= 65 && b <= 90 { b = b + 32; };
+            if a != b { ok = false; break; };
+        }
+        if ok { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn find_byte(buf: ptr, n: u64, from: u64, want: u8) -> u64 {
+    let i = from;
+    while i < n {
+        if byte_at(buf, i) == want { return i; };
+        i = i + 1;
+    }
+    return 4294967295;
+}
+
+fn trim_span(p: ptr, n: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // 已绑 sa_std ts 面 (@ts_str_trim) — wrap-up rebind.
+    @ts_str_trim(out_ptr, out_len, p, n);
+}
+
+fn trim_is_empty(p: ptr, n: u64) -> bool {
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    trim_span(p, n, &tp, &tl);
+    return tl == 0;
+}
+
+fn is_ws(b: u8) -> bool {
+    return b == 32 || b == 9 || b == 10 || b == 13;
+}
+
+fn append_bytes(dst: ptr, cap: u64, at: u64, src: ptr, n: u64) -> u64 {
+    let w: u64 = 0;
+    for i in 0..n {
+        if at + w < cap {
+            PTR_BYTE_SET(dst, at + w, byte_at(src, i));
+            w = w + 1;
+        };
+    }
+    return w;
+}
+
+fn append_u64(dst: ptr, cap: u64, at: u64, v: u64) -> u64 {
+    let digits = [0u8; 20];
+    let dn: u64 = 0;
+    if v == 0 { return append_bytes(dst, cap, at, STR_PTR("0"), 1); };
+    let x = v;
+    while x > 0 {
+        digits[dn] = 48 + (x % 10) as u8;
+        dn = dn + 1;
+        x = x / 10;
+    }
+    let w: u64 = 0;
+    let i = dn;
+    while i > 0 {
+        i = i - 1;
+        if at + w < cap { PTR_BYTE_SET(dst, at + w, digits[i]); w = w + 1; };
+    }
+    return w;
+}
+
+fn append_i64(dst: ptr, cap: u64, at: u64, v: i64) -> u64 {
+    if v < 0 {
+        let n = append_bytes(dst, cap, at, STR_PTR("-"), 1);
+        return n + append_u64(dst, cap, at + n, (0 - v) as u64);
+    };
+    return append_u64(dst, cap, at, v as u64);
+}
+
+fn buf_copy(dst: ptr, cap: u64, src: ptr, n: u64) -> u64 {
+    let m = n;
+    if m > cap { m = cap; };
+    for i in 0..m {
+        PTR_BYTE_SET(dst, i, byte_at(src, i));
+    }
+    return m;
+}

@@ -1,0 +1,200 @@
+// Converted 1:1 from apps/server/src/threadHistoryTail.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+
+@import "sa_std/io/print.sai"
+@import "sa_std/string.sa"
+// DEFECT: node:fs/promises open/stat + Buffer have no direct counterpart; file window reads via sa_std_fs extern (open/read-at/close) approximations.
+// DEFECT: dynamic JSON records (Record<string, unknown> / JsonValue) -> JSON text buffers + sa_json extern traversal throughout this file.
+
+const LARGE_HISTORY_THRESHOLD_BYTES: u64 = 1073741824; // 1024 ** 3
+const DEFAULT_HISTORY_TAIL_BYTES: u64 = 4194304; // 4 * 1024 ** 2
+const TAIL_MAX_TURNS: u64 = 2000;
+const TAIL_TEXT_LIMIT: u64 = 20000;
+
+// L10-17: type JsonRecord = Record<string, unknown>; TailItem = JsonRecord & {id, type}; TailTurn
+// DEFECT: intersection types -> item/turn kept as JSON text buffers with id/type field probes.
+struct TailTurn {
+    id: [u8; 256], id_len: u64,
+    status: [u8; 64], status_len: u64,
+    has_started_at: bool, started_at: f64,
+    has_completed_at: bool, completed_at: f64,
+    // DEFECT: items: TailItem[] -> fixed array capacity 4096 of serialized items
+    items: [u8; 8388608], item_lens: [u64; 4096], items_len: u64,
+}
+
+// L19-22: export type ThreadHistoryTailResult
+struct ThreadHistoryTailResult {
+    // thread: JsonRecord & { turns: TailTurn[] } -> input thread JSON with turns replaced by projected turns (serialized)
+    thread_json: [u8; 16777216], thread_json_len: u64,
+    tail_size_bytes: u64,
+    tail_loaded_bytes: u64,
+    tail_requested_bytes: u64,
+    tail_truncated: bool,
+    tail_dropped_partial_line: bool,
+    tail_parsed_lines: u64,
+    err: [u8; 1024], err_len: u64,
+}
+
+// Projected turns scratch shared by readThreadHistoryTail / projectTailRecords
+struct TailTurns {
+    turns: [u8; 16777216], turn_lens: [u64; 2000], turns_len: u64,
+    // DEFECT: byId: Map<string, TailTurn> -> parallel id array + index lookup
+    ids: [u8; 512000], id_lens: [u64; 2000],
+    current: i64, // index or -1 (TS: TailTurn | undefined)
+    sequence: u64,
+}
+
+// L24-84: export async function readThreadHistoryTail(historyPath, thread, requestedBytes = DEFAULT_HISTORY_TAIL_BYTES)
+// DEFECT: async -> synchronous + status code (-1 not-a-file, -2 no complete JSONL record, -3 no valid records; messages in result.err).
+fn readThreadHistoryTail(path_ptr: ptr, path_len: u64, thread_ptr: ptr, thread_len: u64, has_req: bool, requested_bytes: f64, out: &ThreadHistoryTailResult) -> i32 {
+    // info = await stat(historyPath); if (!info.isFile()) throw Error("Thread history path is not a file")
+    // DEFECT: stat result object -> (size, is_file) out params from extern.
+    // byteLimit = max(1, min(floor(requestedBytes), DEFAULT_HISTORY_TAIL_BYTES))
+    // start = max(0, info.size - byteLimit); text = ""; droppedPartialLine = false
+    // for (probe = 0; probe < 3; probe += 1) {
+    //   handle = await open(historyPath, "r");
+    //   try { len = size - start; buf = Buffer.allocUnsafe(len); {bytesRead} = await handle.read(buf, 0, buf.length, start);
+    //         text = buf.subarray(0, bytesRead).toString("utf8") } finally { await handle.close() }
+    //   DEFECT: try/finally handle close -> explicit close on all paths; Buffer -> fixed 6 MiB text scratch (byteLimit 4 MiB + 2 MiB probe growth).
+    //   if (start === 0) break
+    //   firstNewline = text.indexOf("\n"); if (firstNewline >= 0) { text = text.slice(firstNewline + 1); droppedPartialLine = true; break }
+    //   if (probe >= 2) throw Error("The selected history tail contains no complete JSONL record")
+    //   start = max(0, start - 1024 ** 2)
+    // }
+    // records = []; for (line of text.split(/\r?\n/)) { if (!line.trim()) continue;
+    //   try { parsed = JSON.parse(line); if (isRecord(parsed)) records.push(parsed) } catch { /* incomplete trailing record ignored */ } }
+    // DEFECT: regex split -> manual line scan; per-line try/catch -> parse status branch.
+    // if (records.length === 0) throw Error("No valid JSONL records were found in the selected history tail")
+    // return { thread: {...thread, turns: projectTailRecords(records)},  // DEFECT: object spread -> thread JSON copy with turns field replaced
+    //   tail: { sizeBytes: info.size, loadedBytes: Buffer.byteLength(text), requestedBytes: byteLimit,
+    //           truncated: start > 0, droppedPartialLine, parsedLines: records.length } }
+    return 0;
+}
+
+// L86-139: export function projectTailRecords(records: JsonRecord[]): TailTurn[]
+// DEFECT: records array -> (records_json buffer + count); result in out turns scratch; returns kept-turn count.
+fn projectTailRecords(records_ptr: ptr, records_len: u64, records_count: u64, out: &TailTurns) -> u64 {
+    // turns = []; byId = new Map(); current = undefined; sequence = 0
+    // ensureTurn closure (L93-104) -> tailTurns_ensureTurn below (captures turns/byId/current/sequence via &TailTurns).
+    // for (record of records) {
+    //   if (turns.length >= TAIL_MAX_TURNS) break
+    //   outerType = stringValue(record.type); payload = asRecord(record.payload)
+    //   if (outerType === "turn_context") { ensureTurn(stringValue(payload.turn_id) ?? stringValue(payload.turnId)); continue }
+    //   if (outerType === "compacted") { upsertItem(ensureTurn(), {id: `tail-compaction-${sequence}`, type: "contextCompaction"}); continue }
+    //   DEFECT: template literal id -> formatted buffer.
+    //   if (outerType !== "event_msg") continue
+    //   eventType = stringValue(payload.type); turnId = stringValue(payload.turn_id) ?? stringValue(payload.turnId)
+    //   if (eventType in {task_started, turn_started}) { turn = ensureTurn(turnId); turn.status = "inProgress";
+    //     turn.startedAt = timestampValue(payload.started_at ?? payload.startedAt); continue }
+    //   if (eventType in {task_complete, turn_complete, turn_aborted}) { turn = ensureTurn(turnId);
+    //     turn.status = (eventType === "turn_aborted" || isRecord(payload.error)) ? "failed" : "completed";
+    //     turn.completedAt = timestampValue(payload.completed_at ?? payload.completedAt); continue }
+    //   turn = ensureTurn(turnId); item = eventToItem(eventType, payload, turn.items.length); if (item) upsertItem(turn, item)
+    // }
+    // return turns.filter(turn => turn.items.length > 0) (DEFECT: Array.filter + closure -> in-place compaction loop)
+    return 0;
+}
+
+// L93-104 (hoisted closure): const ensureTurn = (preferredId?: string): TailTurn
+// DEFECT: closure -> named fn over &TailTurns; returns turn index.
+fn tailTurns_ensureTurn(turns: &TailTurns, has_preferred: bool, pref_ptr: ptr, pref_len: u64) -> u64 {
+    // id = preferredId || current?.id || `tail-recovered-${sequence + 1}`
+    // existing = byId.get(id); if (existing) { current = existing; return existing }
+    // turn = {id, status: "completed", items: []} (satisfies TailTurn — DEFECT: satisfies operator dropped)
+    // turns.push(turn); byId.set(id, turn); current = turn; sequence += 1; return turn
+    return 0;
+}
+
+// L141-171: function eventToItem(type, payload, index): TailItem | null
+// DEFECT: null return -> status code (0 item written, 1 null); item as JSON buffer out param.
+fn eventToItem(has_type: bool, type_ptr: ptr, type_len: u64, payload_ptr: ptr, payload_len: u64, index: u64, out_ptr: ptr) -> i32 {
+    // embedded = asRecord(payload.item)
+    // if ((type === "item_started" || type === "item_completed") && stringValue(embedded.id)) return truncateTailItem(embedded as TailItem) (DEFECT: cast dropped)
+    // id = stringValue(payload.call_id) ?? stringValue(payload.item_id) ?? `tail-${type ?? "item"}-${index}`
+    // switch (type) — DEFECT: string switch -> if-chain:
+    //   "user_message" -> truncateTailItem({id, type: "userMessage", content: userMessageContent(payload)})
+    //   "agent_message" -> truncateTailItem({id, type: "agentMessage", text: stringValue(payload.message) ?? ""})
+    //   "agent_reasoning" -> truncateTailItem({id, type: "reasoning", summary: [stringValue(payload.text) ?? ""]})
+    //   "exec_command_begin"|"exec_command_end" -> truncateTailItem({id, type: "commandExecution", command: arrayOrString(payload.command),
+    //       aggregatedOutput: stringValue(payload.aggregated_output) ?? stringValue(payload.formatted_output) ?? "",
+    //       status: type.endsWith("begin") ? "inProgress" : commandStatus(payload)})
+    //   "patch_apply_begin"|"patch_apply_end" -> {id, type: "fileChange", changes: payload.changes ?? {}, status: ...} (NOT truncated in source)
+    //   "mcp_tool_call_begin"|"mcp_tool_call_end" -> { const invocation = asRecord(payload.invocation);
+    //       return {id, type: "mcpToolCall", server: invocation.server, tool: invocation.tool, arguments: invocation.arguments,
+    //               result: payload.result, error: payload.error, status: ...} } (dynamic fields copied raw — DEFECT: dynamic object)
+    //   "view_image_tool_call" -> stringValue(payload.path) ? {id, type: "imageView", path: stringValue(payload.path)!} : null (DEFECT: non-null assertion -> checked)
+    //   "context_compacted" -> {id, type: "contextCompaction", status: "completed"}
+    //   "error" -> {id, type: "error", text: stringValue(payload.message) ?? "Unknown history error", status: "failed"}
+    //   default -> null
+    // DEFECT: object literals -> JSON text assembly into out buffer in field order as written in source.
+    return 1;
+}
+
+// L173-177: function upsertItem(turn, item): void
+fn upsertItem(turn: &TailTurn, item_ptr: ptr, item_len: u64) -> i32 {
+    // index = turn.items.findIndex(current => current.id === item.id) (DEFECT: findIndex + closure -> id-scan loop)
+    // if (index >= 0) turn.items[index] = {...turn.items[index], ...item} (DEFECT: spread merge -> JSON field merge extern)
+    // else turn.items.push(item)
+    return 0;
+}
+
+// L179-196: function truncateTailItem<T extends TailItem>(item: T): T
+// DEFECT: generics -> operates on item JSON buffer in place; returns new length.
+fn truncateTailItem(item_ptr: ptr, item_len: u64) -> u64 {
+    // out = {...item}; for (key of ["text", "aggregatedOutput"]) { value = out[key];
+    //   if (typeof value === "string" && value.length > TAIL_TEXT_LIMIT)
+    //     out[key] = `${value.slice(0, TAIL_TEXT_LIMIT)}\n…[历史过长已截断，原文共 ${value.length} 字符]` }
+    // DEFECT: template literal with Chinese truncation marker preserved at fix stage; slice by chars approximated by bytes (UTF-8 boundary risk noted).
+    // summary = out.summary; if (Array.isArray(summary)) out.summary = summary.map(entry =>
+    //   typeof entry === "string" && entry.length > LIMIT ? truncated : entry) (DEFECT: Array.map -> loop rewrite)
+    // return out as T
+    return item_len;
+}
+
+// L198-206: function userMessageContent(payload): JsonValue[]
+// DEFECT: JsonValue[] return -> JSON array text assembled in out buffer; returns length.
+fn userMessageContent(payload_ptr: ptr, payload_len: u64, out_ptr: ptr) -> u64 {
+    // content = []; message = stringValue(payload.message)
+    // if (message) content.push({type: "text", text: message, text_elements: Array.isArray(payload.text_elements) ? payload.text_elements : []})
+    // for (path of Array.isArray(payload.local_images) ? payload.local_images : []) if (typeof path === "string") content.push({type: "localImage", path})
+    return 0;
+}
+
+// L208-213: function commandStatus(payload): string
+fn commandStatus(payload_ptr: ptr, payload_len: u64, out_ptr: ptr) -> u64 {
+    // status = stringValue(payload.status); if (status) return status
+    // exitCode = typeof payload.exit_code === "number" ? payload.exit_code : 0; return exitCode === 0 ? "completed" : "failed"
+    return 0;
+}
+
+// L215-218: function arrayOrString(value: unknown): string[]
+// DEFECT: string[] -> JSON array text in out buffer; Array.map(String) coercion -> per-element stringify extern.
+fn arrayOrString(json_ptr: ptr, json_len: u64, node_off: u64, out_ptr: ptr) -> u64 {
+    // if (Array.isArray(value)) return value.map(String); return typeof value === "string" ? [value] : []
+    return 0;
+}
+
+// L220-223: function timestampValue(value: unknown): number | undefined
+// DEFECT: undefined -> has flag out param.
+fn timestampValue(json_ptr: ptr, json_len: u64, node_off: u64) -> f64 {
+    // if (typeof value !== "number" || !Number.isFinite(value)) return undefined; return value > 10_000_000_000 ? value : value * 1_000
+    return 0;
+}
+
+// L225-227: function isRecord(value: unknown): value is JsonRecord
+fn isRecord(json_ptr: ptr, json_len: u64, node_off: u64) -> bool {
+    // return Boolean(value) && typeof value === "object" && !Array.isArray(value)
+    return false;
+}
+
+// L228: function asRecord(value: unknown): JsonRecord — isRecord ? value : {}
+fn asRecord(json_ptr: ptr, json_len: u64, node_off: u64) -> u64 {
+    // returns node offset of the record, or offset of an empty-object literal scratch
+    return 0;
+}
+
+// L229: function stringValue(value: unknown): string | undefined
+// DEFECT: undefined -> return 0 length + has flag convention at call sites.
+fn stringValue(json_ptr: ptr, json_len: u64, node_off: u64, out_ptr: ptr) -> u64 {
+    // return typeof value === "string" && value.trim() ? value : undefined (note: returns the untrimmed string as in source)
+    return 0;
+}

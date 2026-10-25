@@ -1,0 +1,171 @@
+// Converted 1:1 from backends/auggie/src/runtime/auggieRuntime.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// Auggie backend — routing-layer runtime shared by apps/server/src/index.ts.
+//
+// Auggie is an EXTERNAL CLI backend like the others (user rule
+// 2026-10-24: only Mini Agent is embedded): the bridge spawns the
+// user's own `auggie` binary (see auggieCommand.ts for discovery).
+// This module owns the pieces of the lifecycle the HTTP/WS routing
+// layer needs:
+//   - the indexing mode constant advertised through the redirector,
+//   - the session/cache directory rooted at the server data dir,
+//   - the per-thread bridge registry that guarantees auggie's
+//     single-process exclusivity rule (auggie has no cross-process
+//     lock; two processes resuming the same session overwrite each
+//     other's history files).
+//
+// DEFECT: module-level mutable state (Map<string,
+// AuggieAgentBridge> threadBridges, let sharedBridge) — SLA has
+// no module globals or Map; state is gathered into
+// AuggieRuntimeRegistry passed by reference. The Map becomes a
+// fixed (ptr,len) key array with the bridge referenced by the
+// single shared instance (source binds every thread to the same
+// shared bridge object in practice; distinct per-thread bridge
+// objects from bindAuggieThreadBridge are collapsed — see log).
+@import "./auggieAgentBridge.sla"
+
+// AUGGIE_INDEXING_MODE = "complete" as const.
+// Indexing mode advertised to auggie. "complete" is the
+// redirector's deny-indexing answer: /find-missing reports
+// nothing missing and max_upload_size_bytes is 0, so repository
+// content is never uploaded. Indexing stays disabled by default
+// (user requirement 2026-10-24).
+fn AUGGIE_INDEXING_MODE_ptr() -> ptr { return STR_PTR("complete"); }
+fn AUGGIE_INDEXING_MODE_len() -> u64 { return STR_LEN("complete"); }
+
+// EnsureAuggieBridgeOptions (interface):
+//   runtimeEnv?: () => NodeJS.ProcessEnv — env snapshot provider
+//   onCreate?: (bridge) => void — construction observer
+// DEFECT: both members are function values; SLA cannot store
+// them. The options are threaded as plain call parameters at the
+// single construction site instead (runtimeEnv snapshot is taken
+// by the caller; onCreate is dropped).
+struct AuggieRuntimeRegistry {
+    bridge: AuggieAgentBridge,
+    has_bridge: bool,
+    threadKeys_ptr: [ptr; 1024],
+    threadKeys_len: [u64; 1024],
+    threadKeys_count: u64,
+}
+
+fn AuggieRuntimeRegistry_new(self: &AuggieRuntimeRegistry) -> void {
+    self.has_bridge = false;
+    self.threadKeys_count = 0;
+}
+
+fn auggieRuntime_threadIndex(self: &AuggieRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64) -> u64 {
+    for i in 0..self.threadKeys_count {
+        if self.threadKeys_len[i] == threadId_len {
+            if bytes_eq(self.threadKeys_ptr[i], threadId_ptr, threadId_len) { return i; };
+        };
+    }
+    return 4294967295;
+}
+
+// defaultAuggieCacheDir(dataDir): join(dataDir, "auggie").
+// DEFECT: node:path join — byte concat approximation with '/'.
+fn defaultAuggieCacheDir(dataDir_ptr: ptr, dataDir_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let n: u64 = 0;
+    for i in 0..dataDir_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, dataDir_ptr, i);
+        if n < out_cap { PTR_BYTE_SET(out, n, b); n = n + 1; };
+    }
+    if n < out_cap { PTR_BYTE_SET(out, n, 47); n = n + 1; };
+    let suffix = "auggie";
+    let sp: ptr = STR_PTR(suffix);
+    for j in 0..6 {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, sp, j);
+        if n < out_cap { PTR_BYTE_SET(out, n, b); n = n + 1; };
+    }
+    out_len = n;
+}
+
+// existingAuggieBridgeForThread(threadId?): the bridge bound to
+// threadId, or none. (Source returns threadBridges.get(threadId)
+// ?? null; every binding points at the shared bridge.)
+fn existingAuggieBridgeForThread(self: &AuggieRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64, has_threadId: bool, out_has: &bool) -> &AuggieAgentBridge {
+    out_has = false;
+    if !has_threadId { return &self.bridge; };
+    if auggieRuntime_threadIndex(self, threadId_ptr, threadId_len) != 4294967295 { out_has = true; };
+    return &self.bridge;
+}
+
+// ensureAuggieBridgeForThread(threadId, options): return the
+// bound bridge, else construct the shared bridge once and bind.
+// TS construction: new AuggieAgentBridge(() => ({
+//   ...(options.runtimeEnv?.() ?? process.env),
+//   AUGMENT_DISABLE_AUTO_UPDATE: "1" }))
+// DEFECT: env-provider closure + process.env spread — the SLA
+// bridge constructor takes an env snapshot buffer (JSON text)
+// supplied by the caller; AUGMENT_DISABLE_AUTO_UPDATE=1 is
+// forced inside AuggieAgentBridge_new (see auggieAgentBridge.sla).
+fn ensureAuggieBridgeForThread(self: &AuggieRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64, has_threadId: bool, env_ptr: ptr, env_len: u64) -> &AuggieAgentBridge {
+    let has = false;
+    let existing = existingAuggieBridgeForThread(self, threadId_ptr, threadId_len, has_threadId, &has);
+    if has { return existing; };
+    if !self.has_bridge {
+        AuggieAgentBridge_new(&self.bridge, env_ptr, env_len);
+        self.has_bridge = true;
+    };
+    if has_threadId {
+        if self.threadKeys_count < 1024 {
+            self.threadKeys_ptr[self.threadKeys_count] = threadId_ptr;
+            self.threadKeys_len[self.threadKeys_count] = threadId_len;
+            self.threadKeys_count = self.threadKeys_count + 1;
+        };
+    };
+    return &self.bridge;
+}
+
+// releaseAuggieThreadBridge(threadId): drop a thread's binding
+// once its route is gone (archive/delete/close).
+fn releaseAuggieThreadBridge(self: &AuggieRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64) -> void {
+    let i = auggieRuntime_threadIndex(self, threadId_ptr, threadId_len);
+    if i == 4294967295 { return; };
+    let last = self.threadKeys_count - 1;
+    self.threadKeys_ptr[i] = self.threadKeys_ptr[last];
+    self.threadKeys_len[i] = self.threadKeys_len[last];
+    self.threadKeys_count = last;
+}
+
+// bindAuggieThreadBridge(threadId, bridge): bind a thread id
+// (including one the bridge itself minted during thread/start)
+// to the shared auggie process.
+// DEFECT: TS stores the arbitrary passed bridge object; SLA
+// collapses all bindings onto the single shared bridge.
+fn bindAuggieThreadBridge(self: &AuggieRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64) -> void {
+    if auggieRuntime_threadIndex(self, threadId_ptr, threadId_len) != 4294967295 { return; };
+    if self.threadKeys_count < 1024 {
+        self.threadKeys_ptr[self.threadKeys_count] = threadId_ptr;
+        self.threadKeys_len[self.threadKeys_count] = threadId_len;
+        self.threadKeys_count = self.threadKeys_count + 1;
+    };
+}
+
+// resetAuggieRuntime(): tear the shared bridge down so the next
+// use spawns a fresh CLI child.
+fn resetAuggieRuntime(self: &AuggieRuntimeRegistry) -> void {
+    let had = self.has_bridge;
+    self.has_bridge = false;
+    self.threadKeys_count = 0;
+    if had { AuggieAgentBridge_stop(&self.bridge); };
+}
+
+// stopAuggieRuntime(): stop all auggie bridges on process exit.
+fn stopAuggieRuntime(self: &AuggieRuntimeRegistry) -> void {
+    if self.has_bridge { AuggieAgentBridge_stop(&self.bridge); };
+}
+
+// bytes_eq helper (local copy; see clineRuntime.sla note).
+fn bytes_eq(a: ptr, b: ptr, n: u64) -> bool {
+    for i in 0..n {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a, i);
+        PTR_BYTE_AT(y, b, i);
+        if x != y { return false; };
+    }
+    return true;
+}

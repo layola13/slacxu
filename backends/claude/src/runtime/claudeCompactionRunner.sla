@@ -1,0 +1,479 @@
+// Converted 1:1 from backends/claude/src/runtime/claudeCompactionRunner.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/json.sai"
+@import "sa_std/process.sai"
+@import "sa_std/env.sai"
+@import "claudeCompatibleProbe.sla"
+
+// DEFECT: node:child_process types (ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio)
+// have no SLA counterpart; the child process is an opaque handle + pid.
+// DEFECT: @codex-ui/shared JsonValue is dynamic JSON; approximated as JSON text buffers.
+
+struct ClaudeCompactionRoute {
+    providerId: [u8; 128],
+    providerId_len: u64,
+    groupId: [u8; 128],
+    groupId_len: u64,
+    model: [u8; 256],
+    model_len: u64,
+}
+
+// DEFECT: runtimeEnv is NodeJS.ProcessEnv (dynamic string map); approximated as
+// env text buffer of "KEY=VALUE\n" lines with lookup helpers in claudeCompatibleProbe.sla.
+struct ClaudeCompactionInput {
+    threadId: [u8; 128],
+    threadId_len: u64,
+    cwd: [u8; 1024],
+    cwd_len: u64,
+    transcript: [u8; 1048576],
+    transcript_len: u64,
+    route: ClaudeCompactionRoute,
+    runtimeEnv: [u8; 65536],
+    runtimeEnv_len: u64,
+    has_cliBackend: bool, // TS cliBackend?: "claude"
+    cliBackend: [u8; 32],
+    cliBackend_len: u64,
+}
+
+// DEFECT: ClaudeCompactionRunner is a function type (input) => Promise<string>;
+// SLA has no first-class async function values. createClaudeCompactionRunner below
+// fills a runner-config struct and claudeCompactionRunner_run executes it synchronously.
+struct ClaudeCompactionRunner {
+    spawnCommand_kind: u64, // 0 = default spawnClaudeCommand
+    terminateChild_kind: u64, // 0 = default (child) => child.kill("SIGTERM")
+}
+
+struct ClaudeChildProcess {
+    handle: u64, // opaque child process handle (spawn_bidi)
+    pid: i64, // TS child.pid ?? null -> -1 when unknown
+    has_pid: bool,
+}
+
+const COMPACTION_TIMEOUT_MS: u64 = 300000; // 5 * 60_000
+
+// DEFECT: regex replace — sa_std has no regex engine. redactCompactionText below
+// approximates the three TS patterns with hand-written scanning:
+//   /sk-[A-Za-z0-9_-]{12,}/g -> "sk-***"
+//   /Bearer\s+[A-Za-z0-9._~+/=-]{12,}/gi -> "Bearer ***"
+//   /api[_-]?key["'=:\s]+[A-Za-z0-9._~+/=-]{8,}/gi -> "api_key=***"
+// Character classes and quantifiers are approximated; semantics not identical.
+fn redactCompactionText(value_ptr: ptr, value_len: u64, out: &ByteBuf) -> u64 {
+    let i: u64 = 0;
+    while i < value_len {
+        // "sk-" prefix with >= 12 token chars following
+        if i + 3 <= value_len && PTR_BYTE_AT(value_ptr, i) == 115 && PTR_BYTE_AT(value_ptr, i + 1) == 107 && PTR_BYTE_AT(value_ptr, i + 2) == 45 {
+            let j: u64 = i + 3;
+            while j < value_len && is_token_char(PTR_BYTE_AT(value_ptr, j)) { j = j + 1; };
+            if j - (i + 3) >= 12 {
+                buf_append_lit(out, STR_PTR("sk-***"), STR_LEN("sk-***"));
+                i = j;
+                continue;
+            };
+        };
+        // "Bearer" + whitespace + >= 12 token chars (case-insensitive in TS)
+        if i + 6 <= value_len && bytes_eq_at(value_ptr, i, STR_PTR("Bearer"), STR_LEN("Bearer")) {
+            let j: u64 = i + 6;
+            while j < value_len && is_space(PTR_BYTE_AT(value_ptr, j)) { j = j + 1; };
+            let k: u64 = j;
+            while k < value_len && is_token_char(PTR_BYTE_AT(value_ptr, k)) { k = k + 1; };
+            if k - j >= 12 {
+                buf_append_lit(out, STR_PTR("Bearer ***"), STR_LEN("Bearer ***"));
+                i = k;
+                continue;
+            };
+        };
+        // "api_key"/"api-key"/"apikey" + separators + >= 8 token chars (case-insensitive in TS)
+        // DEFECT: case-insensitive matching approximated by lowercase-only scan.
+        if i + 7 <= value_len && bytes_eq_at(value_ptr, i, STR_PTR("api_key"), STR_LEN("api_key")) {
+            let j: u64 = i + 7;
+            while j < value_len && is_api_key_sep(PTR_BYTE_AT(value_ptr, j)) { j = j + 1; };
+            let k: u64 = j;
+            while k < value_len && is_token_char(PTR_BYTE_AT(value_ptr, k)) { k = k + 1; };
+            if k - j >= 8 {
+                buf_append_lit(out, STR_PTR("api_key=***"), STR_LEN("api_key=***"));
+                i = k;
+                continue;
+            };
+        };
+        buf_append_byte(out, PTR_BYTE_AT(value_ptr, i));
+        i = i + 1;
+    }
+    return out.len;
+}
+
+fn is_token_char(c: u8) -> bool {
+    if c >= 65 && c <= 90 { return true; };
+    if c >= 97 && c <= 122 { return true; };
+    if c >= 48 && c <= 57 { return true; };
+    return c == 95 || c == 45 || c == 46 || c == 126 || c == 43 || c == 47 || c == 61;
+}
+
+fn is_space(c: u8) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+fn is_api_key_sep(c: u8) -> bool {
+    return c == 34 || c == 39 || c == 61 || c == 58 || is_space(c);
+}
+
+fn bytes_eq_at(p: ptr, off: u64, lit_ptr: ptr, lit_len: u64) -> bool {
+    let i: u64 = 0;
+    while i < lit_len {
+        if PTR_BYTE_AT(p, off + i) != PTR_BYTE_AT(lit_ptr, i) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// DEFECT: dynamic object — TS Record<string, string | number | undefined> result
+// flattened into fixed fields with has_* flags.
+struct CompactionErrnoDetails {
+    has_code: bool,
+    code_is_number: bool,
+    code: [u8; 128],
+    code_len: u64,
+    code_num: i64,
+    has_errno: bool,
+    errno_is_number: bool,
+    errno: [u8; 128],
+    errno_len: u64,
+    errno_num: i64,
+    has_syscall: bool,
+    syscall: [u8; 128],
+    syscall_len: u64,
+    has_path: bool,
+    path: [u8; 1024],
+    path_len: u64,
+}
+
+// fn compactionErrnoDetails(error: unknown): Record<...>
+// DEFECT: `error: unknown` + dynamic property pick; approximated by reading the
+// error's JSON-ish field buffer (error_json) with sa_json probes.
+fn compactionErrnoDetails(error_json_ptr: ptr, error_json_len: u64, out: &CompactionErrnoDetails) -> void {
+    out.has_code = false;
+    out.has_errno = false;
+    out.has_syscall = false;
+    out.has_path = false;
+    if error_json_len == 0 { return; };
+    let doc = sa_json_parse(error_json_ptr, error_json_len);
+    if doc == 0 { return; };
+    // pick(key): typeof value === "string" || typeof value === "number" ? value : undefined
+    out.has_code = sa_json_get_string_or_number(doc, STR_PTR("code"), STR_LEN("code"), &out.code, 128, &out.code_num, &out.code_is_number);
+    out.has_errno = sa_json_get_string_or_number(doc, STR_PTR("errno"), STR_LEN("errno"), &out.errno, 128, &out.errno_num, &out.errno_is_number);
+    out.has_syscall = sa_json_get_string(doc, STR_PTR("syscall"), STR_LEN("syscall"), &out.syscall, 128) > 0 || sa_json_has(doc, STR_PTR("syscall"), STR_LEN("syscall"));
+    out.syscall_len = sa_json_get_string(doc, STR_PTR("syscall"), STR_LEN("syscall"), &out.syscall, 128);
+    out.has_path = sa_json_has(doc, STR_PTR("path"), STR_LEN("path"));
+    out.path_len = sa_json_get_string(doc, STR_PTR("path"), STR_LEN("path"), &out.path, 1024);
+    sa_json_free(doc);
+}
+
+// fn logCompactionEvent(level: "log" | "warn" | "error", event: string, details: Record<string, unknown>): void
+// DEFECT: console[level] dynamic dispatch + JSON.stringify; approximated by level
+// branches and a pre-built details JSON buffer. try/catch in TS (logging must never
+// break compaction) approximated by ignoring all output errors.
+const LOG_LEVEL_LOG: u64 = 0;
+const LOG_LEVEL_WARN: u64 = 1;
+const LOG_LEVEL_ERROR: u64 = 2;
+
+fn logCompactionEvent(level: u64, event_ptr: ptr, event_len: u64, details_json_ptr: ptr, details_json_len: u64) -> void {
+    let redacted = ByteBuf { bytes: [0u8; 8192], len: 0 };
+    redactCompactionText(details_json_ptr, details_json_len, &redacted);
+    // console[level](`[claude-compaction] ${event} ${redacted.slice(0, 4000)}`)
+    let line = ByteBuf { bytes: [0u8; 8192], len: 0 };
+    buf_append_lit(&line, STR_PTR("[claude-compaction] "), STR_LEN("[claude-compaction] "));
+    buf_append_bytes(&line, event_ptr, event_len);
+    buf_append_lit(&line, STR_PTR(" "), STR_LEN(" "));
+    let n: u64 = redacted.len;
+    if n > 4000 { n = 4000; };
+    buf_append_bytes(&line, &redacted.bytes, n);
+    if level == LOG_LEVEL_ERROR {
+        sa_print_stderr(&line.bytes, line.len);
+    } else {
+        println_buf(&line);
+    };
+    return;
+}
+
+// export function createClaudeCompactionRunner(spawnCommand = spawnClaudeCommand,
+//   terminateChild = (child) => child.kill("SIGTERM")): ClaudeCompactionRunner
+// DEFECT: default parameters and closure capture — SLA has no closures/defaults;
+// kinds select the defaults (0) and the run function executes the captured config.
+fn createClaudeCompactionRunner(spawnCommand_kind: u64, terminateChild_kind: u64, out: &ClaudeCompactionRunner) -> void {
+    out.spawnCommand_kind = spawnCommand_kind;
+    out.terminateChild_kind = terminateChild_kind;
+}
+
+// The returned runner: async (input) => Promise<string>
+// DEFECT: async — converted to a synchronous blocking function returning a status
+// code (0 = ok, summary in out; 1 = missing gateway token; 2 = claude bin missing;
+// 3 = spawn failed; 4 = child error; 5 = exited before result; 6 = timeout;
+// 7 = empty summary) with error text in err buffer.
+// DEFECT: Promise + setTimeout + EventEmitter (child.stdout.on("data"), child.once)
+// approximated by a blocking read loop over the child's stdout with line buffering;
+// the 5-minute timeout is approximated by a poll counter.
+// DEFECT: encodeURIComponent approximated by uri_encode_into helper (placeholder).
+fn claudeCompactionRunner_run(runner: &ClaudeCompactionRunner, input: &ClaudeCompactionInput, out_summary: &ByteBuf, err: &ByteBuf) -> i32 {
+    // const gatewayToken = input.runtimeEnv.CODEX_UI_RELAY_GATEWAY_TOKEN?.trim();
+    let token = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    env_get_trimmed(&input.runtimeEnv, input.runtimeEnv_len, STR_PTR("CODEX_UI_RELAY_GATEWAY_TOKEN"), STR_LEN("CODEX_UI_RELAY_GATEWAY_TOKEN"), &token);
+    // if (!gatewayToken) throw new Error("Claude compaction requires a relay gateway credential");
+    if token.len == 0 {
+        buf_append_lit(err, STR_PTR("Claude compaction requires a relay gateway credential"), STR_LEN("Claude compaction requires a relay gateway credential"));
+        return 1;
+    };
+    // const gatewayPort = input.runtimeEnv.CODEX_UI_PORT?.trim() || "43110";
+    let port = ByteBuf { bytes: [0u8; 64], len: 0 };
+    env_get_trimmed(&input.runtimeEnv, input.runtimeEnv_len, STR_PTR("CODEX_UI_PORT"), STR_LEN("CODEX_UI_PORT"), &port);
+    if port.len == 0 { buf_append_lit(&port, STR_PTR("43110"), STR_LEN("43110")); };
+    // const relayCustomHeaders = input.threadId?.trim() ? `thread-id: ${...}` : undefined;
+    let has_relayCustomHeaders: bool = input.threadId_len > 0;
+    // const env = buildSafeClaudeEnv(input.runtimeEnv, { ANTHROPIC_BASE_URL: ..., ANTHROPIC_API_KEY: gatewayToken, CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "1", ...(relayCustomHeaders ? { ANTHROPIC_CUSTOM_HEADERS: relayCustomHeaders } : {}) });
+    let base_url = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    buf_append_lit(&base_url, STR_PTR("http://127.0.0.1:"), STR_LEN("http://127.0.0.1:"));
+    buf_append_bytes(&base_url, &port.bytes, port.len);
+    buf_append_lit(&base_url, STR_PTR("/api/relay-gateway/"), STR_LEN("/api/relay-gateway/"));
+    uri_encode_into(&base_url, &input.route.providerId, input.route.providerId_len);
+    buf_append_lit(&base_url, STR_PTR("/"), STR_LEN("/"));
+    uri_encode_into(&base_url, &input.route.groupId, input.route.groupId_len);
+    let env = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    buildSafeClaudeEnv(&input.runtimeEnv, input.runtimeEnv_len, &env);
+    env_set(&env, STR_PTR("ANTHROPIC_BASE_URL"), STR_LEN("ANTHROPIC_BASE_URL"), &base_url.bytes, base_url.len);
+    env_set(&env, STR_PTR("ANTHROPIC_API_KEY"), STR_LEN("ANTHROPIC_API_KEY"), &token.bytes, token.len);
+    env_set(&env, STR_PTR("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"), STR_LEN("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"), STR_PTR("1"), STR_LEN("1"));
+    if has_relayCustomHeaders {
+        let hdr = ByteBuf { bytes: [0u8; 512], len: 0 };
+        buf_append_lit(&hdr, STR_PTR("thread-id: "), STR_LEN("thread-id: "));
+        buf_append_bytes(&hdr, &input.threadId, input.threadId_len);
+        env_set(&env, STR_PTR("ANTHROPIC_CUSTOM_HEADERS"), STR_LEN("ANTHROPIC_CUSTOM_HEADERS"), &hdr.bytes, hdr.len);
+    };
+    // const args = [...buildClaudeSpawnArgs(input.route.model, "bypassPermissions"), "--bare", "--no-session-persistence", "--tools", ""];
+    let args = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    buildClaudeSpawnArgs(&input.route.model, input.route.model_len, STR_PTR("bypassPermissions"), STR_LEN("bypassPermissions"), &args);
+    strlist_push(&args, STR_PTR("--bare"), STR_LEN("--bare"));
+    strlist_push(&args, STR_PTR("--no-session-persistence"), STR_LEN("--no-session-persistence"));
+    strlist_push(&args, STR_PTR("--tools"), STR_LEN("--tools"));
+    strlist_push(&args, STR_PTR(""), 0);
+    // const bin = findClaudeBin(input.runtimeEnv);
+    let bin = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    let has_bin: bool = findClaudeBin(&input.runtimeEnv, input.runtimeEnv_len, &bin);
+    // if (!bin) throw new Error("Claude CLI is not installed. Set CODEX_UI_CLAUDE_BIN ...");
+    if has_bin == false {
+        buf_append_lit(err, STR_PTR("Claude CLI is not installed. Set CODEX_UI_CLAUDE_BIN to a runnable claude executable."), STR_LEN("Claude CLI is not installed. Set CODEX_UI_CLAUDE_BIN to a runnable claude executable."));
+        return 2;
+    };
+    // logCompactionEvent("log", "start-attempt", { threadId, bin, cwd, providerId, groupId, model, transcriptChars })
+    // DEFECT: details object literal -> hand-built JSON text.
+    let details = ByteBuf { bytes: [0u8; 8192], len: 0 };
+    buf_append_lit(&details, STR_PTR("{\"threadId\":\""), STR_LEN("{\"threadId\":\""));
+    buf_append_bytes(&details, &input.threadId, input.threadId_len);
+    buf_append_lit(&details, STR_PTR("\",\"bin\":\""), STR_LEN("\",\"bin\":\""));
+    buf_append_bytes(&details, &bin.bytes, bin.len);
+    buf_append_lit(&details, STR_PTR("\",\"cwd\":\""), STR_LEN("\",\"cwd\":\""));
+    buf_append_bytes(&details, &input.cwd, input.cwd_len);
+    buf_append_lit(&details, STR_PTR("\",\"transcriptChars\":"), STR_LEN("\",\"transcriptChars\":"));
+    buf_append_u64(&details, input.transcript_len);
+    buf_append_lit(&details, STR_PTR("}"), STR_LEN("}"));
+    logCompactionEvent(LOG_LEVEL_LOG, STR_PTR("start-attempt"), STR_LEN("start-attempt"), &details.bytes, details.len);
+    // let child; try { child = spawnCommand(bin, args, { cwd, env }); } catch (error) { log...; throw error; }
+    let child = ClaudeChildProcess { handle: 0, pid: -1, has_pid: false };
+    let spawn_rc = spawnClaudeCommand(&bin.bytes, bin.len, &args, &input.cwd, input.cwd_len, &env.bytes, env.len, &child);
+    if spawn_rc != 0 {
+        // logCompactionEvent("error", "start-spawn-sync-failed", { threadId, bin, cwd, ...compactionErrnoDetails(error), message })
+        buf_append_lit(err, STR_PTR("spawn failed"), STR_LEN("spawn failed"));
+        return 3;
+    };
+    // logCompactionEvent("log", "start-ok", { threadId, bin, cwd, pid: child.pid ?? null })
+    logCompactionEvent(LOG_LEVEL_LOG, STR_PTR("start-ok"), STR_LEN("start-ok"), &details.bytes, details.len);
+    // return await new Promise<string>((resolve, reject) => { ... })
+    // DEFECT: event-driven Promise body -> blocking loop state below.
+    let settled: bool = false;
+    let failed: bool = false;
+    let stdoutBuffer = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    let assistantParts = StrList { items: [0u8; 1048576], items_len: 0, lens: [0u64; 256], count: 0 };
+    let result_summary = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    let has_result_summary: bool = false;
+    // const prompt = [...].join("\n"); child.stdin.write(JSON.stringify({type:"user", message:{role:"user", content: prompt}, parent_tool_use_id: null}) + "\n");
+    let prompt = ByteBuf { bytes: [0u8; 1048576], len: 0 };
+    buf_append_lit(&prompt, STR_PTR("Create a compact continuation summary of the conversation below.\n"), STR_LEN("Create a compact continuation summary of the conversation below.\n"));
+    buf_append_lit(&prompt, STR_PTR("Preserve user requirements, architectural decisions, completed work, unresolved tasks, exact paths/commands/identifiers, and important failures.\n"), STR_LEN("Preserve user requirements, architectural decisions, completed work, unresolved tasks, exact paths/commands/identifiers, and important failures.\n"));
+    buf_append_lit(&prompt, STR_PTR("Do not answer the conversation. Output only the continuation summary for another coding agent.\n\n"), STR_LEN("Do not answer the conversation. Output only the continuation summary for another coding agent.\n\n"));
+    buf_append_lit(&prompt, STR_PTR("<conversation thread_id=\""), STR_LEN("<conversation thread_id=\""));
+    buf_append_bytes(&prompt, &input.threadId, input.threadId_len);
+    buf_append_lit(&prompt, STR_PTR("\">\n"), STR_LEN("\">\n"));
+    buf_append_bytes(&prompt, &input.transcript, input.transcript_len);
+    buf_append_lit(&prompt, STR_PTR("\n</conversation>"), STR_LEN("\n</conversation>"));
+    let stdin_line = ByteBuf { bytes: [0u8; 1048576], len: 0 };
+    buf_append_lit(&stdin_line, STR_PTR("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\""), STR_LEN("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\""));
+    json_escape_into(&stdin_line, &prompt.bytes, prompt.len);
+    buf_append_lit(&stdin_line, STR_PTR("\"},\"parent_tool_use_id\":null}\n"), STR_LEN("\"},\"parent_tool_use_id\":null}\n"));
+    sa_std_process_write_stdin(child.handle, &stdin_line.bytes, stdin_line.len);
+    // Blocking consume loop standing in for stdout "data" / stderr "data" / "error" / "exit" handlers + setTimeout.
+    let elapsed_ms: u64 = 0;
+    let exit_code: i64 = -1;
+    let exit_signal: i64 = -1;
+    let child_error: bool = false;
+    while settled == false {
+        // setTimeout(COMPACTION_TIMEOUT_MS) approximation
+        if elapsed_ms >= COMPACTION_TIMEOUT_MS {
+            logCompactionEvent(LOG_LEVEL_ERROR, STR_PTR("timeout"), STR_LEN("timeout"), &details.bytes, details.len);
+            buf_append_lit(err, STR_PTR("Claude compaction timed out after 5 minutes"), STR_LEN("Claude compaction timed out after 5 minutes"));
+            terminateChild_default(&child);
+            return 6;
+        };
+        let chunk = ByteBuf { bytes: [0u8; 65536], len: 0 };
+        let n = sa_std_process_read_stdout(child.handle, &chunk.bytes, 65536);
+        if n > 0 {
+            chunk.len = n;
+            // stdoutBuffer += chunk.toString("utf8"); split lines; consumeLine each full line.
+            buf_append_bytes(&stdoutBuffer, &chunk.bytes, chunk.len);
+            let line_start: u64 = 0;
+            let i: u64 = 0;
+            while i < stdoutBuffer.len {
+                if stdoutBuffer.bytes[i] == 10 {
+                    let line_len: u64 = i - line_start;
+                    if line_len > 0 && stdoutBuffer.bytes[i - 1] == 13 { line_len = line_len - 1; };
+                    let st = consumeLine(&stdoutBuffer.bytes, line_start + stdoutBuffer.bytes, line_len, &assistantParts, &result_summary, &has_result_summary, err);
+                    // DEFECT: pointer arithmetic on buffer field approximated.
+                    if st == 1 { settled = true; failed = true; };
+                    if st == 2 { settled = true; };
+                    line_start = i + 1;
+                };
+                i = i + 1;
+            }
+            // stdoutBuffer = lines.pop() ?? "" (keep the partial tail)
+            buf_drop_prefix(&stdoutBuffer, line_start);
+        };
+        // stderr drain: redact + slice(0, 2000) + logCompactionEvent("warn", "child-stderr", ...)
+        let echunk = ByteBuf { bytes: [0u8; 65536], len: 0 };
+        let en = sa_std_process_read_stderr(child.handle, &echunk.bytes, 65536);
+        if en > 0 {
+            echunk.len = en;
+            let red = ByteBuf { bytes: [0u8; 8192], len: 0 };
+            redactCompactionText(&echunk.bytes, echunk.len, &red);
+            if red.len > 2000 { red.len = 2000; };
+            if red.len > 0 {
+                logCompactionEvent(LOG_LEVEL_WARN, STR_PTR("child-stderr"), STR_LEN("child-stderr"), &red.bytes, red.len);
+            };
+        };
+        let poll = sa_std_process_poll(child.handle, &exit_code, &exit_signal);
+        if poll == 2 { child_error = true; break; };
+        if poll == 1 { break; }; // exited
+        elapsed_ms = elapsed_ms + 50;
+        sa_sleep_ms(50);
+    }
+    if child_error {
+        // child.once("error", ...) -> logCompactionEvent("error", "child-error", {...errnoDetails, message}); finish(error)
+        logCompactionEvent(LOG_LEVEL_ERROR, STR_PTR("child-error"), STR_LEN("child-error"), &details.bytes, details.len);
+        terminateChild_default(&child);
+        if err.len == 0 { buf_append_lit(err, STR_PTR("child process error"), STR_LEN("child process error")); };
+        return 4;
+    };
+    // child.once("exit", ...): if (stdoutBuffer) consumeLine(stdoutBuffer);
+    if settled == false && stdoutBuffer.len > 0 {
+        let st = consumeLine(&stdoutBuffer.bytes, stdoutBuffer.bytes, stdoutBuffer.len, &assistantParts, &result_summary, &has_result_summary, err);
+        if st == 1 { failed = true; settled = true; };
+        if st == 2 { settled = true; };
+    };
+    if settled == false {
+        // logCompactionEvent("error", "child-exit-before-result", {...}); finish(new Error(`Claude compaction exited before a result (code ${code ?? "null"}, signal ${signal ?? "null"})`))
+        logCompactionEvent(LOG_LEVEL_ERROR, STR_PTR("child-exit-before-result"), STR_LEN("child-exit-before-result"), &details.bytes, details.len);
+        buf_append_lit(err, STR_PTR("Claude compaction exited before a result (code "), STR_LEN("Claude compaction exited before a result (code "));
+        buf_append_i64(err, exit_code);
+        buf_append_lit(err, STR_PTR(", signal "), STR_LEN(", signal "));
+        buf_append_i64(err, exit_signal);
+        buf_append_lit(err, STR_PTR(")"), STR_LEN(")"));
+        terminateChild_default(&child);
+        return 5;
+    };
+    // logCompactionEvent("log", "child-exit", {...}) on the settled path
+    logCompactionEvent(LOG_LEVEL_LOG, STR_PTR("child-exit"), STR_LEN("child-exit"), &details.bytes, details.len);
+    // finish(): clearTimeout + terminateChild(child) (errors swallowed) + resolve/reject
+    terminateChild_default(&child);
+    if failed { return 4; };
+    // resolve(summary?.trim() || assistantParts.join("\n").trim())
+    if has_result_summary {
+        buf_append_bytes(out_summary, &result_summary.bytes, result_summary.len);
+    } else {
+        strlist_join(&assistantParts, STR_PTR("\n"), STR_LEN("\n"), out_summary);
+    };
+    buf_trim_in_place(out_summary);
+    // }).then((summary) => { if (!summary) { log "empty-summary"; throw ... } log "done"; return summary; })
+    if out_summary.len == 0 {
+        logCompactionEvent(LOG_LEVEL_ERROR, STR_PTR("empty-summary"), STR_LEN("empty-summary"), &details.bytes, details.len);
+        buf_append_lit(err, STR_PTR("Claude compaction returned an empty summary"), STR_LEN("Claude compaction returned an empty summary"));
+        return 7;
+    };
+    logCompactionEvent(LOG_LEVEL_LOG, STR_PTR("done"), STR_LEN("done"), &details.bytes, details.len);
+    return 0;
+}
+
+// consumeLine(line) closure from the Promise body, lifted to a function.
+// Returns 0 = keep consuming, 1 = finish(error), 2 = finish(summary).
+// DEFECT: closure over settled/assistantParts/finish — state passed explicitly.
+fn consumeLine(line_ptr: ptr, unused_base: ptr, line_len: u64, assistantParts: &StrList, result_summary: &ByteBuf, has_result_summary: &bool, err: &ByteBuf) -> i32 {
+    // if (!line.trim()) return;
+    let t = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    buf_append_bytes(&t, line_ptr, line_len);
+    buf_trim_in_place(&t);
+    if t.len == 0 { return 0; };
+    // let message; try { message = JSON.parse(line); } catch { return; }
+    let doc = sa_json_parse(&t.bytes, t.len);
+    if doc == 0 { return 0; };
+    let type_len: u64 = 0;
+    let type_buf: [u8; 64] = [0u8; 64];
+    type_len = sa_json_get_string(doc, STR_PTR("type"), STR_LEN("type"), &type_buf, 64);
+    // if (message.type === "assistant") { const content = message.message?.content; if (Array.isArray(content)) for (block of content) if (block.type === "text" && typeof block.text === "string") assistantParts.push(block.text); }
+    if bytes_eq(&type_buf, type_len, STR_PTR("assistant"), STR_LEN("assistant")) {
+        let count: u64 = sa_json_message_content_count(doc);
+        let i: u64 = 0;
+        while i < count {
+            let btype: [u8; 64] = [0u8; 64];
+            let btype_len: u64 = sa_json_content_block_type(doc, i, &btype, 64);
+            if bytes_eq(&btype, btype_len, STR_PTR("text"), STR_LEN("text")) {
+                let text = ByteBuf { bytes: [0u8; 262144], len: 0 };
+                let tl: u64 = sa_json_content_block_text(doc, i, &text.bytes, 262144);
+                text.len = tl;
+                if tl > 0 || sa_json_content_block_has_text(doc, i) {
+                    strlist_push_buf(assistantParts, &text.bytes, text.len);
+                };
+            };
+            i = i + 1;
+        };
+    };
+    // if (message.type === "result") { const isError = message.is_error === true || (typeof message.subtype === "string" && message.subtype !== "success"); ... }
+    if bytes_eq(&type_buf, type_len, STR_PTR("result"), STR_LEN("result")) {
+        let is_error: bool = sa_json_get_bool(doc, STR_PTR("is_error"), STR_LEN("is_error"));
+        let subtype: [u8; 64] = [0u8; 64];
+        let subtype_len: u64 = sa_json_get_string(doc, STR_PTR("subtype"), STR_LEN("subtype"), &subtype, 64);
+        if subtype_len > 0 && bytes_eq(&subtype, subtype_len, STR_PTR("success"), STR_LEN("success")) == false { is_error = true; };
+        if is_error {
+            // finish(new Error(typeof message.result === "string" ? message.result : "Claude compaction failed"))
+            let rl: u64 = sa_json_get_string(doc, STR_PTR("result"), STR_LEN("result"), &err.bytes, 262144);
+            if rl == 0 {
+                buf_append_lit(err, STR_PTR("Claude compaction failed"), STR_LEN("Claude compaction failed"));
+            } else {
+                err.len = rl;
+            };
+            sa_json_free(doc);
+            return 1;
+        };
+        // finish(undefined, typeof message.result === "string" ? message.result : undefined)
+        let rl2: u64 = sa_json_get_string(doc, STR_PTR("result"), STR_LEN("result"), &result_summary.bytes, 262144);
+        if sa_json_has(doc, STR_PTR("result"), STR_LEN("result")) {
+            result_summary.len = rl2;
+            has_result_summary = true;
+        };
+        sa_json_free(doc);
+        return 2;
+    };
+    sa_json_free(doc);
+    return 0;
+}
+
+// Default terminateChild: (child) => child.kill("SIGTERM")
+// DEFECT: signal-by-name; approximated with sa_std_process_kill(handle, 15).
+fn terminateChild_default(child: &ClaudeChildProcess) -> void {
+    let ignored = sa_std_process_kill(child.handle, 15);
+    return;
+}

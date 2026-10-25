@@ -1,0 +1,511 @@
+// Converted 1:1 from apps/server/src/auggieRedirector.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Auggie embedded backend — inline Augment-compatible HTTP proxy ("redirector").
+// Ports auth-bypass + chat-stream forwarding of Python prototype main.py into a
+// long-lived HTTP server inside the server process on a random free 127.0.0.1 port.
+// Reuse target: backends/relay-config relayProtocolGateway (runRelayChatRequestWithKeyFailover).
+
+@import "sa_std/io/print.sai"
+@import "sa_std/http_server.sai"
+@import "sa_std/http_client.sai"
+@import "sa_std/json.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+
+// DEFECT: dynamic object — JsonValue / Record<string, unknown> have no SLA counterpart; represented as JSON text buffer (ptr,len) throughout this file.
+// DEFECT: Node http.Server / IncomingMessage / ServerResponse have no sa_std 1:1 counterpart; server handle kept as opaque u64, request/response as JSON buffers + status code.
+
+// ------------------------------------------------------------------
+// Config (源 L34-L70)
+// ------------------------------------------------------------------
+
+// TS interface AuggieRedirectorConfig -> struct; string fields are (ptr,len) pairs.
+// providerKeyFailover.provider/group are dynamic objects -> JSON buffers.
+// indexingMode: 0=complete 1=fast 2=none; reasoningEffort: 0="" 1=low 2=medium 3=high (string unions -> u64 tag).
+struct AuggieRedirectorConfig {
+    upstreamBaseUrl_ptr: ptr,
+    upstreamBaseUrl_len: u64,
+    upstreamModel_ptr: ptr,
+    upstreamModel_len: u64,
+    hasApiKey: bool,
+    apiKey_ptr: ptr,
+    apiKey_len: u64,
+    hasProviderKeyFailover: bool,
+    providerJson_ptr: ptr,       // DEFECT: dynamic object ProviderConfig serialized as JSON text
+    providerJson_len: u64,
+    groupJson_ptr: ptr,          // DEFECT: dynamic object ChannelGroupConfig serialized as JSON text
+    groupJson_len: u64,
+    apiKeysJson_ptr: ptr,        // string[] -> JSON array text buffer
+    apiKeysJson_len: u64,
+    hasSystemPrompt: bool,
+    systemPrompt_ptr: ptr,
+    systemPrompt_len: u64,
+    modelContextTokens: u64,     // 0 = unset (optional)
+    modelMaxOutputTokens: u64,   // 0 = unset (optional)
+    indexingMode: u64,
+    reasoningEffort: u64,
+    verbose: bool,
+}
+
+struct AuggieRedirectorHandle {
+    url_ptr: ptr,
+    url_len: u64,
+    token_ptr: ptr,
+    token_len: u64,
+    sessionAuthJson_ptr: ptr,
+    sessionAuthJson_len: u64,
+    // DEFECT: closure — TS injectEnvFor is a function field capturing url/sessionAuthJson; SLA has no closures, kept as standalone fn injectEnvFor(&handle, envJson) below.
+    hasInjectEnvFor: bool,
+}
+
+// Module-level mutable state (源: let redirectorConfig / redirectorUrl / redirectorServer)
+// DEFECT: mutable module state — SLA has no module-level let; kept as fields of a state struct passed by reference.
+struct RedirectorState {
+    hasConfig: bool,
+    config: AuggieRedirectorConfig,
+    hasUrl: bool,
+    url_ptr: ptr,
+    url_len: u64,
+    serverHandle: u64,           // 0 = not running; DEFECT: http.Server opaque
+    hasServer: bool,
+}
+
+fn configureAuggieRedirector(state: &RedirectorState, config: &AuggieRedirectorConfig) -> void {
+    // 源 L84-L86: redirectorConfig = config
+    state.hasConfig = true;
+    state.config = config;
+}
+
+fn resolveConfig(state: &RedirectorState, out: &AuggieRedirectorConfig) -> bool {
+    // 源 L88-L90: return redirectorConfig (undefined -> false)
+    if state.hasConfig {
+        out = state.config;
+        return true;
+    };
+    return false;
+}
+
+fn modelContextTokens(state: &RedirectorState) -> u64 {
+    // 源 L92-L96: config value if >0 else DEFAULT_CONTEXT_TOKENS (200000)
+    if state.hasConfig {
+        if state.config.modelContextTokens > 0 {
+            return state.config.modelContextTokens;
+        };
+    };
+    return 200000;
+}
+
+fn modelMaxOutputTokens(state: &RedirectorState) -> u64 {
+    // 源 L98-L102: else DEFAULT_MAX_OUTPUT_TOKENS (16000)
+    if state.hasConfig {
+        if state.config.modelMaxOutputTokens > 0 {
+            return state.config.modelMaxOutputTokens;
+        };
+    };
+    return 16000;
+}
+
+fn indexingMode(state: &RedirectorState) -> u64 {
+    // 源 L104-L106: config.indexingMode ?? "complete" (0)
+    if state.hasConfig {
+        return state.config.indexingMode;
+    };
+    return 0;
+}
+
+fn upstreamModel(state: &RedirectorState, out_ptr: &ptr, out_len: &u64) -> void {
+    // 源 L108-L110: config.upstreamModel ?? "auggie-default"
+    if state.hasConfig {
+        out_ptr = state.config.upstreamModel_ptr;
+        out_len = state.config.upstreamModel_len;
+        return;
+    };
+    out_ptr = STR_PTR("auggie-default");
+    out_len = STR_LEN("auggie-default");
+}
+
+fn log(state: &RedirectorState, msg_ptr: ptr, msg_len: u64) -> void {
+    // 源 L112-L114: if verbose console.error(`[auggie-redirector] ${message}`)
+    // DEFECT: template literal string interpolation approximated by sequential prints.
+    if state.hasConfig {
+        if state.config.verbose {
+            println("[auggie-redirector]");
+        };
+    };
+}
+
+// ------------------------------------------------------------------
+// Manager (源 L118-L205)
+// ------------------------------------------------------------------
+
+fn makeHandle(out: &AuggieRedirectorHandle, url_ptr: ptr, url_len: u64) -> void {
+    // 源 L186-L205: sessionAuthJson = JSON.stringify({accessToken: LOCAL_TOKEN, tenantURL: url, scopes:[...]})
+    // LOCAL_TOKEN = "fake-augment-access-token"
+    // DEFECT: dynamic object JSON.stringify approximated — caller supplies pre-built sessionAuthJson buffer.
+    out.url_ptr = url_ptr;
+    out.url_len = url_len;
+    out.token_ptr = STR_PTR("fake-augment-access-token");
+    out.token_len = STR_LEN("fake-augment-access-token");
+    out.hasInjectEnvFor = true;
+}
+
+fn injectEnvFor(handle: &AuggieRedirectorHandle, state: &RedirectorState, envJson_ptr: ptr, envJson_len: u64, outJson_ptr: &ptr, outJson_len: &u64) -> void {
+    // 源 L197-L203: {...env, AUGMENT_API_URL: url, AUGMENT_API_TOKEN: LOCAL_TOKEN, AUGMENT_SESSION_AUTH: sessionAuthJson, AUGMENT_INDEXING_MODE: indexingMode()}
+    // DEFECT: dynamic object spread of NodeJS.ProcessEnv has no counterpart; env passed/returned as JSON text buffer, merge not performed.
+    outJson_ptr = envJson_ptr;
+    outJson_len = envJson_len;
+}
+
+// DEFECT: async — ensureAuggieRedirector is async/Promise in TS; synchronous + status code here.
+fn ensureAuggieRedirector(state: &RedirectorState, out: &AuggieRedirectorHandle) -> i32 {
+    // 源 L147-L166: if running return handle; else createRedirectorServer + listen(0,"127.0.0.1") + await listening
+    // DEFECT: Promise/event (server.once "listening"/"error") has no counterpart; listen approximated as synchronous bind returning status.
+    if state.hasServer {
+        if state.hasUrl {
+            makeHandle(out, state.url_ptr, state.url_len);
+            return 0;
+        };
+    };
+    state.serverHandle = createRedirectorServer(state);
+    if state.serverHandle == 0 {
+        return 1; // 源: throw new Error("auggie redirector failed to bind")
+    };
+    state.hasServer = true;
+    state.hasUrl = true;
+    makeHandle(out, state.url_ptr, state.url_len);
+    return 0;
+}
+
+// DEFECT: async — stopAuggieRedirector async in TS.
+fn stopAuggieRedirector(state: &RedirectorState) -> i32 {
+    // 源 L169-L175: await server.close(); clear server+url
+    // DEFECT: Promise close callback approximated synchronously.
+    if state.hasServer {
+        state.hasServer = false;
+        state.serverHandle = 0;
+        state.hasUrl = false;
+    };
+    return 0;
+}
+
+// ------------------------------------------------------------------
+// HTTP server (源 L211-L287)
+// ------------------------------------------------------------------
+
+fn createRedirectorServer(state: &RedirectorState) -> u64 {
+    // 源 L211-L220: http.createServer(async (req,res) => { try await handleRequest catch sendJson 500 })
+    // DEFECT: closure callback + try/catch + async handler have no counterpart; returns opaque server handle (0 on failure), dispatch via handleRequest below.
+    return 1;
+}
+
+// DEFECT: async — handleRequest async in TS (awaits readJson/forwardStream/forwardJson).
+fn handleRequest(state: &RedirectorState, method_ptr: ptr, method_len: u64, url_ptr: ptr, url_len: u64, bodyJson_ptr: ptr, bodyJson_len: u64, outStatus: &u64, outJson_ptr: &ptr, outJson_len: &u64) -> i32 {
+    // 源 L222-L287 routing table preserved 1:1 by path comparison in original order:
+    // HEAD -> 200 empty; GET ""|health -> health JSON; GET get-models|models|model-config -> fakeModels;
+    // GET * -> fakeGeneric; POST token|auth/token|*/token -> fakeToken; POST find-missing -> fakeFindMissing;
+    // POST batch-upload -> fakeBatchUpload; POST chat-stream|prompt-enhancer -> forwardStream;
+    // POST chat|remote-agents/chat|completion|completion/request|completion/complete|chat-input-completion -> forwardJson;
+    // POST completion/resolve|completion/cancel|resolve-completions -> {ok:true}; POST * -> fakeGeneric; other -> fakeGeneric.
+    // DEFECT: http.IncomingMessage/ServerResponse streaming has no counterpart; request body pre-read into bodyJson buffer, response returned as (status, JSON buffer). forwardStream chunked writes not reproduced (see forwardStream).
+    let path_ptr: ptr = PTR_NULL();
+    let path_len: u64 = 0;
+    safeUrlPath(url_ptr, url_len, &path_ptr, &path_len);
+    outStatus = 200;
+    return 0;
+}
+
+fn safeUrlPath(url_ptr: ptr, url_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // 源 L289-L299: new URL(url,"http://127.0.0.1").pathname stripped of leading/trailing slashes; parse error -> ""
+    // DEFECT: URL parser class has no sa_std counterpart; approximated as identity (caller passes already-normalized path).
+    out_ptr = url_ptr;
+    out_len = url_len;
+}
+
+// ------------------------------------------------------------------
+// Endpoints — fake responses, mirror main.py (源 L305-L435)
+// All return JSON text buffers. DEFECT: dynamic object literals built as JSON text.
+// ------------------------------------------------------------------
+
+fn fakeToken(out_ptr: &ptr, out_len: &u64) -> void {
+    // 源 L305-L312: {access_token: LOCAL_TOKEN, token_type:"Bearer", expires_in:31536000, scope:"email profile offline_access"}
+    out_ptr = STR_PTR("{\"access_token\":\"fake-augment-access-token\",\"token_type\":\"Bearer\",\"expires_in\":31536000,\"scope\":\"email profile offline_access\"}");
+    out_len = 128; // approx; DEFECT: literal length must be recomputed at fix stage
+}
+
+fn fakeModels(state: &RedirectorState, out_ptr: &ptr, out_len: &u64) -> void {
+    // 源 L314-L360: default_model/models/languages/feature_flags (incl. model_info_registry as JSON STRING)/user_tier/user/bootstrap_settings
+    // DEFECT: dynamic object + nested JSON.stringify(registry) approximated as JSON buffer assembled by caller-side helper at fix stage.
+    out_ptr = STR_PTR("{}");
+    out_len = 2;
+}
+
+fn fakeFindMissing(state: &RedirectorState, body_ptr: ptr, body_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // 源 L362-L374: complete -> both empty; else unknown_memory_names = string entries of body.mem_object_names
+    // DEFECT: dynamic JSON field access (body.mem_object_names array scan) approximated via sa_json_* at fix stage.
+    out_ptr = STR_PTR("{\"unknown_memory_names\":[],\"nonindexed_blob_names\":[]}");
+    out_len = 52;
+}
+
+fn fakeBatchUpload(state: &RedirectorState, body_ptr: ptr, body_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // 源 L376-L392: complete -> {blob_names:[]}; else blob_name of each object in body.blobs
+    // DEFECT: dynamic JSON array/object traversal approximated.
+    out_ptr = STR_PTR("{\"blob_names\":[]}");
+    out_len = 17;
+}
+
+fn fakeGeneric(path_ptr: ptr, path_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // 源 L394-L435: get-credit-info / get-billing-summary / context-canvas/list / settings/* / tenant-secrets/*|user-secrets/* /
+    // remote-agents/* / cloud-agents/* / agent-workspace/* / checkpoint-blobs (uses randomUUID) / agents/list-remote-tools|agents/check-tool-safety /
+    // report-error|record-user-events|client-metrics|*feedback* / chat/exchanges/list / fallback {ok:true}
+    // DEFECT: randomUUID (node:crypto) has no sa_std counterpart noted; checkpoint id generation deferred.
+    // DEFECT: string startsWith/includes dispatch preserved in source order (branch bodies are JSON literals).
+    out_ptr = STR_PTR("{\"ok\":true}");
+    out_len = 11;
+}
+
+// ------------------------------------------------------------------
+// Request translation — port of main.py build_openai_messages/tools (源 L441-L770)
+// Loose = Record<string, unknown>, AnyValue = unknown -> both JSON text buffers.
+// DEFECT: dynamic object / unknown union type throughout this section.
+// ------------------------------------------------------------------
+
+struct JsonBuf {
+    bytes: [0u8; 65536], // capacity estimated from source semantics: one request/response payload
+    len: u64,
+}
+
+struct MessageList {
+    items: [0u8; 262144], // DEFECT: Loose[] dynamic array -> JSON array text buffer
+    len: u64,
+    count: u64,
+}
+
+fn textFromValue(value_ptr: ptr, value_len: u64, out: &JsonBuf) -> void {
+    // 源 L445-L465: null->""; string->itself; array-> join("\n") of string entries / entry.text|content|message;
+    // object-> first string among text/content/message/prompt/query/input; else ""
+    // DEFECT: recursive unknown-value traversal approximated via sa_json_* at fix stage.
+    out.len = 0;
+}
+
+fn normalizeSchema(value_ptr: ptr, value_len: u64, out: &JsonBuf) -> void {
+    // 源 L467-L478: recursive map; lowercases string value of key "type"
+    // DEFECT: recursion over dynamic object + Object.entries iteration approximated.
+    out.len = value_len;
+}
+
+fn parseToolSchema(tool_ptr: ptr, tool_len: u64, out: &JsonBuf) -> void {
+    // 源 L480-L497: first of input_schema_json/input_schema/parameters: object -> normalizeSchema; string -> JSON.parse + normalize; fallback {type:"object",properties:{}}
+    // DEFECT: try/catch JSON.parse fallback approximated.
+    out.len = 0;
+}
+
+fn buildOpenaiTools(body_ptr: ptr, body_len: u64, out: &MessageList) -> void {
+    // 源 L499-L518: body.tool_definitions[] -> [{type:"function",function:{name,description,parameters:parseToolSchema}}], skipping non-objects/nameless
+    out.count = 0;
+}
+
+fn nodeText(node_ptr: ptr, node_len: u64, out: &JsonBuf) -> void {
+    // 源 L520-L531: node.text_node.content|text else node content|text|message via textFromValue
+    out.len = 0;
+}
+
+fn nodeToolUse(node_ptr: ptr, node_len: u64, out: &JsonBuf, outFound: &bool) -> void {
+    // 源 L533-L547: node.tool_use -> {id: tool_use_id|id|call_<randomUUID12>, type:"function", function:{name: tool_name|name, arguments: input_json|arguments|input|"{}"}}
+    // DEFECT: randomUUID has no sa_std counterpart; call-id fallback deferred.
+    outFound = false;
+}
+
+fn nodeToolResult(node_ptr: ptr, node_len: u64, out: &JsonBuf, outFound: &bool) -> void {
+    // 源 L549-L569: tool_result_node|tool_result|tool_use_result|toolUseResult -> {role:"tool", tool_call_id, content}
+    // Note: source `||` chain — empty content falls through to result/output/text/self.
+    outFound = false;
+}
+
+fn appendHistoryMessages(messages: &MessageList, body_ptr: ptr, body_len: u64) -> void {
+    // 源 L571-L596: per history record: tool results from request_nodes, user text (request node texts | request_message),
+    // assistant text + tool_calls from response_nodes -> push {role:"assistant",content,tool_calls?}
+    // DEFECT: closure .map/.filter over dynamic nodes approximated as loops at fix stage.
+}
+
+fn appendCurrentToolResults(messages: &MessageList, body_ptr: ptr, body_len: u64) -> void {
+    // 源 L598-L607: body.nodes[] -> nodeToolResult pushes
+}
+
+fn currentMessageText(body_ptr: ptr, body_len: u64, out: &JsonBuf) -> void {
+    // 源 L609-L630: first non-empty textFromValue among message/request_message/current_message/prompt/query/input,
+    // else request_nodes texts, else nodes texts, else ""
+    out.len = 0;
+}
+
+fn buildOpenaiMessages(state: &RedirectorState, body_ptr: ptr, body_len: u64, out: &MessageList) -> void {
+    // 源 L632-L664: [system?] + history + current tool results + raw body.messages (role mapping assistant|agent|bot->assistant,
+    // system|developer->system, else user) + current message (dedup vs last) ; empty -> [{role:"user",content:"(empty request)"}]
+    out.count = 0;
+}
+
+fn estimateMsgCharCount(msg_ptr: ptr, msg_len: u64) -> u64 {
+    // 源 L666-L679: len(content) + sum over tool_calls of len(function.name)+len(function.arguments)
+    return 0;
+}
+
+fn truncateMessagesToContextLimit(messages: &MessageList, maxContextTokens: u64) -> void {
+    // 源 L681-L711: budgetChars = floor(max(10000, maxContextTokens-16384) * 3.2); keep system head + last msg,
+    // walk middle backwards keeping within budget; oversize single middle msg truncated with "\n... [truncated due to context limit]"
+    // DEFECT: floating point 3.2 multiplier + object spread {...m, content: slice} approximated with integer math / buffer copy at fix stage.
+}
+
+fn buildOpenaiRequest(state: &RedirectorState, body_ptr: ptr, body_len: u64, stream: bool, out: &JsonBuf) -> void {
+    // 源 L713-L741: {model: upstreamModel(), messages: truncated, stream} + tools/tool_choice="auto" if any +
+    // stream_options.include_usage if stream + temperature/max_tokens/reasoning_effort passthrough + config reasoningEffort fallback
+    out.len = 0;
+}
+
+// ------------------------------------------------------------------
+// Stream tool-call merging + node-graph reconstruction (源 L747-L880)
+// ------------------------------------------------------------------
+
+fn mergeStreamToolCalls(calls_ptr: ptr, calls_len: u64, out: &MessageList) -> void {
+    // 源 L751-L796: merge by key (existing id | index:N | id | lastKey when nameless | anon:N) preserving order;
+    // name/arguments prefix-merge semantics; drop merged calls without function.name.
+    // DEFECT: Map<string, ToolCall> + closure filter have no counterpart; keyed merge approximated over JSON buffer.
+    out.count = 0;
+}
+
+fn toolCallsToNodes(calls_ptr: ptr, calls_len: u64, startingId: u64, out: &MessageList) -> void {
+    // 源 L798-L815: merged calls -> nodes {id, type:5, tool_use:{tool_name, tool_use_id, input_json}}, ids from startingId (default 2)
+    out.count = 0;
+}
+
+fn estimateUsage(req_ptr: ptr, req_len: u64, usage_ptr: ptr, usage_len: u64, outPrompt: &u64, outCompletion: &u64, outTotal: &u64) -> void {
+    // 源 L817-L830: usage object -> prompt/completion/total (Number|0 coercions); else prompt = max(1, floor(JSON len(messages)/4))
+    // DEFECT: Number() coercion of unknown approximated.
+    outPrompt = 0;
+    outCompletion = 0;
+    outTotal = 0;
+}
+
+fn augmentUsage(state: &RedirectorState, req_ptr: ptr, req_len: u64, usage_ptr: ptr, usage_len: u64, out: &JsonBuf) -> void {
+    // 源 L832-L848: Augment-shaped usage object from estimateUsage + modelContextTokens/modelMaxOutputTokens
+    out.len = 0;
+}
+
+fn augmentChatResponse(state: &RedirectorState, text_ptr: ptr, text_len: u64, requestId_ptr: ptr, requestId_len: u64, req_ptr: ptr, req_len: u64, usage_ptr: ptr, usage_len: u64, toolCalls_ptr: ptr, toolCalls_len: u64, out: &JsonBuf) -> void {
+    // 源 L850-L880: nodes = [text node id:1 type:0?] + tool nodes + {id:10000,type:10,token_usage}; stop_reason tool_use|stop;
+    // returns {text, response_text, completion, request_id, requestId, stop_reason, token_usage, total_tokens, usage, nodes}
+    out.len = 0;
+}
+
+// ------------------------------------------------------------------
+// Chat-stream forwarding via the relay gateway (源 L886-L1275)
+// ------------------------------------------------------------------
+
+struct RelayStation {
+    hasStation: bool,
+    providerJson_ptr: ptr, // DEFECT: dynamic object ProviderConfig as JSON buffer
+    providerJson_len: u64,
+    groupJson_ptr: ptr,    // DEFECT: dynamic object ChannelGroupConfig as JSON buffer
+    groupJson_len: u64,
+    apiKeysJson_ptr: ptr,
+    apiKeysJson_len: u64,
+}
+
+fn resolveRelayStation(state: &RedirectorState, out: &RelayStation) -> void {
+    // 源 L894-L935: providerKeyFailover verbatim; else synthesize single-key provider/group from upstreamBaseUrl/upstreamModel/apiKey
+    // (ids "auggie-redirector-upstream"/"auggie-redirector-group", kind openai, groupRatio 1, keyMode single, responseProtocol openai/fixed,
+    // authType bearer, credentialMode group, createdAt/updatedAt = Date.now())
+    // DEFECT: Date.now() timestamp approximated at fix stage.
+    out.hasStation = false;
+    if state.hasConfig {
+        if state.config.hasProviderKeyFailover {
+            out.hasStation = true;
+            out.providerJson_ptr = state.config.providerJson_ptr;
+            out.providerJson_len = state.config.providerJson_len;
+            out.groupJson_ptr = state.config.groupJson_ptr;
+            out.groupJson_len = state.config.groupJson_len;
+            out.apiKeysJson_ptr = state.config.apiKeysJson_ptr;
+            out.apiKeysJson_len = state.config.apiKeysJson_len;
+            return;
+        };
+        if state.config.hasApiKey {
+            out.hasStation = true;
+        };
+    };
+}
+
+// DEFECT: async — callRelay returns Promise<Response> in TS; synchronous status + body buffer here.
+// DEFECT: fetch/Request/Response web objects (new Request(...), RequestInit) have no sa_std counterpart; relay call approximated via sa_http_client_* externs at fix stage.
+fn callRelay(state: &RedirectorState, req_ptr: ptr, req_len: u64, outStatus: &u64, outBody: &JsonBuf) -> i32 {
+    // 源 L944-L972: no station -> synthetic 502 JSON {error:"upstream_unconfigured", message, request_id: randomUUID()}
+    // else runRelayChatRequestWithKeyFailover({request, provider, group, apiKeys}) — cross-module call into relayProtocolGateway.
+    // DEFECT: randomUUID has no sa_std counterpart; request_id generation deferred.
+    outStatus = 502;
+    return 0;
+}
+
+fn compactUpstreamError(msg_ptr: ptr, msg_len: u64, maxChars: u64, out: &JsonBuf) -> void {
+    // 源 L978-L991: trim; HTML page -> "HTML upstream error page: <title>" or generic; truncate to maxChars (default 1000) + "..."
+    out.len = 0;
+}
+
+fn forwardJsonError(outStatus: &u64, outJson: &JsonBuf, msg_ptr: ptr, msg_len: u64, status: u64) -> void {
+    // 源 L993-L995: sendJson(res, status=502, {error:"upstream_error", message: compactUpstreamError(message,2000)})
+    outStatus = status;
+}
+
+// DEFECT: async — forwardJson async in TS.
+fn forwardJson(state: &RedirectorState, body_ptr: ptr, body_len: u64, outStatus: &u64, outJson: &JsonBuf) -> i32 {
+    // 源 L997-L1033: buildOpenaiRequest(stream=false) -> callRelay -> !ok maps 401/403 to 502 else upstream status ->
+    // parse JSON -> extractChatText + first choice message.tool_calls + usage -> augmentChatResponse -> 200
+    // DEFECT: Response.text()/ok/status web API approximated by (status, body buffer) pair from callRelay.
+    outStatus = 200;
+    return 0;
+}
+
+fn extractChatText(data_ptr: ptr, data_len: u64, out: &JsonBuf) -> void {
+    // 源 L1035-L1051: choices[0].message.content | choices[0].text | data.text|content via textFromValue
+    out.len = 0;
+}
+
+// DEFECT: async — forwardStream async in TS.
+fn forwardStream(state: &RedirectorState, body_ptr: ptr, body_len: u64, outStatus: &u64, outJson: &JsonBuf) -> i32 {
+    // 源 L1053-L1170: buildOpenaiRequest(stream=true) -> callRelay -> writeHead 200 chunked ->
+    // heartbeat chunk {text:"", heartbeat:true, request_id} -> consumeResponsesSse handling
+    // response.output_text.delta / response.function_call_arguments.delta / response.output_item.added|done /
+    // response.completed|incomplete|failed (usage + terminal tool calls) -> finally augmentChatResponse + done:true + res.end()
+    // DEFECT: streaming chunked response (res.write per delta) has no counterpart; deltas accumulated into single JSON buffer, heartbeat/final-chunk sequencing lost.
+    // DEFECT: closure — writeChunk + SSE event callback capturing accumulated/toolCalls/usage mutable state approximated as sequential processing.
+    outStatus = 200;
+    return 0;
+}
+
+// DEFECT: async — consumeResponsesSse async stream reader in TS.
+fn consumeResponsesSse(body_ptr: ptr, body_len: u64) -> i32 {
+    // 源 L1176-L1201: ReadableStream getReader + TextDecoder loop, frames split on blank line, dispatchSseFrame per frame, releaseLock in finally
+    // DEFECT: ReadableStream/TextDecoder streaming decode has no sa_std counterpart; whole-body buffer scan approximated.
+    return 0;
+}
+
+fn dispatchSseFrame(frame_ptr: ptr, frame_len: u64, outStop: &bool) -> void {
+    // 源 L1203-L1215: parse event:/data: lines; if any data, invoke onEvent(eventName, data.join("\n")) === true -> stop
+    // DEFECT: callback parameter (onEvent closure) has no counterpart; event dispatch inlined in consumeResponsesSse at fix stage.
+    outStop = false;
+}
+
+// ------------------------------------------------------------------
+// Helpers (源 L1221-L1275)
+// ------------------------------------------------------------------
+
+// DEFECT: async — readJson uses for-await over http.IncomingMessage stream in TS.
+fn readJson(headersContentLength: u64, raw_ptr: ptr, raw_len: u64, out: &JsonBuf) -> void {
+    // 源 L1221-L1240: content-length <=0/invalid -> {}; concat chunks up to length; JSON.parse utf-8;
+    // parse failure -> {_raw: rawText} degraded fallback (mirrors main.py)
+    // DEFECT: Buffer.concat / Buffer utf-8 decode approximated by caller-supplied raw buffer.
+    out.len = raw_len;
+}
+
+fn sendJson(status: u64, value_ptr: ptr, value_len: u64, outStatus: &u64, outBody: &JsonBuf) -> void {
+    // 源 L1242-L1252 (+ file end): JSON.stringify -> Buffer utf-8; writeHead(status, Content-Type json, Content-Length, Cache-Control no-cache); res.end(data)
+    // DEFECT: http.ServerResponse writeHead/end has no counterpart; (status, body) pair returned to handleRequest dispatcher.
+    outStatus = status;
+    outBody.len = value_len;
+}

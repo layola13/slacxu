@@ -1,0 +1,2349 @@
+// Converted 1:1 from backends/command-code/src/runtime/commandCodeAgentBridge.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// Command Code backend bridge — a CodexRuntimeClient that
+// spawns the user's external `command-code` binary once per
+// turn in print mode and projects its NDJSON AgentEvent stream
+// onto the workbench surface.
+//
+// No-login relay operation (verified live against command-code
+// 1.88.0):
+//  - The child runs with HOME=<isolated home> so all of the
+//    CLI's state (providers, sessions, MCP config) lives in the
+//    app data dir.
+//  - COMMAND_CODE_API_KEY is set to a placeholder: its presence
+//    satisfies the CLI's headless auth gate, and --local-only
+//    guarantees no Command Code account traffic; model calls go
+//    to the BYOK provider the host registered in
+//    providers.json (loopback relay gateway), whose apiKey is
+//    an env reference to a placeholder the gateway ignores.
+//  - Sessions persist as transcripts under
+//    <home>/.commandcode/projects/<slug>/<sessionId>.jsonl;
+//    follow-up turns resume with --resume <sessionId>.
+//  - Approvals: print mode runs with --yolo + -t (the CLI's
+//    headless posture); the manifest honestly declares
+//    permissionRoundTrips=false.
+//
+// DEFECT: ChildProcess streams — the child is pumped by
+// CommandCodeAgentBridge_pump (blocking sa_io_read per session
+// in this pass; the async face — async.sla/future.sa — is the
+// repair-phase evaluation target). DEFECT: child.kill signals —
+// process_kill shim (no verified std kill surface).
+// DEFECT: setTimeout SIGKILL escalation — a deadline field.
+// DEFECT: runtimeEnv callback — env snapshot text.
+// DEFECT: mappings Record — an in-memory table mirrored to the
+// JSON file (the source re-reads the file on every access;
+// external edits after first load are missed here).
+// DEFECT: BridgeEventLogger (sdk) — host shim by use.
+// DEFECT: String trim/lowercase/split in isCommandCodeTaskTool
+// — trim 已绑 sa_std ts 面 (@ts_str_trim); split 走
+// @ts_str_split 绑定点（见该函数注）。
+
+@import "./commandCodeCommand.sla"
+@import "./commandCodeProviders.sla"
+@import "../../../../../sdk-backend/src/process.sla"
+
+// CommandCodeUpstreamConfig (interface): providerId, model.
+struct CommandCodeUpstreamConfig {
+    providerId_ptr: ptr,
+    providerId_len: u64,
+    model_ptr: ptr,
+    model_len: u64,
+}
+
+struct CcTurnRow {
+    id: [u8; 64],
+    id_len: u64,
+    threadId_ptr: ptr,
+    threadId_len: u64,
+    has_threadId: bool,
+    status: [u8; 32],
+    status_len: u64,
+    items_json: [u8; 262144],
+    items_json_len: u64,
+}
+
+struct CommandCodeSessionState {
+    threadId_ptr: ptr,
+    threadId_len: u64,
+    sessionId_ptr: ptr,
+    sessionId_len: u64,
+    has_sessionId: bool,
+    cwd_ptr: ptr,
+    cwd_len: u64,
+    has_cwd: bool,
+    model_ptr: ptr,
+    model_len: u64,
+    has_model: bool,
+    providerId_ptr: ptr,
+    providerId_len: u64,
+    has_providerId: bool,
+    createdAt: u64,
+    activeTurnId: [u8; 64],
+    activeTurnId_len: u64,
+    has_activeTurnId: bool,
+    activeItemId: [u8; 160],
+    activeItemId_len: u64,
+    has_activeItemId: bool,
+    streamedText: [u8; 262144],
+    streamedText_len: u64,
+    itemStarted: bool,
+    textSegIndex: u64,
+    interrupting: bool,
+    proc: u64,
+    hin: u64,
+    hout: u64,
+    herr: u64,
+    has_child: bool,
+    kill_deadline: u64,
+    has_kill_deadline: bool,
+    lineBuf: [u8; 262144],
+    lineBuf_len: u64,
+    stderrTail: [u8; 4096],
+    stderrTail_len: u64,
+    sawResultLine: bool,
+    turns: [CcTurnRow; 128],
+    turns_count: u64,
+    messages: [u8; 1048576],
+    messages_len: u64,
+    msg_off: [u64; 2048],
+    msg_len_arr: [u64; 2048],
+    msg_count: u64,
+    turnScratch: [u8; 524288],
+    turnScratch_len: u64,
+    fileScratch: [u8; 1048576],
+    fileScratch_len: u64,
+    pathScratch: [u8; 32768],
+    pathScratch_len: u64,
+}
+
+// ThreadMapping (interface): sessionId?, cwd?, model?,
+// providerId?, createdAt?.
+struct CcMapping {
+    threadId_off: u64,
+    threadId_len: u64,
+    sessionId_off: u64,
+    sessionId_len: u64,
+    has_sessionId: bool,
+    cwd_off: u64,
+    cwd_len: u64,
+    has_cwd: bool,
+    model_off: u64,
+    model_len: u64,
+    has_model: bool,
+    providerId_off: u64,
+    providerId_len: u64,
+    has_providerId: bool,
+    createdAt: u64,
+    has_createdAt: bool,
+}
+
+struct CommandCodeAgentBridge {
+    homeDir_ptr: ptr,
+    homeDir_len: u64,
+    env_ptr: ptr,
+    env_len: u64,
+    status_phase: [u8; 32],
+    status_phase_len: u64,
+    status_message: [u8; 1024],
+    status_message_len: u64,
+    has_status_message: bool,
+    sessions: [CommandCodeSessionState; 16],
+    sessions_count: u64,
+    pendingUpstream_keys: [u8; 8192],
+    pendingUpstream_len: u64,
+    pending_off: [u64; 64],
+    pending_slen: [u64; 64],
+    pending_cfg: [CommandCodeUpstreamConfig; 64],
+    pending_count: u64,
+    defaultUpstream: CommandCodeUpstreamConfig,
+    has_defaultUpstream: bool,
+    loggedFrameTypes: [u8; 8192],
+    loggedFrameTypes_len: u64,
+    logged_off: [u64; 128],
+    logged_slen: [u64; 128],
+    logged_count: u64,
+    mappings: [CcMapping; 256],
+    mappings_count: u64,
+    mappings_arena: [u8; 262144],
+    mappings_arena_len: u64,
+    mappings_loaded: bool,
+    versionCache: CommandCodeVersionCache,
+    eventQueue: [u8; 1048576],
+    eventQueue_len: u64,
+}
+
+fn CommandCodeAgentBridge_new(self: &CommandCodeAgentBridge, homeDir_ptr: ptr, homeDir_len: u64, env_ptr: ptr, env_len: u64) -> void {
+    self.homeDir_ptr = homeDir_ptr;
+    self.homeDir_len = homeDir_len;
+    self.env_ptr = env_ptr;
+    self.env_len = env_len;
+    self.status_phase_len = buf_copy(&self.status_phase, 32, STR_PTR("stopped"), STR_LEN("stopped"));
+    self.has_status_message = false;
+    self.status_message_len = 0;
+    self.sessions_count = 0;
+    self.pendingUpstream_len = 0;
+    self.pending_count = 0;
+    self.has_defaultUpstream = false;
+    self.loggedFrameTypes_len = 0;
+    self.logged_count = 0;
+    self.mappings_count = 0;
+    self.mappings_arena_len = 0;
+    self.mappings_loaded = false;
+    self.eventQueue_len = 0;
+    CommandCodeVersionCache_new(&self.versionCache);
+    // eventLog = createBridgeEventLogger("command-code", homeDir)
+    host_event_log_init(homeDir_ptr, homeDir_len);
+}
+
+// applyUpstream(config, threadId?): point upcoming turns at a
+// relay station (host-resolved).
+fn CommandCodeAgentBridge_applyUpstream(self: &CommandCodeAgentBridge, config: &CommandCodeUpstreamConfig, threadId_ptr: ptr, threadId_len: u64, has_thread: bool) -> void {
+    if has_thread {
+        for i in 0..self.pending_count {
+            if self.pending_slen[i] == threadId_len && bytes_eq(slot(&self.pendingUpstream_keys, self.pending_off[i]), threadId_ptr, threadId_len) {
+                self.pending_cfg[i] = config;
+                return;
+            };
+        }
+        if self.pending_count < 64 {
+            let idx = self.pending_count;
+            self.pending_off[idx] = self.pendingUpstream_len;
+            self.pending_slen[idx] = threadId_len;
+            for i in 0..threadId_len {
+                if self.pendingUpstream_len < 8192 { self.pendingUpstream_keys[self.pendingUpstream_len] = byte_at(threadId_ptr, i); self.pendingUpstream_len = self.pendingUpstream_len + 1; };
+            }
+            self.pending_cfg[idx] = config;
+            self.pending_count = self.pending_count + 1;
+        };
+    } else {
+        self.defaultUpstream = config;
+        self.has_defaultUpstream = true;
+    };
+}
+
+fn pending_upstream_get(self: &CommandCodeAgentBridge, threadId_ptr: ptr, threadId_len: u64, out: &CommandCodeUpstreamConfig, out_has: &bool) -> void {
+    out_has = false;
+    for i in 0..self.pending_count {
+        if self.pending_slen[i] == threadId_len && bytes_eq(slot(&self.pendingUpstream_keys, self.pending_off[i]), threadId_ptr, threadId_len) {
+            out.providerId_ptr = self.pending_cfg[i].providerId_ptr;
+            out.providerId_len = self.pending_cfg[i].providerId_len;
+            out.model_ptr = self.pending_cfg[i].model_ptr;
+            out.model_len = self.pending_cfg[i].model_len;
+            out_has = true;
+            return;
+        };
+    }
+}
+
+// getStatus(): EngineStatus as JSON text.
+fn CommandCodeAgentBridge_getStatus(self: &CommandCodeAgentBridge, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"phase\":\""), STR_LEN("{\"phase\":\""));
+    n = n + append_bytes(out, out_cap, n, &self.status_phase, self.status_phase_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    if self.has_status_message {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"message\":\""), STR_LEN(",\"message\":\""));
+        n = n + append_bytes(out, out_cap, n, &self.status_message, self.status_message_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR("}"), 1);
+    out_len = n;
+}
+
+fn bridge_set_status(self: &CommandCodeAgentBridge, phase_ptr: ptr, phase_len: u64, message_ptr: ptr, message_len: u64, has_message: bool) -> void {
+    self.status_phase_len = buf_copy(&self.status_phase, 32, phase_ptr, phase_len);
+    self.has_status_message = has_message;
+    if has_message { self.status_message_len = buf_copy(&self.status_message, 1024, message_ptr, message_len); };
+    let status = [0u8; 2048];
+    let status_len: u64 = 0;
+    CommandCodeAgentBridge_getStatus(self, &status, 2048, &status_len);
+    bridge_emit(self, STR_PTR("status"), STR_LEN("status"), &status, status_len);
+}
+
+// start()
+fn CommandCodeAgentBridge_start(self: &CommandCodeAgentBridge, out_err: ptr, out_err_cap: u64, out_err_len: &u64) -> i32 {
+    if str_is(&self.status_phase, self.status_phase_len, STR_PTR("ready"), STR_LEN("ready")) { return 0; };
+    let bin = [0u8; 1024];
+    let bin_len: u64 = 0;
+    let has_bin = false;
+    findCommandCodeBin(&self.versionCache, &bin, 1024, &bin_len, &has_bin);
+    if !has_bin {
+        let message = STR_PTR("Command Code backend could not resolve a command-code binary (install command-code or set COMMAND_CODE_BIN).");
+        let message_len = STR_LEN("Command Code backend could not resolve a command-code binary (install command-code or set COMMAND_CODE_BIN).");
+        bridge_set_status(self, STR_PTR("error"), STR_LEN("error"), message, message_len, true);
+        out_err_len = append_bytes(out_err, out_err_cap, 0, message, message_len);
+        return 1;
+    };
+    bridge_set_status(self, STR_PTR("ready"), STR_LEN("ready"), PTR_NULL(), 0, false);
+    return 0;
+}
+
+// restart(): stop + start.
+fn CommandCodeAgentBridge_restart(self: &CommandCodeAgentBridge, out_err: ptr, out_err_cap: u64, out_err_len: &u64) -> i32 {
+    CommandCodeAgentBridge_stop(self);
+    return CommandCodeAgentBridge_start(self, out_err, out_err_cap, out_err_len);
+}
+
+// stop(): SIGKILL every child, status stopped.
+fn CommandCodeAgentBridge_stop(self: &CommandCodeAgentBridge) -> void {
+    for i in 0..self.sessions_count {
+        let s = &self.sessions[i];
+        if s.has_child {
+            process_kill(s.proc, STR_PTR("SIGKILL"), STR_LEN("SIGKILL"));
+            s.has_child = false;
+        };
+    }
+    bridge_set_status(self, STR_PTR("stopped"), STR_LEN("stopped"), PTR_NULL(), 0, false);
+}
+
+// hasSession(threadId): live session or a stored mapping.
+fn CommandCodeAgentBridge_hasSession(self: &CommandCodeAgentBridge, threadId_ptr: ptr, threadId_len: u64) -> bool {
+    if cc_find(self, threadId_ptr, threadId_len) != 4294967295 { return true; };
+    mappings_load(self);
+    return mapping_find(self, threadId_ptr, threadId_len) != 4294967295;
+}
+
+// notify / respond: no-ops in print mode (source comments).
+
+// ---- thread mapping store ----
+
+fn mappingPath(self: &CommandCodeAgentBridge, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let mid = [0u8; 2048];
+    let mid_len: u64 = 0;
+    mid_len = join2(&mid, 2048, self.homeDir_ptr, self.homeDir_len, STR_PTR(".commandcode"), STR_LEN(".commandcode"));
+    out_len = join2(out, out_cap, &mid, mid_len, STR_PTR("cxu-threads.json"), STR_LEN("cxu-threads.json"));
+}
+
+fn mappings_load(self: &CommandCodeAgentBridge) -> void {
+    if self.mappings_loaded { return; };
+    self.mappings_loaded = true;
+    let path = [0u8; 2048];
+    let path_len: u64 = 0;
+    mappingPath(self, &path, 2048, &path_len);
+    let total: u64 = 0;
+    if sa_std_fs_len(&path, path_len, &total) != 0 { return; };
+    let raw = [0u8; 1048576];
+    let raw_len: u64 = 0;
+    if !read_file_into(&path, path_len, &raw, 1048576, &raw_len) { return; };
+    let doc = sa_json_parse(&raw, raw_len);
+    if doc == 0 { return; };
+    // DEFECT: Object.entries over the mappings object — no key
+    // enumeration in the sa_json surface; the host shim
+    // json_object_keys supplies the key list in this pass.
+    let keys = [0u8; 65536];
+    let keys_off: [u64; 256] = [0u64; 256];
+    let keys_len_arr: [u64; 256] = [0u64; 256];
+    let keys_count: u64 = 0;
+    json_object_keys(doc, &keys, 65536, &keys_off, &keys_len_arr, &keys_count);
+    for ki in 0..keys_count {
+        if self.mappings_count >= 256 { break; };
+        let key_ptr = slot(&keys, keys_off[ki]);
+        let key_len = keys_len_arr[ki];
+        let node: u64 = 0;
+        if sa_json_object_get(doc, key_ptr, key_len, &node) != 0 { continue; };
+        let idx = self.mappings_count;
+        self.mappings[idx].threadId_off = mappings_put(self, key_ptr, key_len);
+        self.mappings[idx].threadId_len = key_len;
+        self.mappings[idx].has_sessionId = false;
+        self.mappings[idx].has_cwd = false;
+        self.mappings[idx].has_model = false;
+        self.mappings[idx].has_providerId = false;
+        self.mappings[idx].has_createdAt = false;
+        let v_ptr: ptr = PTR_NULL();
+        let v_len: u64 = 0;
+        if sa_json_object_get_string(node, STR_PTR("sessionId"), STR_LEN("sessionId"), &v_ptr, &v_len) == 0 { self.mappings[idx].sessionId_off = mappings_put(self, v_ptr, v_len); self.mappings[idx].sessionId_len = v_len; self.mappings[idx].has_sessionId = true; };
+        if sa_json_object_get_string(node, STR_PTR("cwd"), STR_LEN("cwd"), &v_ptr, &v_len) == 0 { self.mappings[idx].cwd_off = mappings_put(self, v_ptr, v_len); self.mappings[idx].cwd_len = v_len; self.mappings[idx].has_cwd = true; };
+        if sa_json_object_get_string(node, STR_PTR("model"), STR_LEN("model"), &v_ptr, &v_len) == 0 { self.mappings[idx].model_off = mappings_put(self, v_ptr, v_len); self.mappings[idx].model_len = v_len; self.mappings[idx].has_model = true; };
+        if sa_json_object_get_string(node, STR_PTR("providerId"), STR_LEN("providerId"), &v_ptr, &v_len) == 0 { self.mappings[idx].providerId_off = mappings_put(self, v_ptr, v_len); self.mappings[idx].providerId_len = v_len; self.mappings[idx].has_providerId = true; };
+        let created: i64 = 0;
+        if sa_json_object_get_i64(node, STR_PTR("createdAt"), STR_LEN("createdAt"), &created) == 0 { self.mappings[idx].createdAt = created as u64; self.mappings[idx].has_createdAt = true; };
+        self.mappings_count = self.mappings_count + 1;
+    }
+}
+
+fn mappings_put(self: &CommandCodeAgentBridge, p: ptr, n: u64) -> u64 {
+    let off = self.mappings_arena_len;
+    for i in 0..n {
+        if self.mappings_arena_len < 262144 { self.mappings_arena[self.mappings_arena_len] = byte_at(p, i); self.mappings_arena_len = self.mappings_arena_len + 1; };
+    }
+    return off;
+}
+
+fn mapping_find(self: &CommandCodeAgentBridge, threadId_ptr: ptr, threadId_len: u64) -> u64 {
+    for i in 0..self.mappings_count {
+        if self.mappings[i].threadId_len == threadId_len && bytes_eq(slot(&self.mappings_arena, self.mappings[i].threadId_off), threadId_ptr, threadId_len) { return i; };
+    }
+    return 4294967295;
+}
+
+fn mappings_persist(self: &CommandCodeAgentBridge) -> void {
+    let path = [0u8; 2048];
+    let path_len: u64 = 0;
+    mappingPath(self, &path, 2048, &path_len);
+    let text = [0u8; 1048576];
+    let text_len: u64 = 0;
+    text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR("{\n"), 2);
+    for i in 0..self.mappings_count {
+        if i > 0 { text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR(",\n"), 2); };
+        let m = &self.mappings[i];
+        text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR("  \""), 3);
+        text_len = text_len + append_bytes(&text, 1048576, text_len, slot(&self.mappings_arena, m.threadId_off), m.threadId_len);
+        text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR("\": {"), STR_LEN("\": {"));
+        let first = true;
+        if m.has_sessionId {
+            if !first { text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR(", "), 2); };
+            first = false;
+            text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR("\"sessionId\": \""), STR_LEN("\"sessionId\": \""));
+            text_len = text_len + append_bytes(&text, 1048576, text_len, slot(&self.mappings_arena, m.sessionId_off), m.sessionId_len);
+            text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR("\""), 1);
+        };
+        if m.has_cwd {
+            if !first { text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR(", "), 2); };
+            first = false;
+            text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR("\"cwd\": \""), STR_LEN("\"cwd\": \""));
+            text_len = text_len + append_bytes(&text, 1048576, text_len, slot(&self.mappings_arena, m.cwd_off), m.cwd_len);
+            text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR("\""), 1);
+        };
+        if m.has_model {
+            if !first { text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR(", "), 2); };
+            first = false;
+            text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR("\"model\": \""), STR_LEN("\"model\": \""));
+            text_len = text_len + append_bytes(&text, 1048576, text_len, slot(&self.mappings_arena, m.model_off), m.model_len);
+            text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR("\""), 1);
+        };
+        if m.has_providerId {
+            if !first { text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR(", "), 2); };
+            first = false;
+            text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR("\"providerId\": \""), STR_LEN("\"providerId\": \""));
+            text_len = text_len + append_bytes(&text, 1048576, text_len, slot(&self.mappings_arena, m.providerId_off), m.providerId_len);
+            text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR("\""), 1);
+        };
+        if m.has_createdAt {
+            if !first { text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR(", "), 2); };
+            first = false;
+            text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR("\"createdAt\": "), STR_LEN("\"createdAt\": "));
+            text_len = text_len + append_u64(&text, 1048576, text_len, m.createdAt);
+        };
+        text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR("}"), 1);
+    }
+    if self.mappings_count > 0 { text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR("\n"), 1); };
+    text_len = text_len + append_bytes(&text, 1048576, text_len, STR_PTR("}\n"), 2);
+    sa_fs_write_file(&path, path_len, &text, text_len);
+}
+
+// writeMapping(threadId, mapping): merge fields + persist.
+// The partial mapping arrives as field tuples.
+fn writeMapping(self: &CommandCodeAgentBridge, threadId_ptr: ptr, threadId_len: u64, sessionId_ptr: ptr, sessionId_len: u64, has_sessionId: bool, cwd_ptr: ptr, cwd_len: u64, has_cwd: bool, model_ptr: ptr, model_len: u64, has_model: bool, providerId_ptr: ptr, providerId_len: u64, has_providerId: bool, createdAt: u64, has_createdAt: bool) -> void {
+    mappings_load(self);
+    let idx = mapping_find(self, threadId_ptr, threadId_len);
+    if idx == 4294967295 {
+        if self.mappings_count >= 256 { return; };
+        idx = self.mappings_count;
+        self.mappings[idx].threadId_off = mappings_put(self, threadId_ptr, threadId_len);
+        self.mappings[idx].threadId_len = threadId_len;
+        self.mappings[idx].has_sessionId = false;
+        self.mappings[idx].has_cwd = false;
+        self.mappings[idx].has_model = false;
+        self.mappings[idx].has_providerId = false;
+        self.mappings[idx].has_createdAt = false;
+        self.mappings_count = self.mappings_count + 1;
+    };
+    if has_sessionId { self.mappings[idx].sessionId_off = mappings_put(self, sessionId_ptr, sessionId_len); self.mappings[idx].sessionId_len = sessionId_len; self.mappings[idx].has_sessionId = true; };
+    if has_cwd { self.mappings[idx].cwd_off = mappings_put(self, cwd_ptr, cwd_len); self.mappings[idx].cwd_len = cwd_len; self.mappings[idx].has_cwd = true; };
+    if has_model { self.mappings[idx].model_off = mappings_put(self, model_ptr, model_len); self.mappings[idx].model_len = model_len; self.mappings[idx].has_model = true; };
+    if has_providerId { self.mappings[idx].providerId_off = mappings_put(self, providerId_ptr, providerId_len); self.mappings[idx].providerId_len = providerId_len; self.mappings[idx].has_providerId = true; };
+    if has_createdAt { self.mappings[idx].createdAt = createdAt; self.mappings[idx].has_createdAt = true; };
+    mappings_persist(self);
+}
+
+fn deleteMapping(self: &CommandCodeAgentBridge, threadId_ptr: ptr, threadId_len: u64) -> void {
+    mappings_load(self);
+    let idx = mapping_find(self, threadId_ptr, threadId_len);
+    if idx == 4294967295 { return; };
+    let i = idx;
+    while i + 1 < self.mappings_count {
+        self.mappings[i] = self.mappings[i + 1];
+        i = i + 1;
+    }
+    self.mappings_count = self.mappings_count - 1;
+    mappings_persist(self);
+}
+
+// ---- session helpers ----
+
+fn cc_find(self: &CommandCodeAgentBridge, threadId_ptr: ptr, threadId_len: u64) -> u64 {
+    for i in 0..self.sessions_count {
+        if self.sessions[i].threadId_len == threadId_len && bytes_eq(self.sessions[i].threadId_ptr, threadId_ptr, threadId_len) { return i; };
+    }
+    return 4294967295;
+}
+
+fn bridge_emit(self: &CommandCodeAgentBridge, kind_ptr: ptr, kind_len: u64, payload_ptr: ptr, payload_len: u64) -> void {
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, kind_ptr, kind_len);
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, STR_PTR("\t"), 1);
+    if payload_len > 0 {
+        self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, payload_ptr, payload_len);
+    };
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, STR_PTR("\n"), 1);
+}
+
+// emit_message: an EventEmitter "message" record carrying a
+// JsonRpcMessage JSON text ({method, params}).
+fn emit_message(self: &CommandCodeAgentBridge, json_ptr: ptr, json_len: u64) -> void {
+    bridge_emit(self, STR_PTR("message"), STR_LEN("message"), json_ptr, json_len);
+}
+
+fn session_init(s: &CommandCodeSessionState, threadId_ptr: ptr, threadId_len: u64) -> void {
+    s.threadId_ptr = threadId_ptr;
+    s.threadId_len = threadId_len;
+    s.has_sessionId = false;
+    s.has_cwd = false;
+    s.has_model = false;
+    s.has_providerId = false;
+    s.createdAt = 0;
+    s.has_activeTurnId = false;
+    s.activeTurnId_len = 0;
+    s.has_activeItemId = false;
+    s.activeItemId_len = 0;
+    s.streamedText_len = 0;
+    s.itemStarted = false;
+    s.textSegIndex = 0;
+    s.interrupting = false;
+    s.has_child = false;
+    s.has_kill_deadline = false;
+    s.lineBuf_len = 0;
+    s.stderrTail_len = 0;
+    s.sawResultLine = false;
+    s.turns_count = 0;
+    s.messages_len = 0;
+    s.msg_count = 0;
+}
+
+fn cc_msg_ptr(s: &CommandCodeSessionState, idx: u64) -> ptr {
+    let r: ptr = PTR_NULL();
+    PTR_BYTE_ADD(r, &s.messages, s.msg_off[idx]);
+    return r;
+}
+
+fn cc_push_message(s: &CommandCodeSessionState, json_ptr: ptr, json_len: u64) -> void {
+    if s.msg_count >= 2048 { return; };
+    let idx = s.msg_count;
+    s.msg_off[idx] = s.messages_len;
+    s.msg_len_arr[idx] = json_len;
+    for i in 0..json_len {
+        if s.messages_len < 1048576 { s.messages[s.messages_len] = byte_at(json_ptr, i); s.messages_len = s.messages_len + 1; };
+    }
+    s.msg_count = s.msg_count + 1;
+}
+
+// cc_replace_message: messages[idx] = item — slots are
+// append-only arenas in this pass, so replacement appends a
+// new slot and re-points the index (the old bytes leak until
+// the repair phase).
+fn cc_replace_message(s: &CommandCodeSessionState, idx: u64, json_ptr: ptr, json_len: u64) -> void {
+    let off = s.messages_len;
+    for i in 0..json_len {
+        if s.messages_len < 1048576 { s.messages[s.messages_len] = byte_at(json_ptr, i); s.messages_len = s.messages_len + 1; };
+    }
+    s.msg_off[idx] = off;
+    s.msg_len_arr[idx] = json_len;
+}
+
+// find message index by (type, id) over parsed docs.
+fn cc_find_message(s: &CommandCodeSessionState, type_ptr: ptr, type_len: u64, id_ptr: ptr, id_len: u64) -> u64 {
+    for i in 0..s.msg_count {
+        let doc = sa_json_parse(cc_msg_ptr(s, i), s.msg_len_arr[i]);
+        if doc == 0 { continue; };
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len) != 0 { continue; };
+        if !str_is(t_ptr, t_len, type_ptr, type_len) { continue; };
+        let v_ptr: ptr = PTR_NULL();
+        let v_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("id"), STR_LEN("id"), &v_ptr, &v_len) != 0 { continue; };
+        if v_len == id_len && bytes_eq(v_ptr, id_ptr, id_len) { return i; };
+    }
+    return 4294967295;
+}
+
+// ---- request dispatch ----
+
+fn p_str(p: u64, key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    out_ptr = PTR_NULL();
+    out_len = 0;
+    if p == 0 { return false; };
+    return sa_json_object_get_string(p, key_ptr, key_len, out_ptr, out_len) == 0;
+}
+
+fn CommandCodeAgentBridge_request(self: &CommandCodeAgentBridge, method_ptr: ptr, method_len: u64, params_ptr: ptr, params_len: u64, out: ptr, out_cap: u64, out_len: &u64, out_err: ptr, out_err_cap: u64, out_err_len: &u64) -> i32 {
+    let p = sa_json_parse(params_ptr, params_len);
+    if str_is(method_ptr, method_len, STR_PTR("initialize"), STR_LEN("initialize")) || str_is(method_ptr, method_len, STR_PTR("config/read"), STR_LEN("config/read")) {
+        let bin = [0u8; 1024];
+        let bin_len: u64 = 0;
+        let has_bin = false;
+        findCommandCodeBin(&self.versionCache, &bin, 1024, &bin_len, &has_bin);
+        let ver_ptr: ptr = PTR_NULL();
+        let ver_len: u64 = 0;
+        let has_ver = false;
+        if has_bin { probeCommandCodeVersion(&self.versionCache, &bin, bin_len, &ver_ptr, &ver_len, &has_ver); };
+        let n: u64 = 0;
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"userAgent\":\"command-code/"), STR_LEN("{\"userAgent\":\"command-code/"));
+        if has_ver {
+            n = n + append_bytes(out, out_cap, n, ver_ptr, ver_len);
+        } else {
+            n = n + append_bytes(out, out_cap, n, STR_PTR("external"), STR_LEN("external"));
+        };
+        n = n + append_bytes(out, out_cap, n, STR_PTR(" codex-react-ui/0.1.0\",\"codexHome\":\""), STR_LEN(" codex-react-ui/0.1.0\",\"codexHome\":\""));
+        let home_ptr: ptr = PTR_NULL();
+        let home_len: u64 = 0;
+        let has_home = false;
+        env_get(STR_PTR("CODEX_HOME"), STR_LEN("CODEX_HOME"), &home_ptr, &home_len, &has_home);
+        if has_home { n = n + append_bytes(out, out_cap, n, home_ptr, home_len); };
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"capabilities\":{\"experimentalApi\":true}}"), STR_LEN("\",\"capabilities\":{\"experimentalApi\":true}}"));
+        out_len = n;
+        return 0;
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/start"), STR_LEN("thread/start")) {
+        let rc = CommandCodeAgentBridge_start(self, out_err, out_err_cap, out_err_len);
+        if rc != 0 { return rc; };
+        let thread_id = [0u8; 64];
+        let thread_len: u64 = 0;
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        if p_str(p, STR_PTR("threadId"), STR_LEN("threadId"), &t_ptr, &t_len) {
+            thread_len = buf_copy(&thread_id, 64, t_ptr, t_len);
+        } else {
+            uuid_new(&thread_id, 64, &thread_len);
+        };
+        let cwd = [0u8; 1024];
+        let cwd_len: u64 = 0;
+        let has_cwd = false;
+        let c_ptr: ptr = PTR_NULL();
+        let c_len: u64 = 0;
+        if p_str(p, STR_PTR("cwd"), STR_LEN("cwd"), &c_ptr, &c_len) {
+            cwd_len = buf_copy(&cwd, 1024, c_ptr, c_len);
+            has_cwd = true;
+        } else {
+            cwd_len = process_cwd(&cwd, 1024);
+            has_cwd = true;
+        };
+        // upstream = pendingUpstream.get(threadId) ??
+        // defaultUpstream
+        let upstream = CommandCodeUpstreamConfig { providerId_ptr: PTR_NULL(), providerId_len: 0, model_ptr: PTR_NULL(), model_len: 0 };
+        let has_upstream = false;
+        pending_upstream_get(self, &thread_id, thread_len, &upstream, &has_upstream);
+        if !has_upstream && self.has_defaultUpstream {
+            upstream = self.defaultUpstream;
+            has_upstream = true;
+        };
+        let model_ptr: ptr = PTR_NULL();
+        let model_len: u64 = 0;
+        let has_model = false;
+        let m_ptr: ptr = PTR_NULL();
+        let m_len: u64 = 0;
+        if p_str(p, STR_PTR("model"), STR_LEN("model"), &m_ptr, &m_len) {
+            model_ptr = m_ptr;
+            model_len = m_len;
+            has_model = true;
+        } else if has_upstream {
+            model_ptr = upstream.model_ptr;
+            model_len = upstream.model_len;
+            has_model = true;
+        };
+        if self.sessions_count >= 16 { out_err_len = append_bytes(out_err, out_err_cap, 0, STR_PTR("too many command-code sessions"), STR_LEN("too many command-code sessions")); return 1; };
+        let idx = self.sessions_count;
+        let s = &self.sessions[idx];
+        session_init(s, &thread_id, thread_len);
+        s.cwd_ptr = &cwd;
+        s.cwd_len = cwd_len;
+        s.has_cwd = has_cwd;
+        if has_model { s.model_ptr = model_ptr; s.model_len = model_len; s.has_model = true; };
+        if has_upstream { s.providerId_ptr = upstream.providerId_ptr; s.providerId_len = upstream.providerId_len; s.has_providerId = true; };
+        s.createdAt = now_ms();
+        self.sessions_count = self.sessions_count + 1;
+        writeMapping(self, &thread_id, thread_len, PTR_NULL(), 0, false, &cwd, cwd_len, has_cwd, model_ptr, model_len, has_model, s.providerId_ptr, s.providerId_len, s.has_providerId, s.createdAt, true);
+        // emit thread/started
+        let msg = [0u8; 4096];
+        let msg_len: u64 = 0;
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, STR_PTR("{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\""), STR_LEN("{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\""));
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, &thread_id, thread_len);
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, STR_PTR("\",\"model\":"), STR_LEN("\",\"model\":"));
+        msg_len = append_nullable_str(&msg, 4096, msg_len, model_ptr, model_len, has_model);
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, STR_PTR(",\"cliBackend\":\"command-code\",\"status\":{\"type\":\"idle\"},\"cwd\":\""), STR_LEN(",\"cliBackend\":\"command-code\",\"status\":{\"type\":\"idle\"},\"cwd\":\""));
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, &cwd, cwd_len);
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, STR_PTR("\"}}}"), 4);
+        emit_message(self, &msg, msg_len);
+        let n: u64 = 0;
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"thread\":{\"id\":\""), STR_LEN("{\"thread\":{\"id\":\""));
+        n = n + append_bytes(out, out_cap, n, &thread_id, thread_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"model\":"), STR_LEN("\",\"model\":"));
+        n = append_nullable_str(out, out_cap, n, model_ptr, model_len, has_model);
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"cliBackend\":\"command-code\",\"status\":{\"type\":\"idle\"}}}"), STR_LEN(",\"cliBackend\":\"command-code\",\"status\":{\"type\":\"idle\"}}}"));
+        out_len = n;
+        return 0;
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/resume"), STR_LEN("thread/resume")) {
+        let rc = CommandCodeAgentBridge_start(self, out_err, out_err_cap, out_err_len);
+        if rc != 0 { return rc; };
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        p_str(p, STR_PTR("threadId"), STR_LEN("threadId"), &t_ptr, &t_len);
+        let idx: u64 = 0;
+        let has = false;
+        restoreSession(self, t_ptr, t_len, &idx, &has);
+        if !has {
+            out_err_len = err_unknown_thread(out_err, out_err_cap, t_ptr, t_len);
+            return 1;
+        };
+        let s = &self.sessions[idx];
+        let n: u64 = 0;
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"thread\":{\"id\":\""), STR_LEN("{\"thread\":{\"id\":\""));
+        n = n + append_bytes(out, out_cap, n, s.threadId_ptr, s.threadId_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"model\":"), STR_LEN("\",\"model\":"));
+        n = append_nullable_str(out, out_cap, n, s.model_ptr, s.model_len, s.has_model);
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"cliBackend\":\"command-code\",\"status\":{\"type\":\"idle\"},\"cwd\":"), STR_LEN(",\"cliBackend\":\"command-code\",\"status\":{\"type\":\"idle\"},\"cwd\":"));
+        n = append_nullable_str(out, out_cap, n, s.cwd_ptr, s.cwd_len, s.has_cwd);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("}}"), 2);
+        out_len = n;
+        return 0;
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/list"), STR_LEN("thread/list")) {
+        return request_list_threads(self, out, out_cap, out_len);
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/turns/list"), STR_LEN("thread/turns/list")) {
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        p_str(p, STR_PTR("threadId"), STR_LEN("threadId"), &t_ptr, &t_len);
+        let idx: u64 = 0;
+        let has = false;
+        restoreSession(self, t_ptr, t_len, &idx, &has);
+        let n: u64 = 0;
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"turns\":["), STR_LEN("{\"turns\":["));
+        if has {
+            let s = &self.sessions[idx];
+            for i in 0..s.turns_count {
+                if i > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+                n = n + turn_json(&s.turns[i], out, out_cap, n);
+            }
+        };
+        n = n + append_bytes(out, out_cap, n, STR_PTR("]}"), 2);
+        out_len = n;
+        return 0;
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/items/list"), STR_LEN("thread/items/list")) {
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        p_str(p, STR_PTR("threadId"), STR_LEN("threadId"), &t_ptr, &t_len);
+        let idx: u64 = 0;
+        let has = false;
+        restoreSession(self, t_ptr, t_len, &idx, &has);
+        let n: u64 = 0;
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"items\":["), STR_LEN("{\"items\":["));
+        if has {
+            let s = &self.sessions[idx];
+            for i in 0..s.msg_count {
+                if i > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+                n = n + append_bytes(out, out_cap, n, cc_msg_ptr(s, i), s.msg_len_arr[i]);
+            }
+        };
+        n = n + append_bytes(out, out_cap, n, STR_PTR("]}"), 2);
+        out_len = n;
+        return 0;
+    };
+    if str_is(method_ptr, method_len, STR_PTR("turn/start"), STR_LEN("turn/start")) || str_is(method_ptr, method_len, STR_PTR("turn/steer"), STR_LEN("turn/steer")) {
+        return request_turn_start(self, p, str_is(method_ptr, method_len, STR_PTR("turn/steer"), STR_LEN("turn/steer")), out, out_cap, out_len, out_err, out_err_cap, out_err_len);
+    };
+    if str_is(method_ptr, method_len, STR_PTR("turn/interrupt"), STR_LEN("turn/interrupt")) {
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        p_str(p, STR_PTR("threadId"), STR_LEN("threadId"), &t_ptr, &t_len);
+        let idx = cc_find(self, t_ptr, t_len);
+        if idx != 4294967295 {
+            let s = &self.sessions[idx];
+            if s.has_child {
+                s.interrupting = true;
+                process_kill(s.proc, STR_PTR("SIGINT"), STR_LEN("SIGINT"));
+                s.kill_deadline = now_ms() + 3000;
+                s.has_kill_deadline = true;
+            };
+        };
+        out_len = append_bytes(out, out_cap, 0, STR_PTR("{}"), 2);
+        return 0;
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/delete"), STR_LEN("thread/delete")) || str_is(method_ptr, method_len, STR_PTR("thread/archive"), STR_LEN("thread/archive")) || str_is(method_ptr, method_len, STR_PTR("thread/closed"), STR_LEN("thread/closed")) || str_is(method_ptr, method_len, STR_PTR("thread/unsubscribe"), STR_LEN("thread/unsubscribe")) {
+        let is_delete = str_is(method_ptr, method_len, STR_PTR("thread/delete"), STR_LEN("thread/delete"));
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        p_str(p, STR_PTR("threadId"), STR_LEN("threadId"), &t_ptr, &t_len);
+        if t_len > 0 {
+            let idx = cc_find(self, t_ptr, t_len);
+            if idx != 4294967295 {
+                let s = &self.sessions[idx];
+                if s.has_child { process_kill(s.proc, STR_PTR("SIGKILL"), STR_LEN("SIGKILL")); s.has_child = false; };
+                if is_delete {
+                    if s.has_sessionId { deleteTranscript(self, s.sessionId_ptr, s.sessionId_len); };
+                    deleteMapping(self, t_ptr, t_len);
+                };
+                let i = idx;
+                while i + 1 < self.sessions_count {
+                    self.sessions[i] = self.sessions[i + 1];
+                    i = i + 1;
+                }
+                self.sessions_count = self.sessions_count - 1;
+            } else if is_delete {
+                deleteMapping(self, t_ptr, t_len);
+            };
+        };
+        out_len = append_bytes(out, out_cap, 0, STR_PTR("{}"), 2);
+        return 0;
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/fork"), STR_LEN("thread/fork")) {
+        out_err_len = append_bytes(out_err, out_err_cap, 0, STR_PTR("Command Code backend does not support thread/fork"), STR_LEN("Command Code backend does not support thread/fork"));
+        return 1;
+    };
+    out_len = append_bytes(out, out_cap, 0, STR_PTR("{}"), 2);
+    return 0;
+}
+
+fn append_nullable_str(out: ptr, out_cap: u64, at: u64, v_ptr: ptr, v_len: u64, has: bool) -> u64 {
+    if !has { return at + append_bytes(out, out_cap, at, STR_PTR("null"), 4); };
+    let n = at;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    n = n + append_bytes(out, out_cap, n, v_ptr, v_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    return n;
+}
+
+fn err_unknown_thread(out_err: ptr, out_err_cap: u64, thread_ptr: ptr, thread_len: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out_err, out_err_cap, n, STR_PTR("Unknown thread: "), STR_LEN("Unknown thread: "));
+    n = n + append_bytes(out_err, out_err_cap, n, thread_ptr, thread_len);
+    return n;
+}
+
+fn turn_json(t: &CcTurnRow, out: ptr, out_cap: u64, at: u64) -> u64 {
+    let n = at;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+    n = n + append_bytes(out, out_cap, n, &t.id, t.id_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    if t.has_threadId {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"threadId\":\""), STR_LEN(",\"threadId\":\""));
+        n = n + append_bytes(out, out_cap, n, t.threadId_ptr, t.threadId_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"status\":\""), STR_LEN(",\"status\":\""));
+    n = n + append_bytes(out, out_cap, n, &t.status, t.status_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"items\":"), STR_LEN("\",\"items\":"));
+    n = n + append_bytes(out, out_cap, n, &t.items_json, t.items_json_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("}"), 1);
+    return n;
+}
+
+// request_turn_start / turn/steer
+fn request_turn_start(self: &CommandCodeAgentBridge, p: u64, is_steer: bool, out: ptr, out_cap: u64, out_len: &u64, out_err: ptr, out_err_cap: u64, out_err_len: &u64) -> i32 {
+    let t_ptr: ptr = PTR_NULL();
+    let t_len: u64 = 0;
+    p_str(p, STR_PTR("threadId"), STR_LEN("threadId"), &t_ptr, &t_len);
+    let idx = cc_find(self, t_ptr, t_len);
+    if idx == 4294967295 {
+        let found = false;
+        restoreSession(self, t_ptr, t_len, &idx, &found);
+    };
+    if idx == 4294967295 {
+        out_err_len = err_unknown_thread(out_err, out_err_cap, t_ptr, t_len);
+        return 1;
+    };
+    let s = &self.sessions[idx];
+    if !is_steer && s.has_activeTurnId {
+        let n: u64 = 0;
+        n = n + append_bytes(out_err, out_err_cap, n, STR_PTR("Turn is already active: "), STR_LEN("Turn is already active: "));
+        n = n + append_bytes(out_err, out_err_cap, n, &s.activeTurnId, s.activeTurnId_len);
+        out_err_len = n;
+        return 1;
+    };
+    let text = [0u8; 262144];
+    let text_len: u64 = 0;
+    extractTurnText(p, &text, 262144, &text_len);
+    if text_len == 0 {
+        out_err_len = append_bytes(out_err, out_err_cap, 0, STR_PTR("Command Code turns require a text prompt in v1"), STR_LEN("Command Code turns require a text prompt in v1"));
+        return 1;
+    };
+    // turnId: steer + active -> active; else p.turnId or uuid
+    let turn_id = [0u8; 64];
+    let turn_len: u64 = 0;
+    if is_steer && s.has_activeTurnId {
+        turn_len = buf_copy(&turn_id, 64, &s.activeTurnId, s.activeTurnId_len);
+    } else {
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        if p_str(p, STR_PTR("turnId"), STR_LEN("turnId"), &tp, &tl) {
+            turn_len = buf_copy(&turn_id, 64, tp, tl);
+        } else {
+            uuid_new(&turn_id, 64, &turn_len);
+        };
+    };
+    // A station switch applies from the next spawned process.
+    let upstream = CommandCodeUpstreamConfig { providerId_ptr: PTR_NULL(), providerId_len: 0, model_ptr: PTR_NULL(), model_len: 0 };
+    let has_upstream = false;
+    pending_upstream_get(self, t_ptr, t_len, &upstream, &has_upstream);
+    if !has_upstream && self.has_defaultUpstream {
+        upstream = self.defaultUpstream;
+        has_upstream = true;
+    };
+    if has_upstream {
+        s.providerId_ptr = upstream.providerId_ptr;
+        s.providerId_len = upstream.providerId_len;
+        s.has_providerId = true;
+        if !s.has_model || upstream.model_len > 0 {
+            s.model_ptr = upstream.model_ptr;
+            s.model_len = upstream.model_len;
+            s.has_model = true;
+        };
+    };
+    // userItem + emit item/completed
+    let user_item = [0u8; 262144];
+    let user_item_len: u64 = 0;
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, STR_PTR("{\"type\":\"userMessage\",\"id\":\"command-code-"), STR_LEN("{\"type\":\"userMessage\",\"id\":\"command-code-"));
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, &turn_id, turn_len);
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, STR_PTR("-user\",\"turnId\":\""), STR_LEN("-user\",\"turnId\":\""));
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, &turn_id, turn_len);
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, t_ptr, t_len);
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, STR_PTR("\",\"content\":[{\"type\":\"text\",\"text\":\""), STR_LEN("\",\"content\":[{\"type\":\"text\",\"text\":\""));
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, &text, text_len);
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, STR_PTR("\"}],\"status\":\"completed\"}"), STR_LEN("\"}],\"status\":\"completed\"}"));
+    cc_push_message(s, &user_item, user_item_len);
+    let msg = [0u8; 262144];
+    let msg_len: u64 = 0;
+    msg_len = msg_len + append_bytes(&msg, 262144, msg_len, STR_PTR("{\"method\":\"item/completed\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"item/completed\",\"params\":{\"threadId\":\""));
+    msg_len = msg_len + append_bytes(&msg, 262144, msg_len, t_ptr, t_len);
+    msg_len = msg_len + append_bytes(&msg, 262144, msg_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    msg_len = msg_len + append_bytes(&msg, 262144, msg_len, &turn_id, turn_len);
+    msg_len = msg_len + append_bytes(&msg, 262144, msg_len, STR_PTR("\",\"item\":"), STR_LEN("\",\"item\":"));
+    msg_len = msg_len + append_bytes(&msg, 262144, msg_len, &user_item, user_item_len);
+    msg_len = msg_len + append_bytes(&msg, 262144, msg_len, STR_PTR("}}"), 2);
+    emit_message(self, &msg, msg_len);
+    if !is_steer {
+        s.activeTurnId_len = buf_copy(&s.activeTurnId, 64, &turn_id, turn_len);
+        s.has_activeTurnId = true;
+        s.streamedText_len = 0;
+        s.itemStarted = false;
+        s.interrupting = false;
+        if s.turns_count < 128 {
+            let ti = s.turns_count;
+            s.turns[ti].id_len = buf_copy(&s.turns[ti].id, 64, &turn_id, turn_len);
+            s.turns[ti].threadId_ptr = t_ptr;
+            s.turns[ti].threadId_len = t_len;
+            s.turns[ti].has_threadId = true;
+            s.turns[ti].status_len = buf_copy(&s.turns[ti].status, 32, STR_PTR("inProgress"), STR_LEN("inProgress"));
+            s.turns[ti].items_json_len = buf_copy(&s.turns[ti].items_json, 262144, STR_PTR("[]"), 2);
+            s.turns_count = s.turns_count + 1;
+        };
+    };
+    spawnTurn(self, idx, &text, text_len);
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"turn\":{\"id\":\""), STR_LEN("{\"turn\":{\"id\":\""));
+    n = n + append_bytes(out, out_cap, n, &turn_id, turn_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    n = n + append_bytes(out, out_cap, n, t_ptr, t_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"status\":\"inProgress\"}}"), STR_LEN("\",\"status\":\"inProgress\"}}"));
+    out_len = n;
+    return 0;
+}
+
+
+// ---- per-turn process ----
+
+// spawnTurn(state, text)
+fn spawnTurn(self: &CommandCodeAgentBridge, session_idx: u64, text_ptr: ptr, text_len: u64) -> void {
+    let s = &self.sessions[session_idx];
+    let bin = [0u8; 1024];
+    let bin_len: u64 = 0;
+    let has_bin = false;
+    findCommandCodeBin(&self.versionCache, &bin, 1024, &bin_len, &has_bin);
+    if !has_bin {
+        finishTurn(self, session_idx, STR_PTR("failed"), STR_LEN("failed"), &s.streamedText, s.streamedText_len, 0, false, STR_PTR("command-code binary not found"), STR_LEN("command-code binary not found"), true);
+        return;
+    };
+    // args: -p text --output-format json --local-only
+    // --skip-onboarding -t --yolo --add-dir <cwd>
+    // [-m provider/model | -m model] [--resume sessionId]
+    let argv = [0u8; 262144];
+    let offs: [u64; 16] = [0u64; 16];
+    let lens: [u64; 16] = [0u64; 16];
+    let argc: u64 = 0;
+    let used: u64 = 0;
+    offs[argc] = used;
+    used = used + append_bytes(&argv, 262144, used, &bin, bin_len);
+    lens[argc] = bin_len;
+    argc = argc + 1;
+    offs[argc] = used;
+    used = used + append_bytes(&argv, 262144, used, STR_PTR("-p"), 2);
+    lens[argc] = 2;
+    argc = argc + 1;
+    offs[argc] = used;
+    used = used + append_bytes(&argv, 262144, used, text_ptr, text_len);
+    lens[argc] = text_len;
+    argc = argc + 1;
+    let flags = [STR_PTR("--output-format"), STR_PTR("--local-only"), STR_PTR("--skip-onboarding"), STR_PTR("-t"), STR_PTR("--yolo")];
+    let flag_lens = [STR_LEN("--output-format"), STR_LEN("--local-only"), STR_LEN("--skip-onboarding"), 2, STR_LEN("--yolo")];
+    // --output-format takes "json" as its value.
+    offs[argc] = used;
+    used = used + append_bytes(&argv, 262144, used, STR_PTR("--output-format"), STR_LEN("--output-format"));
+    lens[argc] = STR_LEN("--output-format");
+    argc = argc + 1;
+    offs[argc] = used;
+    used = used + append_bytes(&argv, 262144, used, STR_PTR("json"), 4);
+    lens[argc] = 4;
+    argc = argc + 1;
+    for fi in 1..5 {
+        offs[argc] = used;
+        used = used + append_bytes(&argv, 262144, used, flags[fi], flag_lens[fi]);
+        lens[argc] = flag_lens[fi];
+        argc = argc + 1;
+    }
+    offs[argc] = used;
+    used = used + append_bytes(&argv, 262144, used, STR_PTR("--add-dir"), STR_LEN("--add-dir"));
+    lens[argc] = STR_LEN("--add-dir");
+    argc = argc + 1;
+    let cwd_ptr = s.cwd_ptr;
+    let cwd_len = s.cwd_len;
+    if !s.has_cwd {
+        let cwd_buf = [0u8; 1024];
+        let cwd_buf_len: u64 = 0;
+        cwd_buf_len = process_cwd(&cwd_buf, 1024);
+        cwd_ptr = &cwd_buf;
+        cwd_len = cwd_buf_len;
+    };
+    offs[argc] = used;
+    used = used + append_bytes(&argv, 262144, used, cwd_ptr, cwd_len);
+    lens[argc] = cwd_len;
+    argc = argc + 1;
+    if s.has_providerId && s.has_model {
+        offs[argc] = used;
+        used = used + append_bytes(&argv, 262144, used, STR_PTR("-m"), 2);
+        lens[argc] = 2;
+        argc = argc + 1;
+        offs[argc] = used;
+        used = used + append_bytes(&argv, 262144, used, s.providerId_ptr, s.providerId_len);
+        used = used + append_bytes(&argv, 262144, used, STR_PTR("/"), 1);
+        used = used + append_bytes(&argv, 262144, used, s.model_ptr, s.model_len);
+        lens[argc] = s.providerId_len + 1 + s.model_len;
+        argc = argc + 1;
+    } else if s.has_model {
+        offs[argc] = used;
+        used = used + append_bytes(&argv, 262144, used, STR_PTR("-m"), 2);
+        lens[argc] = 2;
+        argc = argc + 1;
+        offs[argc] = used;
+        used = used + append_bytes(&argv, 262144, used, s.model_ptr, s.model_len);
+        lens[argc] = s.model_len;
+        argc = argc + 1;
+    };
+    if s.has_sessionId {
+        offs[argc] = used;
+        used = used + append_bytes(&argv, 262144, used, STR_PTR("--resume"), STR_LEN("--resume"));
+        lens[argc] = STR_LEN("--resume");
+        argc = argc + 1;
+        offs[argc] = used;
+        used = used + append_bytes(&argv, 262144, used, s.sessionId_ptr, s.sessionId_len);
+        lens[argc] = s.sessionId_len;
+        argc = argc + 1;
+    };
+    // env: runtimeEnv + HOME=homeDir +
+    // COMMAND_CODE_API_KEY=placeholder +
+    // <RELAY_KEY_ENV>=placeholder + CMD_LOCAL_ONLY=1
+    let env = [0u8; 32768];
+    let env_len: u64 = 0;
+    env_len = env_len + append_bytes(&env, 32768, env_len, self.env_ptr, self.env_len);
+    env_len = env_len + append_bytes(&env, 32768, env_len, STR_PTR("HOME="), STR_LEN("HOME="));
+    env_len = env_len + append_bytes(&env, 32768, env_len, self.homeDir_ptr, self.homeDir_len);
+    env_len = env_len + append_bytes(&env, 32768, env_len, STR_PTR("\nCOMMAND_CODE_API_KEY="), STR_LEN("\nCOMMAND_CODE_API_KEY="));
+    env_len = env_len + append_bytes(&env, 32768, env_len, COMMAND_CODE_LOCAL_API_KEY_PLACEHOLDER_ptr(), COMMAND_CODE_LOCAL_API_KEY_PLACEHOLDER_len());
+    env_len = env_len + append_bytes(&env, 32768, env_len, STR_PTR("\n"), 1);
+    env_len = env_len + append_bytes(&env, 32768, env_len, COMMAND_CODE_RELAY_KEY_ENV_ptr(), COMMAND_CODE_RELAY_KEY_ENV_len());
+    env_len = env_len + append_bytes(&env, 32768, env_len, STR_PTR("="), 1);
+    env_len = env_len + append_bytes(&env, 32768, env_len, COMMAND_CODE_RELAY_KEY_PLACEHOLDER_ptr(), COMMAND_CODE_RELAY_KEY_PLACEHOLDER_len());
+    env_len = env_len + append_bytes(&env, 32768, env_len, STR_PTR("\nCMD_LOCAL_ONLY=1\n"), STR_LEN("\nCMD_LOCAL_ONLY=1\n"));
+    let proc: u64 = 0;
+    let hin: u64 = 0;
+    let hout: u64 = 0;
+    let herr: u64 = 0;
+    if spawn_bidi_env(&argv, &offs, &lens, argc, &env, env_len, &proc, &hin, &hout, &herr) != 0 {
+        finishTurn(self, session_idx, STR_PTR("failed"), STR_LEN("failed"), &s.streamedText, s.streamedText_len, 0, false, STR_PTR("command-code spawn failed"), STR_LEN("command-code spawn failed"), true);
+        return;
+    };
+    sa_std_close(hin);
+    s.proc = proc;
+    s.hout = hout;
+    s.herr = herr;
+    s.has_child = true;
+    s.sawResultLine = false;
+    s.lineBuf_len = 0;
+    s.stderrTail_len = 0;
+}
+
+// pump: owner-driven child output drain for every session —
+// stdout bytes -> line buffer -> handleFrame per line; stderr
+// bytes -> tail + "stderr" emit; kill deadlines; exit
+// detection via a nonblocking wait shim (process_poll_exit).
+// DEFECT: exit/error events collapse into the pump (the
+// source's child.on handlers); blocking reads are bounded to
+// one chunk per session per pump call in this pass.
+fn CommandCodeAgentBridge_pump(self: &CommandCodeAgentBridge) -> void {
+    let now = now_ms();
+    for i in 0..self.sessions_count {
+        let s = &self.sessions[i];
+        if s.has_kill_deadline && now >= s.kill_deadline {
+            s.has_kill_deadline = false;
+            if s.has_child { process_kill(s.proc, STR_PTR("SIGKILL"), STR_LEN("SIGKILL")); };
+        };
+        if !s.has_child { continue; };
+        // stderr chunk
+        let echunk = [0u8; 8192];
+        let egot: u64 = 0;
+        if sa_io_read(s.herr, &echunk, 8192, &egot) == 0 && egot > 0 {
+            // stderrTail = (tail + text).slice(-2000)
+            let combined = [0u8; 12288];
+            let combined_len: u64 = 0;
+            combined_len = combined_len + append_bytes(&combined, 12288, combined_len, &s.stderrTail, s.stderrTail_len);
+            combined_len = combined_len + append_bytes(&combined, 12288, combined_len, &echunk, egot);
+            if combined_len > 2000 {
+                s.stderrTail_len = buf_copy(&s.stderrTail, 4096, byte_off(&combined, combined_len - 2000), 2000);
+            } else {
+                s.stderrTail_len = buf_copy(&s.stderrTail, 4096, &combined, combined_len);
+            };
+            bridge_emit(self, STR_PTR("stderr"), STR_LEN("stderr"), &echunk, egot);
+        };
+        // stdout chunk -> lines
+        let chunk = [0u8; 16384];
+        let got: u64 = 0;
+        if sa_io_read(s.hout, &chunk, 16384, &got) == 0 && got > 0 {
+            s.lineBuf_len = s.lineBuf_len + append_bytes(&s.lineBuf, 262144, s.lineBuf_len, &chunk, got);
+            // while ((newlineIndex = buf.indexOf("\n")) >= 0)
+            while true {
+                let nl = find_byte(&s.lineBuf, s.lineBuf_len, 0, 10);
+                if nl == 4294967295 { break; };
+                let line = [0u8; 262144];
+                let line_len: u64 = 0;
+                // line = buf.slice(0, nl).trim() — trim 已绑
+                // sa_std ts 面 (@ts_str_trim).
+                let tp: ptr = PTR_NULL();
+                let tl: u64 = 0;
+                ts_trim_span(&s.lineBuf, nl, &tp, &tl);
+                line_len = buf_copy(&line, 262144, tp, tl);
+                // buf = buf.slice(nl + 1)
+                let rest = [0u8; 262144];
+                let rest_len: u64 = 0;
+                if nl + 1 < s.lineBuf_len {
+                    rest_len = buf_copy(&rest, 262144, byte_off(&s.lineBuf, nl + 1), s.lineBuf_len - nl - 1);
+                };
+                s.lineBuf_len = buf_copy(&s.lineBuf, 262144, &rest, rest_len);
+                if line_len > 0 {
+                    if handleFrame(self, i, &line, line_len) { s.sawResultLine = true; };
+                };
+            }
+        };
+        // exit?
+        let code: i32 = 0;
+        let exited = false;
+        process_poll_exit(s.proc, &code, &exited);
+        if exited {
+            s.has_child = false;
+            sa_std_close(s.hout);
+            sa_std_close(s.herr);
+            if s.has_activeTurnId {
+                if s.interrupting {
+                    finishTurn(self, i, STR_PTR("interrupted"), STR_LEN("interrupted"), &s.streamedText, s.streamedText_len, 0, false, PTR_NULL(), 0, false);
+                } else if !s.sawResultLine {
+                    // detail = stderrTail.trim().split("\n")
+                    //   .at(-1) ?? ""
+                    let tail_ptr: ptr = PTR_NULL();
+                    let tail_len: u64 = 0;
+                    ts_trim_span(&s.stderrTail, s.stderrTail_len, &tail_ptr, &tail_len);
+                    let detail_ptr = tail_ptr;
+                    let detail_len = tail_len;
+                    let k = tail_len;
+                    while k > 0 {
+                        k = k - 1;
+                        if byte_at(tail_ptr, k) == 10 { detail_ptr = byte_off(tail_ptr, k + 1); detail_len = tail_len - k - 1; break; };
+                    }
+                    let msg = [0u8; 4096];
+                    let msg_len: u64 = 0;
+                    msg_len = msg_len + append_bytes(&msg, 4096, msg_len, STR_PTR("command-code exited with code "), STR_LEN("command-code exited with code "));
+                    if code == 0 - 1 {
+                        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, STR_PTR("?"), 1);
+                    } else {
+                        msg_len = msg_len + append_i64(&msg, 4096, msg_len, code as i64);
+                    };
+                    if detail_len > 0 {
+                        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, STR_PTR(": "), 2);
+                        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, detail_ptr, detail_len);
+                    };
+                    finishTurn(self, i, STR_PTR("failed"), STR_LEN("failed"), &s.streamedText, s.streamedText_len, 0, false, &msg, msg_len, true);
+                };
+            };
+        };
+    }
+}
+
+// logUnknownFrameType: log an unrecognized frame type once,
+// with top-level key names (never values).
+fn logUnknownFrameType(self: &CommandCodeAgentBridge, frameType_ptr: ptr, frameType_len: u64, event_doc: u64) -> void {
+    let key_ptr = frameType_ptr;
+    let key_len = frameType_len;
+    if key_len == 0 { key_ptr = STR_PTR("unknown"); key_len = STR_LEN("unknown"); };
+    for i in 0..self.logged_count {
+        if self.logged_slen[i] == key_len && bytes_eq(slot(&self.loggedFrameTypes, self.logged_off[i]), key_ptr, key_len) { return; };
+    }
+    if self.logged_count < 128 {
+        let idx = self.logged_count;
+        self.logged_off[idx] = self.loggedFrameTypes_len;
+        self.logged_slen[idx] = key_len;
+        for i in 0..key_len {
+            if self.loggedFrameTypes_len < 8192 { self.loggedFrameTypes[self.loggedFrameTypes_len] = byte_at(key_ptr, i); self.loggedFrameTypes_len = self.loggedFrameTypes_len + 1; };
+        }
+        self.logged_count = self.logged_count + 1;
+    };
+    // console.info line is dropped in this pass (keys list
+    // requires object key enumeration — see log).
+}
+
+// closeOpenTextSegment(state)
+fn closeOpenTextSegment(self: &CommandCodeAgentBridge, session_idx: u64) -> void {
+    let s = &self.sessions[session_idx];
+    if !s.has_activeTurnId || !s.has_activeItemId { return; };
+    let text_len = s.streamedText_len;
+    let item_id = [0u8; 160];
+    let item_id_len = buf_copy(&item_id, 160, &s.activeItemId, s.activeItemId_len);
+    s.has_activeItemId = false;
+    s.activeItemId_len = 0;
+    s.streamedText_len = 0;
+    s.itemStarted = false;
+    if text_len == 0 { return; };
+    let item = [0u8; 262144];
+    let item_len: u64 = 0;
+    item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("{\"type\":\"agentMessage\",\"id\":\""), STR_LEN("{\"type\":\"agentMessage\",\"id\":\""));
+    item_len = item_len + append_bytes(&item, 262144, item_len, &item_id, item_id_len);
+    item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    item_len = item_len + append_bytes(&item, 262144, item_len, &s.activeTurnId, s.activeTurnId_len);
+    item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    item_len = item_len + append_bytes(&item, 262144, item_len, s.threadId_ptr, s.threadId_len);
+    item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"content\":\""), STR_LEN("\",\"content\":\""));
+    item_len = item_len + append_bytes(&item, 262144, item_len, &s.streamedText, text_len);
+    item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"role\":\"assistant\",\"status\":\"completed\"}"), STR_LEN("\",\"role\":\"assistant\",\"status\":\"completed\"}"));
+    let found = cc_find_message(s, STR_PTR("agentMessage"), STR_LEN("agentMessage"), &item_id, item_id_len);
+    if found != 4294967295 {
+        cc_replace_message(s, found, &item, item_len);
+    } else {
+        cc_push_message(s, &item, item_len);
+    };
+    let msg = [0u8; 262144];
+    let msg_len: u64 = 0;
+    msg_len = wrap_item_message(&msg, 262144, STR_PTR("item/completed"), STR_LEN("item/completed"), s.threadId_ptr, s.threadId_len, &s.activeTurnId, s.activeTurnId_len, &item, item_len);
+    emit_message(self, &msg, msg_len);
+}
+
+fn wrap_item_message(out: ptr, out_cap: u64, method_ptr: ptr, method_len: u64, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, item_ptr: ptr, item_len: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"method\":\""), STR_LEN("{\"method\":\""));
+    n = n + append_bytes(out, out_cap, n, method_ptr, method_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"params\":{\"threadId\":\""), STR_LEN("\",\"params\":{\"threadId\":\""));
+    n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    n = n + append_bytes(out, out_cap, n, turn_ptr, turn_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"item\":"), STR_LEN("\",\"item\":"));
+    n = n + append_bytes(out, out_cap, n, item_ptr, item_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("}}"), 2);
+    return n;
+}
+
+// handleFrame(state, line): returns true when the frame was
+// the terminal result line.
+fn handleFrame(self: &CommandCodeAgentBridge, session_idx: u64, line_ptr: ptr, line_len: u64) -> bool {
+    let s = &self.sessions[session_idx];
+    let frame = sa_json_parse(line_ptr, line_len);
+    if frame == 0 { return false; };
+    let event_node: u64 = 0;
+    sa_json_object_get(frame, STR_PTR("event"), STR_LEN("event"), &event_node);
+    let ev_type_ptr: ptr = PTR_NULL();
+    let ev_type_len: u64 = 0;
+    if event_node != 0 { sa_json_object_get_string(event_node, STR_PTR("type"), STR_LEN("type"), &ev_type_ptr, &ev_type_len); };
+    let frame_type_ptr: ptr = PTR_NULL();
+    let frame_type_len: u64 = 0;
+    sa_json_object_get_string(frame, STR_PTR("type"), STR_LEN("type"), &frame_type_ptr, &frame_type_len);
+    // Diagnostic frame log (local disk via the sdk logger
+    // shim): streamed chunks log a length only.
+    let is_stream = str_is(ev_type_ptr, ev_type_len, STR_PTR("text_delta"), STR_LEN("text_delta")) || str_is(ev_type_ptr, ev_type_len, STR_PTR("thinking_delta"), STR_LEN("thinking_delta")) || str_is(ev_type_ptr, ev_type_len, STR_PTR("message_update"), STR_LEN("message_update"));
+    if str_is(frame_type_ptr, frame_type_len, STR_PTR("text_delta"), STR_LEN("text_delta")) || is_stream {
+        let d_ptr: ptr = PTR_NULL();
+        let d_len: u64 = 0;
+        if event_node != 0 {
+            if sa_json_object_get_string(event_node, STR_PTR("delta"), STR_LEN("delta"), &d_ptr, &d_len) != 0 {
+                if sa_json_object_get_string(event_node, STR_PTR("text"), STR_LEN("text"), &d_ptr, &d_len) != 0 {
+                    sa_json_object_get_string(event_node, STR_PTR("content"), STR_LEN("content"), &d_ptr, &d_len);
+                };
+            };
+        };
+        host_event_log_frame(ev_type_ptr, ev_type_len, d_len);
+    } else if str_is(frame_type_ptr, frame_type_len, STR_PTR("event"), STR_LEN("event")) {
+        host_event_log_event(ev_type_ptr, ev_type_len, line_ptr, line_len);
+    } else {
+        host_event_log_event(frame_type_ptr, frame_type_len, line_ptr, line_len);
+    };
+    if str_is(frame_type_ptr, frame_type_len, STR_PTR("result"), STR_LEN("result")) {
+        let usage: u64 = 0;
+        sa_json_object_get(frame, STR_PTR("usage"), STR_LEN("usage"), &usage);
+        let subtype_ptr: ptr = PTR_NULL();
+        let subtype_len: u64 = 0;
+        sa_json_object_get_string(frame, STR_PTR("subtype"), STR_LEN("subtype"), &subtype_ptr, &subtype_len);
+        if str_is(subtype_ptr, subtype_len, STR_PTR("success"), STR_LEN("success")) {
+            let final_ptr: ptr = PTR_NULL();
+            let final_len: u64 = 0;
+            let ft_ptr: ptr = PTR_NULL();
+            let ft_len: u64 = 0;
+            if sa_json_object_get_string(frame, STR_PTR("finalText"), STR_LEN("finalText"), &ft_ptr, &ft_len) == 0 {
+                final_ptr = ft_ptr;
+                final_len = ft_len;
+            } else {
+                final_ptr = &s.streamedText;
+                final_len = s.streamedText_len;
+            };
+            finishTurn(self, session_idx, STR_PTR("completed"), STR_LEN("completed"), final_ptr, final_len, usage, usage != 0, PTR_NULL(), 0, false);
+        } else {
+            let e_ptr: ptr = PTR_NULL();
+            let e_len: u64 = 0;
+            if sa_json_object_get_string(frame, STR_PTR("error"), STR_LEN("error"), &e_ptr, &e_len) != 0 || e_len == 0 {
+                e_ptr = STR_PTR("Command Code run failed");
+                e_len = STR_LEN("Command Code run failed");
+            };
+            finishTurn(self, session_idx, STR_PTR("failed"), STR_LEN("failed"), &s.streamedText, s.streamedText_len, usage, usage != 0, e_ptr, e_len, true);
+        };
+        return true;
+    };
+    if !str_is(frame_type_ptr, frame_type_len, STR_PTR("event"), STR_LEN("event")) { return false; };
+    let event = event_node;
+    if str_is(ev_type_ptr, ev_type_len, STR_PTR("run_start"), STR_LEN("run_start")) {
+        let sid_ptr: ptr = PTR_NULL();
+        let sid_len: u64 = 0;
+        if sa_json_object_get_string(event, STR_PTR("sessionId"), STR_LEN("sessionId"), &sid_ptr, &sid_len) == 0 {
+            if !(s.has_sessionId && s.sessionId_len == sid_len && bytes_eq(s.sessionId_ptr, sid_ptr, sid_len)) {
+                s.sessionId_ptr = sid_ptr;
+                s.sessionId_len = sid_len;
+                s.has_sessionId = true;
+                writeMapping(self, s.threadId_ptr, s.threadId_len, sid_ptr, sid_len, true, PTR_NULL(), 0, false, PTR_NULL(), 0, false, PTR_NULL(), 0, false, 0, false);
+            };
+        };
+        return false;
+    };
+    if str_is(ev_type_ptr, ev_type_len, STR_PTR("text_delta"), STR_LEN("text_delta")) {
+        let delta_ptr: ptr = PTR_NULL();
+        let delta_len: u64 = 0;
+        sa_json_object_get_string(event, STR_PTR("delta"), STR_LEN("delta"), &delta_ptr, &delta_len);
+        if delta_len == 0 || !s.has_activeTurnId { return false; };
+        if !s.has_activeItemId {
+            s.textSegIndex = s.textSegIndex + 1;
+            s.activeItemId_len = 0;
+            s.activeItemId_len = s.activeItemId_len + append_bytes(&s.activeItemId, 160, s.activeItemId_len, STR_PTR("command-code-"), STR_LEN("command-code-"));
+            s.activeItemId_len = s.activeItemId_len + append_bytes(&s.activeItemId, 160, s.activeItemId_len, &s.activeTurnId, s.activeTurnId_len);
+            s.activeItemId_len = s.activeItemId_len + append_bytes(&s.activeItemId, 160, s.activeItemId_len, STR_PTR("-text-"), STR_LEN("-text-"));
+            s.activeItemId_len = s.activeItemId_len + append_u64(&s.activeItemId, 160, s.activeItemId_len, s.textSegIndex);
+            s.has_activeItemId = true;
+        };
+        s.streamedText_len = s.streamedText_len + append_bytes(&s.streamedText, 262144, s.streamedText_len, delta_ptr, delta_len);
+        if !s.itemStarted {
+            s.itemStarted = true;
+            let text_item = [0u8; 1024];
+            let text_item_len: u64 = 0;
+            text_item_len = text_item_len + append_bytes(&text_item, 1024, text_item_len, STR_PTR("{\"type\":\"agentMessage\",\"id\":\""), STR_LEN("{\"type\":\"agentMessage\",\"id\":\""));
+            text_item_len = text_item_len + append_bytes(&text_item, 1024, text_item_len, &s.activeItemId, s.activeItemId_len);
+            text_item_len = text_item_len + append_bytes(&text_item, 1024, text_item_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+            text_item_len = text_item_len + append_bytes(&text_item, 1024, text_item_len, &s.activeTurnId, s.activeTurnId_len);
+            text_item_len = text_item_len + append_bytes(&text_item, 1024, text_item_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+            text_item_len = text_item_len + append_bytes(&text_item, 1024, text_item_len, s.threadId_ptr, s.threadId_len);
+            text_item_len = text_item_len + append_bytes(&text_item, 1024, text_item_len, STR_PTR("\",\"status\":\"inProgress\"}"), STR_LEN("\",\"status\":\"inProgress\"}"));
+            cc_push_message(s, &text_item, text_item_len);
+            let msg = [0u8; 2048];
+            let msg_len: u64 = 0;
+            msg_len = wrap_item_message(&msg, 2048, STR_PTR("item/started"), STR_LEN("item/started"), s.threadId_ptr, s.threadId_len, &s.activeTurnId, s.activeTurnId_len, &text_item, text_item_len);
+            emit_message(self, &msg, msg_len);
+        };
+        let msg = [0u8; 262144];
+        let msg_len: u64 = 0;
+        msg_len = msg_len + append_bytes(&msg, 262144, msg_len, STR_PTR("{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\""));
+        msg_len = msg_len + append_bytes(&msg, 262144, msg_len, s.threadId_ptr, s.threadId_len);
+        msg_len = msg_len + append_bytes(&msg, 262144, msg_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        msg_len = msg_len + append_bytes(&msg, 262144, msg_len, &s.activeTurnId, s.activeTurnId_len);
+        msg_len = msg_len + append_bytes(&msg, 262144, msg_len, STR_PTR("\",\"itemId\":\""), STR_LEN("\",\"itemId\":\""));
+        msg_len = msg_len + append_bytes(&msg, 262144, msg_len, &s.activeItemId, s.activeItemId_len);
+        msg_len = msg_len + append_bytes(&msg, 262144, msg_len, STR_PTR("\",\"delta\":\""), STR_LEN("\",\"delta\":\""));
+        msg_len = msg_len + append_bytes(&msg, 262144, msg_len, delta_ptr, delta_len);
+        msg_len = msg_len + append_bytes(&msg, 262144, msg_len, STR_PTR("\"}}"), 3);
+        emit_message(self, &msg, msg_len);
+        return false;
+    };
+    if is_tool_start_type(ev_type_ptr, ev_type_len) {
+        return handle_tool_start(self, session_idx, event);
+    };
+    if is_tool_result_type(ev_type_ptr, ev_type_len) {
+        return handle_tool_result(self, session_idx, event, ev_type_ptr, ev_type_len);
+    };
+    logUnknownFrameType(self, ev_type_ptr, ev_type_len, event);
+    return false;
+}
+
+fn is_tool_start_type(t_ptr: ptr, t_len: u64) -> bool {
+    return str_is(t_ptr, t_len, STR_PTR("tool_use"), STR_LEN("tool_use")) || str_is(t_ptr, t_len, STR_PTR("tool_queued"), STR_LEN("tool_queued")) || str_is(t_ptr, t_len, STR_PTR("tool_running"), STR_LEN("tool_running"));
+}
+
+fn is_tool_result_type(t_ptr: ptr, t_len: u64) -> bool {
+    return str_is(t_ptr, t_len, STR_PTR("tool_result"), STR_LEN("tool_result")) || str_is(t_ptr, t_len, STR_PTR("tool_completed"), STR_LEN("tool_completed")) || str_is(t_ptr, t_len, STR_PTR("tool_denied"), STR_LEN("tool_denied")) || str_is(t_ptr, t_len, STR_PTR("tool_errored"), STR_LEN("tool_errored")) || str_is(t_ptr, t_len, STR_PTR("tool_hook_blocked"), STR_LEN("tool_hook_blocked")) || str_is(t_ptr, t_len, STR_PTR("tool_update"), STR_LEN("tool_update"));
+}
+
+// tool id resolution shared by both tool cases:
+// event.toolCallId || event.id || event.toolUseId ||
+// event.tool_id || ""
+fn tool_id_of(event: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    if sa_json_object_get_string(event, STR_PTR("toolCallId"), STR_LEN("toolCallId"), &v_ptr, &v_len) == 0 && v_len > 0 { out_len = buf_copy(out, out_cap, v_ptr, v_len); return; };
+    if sa_json_object_get_string(event, STR_PTR("id"), STR_LEN("id"), &v_ptr, &v_len) == 0 { out_len = buf_copy(out, out_cap, v_ptr, v_len); return; };
+    if sa_json_object_get_string(event, STR_PTR("toolUseId"), STR_LEN("toolUseId"), &v_ptr, &v_len) == 0 { out_len = buf_copy(out, out_cap, v_ptr, v_len); return; };
+    if sa_json_object_get_string(event, STR_PTR("tool_id"), STR_LEN("tool_id"), &v_ptr, &v_len) == 0 { out_len = buf_copy(out, out_cap, v_ptr, v_len); return; };
+    out_len = 0;
+}
+
+fn tool_name_of(event: u64, prior: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    if sa_json_object_get_string(event, STR_PTR("toolName"), STR_LEN("toolName"), &v_ptr, &v_len) == 0 && v_len > 0 { out_len = buf_copy(out, out_cap, v_ptr, v_len); return; };
+    if sa_json_object_get_string(event, STR_PTR("name"), STR_LEN("name"), &v_ptr, &v_len) == 0 && v_len > 0 { out_len = buf_copy(out, out_cap, v_ptr, v_len); return; };
+    if sa_json_object_get_string(event, STR_PTR("title"), STR_LEN("title"), &v_ptr, &v_len) == 0 && v_len > 0 { out_len = buf_copy(out, out_cap, v_ptr, v_len); return; };
+    if prior != 0 && sa_json_object_get_string(prior, STR_PTR("toolName"), STR_LEN("toolName"), &v_ptr, &v_len) == 0 { out_len = buf_copy(out, out_cap, v_ptr, v_len); return; };
+    out_len = buf_copy(out, out_cap, STR_PTR("Tool"), 4);
+}
+
+// find a stored toolCall message doc by id (recordOf scan).
+fn find_tool_doc(s: &CommandCodeSessionState, tool_id_ptr: ptr, tool_id_len: u64) -> u64 {
+    for i in 0..s.msg_count {
+        let doc = sa_json_parse(cc_msg_ptr(s, i), s.msg_len_arr[i]);
+        if doc == 0 { continue; };
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len) != 0 { continue; };
+        if !str_is(t_ptr, t_len, STR_PTR("toolCall"), STR_LEN("toolCall")) && !str_is(t_ptr, t_len, STR_PTR("collabAgentToolCall"), STR_LEN("collabAgentToolCall")) { continue; };
+        let v_ptr: ptr = PTR_NULL();
+        let v_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("id"), STR_LEN("id"), &v_ptr, &v_len) == 0 && v_len == tool_id_len && bytes_eq(v_ptr, tool_id_ptr, tool_id_len) { return doc; };
+    }
+    return 0;
+}
+
+// args_json_of: recordOf(node[inputKey]) serialized, or "{}".
+fn args_json_of(doc: u64, key_ptr: ptr, key_len: u64, out: ptr, out_cap: u64) -> u64 {
+    let node: u64 = 0;
+    if doc != 0 && sa_json_object_get(doc, key_ptr, key_len, &node) == 0 { return stringify_into(node, out, out_cap); };
+    return append_bytes(out, out_cap, 0, STR_PTR("{}"), 2);
+}
+
+fn handle_tool_start(self: &CommandCodeAgentBridge, session_idx: u64, event: u64) -> bool {
+    let s = &self.sessions[session_idx];
+    if !s.has_activeTurnId { return false; };
+    closeOpenTextSegment(self, session_idx);
+    let tool_id = [0u8; 128];
+    let tool_id_len: u64 = 0;
+    tool_id_of(event, &tool_id, 128, &tool_id_len);
+    if tool_id_len == 0 { return false; };
+    let prior = find_tool_doc(s, &tool_id, tool_id_len);
+    let name = [0u8; 256];
+    let name_len: u64 = 0;
+    tool_name_of(event, prior, &name, 256, &name_len);
+    // frameArgs = recordOf(event.input ?? event.arguments ??
+    // event.args); empty -> prior input/arguments.
+    let args = [0u8; 32768];
+    let args_len: u64 = 0;
+    let input_node: u64 = 0;
+    let has_input = sa_json_object_get(event, STR_PTR("input"), STR_LEN("input"), &input_node) == 0 || sa_json_object_get(event, STR_PTR("arguments"), STR_LEN("arguments"), &input_node) == 0 || sa_json_object_get(event, STR_PTR("args"), STR_LEN("args"), &input_node) == 0;
+    if has_input {
+        args_len = stringify_into(input_node, &args, 32768);
+    };
+    if !has_input || args_len <= 2 {
+        if prior != 0 {
+            args_len = args_json_of(prior, STR_PTR("input"), STR_LEN("input"), &args, 32768);
+            if args_len <= 2 { args_len = args_json_of(prior, STR_PTR("arguments"), STR_LEN("arguments"), &args, 32768); };
+        } else if !has_input {
+            args_len = append_bytes(&args, 32768, 0, STR_PTR("{}"), 2);
+        };
+    };
+    let item = [0u8; 65536];
+    let item_len: u64 = 0;
+    if isCommandCodeTaskTool(&name, name_len) {
+        item_len = buildCommandCodeCollabItem(s.threadId_ptr, s.threadId_len, &s.activeTurnId, s.activeTurnId_len, true, &tool_id, tool_id_len, &name, name_len, &args, args_len, STR_PTR("inProgress"), STR_LEN("inProgress"), PTR_NULL(), 0, false, &item, 65536);
+    } else {
+        item_len = build_tool_item(&item, 65536, s.threadId_ptr, s.threadId_len, &s.activeTurnId, s.activeTurnId_len, &tool_id, tool_id_len, &name, name_len, &name, name_len, &args, args_len, &args, args_len, STR_PTR("inProgress"), STR_LEN("inProgress"), PTR_NULL(), 0, false);
+    };
+    upsertCommandCodeItem(s, &item, item_len);
+    let msg = [0u8; 65536];
+    let msg_len: u64 = 0;
+    msg_len = wrap_item_message(&msg, 65536, STR_PTR("item/started"), STR_LEN("item/started"), s.threadId_ptr, s.threadId_len, &s.activeTurnId, s.activeTurnId_len, &item, item_len);
+    emit_message(self, &msg, msg_len);
+    return false;
+}
+
+fn handle_tool_result(self: &CommandCodeAgentBridge, session_idx: u64, event: u64, ev_type_ptr: ptr, ev_type_len: u64) -> bool {
+    let s = &self.sessions[session_idx];
+    if !s.has_activeTurnId { return false; };
+    let tool_id = [0u8; 128];
+    let tool_id_len: u64 = 0;
+    tool_id_of(event, &tool_id, 128, &tool_id_len);
+    if tool_id_len == 0 { return false; };
+    let update_status = [0u8; 64];
+    let update_status_len: u64 = 0;
+    let st_ptr: ptr = PTR_NULL();
+    let st_len: u64 = 0;
+    if sa_json_object_get_string(event, STR_PTR("status"), STR_LEN("status"), &st_ptr, &st_len) == 0 {
+        update_status_len = to_lower(&update_status, 64, st_ptr, st_len);
+    } else if sa_json_object_get_string(event, STR_PTR("state"), STR_LEN("state"), &st_ptr, &st_len) == 0 {
+        update_status_len = to_lower(&update_status, 64, st_ptr, st_len);
+    };
+    let is_update = str_is(ev_type_ptr, ev_type_len, STR_PTR("tool_update"), STR_LEN("tool_update"));
+    let done_flag = false;
+    let iserr_flag = false;
+    sa_json_object_get_bool(event, STR_PTR("done"), STR_LEN("done"), &done_flag);
+    sa_json_object_get_bool(event, STR_PTR("is_error"), STR_LEN("is_error"), &iserr_flag);
+    let terminal = !is_update || str_is(&update_status, update_status_len, STR_PTR("completed"), STR_LEN("completed")) || str_is(&update_status, update_status_len, STR_PTR("failed"), STR_LEN("failed")) || str_is(&update_status, update_status_len, STR_PTR("done"), 4) || str_is(&update_status, update_status_len, STR_PTR("error"), STR_LEN("error")) || str_is(&update_status, update_status_len, STR_PTR("errored"), STR_LEN("errored")) || str_is(&update_status, update_status_len, STR_PTR("denied"), STR_LEN("denied")) || done_flag || iserr_flag;
+    let failed = str_is(ev_type_ptr, ev_type_len, STR_PTR("tool_denied"), STR_LEN("tool_denied")) || str_is(ev_type_ptr, ev_type_len, STR_PTR("tool_errored"), STR_LEN("tool_errored")) || str_is(ev_type_ptr, ev_type_len, STR_PTR("tool_hook_blocked"), STR_LEN("tool_hook_blocked")) || str_is(&update_status, update_status_len, STR_PTR("failed"), STR_LEN("failed")) || str_is(&update_status, update_status_len, STR_PTR("error"), STR_LEN("error")) || str_is(&update_status, update_status_len, STR_PTR("errored"), STR_LEN("errored")) || str_is(&update_status, update_status_len, STR_PTR("denied"), STR_LEN("denied")) || iserr_flag;
+    let started = find_tool_doc(s, &tool_id, tool_id_len);
+    // output text: hook/denied notes, else
+    // result ?? output ?? text ?? content ?? error ?? ""
+    let out_text = [0u8; 262144];
+    let out_text_len: u64 = 0;
+    if str_is(ev_type_ptr, ev_type_len, STR_PTR("tool_hook_blocked"), STR_LEN("tool_hook_blocked")) {
+        let h_ptr: ptr = PTR_NULL();
+        let h_len: u64 = 0;
+        if sa_json_object_get_string(event, STR_PTR("hookOutput"), STR_LEN("hookOutput"), &h_ptr, &h_len) == 0 && h_len > 0 {
+            out_text_len = out_text_len + append_bytes(&out_text, 262144, out_text_len, STR_PTR("Blocked by a hook: "), STR_LEN("Blocked by a hook: "));
+            out_text_len = out_text_len + append_bytes(&out_text, 262144, out_text_len, h_ptr, h_len);
+        };
+    };
+    if out_text_len == 0 && str_is(ev_type_ptr, ev_type_len, STR_PTR("tool_denied"), STR_LEN("tool_denied")) {
+        out_text_len = buf_copy(&out_text, 262144, STR_PTR("Permission denied by the user."), STR_LEN("Permission denied by the user."));
+    };
+    if out_text_len == 0 {
+        let raw: u64 = 0;
+        let has_raw = sa_json_object_get(event, STR_PTR("result"), STR_LEN("result"), &raw) == 0 || sa_json_object_get(event, STR_PTR("output"), STR_LEN("output"), &raw) == 0 || sa_json_object_get(event, STR_PTR("text"), STR_LEN("text"), &raw) == 0 || sa_json_object_get(event, STR_PTR("content"), STR_LEN("content"), &raw) == 0 || sa_json_object_get(event, STR_PTR("error"), STR_LEN("error"), &raw) == 0;
+        if has_raw {
+            let r_ptr: ptr = PTR_NULL();
+            let r_len: u64 = 0;
+            json_node_string(raw, &r_ptr, &r_len);
+            if r_len > 0 || raw != 0 {
+                let is_str = false;
+                json_node_is_string(raw, &is_str);
+                if is_str {
+                    out_text_len = buf_copy(&out_text, 262144, r_ptr, r_len);
+                } else {
+                    out_text_len = stringify_into(raw, &out_text, 262144);
+                };
+            };
+        };
+    };
+    // resolved name/input/args carry the started card forward.
+    let name = [0u8; 256];
+    let name_len: u64 = 0;
+    let nv_ptr: ptr = PTR_NULL();
+    let nv_len: u64 = 0;
+    if sa_json_object_get_string(event, STR_PTR("toolName"), STR_LEN("toolName"), &nv_ptr, &nv_len) == 0 && nv_len > 0 { name_len = buf_copy(&name, 256, nv_ptr, nv_len); } else if sa_json_object_get_string(event, STR_PTR("name"), STR_LEN("name"), &nv_ptr, &nv_len) == 0 && nv_len > 0 { name_len = buf_copy(&name, 256, nv_ptr, nv_len); } else if sa_json_object_get_string(event, STR_PTR("title"), STR_LEN("title"), &nv_ptr, &nv_len) == 0 && nv_len > 0 { name_len = buf_copy(&name, 256, nv_ptr, nv_len); } else if started != 0 && sa_json_object_get_string(started, STR_PTR("name"), STR_LEN("name"), &nv_ptr, &nv_len) == 0 { name_len = buf_copy(&name, 256, nv_ptr, nv_len); } else { name_len = buf_copy(&name, 256, STR_PTR("Tool"), 4); };
+    let input_json = [0u8; 32768];
+    let input_len: u64 = 0;
+    input_len = args_json_of(started, STR_PTR("input"), STR_LEN("input"), &input_json, 32768);
+    if input_len <= 2 { input_len = args_json_of(started, STR_PTR("arguments"), STR_LEN("arguments"), &input_json, 32768); };
+    if input_len <= 2 { input_len = args_json_of(event, STR_PTR("input"), STR_LEN("input"), &input_json, 32768); };
+    if input_len <= 2 { input_len = args_json_of(event, STR_PTR("arguments"), STR_LEN("arguments"), &input_json, 32768); };
+    let args_json = [0u8; 32768];
+    let args_len: u64 = 0;
+    args_len = args_json_of(started, STR_PTR("arguments"), STR_LEN("arguments"), &args_json, 32768);
+    if args_len <= 2 { args_len = args_json_of(started, STR_PTR("input"), STR_LEN("input"), &args_json, 32768); };
+    if args_len <= 2 { args_len = args_json_of(event, STR_PTR("input"), STR_LEN("input"), &args_json, 32768); };
+    if args_len <= 2 { args_len = args_json_of(event, STR_PTR("arguments"), STR_LEN("arguments"), &args_json, 32768); };
+    let status_ptr = STR_PTR("inProgress");
+    let status_len = STR_LEN("inProgress");
+    if terminal {
+        if failed { status_ptr = STR_PTR("failed"); status_len = STR_LEN("failed"); } else { status_ptr = STR_PTR("completed"); status_len = STR_LEN("completed"); };
+    };
+    let item = [0u8; 65536];
+    let item_len: u64 = 0;
+    if isCommandCodeTaskTool(&name, name_len) {
+        item_len = buildCommandCodeCollabItem(s.threadId_ptr, s.threadId_len, &s.activeTurnId, s.activeTurnId_len, true, &tool_id, tool_id_len, &name, name_len, &args_json, args_len, status_ptr, status_len, &out_text, out_text_len, out_text_len > 0, &item, 65536);
+    } else {
+        // tool field: started.tool ?? nameFromEvent
+        let tool_field_ptr: ptr = PTR_NULL();
+        let tool_field_len: u64 = 0;
+        let has_tool_field = false;
+        if started != 0 && sa_json_object_get_string(started, STR_PTR("tool"), STR_LEN("tool"), &tool_field_ptr, &tool_field_len) == 0 { has_tool_field = true; };
+        item_len = build_tool_item(&item, 65536, s.threadId_ptr, s.threadId_len, &s.activeTurnId, s.activeTurnId_len, &tool_id, tool_id_len, &name, name_len, if has_tool_field { tool_field_ptr } else { nv_ptr }, if has_tool_field { tool_field_len } else { nv_len }, &input_json, input_len, &args_json, args_len, status_ptr, status_len, &out_text, out_text_len, out_text_len > 0);
+    };
+    upsertCommandCodeItem(s, &item, item_len);
+    let msg = [0u8; 65536];
+    let msg_len: u64 = 0;
+    msg_len = wrap_item_message(&msg, 65536, if terminal { STR_PTR("item/completed") } else { STR_PTR("item/started") }, if terminal { STR_LEN("item/completed") } else { STR_LEN("item/started") }, s.threadId_ptr, s.threadId_len, &s.activeTurnId, s.activeTurnId_len, &item, item_len);
+    emit_message(self, &msg, msg_len);
+    return false;
+}
+
+// build_tool_item: the plain toolCall item JSON (tool field
+// overridable for the result path).
+fn build_tool_item(out: ptr, out_cap: u64, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, id_ptr: ptr, id_len: u64, name_ptr: ptr, name_len: u64, tool_ptr: ptr, tool_len: u64, input_ptr: ptr, input_len: u64, args_ptr: ptr, args_len: u64, status_ptr: ptr, status_len: u64, output_ptr: ptr, output_len: u64, has_output: bool) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"type\":\"toolCall\",\"id\":\""), STR_LEN("{\"type\":\"toolCall\",\"id\":\""));
+    n = n + append_bytes(out, out_cap, n, id_ptr, id_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    n = n + append_bytes(out, out_cap, n, turn_ptr, turn_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"name\":\""), STR_LEN("\",\"name\":\""));
+    n = n + append_bytes(out, out_cap, n, name_ptr, name_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"tool\":"), STR_LEN("\",\"tool\":"));
+    if tool_len > 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+        n = n + append_bytes(out, out_cap, n, tool_ptr, tool_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    } else {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("null"), 4);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"toolName\":\""), STR_LEN(",\"toolName\":\""));
+    n = n + append_bytes(out, out_cap, n, name_ptr, name_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"input\":"), STR_LEN("\",\"input\":"));
+    n = n + append_bytes(out, out_cap, n, input_ptr, input_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"arguments\":"), STR_LEN(",\"arguments\":"));
+    n = n + append_bytes(out, out_cap, n, args_ptr, args_len);
+    if has_output {
+        let take = output_len;
+        if take > 4000 { take = 4000; };
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"output\":\""), STR_LEN(",\"output\":\""));
+        n = n + append_bytes(out, out_cap, n, output_ptr, take);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"result\":{\"content\":\""), STR_LEN("\",\"result\":{\"content\":\""));
+        n = n + append_bytes(out, out_cap, n, output_ptr, take);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\"}"), 2);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"status\":\""), STR_LEN(",\"status\":\""));
+    n = n + append_bytes(out, out_cap, n, status_ptr, status_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\"}"), 2);
+    return n;
+}
+
+// upsertCommandCodeItem(state, item): insert or replace a
+// toolCall card by id. NOTE: collab items type-check as
+// toolCall in the source's find (record.type === "toolCall")
+// — collab cards (type collabAgentToolCall) therefore always
+// append in the source too; preserved.
+fn upsertCommandCodeItem(s: &CommandCodeSessionState, item_ptr: ptr, item_len: u64) -> void {
+    let doc = sa_json_parse(item_ptr, item_len);
+    let id_ptr: ptr = PTR_NULL();
+    let id_len: u64 = 0;
+    if doc != 0 { sa_json_object_get_string(doc, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len); };
+    let found = cc_find_message(s, STR_PTR("toolCall"), STR_LEN("toolCall"), id_ptr, id_len);
+    if found != 4294967295 {
+        cc_replace_message(s, found, item_ptr, item_len);
+    } else {
+        cc_push_message(s, item_ptr, item_len);
+    };
+}
+
+// finishTurn(state, status, finalText, usage?, errorMessage?)
+fn finishTurn(self: &CommandCodeAgentBridge, session_idx: u64, status_ptr: ptr, status_len: u64, final_ptr: ptr, final_len: u64, usage: u64, has_usage: bool, err_ptr: ptr, err_len: u64, has_err: bool) -> void {
+    let s = &self.sessions[session_idx];
+    if !s.has_activeTurnId { return; };
+    let turn_id = [0u8; 64];
+    let turn_len = buf_copy(&turn_id, 64, &s.activeTurnId, s.activeTurnId_len);
+    s.has_activeTurnId = false;
+    s.activeTurnId_len = 0;
+    if final_len > 0 {
+        let item_id = [0u8; 192];
+        let item_id_len: u64 = 0;
+        if s.has_activeItemId {
+            item_id_len = buf_copy(&item_id, 192, &s.activeItemId, s.activeItemId_len);
+        } else {
+            item_id_len = item_id_len + append_bytes(&item_id, 192, item_id_len, STR_PTR("command-code-"), STR_LEN("command-code-"));
+            item_id_len = item_id_len + append_bytes(&item_id, 192, item_id_len, &turn_id, turn_len);
+            item_id_len = item_id_len + append_bytes(&item_id, 192, item_id_len, STR_PTR("-text"), STR_LEN("-text"));
+        };
+        let item = [0u8; 262144];
+        let item_len: u64 = 0;
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("{\"type\":\"agentMessage\",\"id\":\""), STR_LEN("{\"type\":\"agentMessage\",\"id\":\""));
+        item_len = item_len + append_bytes(&item, 262144, item_len, &item_id, item_id_len);
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        item_len = item_len + append_bytes(&item, 262144, item_len, &turn_id, turn_len);
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        item_len = item_len + append_bytes(&item, 262144, item_len, s.threadId_ptr, s.threadId_len);
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"content\":\""), STR_LEN("\",\"content\":\""));
+        item_len = item_len + append_bytes(&item, 262144, item_len, final_ptr, final_len);
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"role\":\"assistant\",\"status\":\"completed\"}"), STR_LEN("\",\"role\":\"assistant\",\"status\":\"completed\"}"));
+        let msg = [0u8; 262144];
+        let msg_len: u64 = 0;
+        msg_len = wrap_item_message(&msg, 262144, STR_PTR("item/completed"), STR_LEN("item/completed"), s.threadId_ptr, s.threadId_len, &turn_id, turn_len, &item, item_len);
+        emit_message(self, &msg, msg_len);
+        let found = cc_find_message(s, STR_PTR("agentMessage"), STR_LEN("agentMessage"), &item_id, item_id_len);
+        if found != 4294967295 {
+            cc_replace_message(s, found, &item, item_len);
+        } else {
+            // only fill the gap when no text row exists for
+            // the turn
+            let has_text = false;
+            for i in 0..s.msg_count {
+                let mdoc = sa_json_parse(cc_msg_ptr(s, i), s.msg_len_arr[i]);
+                if mdoc == 0 { continue; };
+                let t_ptr: ptr = PTR_NULL();
+                let t_len: u64 = 0;
+                if sa_json_object_get_string(mdoc, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len) != 0 { continue; };
+                if !str_is(t_ptr, t_len, STR_PTR("agentMessage"), STR_LEN("agentMessage")) { continue; };
+                let v_ptr: ptr = PTR_NULL();
+                let v_len: u64 = 0;
+                if sa_json_object_get_string(mdoc, STR_PTR("turnId"), STR_LEN("turnId"), &v_ptr, &v_len) == 0 && v_len == turn_len && bytes_eq(v_ptr, &turn_id, turn_len) { has_text = true; break; };
+            }
+            if !has_text { cc_push_message(s, &item, item_len); };
+        };
+    };
+    s.has_activeItemId = false;
+    s.activeItemId_len = 0;
+    s.streamedText_len = 0;
+    s.itemStarted = false;
+    s.interrupting = false;
+    for i in 0..s.turns_count {
+        if s.turns[i].id_len == turn_len && bytes_eq(&s.turns[i].id, &turn_id, turn_len) {
+            s.turns[i].status_len = buf_copy(&s.turns[i].status, 32, status_ptr, status_len);
+            break;
+        };
+    }
+    if has_usage && usage != 0 {
+        let prompt_tokens: i64 = 0;
+        let completion_tokens: i64 = 0;
+        let has_prompt = number_of(usage, STR_PTR("inputTokens"), STR_LEN("inputTokens"), &prompt_tokens);
+        let has_completion = number_of(usage, STR_PTR("outputTokens"), STR_LEN("outputTokens"), &completion_tokens);
+        if has_prompt || has_completion {
+            let cache_tokens: i64 = 0;
+            let has_cache = number_of(usage, STR_PTR("cacheReadTokens"), STR_LEN("cacheReadTokens"), &cache_tokens);
+            let msg = [0u8; 2048];
+            let msg_len: u64 = 0;
+            msg_len = msg_len + append_bytes(&msg, 2048, msg_len, STR_PTR("{\"method\":\"thread/tokenUsage/requestUpdated\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"thread/tokenUsage/requestUpdated\",\"params\":{\"threadId\":\""));
+            msg_len = msg_len + append_bytes(&msg, 2048, msg_len, s.threadId_ptr, s.threadId_len);
+            msg_len = msg_len + append_bytes(&msg, 2048, msg_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+            msg_len = msg_len + append_bytes(&msg, 2048, msg_len, &turn_id, turn_len);
+            msg_len = msg_len + append_bytes(&msg, 2048, msg_len, STR_PTR("\",\"requestId\":\"command-code-turn-"), STR_LEN("\",\"requestId\":\"command-code-turn-"));
+            msg_len = msg_len + append_bytes(&msg, 2048, msg_len, &turn_id, turn_len);
+            msg_len = msg_len + append_bytes(&msg, 2048, msg_len, STR_PTR("\",\"usage\":{\"prompt_tokens\":"), STR_LEN("\",\"usage\":{\"prompt_tokens\":"));
+            msg_len = msg_len + append_i64(&msg, 2048, msg_len, if has_prompt { prompt_tokens } else { 0 });
+            msg_len = msg_len + append_bytes(&msg, 2048, msg_len, STR_PTR(",\"completion_tokens\":"), STR_LEN(",\"completion_tokens\":"));
+            msg_len = msg_len + append_i64(&msg, 2048, msg_len, if has_completion { completion_tokens } else { 0 });
+            msg_len = msg_len + append_bytes(&msg, 2048, msg_len, STR_PTR(",\"total_tokens\":"), STR_LEN(",\"total_tokens\":"));
+            msg_len = msg_len + append_i64(&msg, 2048, msg_len, (if has_prompt { prompt_tokens } else { 0 }) + (if has_completion { completion_tokens } else { 0 }));
+            if has_cache {
+                msg_len = msg_len + append_bytes(&msg, 2048, msg_len, STR_PTR(",\"prompt_tokens_details\":{\"cached_tokens\":"), STR_LEN(",\"prompt_tokens_details\":{\"cached_tokens\":"));
+                msg_len = msg_len + append_i64(&msg, 2048, msg_len, cache_tokens);
+                msg_len = msg_len + append_bytes(&msg, 2048, msg_len, STR_PTR("}"), 1);
+            };
+            msg_len = msg_len + append_bytes(&msg, 2048, msg_len, STR_PTR("}}}"), 3);
+            emit_message(self, &msg, msg_len);
+        };
+    };
+    if str_is(status_ptr, status_len, STR_PTR("failed"), STR_LEN("failed")) {
+        let msg = [0u8; 8192];
+        let msg_len: u64 = 0;
+        msg_len = msg_len + append_bytes(&msg, 8192, msg_len, STR_PTR("{\"method\":\"turn/failed\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"turn/failed\",\"params\":{\"threadId\":\""));
+        msg_len = msg_len + append_bytes(&msg, 8192, msg_len, s.threadId_ptr, s.threadId_len);
+        msg_len = msg_len + append_bytes(&msg, 8192, msg_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        msg_len = msg_len + append_bytes(&msg, 8192, msg_len, &turn_id, turn_len);
+        msg_len = msg_len + append_bytes(&msg, 8192, msg_len, STR_PTR("\",\"turn\":{\"id\":\""), STR_LEN("\",\"turn\":{\"id\":\""));
+        msg_len = msg_len + append_bytes(&msg, 8192, msg_len, &turn_id, turn_len);
+        msg_len = msg_len + append_bytes(&msg, 8192, msg_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        msg_len = msg_len + append_bytes(&msg, 8192, msg_len, s.threadId_ptr, s.threadId_len);
+        msg_len = msg_len + append_bytes(&msg, 8192, msg_len, STR_PTR("\",\"status\":\"failed\"},\"error\":\""), STR_LEN("\",\"status\":\"failed\"},\"error\":\""));
+        if has_err {
+            msg_len = msg_len + append_bytes(&msg, 8192, msg_len, err_ptr, err_len);
+        } else {
+            msg_len = msg_len + append_bytes(&msg, 8192, msg_len, STR_PTR("Command Code run failed"), STR_LEN("Command Code run failed"));
+        };
+        msg_len = msg_len + append_bytes(&msg, 8192, msg_len, STR_PTR("\"}}"), 3);
+        emit_message(self, &msg, msg_len);
+    } else {
+        let msg = [0u8; 4096];
+        let msg_len: u64 = 0;
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, STR_PTR("{\"method\":\"turn/completed\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"turn/completed\",\"params\":{\"threadId\":\""));
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, s.threadId_ptr, s.threadId_len);
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, &turn_id, turn_len);
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, STR_PTR("\",\"turn\":{\"id\":\""), STR_LEN("\",\"turn\":{\"id\":\""));
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, &turn_id, turn_len);
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, s.threadId_ptr, s.threadId_len);
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, STR_PTR("\",\"status\":\""), STR_LEN("\",\"status\":\""));
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, status_ptr, status_len);
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, STR_PTR("\",\"completedAt\":"), STR_LEN("\",\"completedAt\":"));
+        msg_len = msg_len + append_u64(&msg, 4096, msg_len, now_ms() / 1000);
+        msg_len = msg_len + append_bytes(&msg, 4096, msg_len, STR_PTR("}}}"), 3);
+        emit_message(self, &msg, msg_len);
+    };
+}
+
+// number_of: typeof number && Number.isFinite over a doc
+// field (i64 read in this pass).
+fn number_of(doc: u64, key_ptr: ptr, key_len: u64, out: &i64) -> bool {
+    return sa_json_object_get_i64(doc, key_ptr, key_len, out) == 0;
+}
+
+// ---- history / restore ----
+
+
+// buildHistoryFromItems(threadId, fileThreadId, items,
+// fallbackMessage): restore path — converts stored items
+// into turns + messages.
+fn buildHistoryFromItems(self: &CommandCodeAgentBridge, s: &CommandCodeSessionState, items_ptr: ptr, items_len: u64, fallback_ptr: ptr, fallback_len: u64, has_fallback: bool) -> void {
+    s.msg_count = 0;
+    s.turns_count = 0;
+    let items = sa_json_parse(items_ptr, items_len);
+    if items == 0 { return; };
+    let count: u64 = 0;
+    sa_json_array_len(items, &count);
+    for i in 0..count {
+        let item: u64 = 0;
+        sa_json_array_get(items, i, &item);
+        if item == 0 { continue; };
+        let rtype_ptr: ptr = PTR_NULL();
+        let rtype_len: u64 = 0;
+        sa_json_object_get_string(item, STR_PTR("type"), STR_LEN("type"), &rtype_ptr, &rtype_len);
+        let role_ptr: ptr = PTR_NULL();
+        let role_len: u64 = 0;
+        sa_json_object_get_string(item, STR_PTR("role"), STR_LEN("role"), &role_ptr, &role_len);
+        // role === "user" || type userMessage -> user row
+        if (role_len > 0 && str_is(role_ptr, role_len, STR_PTR("user"), 4)) || str_is(rtype_ptr, rtype_len, STR_PTR("userMessage"), STR_LEN("userMessage")) {
+            let turn_id_ptr: ptr = PTR_NULL();
+            let turn_id_len: u64 = 0;
+            sa_json_object_get_string(item, STR_PTR("turnId"), STR_LEN("turnId"), &turn_id_ptr, &turn_id_len);
+            let content_ptr: ptr = PTR_NULL();
+            let content_len: u64 = 0;
+            sa_json_object_get_string(item, STR_PTR("content"), STR_LEN("content"), &content_ptr, &content_len);
+            if turn_id_len > 0 && s.turns_count < 1024 {
+                let row = &s.turns[s.turns_count];
+                row.id_len = buf_copy(&row.id, 64, turn_id_ptr, turn_id_len);
+                row.status_len = buf_copy(&row.status, 32, STR_PTR("completed"), STR_LEN("completed"));
+                row.startedAt_s = 0;
+                row.has_startedAt = false;
+                row.completedAt_s = 0;
+                row.has_completedAt = false;
+                row.ts_ms = 0;
+                row.has_ts = false;
+                s.turns_count = s.turns_count + 1;
+            };
+            let json = [0u8; 262144];
+            let json_len: u64 = 0;
+            json_len = json_len + append_bytes(&json, 262144, json_len, STR_PTR("{\"type\":\"userMessage\",\"id\":\""), STR_LEN("{\"type\":\"userMessage\",\"id\":\""));
+            json_len = json_len + append_bytes(&json, 262144, json_len, s.threadId_ptr, s.threadId_len);
+            json_len = json_len + append_bytes(&json, 262144, json_len, STR_PTR("-user\""), STR_LEN("-user\""));
+            json_len = json_len + append_bytes(&json, 262144, json_len, STR_PTR(",\"turnId\":\""), STR_LEN(",\"turnId\":\""));
+            json_len = json_len + append_bytes(&json, 262144, json_len, turn_id_ptr, turn_id_len);
+            json_len = json_len + append_bytes(&json, 262144, json_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+            json_len = json_len + append_bytes(&json, 262144, json_len, s.threadId_ptr, s.threadId_len);
+            json_len = json_len + append_bytes(&json, 262144, json_len, STR_PTR("\",\"content\":\""), STR_LEN("\",\"content\":\""));
+            json_len = json_len + append_bytes(&json, 262144, json_len, content_ptr, content_len);
+            json_len = json_len + append_bytes(&json, 262144, json_len, STR_PTR("\",\"role\":\"user\"}"), STR_LEN("\",\"role\":\"user\"}"));
+            cc_push_message(s, &json, json_len);
+            continue;
+        };
+        // assistant/tool items: transform via
+        // mapHistoryItemToTurns
+        let turn_id_ptr: ptr = PTR_NULL();
+        let turn_id_len: u64 = 0;
+        sa_json_object_get_string(item, STR_PTR("turnId"), STR_LEN("turnId"), &turn_id_ptr, &turn_id_len);
+        if turn_id_len == 0 { continue; };
+        // turn row (create once per turnId)
+        let existing = false;
+        for j in 0..s.turns_count {
+            if s.turns[j].id_len == turn_id_len && bytes_eq(&s.turns[j].id, turn_id_ptr, turn_id_len) { existing = true; break; };
+        }
+        if !existing && s.turns_count < 1024 {
+            let row = &s.turns[s.turns_count];
+            row.id_len = buf_copy(&row.id, 64, turn_id_ptr, turn_id_len);
+            row.status_len = buf_copy(&row.status, 32, STR_PTR("completed"), STR_LEN("completed"));
+            row.startedAt_s = 0;
+            row.has_startedAt = false;
+            row.completedAt_s = 0;
+            row.has_completedAt = false;
+            row.ts_ms = 0;
+            row.has_ts = false;
+            s.turns_count = s.turns_count + 1;
+        };
+        if str_is(rtype_ptr, rtype_len, STR_PTR("agentMessage"), STR_LEN("agentMessage")) {
+            let item_text = stringify_into(item, &s.turnScratch, 524288);
+            cc_push_message(s, &s.turnScratch, item_text);
+        } else if str_is(rtype_ptr, rtype_len, STR_PTR("toolCall"), STR_LEN("toolCall")) {
+            let item_text = stringify_into(item, &s.turnScratch, 524288);
+            cc_push_message(s, &s.turnScratch, item_text);
+        } else if str_is(rtype_ptr, rtype_len, STR_PTR("collabAgentToolCall"), STR_LEN("collabAgentToolCall")) {
+            let item_text = stringify_into(item, &s.turnScratch, 524288);
+            cc_push_message(s, &s.turnScratch, item_text);
+        };
+    }
+    // trailing fallback assistant message
+    if has_fallback && fallback_len > 0 {
+        let json = [0u8; 262144];
+        let json_len: u64 = 0;
+        json_len = json_len + append_bytes(&json, 262144, json_len, STR_PTR("{\"type\":\"agentMessage\",\"id\":\"final-"), STR_LEN("{\"type\":\"agentMessage\",\"id\":\"final-"));
+        json_len = json_len + append_bytes(&json, 262144, json_len, s.threadId_ptr, s.threadId_len);
+        json_len = json_len + append_bytes(&json, 262144, json_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        json_len = json_len + append_bytes(&json, 262144, json_len, s.threadId_ptr, s.threadId_len);
+        json_len = json_len + append_bytes(&json, 262144, json_len, STR_PTR("\",\"content\":\""), STR_LEN("\",\"content\":\""));
+        json_len = json_len + append_bytes(&json, 262144, json_len, fallback_ptr, fallback_len);
+        json_len = json_len + append_bytes(&json, 262144, json_len, STR_PTR("\",\"role\":\"assistant\",\"status\":\"completed\"}"), STR_LEN("\",\"role\":\"assistant\",\"status\":\"completed\"}"));
+        cc_push_message(s, &json, json_len);
+    };
+}
+
+// readTranscriptItems / deleteTranscriptFile /
+// transcriptPath (record's transcriptPath first, else the
+// computed projects path with the .jsonl cleanup).
+fn readTranscriptItems(self: &CommandCodeAgentBridge, s: &CommandCodeSessionState, record: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    let tp_ptr: ptr = PTR_NULL();
+    let tp_len: u64 = 0;
+    if record != 0 && sa_json_object_get_string(record, STR_PTR("transcriptPath"), STR_LEN("transcriptPath"), &tp_ptr, &tp_len) == 0 && tp_len > 0 {
+        if fs_read_all(tp_ptr, tp_len, &s.fileScratch, 1048576, out_len) == 0 {
+            out_ptr = &s.fileScratch;
+            return true;
+        };
+    };
+    let text_ptr: ptr = PTR_NULL();
+    let text_len: u64 = 0;
+    transcriptPathText(self, s, &text_ptr, &text_len);
+    if text_len == 0 { return false; };
+    if fs_read_all(text_ptr, text_len, &s.fileScratch, 1048576, out_len) == 0 {
+        out_ptr = &s.fileScratch;
+        return true;
+    };
+    out_ptr = PTR_NULL();
+    out_len = 0;
+    return false;
+    // items/transcript.items JSON shapes: the record's
+    // items (or transcript.items) array is re-serialized by
+    // the caller-facing restoreSession via itemsJsonOf —
+    // see note in the defect log (items text passthrough).
+}
+
+// itemsJsonOf(record): record.items ?? record.transcript
+// .items ?? [] as text (restoreSession path).
+fn itemsJsonOf(record: u64, out: ptr, out_cap: u64) -> u64 {
+    let node: u64 = 0;
+    if record != 0 && sa_json_object_get(record, STR_PTR("items"), STR_LEN("items"), &node) == 0 { return stringify_into(node, out, out_cap); };
+    let tr: u64 = 0;
+    if record != 0 && sa_json_object_get(record, STR_PTR("transcript"), STR_LEN("transcript"), &tr) == 0 && tr != 0 && sa_json_object_get(tr, STR_PTR("items"), STR_LEN("items"), &node) == 0 { return stringify_into(node, out, out_cap); };
+    return append_bytes(out, out_cap, 0, STR_PTR("[]"), 2);
+}
+
+// transcriptPathText: join(commandCodeProjectsDir,
+// `${sessionId}.json`) with the trailing `.jsonl` replaced by
+// `.json` when present (source regex /\.jsonl$/i on the
+// computed path only).
+fn transcriptPathText(self: &CommandCodeAgentBridge, s: &CommandCodeSessionState, out_ptr: &ptr, out_len: &u64) -> void {
+    if !s.has_sessionId {
+        out_ptr = PTR_NULL();
+        out_len = 0;
+        return;
+    };
+    let dir = [0u8; 1024];
+    let dir_len = commandCodeProjectsDir(&dir, 1024);
+    let n: u64 = 0;
+    n = n + append_bytes(&s.pathScratch, 32768, n, &dir, dir_len);
+    n = n + append_bytes(&s.pathScratch, 32768, n, STR_PTR("/"), 1);
+    n = n + append_bytes(&s.pathScratch, 32768, n, s.sessionId_ptr, s.sessionId_len);
+    n = n + append_bytes(&s.pathScratch, 32768, n, STR_PTR(".jsonl"), STR_LEN(".jsonl"));
+    // .replace(/\.jsonl$/i, ".json")
+    n = n - 5;
+    n = n + append_bytes(&s.pathScratch, 32768, n, STR_PTR(".json"), STR_LEN(".json"));
+    out_ptr = &s.pathScratch;
+    out_len = n;
+}
+
+// restoreSession(threadId, outIdx, outFound)
+fn restoreSession(self: &CommandCodeAgentBridge, thread_ptr: ptr, thread_len: u64, out_idx: &u64, out_found: &bool) -> void {
+    out_found = false;
+    let record = mappingRecord(self, thread_ptr, thread_len);
+    if record == 0 { return; };
+    let sid_ptr: ptr = PTR_NULL();
+    let sid_len: u64 = 0;
+    sa_json_object_get_string(record, STR_PTR("sessionId"), STR_LEN("sessionId"), &sid_ptr, &sid_len);
+    let idx = cc_find(self, thread_ptr, thread_len);
+    if idx == 4294967295 {
+        if self.sessions_count >= 16 { return; };
+        idx = self.sessions_count;
+        self.sessions_count = self.sessions_count + 1;
+        session_init(&self.sessions[idx], thread_ptr, thread_len);
+    };
+    let s = &self.sessions[idx];
+    if sid_len > 0 {
+        s.sessionId_ptr = sid_ptr;
+        s.sessionId_len = sid_len;
+        s.has_sessionId = true;
+    };
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    if sa_json_object_get_string(record, STR_PTR("cwd"), STR_LEN("cwd"), &v_ptr, &v_len) == 0 { s.cwd_ptr = v_ptr; s.cwd_len = v_len; s.has_cwd = true; };
+    if sa_json_object_get_string(record, STR_PTR("model"), STR_LEN("model"), &v_ptr, &v_len) == 0 { s.model_ptr = v_ptr; s.model_len = v_len; s.has_model = true; };
+    if sa_json_object_get_string(record, STR_PTR("providerId"), STR_LEN("providerId"), &v_ptr, &v_len) == 0 { s.providerId_ptr = v_ptr; s.providerId_len = v_len; s.has_providerId = true; };
+    let name_ptr: ptr = PTR_NULL();
+    let name_len: u64 = 0;
+    if sa_json_object_get_string(record, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len) == 0 && name_len > 0 {
+        s.name_len = buf_copy(&s.name, 1024, name_ptr, name_len);
+        s.has_name = true;
+    };
+    let items = [0u8; 524288];
+    let items_len = itemsJsonOf(record, &items, 524288);
+    buildHistoryFromItems(self, s, &items, items_len, PTR_NULL(), 0, false);
+    out_idx = idx;
+    out_found = true;
+}
+
+// request_list_threads: mapping rows -> thread list. Shared
+// by dispatch "thread/list" (via runtime) — defined here as
+// the bridge's own listing (buildThreadsResponse form).
+fn request_list_threads(self: &CommandCodeAgentBridge) -> CcBuild {
+    let page: [u8; 65536] = [0u8; 65536];
+    let page_len: u64 = 0;
+    page_len = page_len + append_bytes(&page, 65536, page_len, STR_PTR("{\"data\":["), STR_LEN("{\"data\":["));
+    let first = true;
+    for i in 0..self.map_count {
+        let rec = sa_json_parse(slot(&self.mapArena, self.map_off[i]), self.map_len_arr[i]);
+        if rec == 0 { continue; };
+        let threadId_ptr: ptr = PTR_NULL();
+        let threadId_len: u64 = 0;
+        if sa_json_object_get_string(rec, STR_PTR("threadId"), STR_LEN("threadId"), &threadId_ptr, &threadId_len) != 0 { threadId_ptr = slot(&self.mapArena, self.map_key_off[i]); threadId_len = self.map_key_len[i]; };
+        let updated: i64 = 0;
+        sa_json_object_get_i64(rec, STR_PTR("updatedAt"), STR_LEN("updatedAt"), &updated);
+        // rows are unsorted in this pass (source sorts desc).
+        if !first { page_len = page_len + append_bytes(&page, 65536, page_len, STR_PTR(","), 1); };
+        first = false;
+        page_len = page_len + append_bytes(&page, 65536, page_len, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+        page_len = page_len + append_bytes(&page, 65536, page_len, threadId_ptr, threadId_len);
+        page_len = page_len + append_bytes(&page, 65536, page_len, STR_PTR("\",\"backend\":\"command-code\",\"modelProvider\":\"command-code\",\"source\":\"command-code\",\"createdAt\":"), STR_LEN("\",\"backend\":\"command-code\",\"modelProvider\":\"command-code\",\"source\":\"command-code\",\"createdAt\":"));
+        page_len = page_len + append_i64(&page, 65536, page_len, updated);
+        page_len = page_len + append_bytes(&page, 65536, page_len, STR_PTR(",\"updatedAt\":"), STR_LEN(",\"updatedAt\":"));
+        page_len = page_len + append_i64(&page, 65536, page_len, updated);
+        page_len = page_len + append_bytes(&page, 65536, page_len, STR_PTR(",\"name\":null,\"preview\":\"\",\"cwd\":\"\",\"status\":{\"type\":\"idle\"},\"path\":\"\",\"recencyAt\":"), STR_LEN(",\"name\":null,\"preview\":\"\",\"cwd\":\"\",\"status\":{\"type\":\"idle\"},\"path\":\"\",\"recencyAt\":"));
+        page_len = page_len + append_i64(&page, 65536, page_len, updated);
+        page_len = page_len + append_bytes(&page, 65536, page_len, STR_PTR(",\"ephemeral\":false,\"forkedFromId\":null,\"parentThreadId\":null,\"gitInfo\":null}"), STR_LEN(",\"ephemeral\":false,\"forkedFromId\":null,\"parentThreadId\":null,\"gitInfo\":null}"));
+    }
+    page_len = page_len + append_bytes(&page, 65536, page_len, STR_PTR("],\"nextCursor\":null}"), STR_LEN("],\"nextCursor\":null}"));
+    return CcBuild{ page: page, page_len: page_len, created: [0u8; 4096], created_len: 0, is_error: false, err: [0u8; 1024], err_len: 0, has_id: false, id: [0u8; 64], id_len: 0, payload: [0u8; 65536], payload_len: 0 };
+}
+
+// ---- free functions ----
+
+// isCommandCodeTaskTool(toolName)
+fn isCommandCodeTaskTool(name_ptr: ptr, name_len: u64) -> bool {
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    // trim 已绑 sa_std ts 面 (@ts_str_trim).
+    ts_trim_span(name_ptr, name_len, &tp, &tl);
+    let lowered = [0u8; 512];
+    let lowered_len = to_lower(&lowered, 512, tp, tl);
+    let unified_ptr: ptr = PTR_NULL();
+    let unified_len: u64 = 0;
+    // replace(/[\s-]+/g, "_") — split on runs of space/tab and
+    // dashes, join "_" — via the ts split binding
+    // (@ts_str_split) at the repair phase; hand scan here.
+    let unified = [0u8; 512];
+    let unified_len_v: u64 = 0;
+    let in_sep = false;
+    for i in 0..lowered_len {
+        let b = lowered[i];
+        if b == 32 || b == 9 || b == 45 {
+            if !in_sep && unified_len_v > 0 {
+                unified[unified_len_v] = 95;
+                unified_len_v = unified_len_v + 1;
+                in_sep = true;
+            };
+        } else {
+            unified[unified_len_v] = b;
+            unified_len_v = unified_len_v + 1;
+            in_sep = false;
+        };
+    }
+    // strip trailing "_" left by a trailing separator run
+    if unified_len_v > 0 && unified[unified_len_v - 1] == 95 { unified_len_v = unified_len_v - 1; };
+    unified_ptr = &unified;
+    unified_len = unified_len_v;
+    if str_is(unified_ptr, unified_len, STR_PTR("task"), 4) { return true; };
+    if str_is(unified_ptr, unified_len, STR_PTR("tasks"), 5) { return true; };
+    if str_is(unified_ptr, unified_len, STR_PTR("sub_agent"), STR_LEN("sub_agent")) { return true; };
+    if str_is(unified_ptr, unified_len, STR_PTR("spawn_agent"), STR_LEN("spawn_agent")) { return true; };
+    if str_is(unified_ptr, unified_len, STR_PTR("spawn_subagent"), STR_LEN("spawn_subagent")) { return true; };
+    if str_is(unified_ptr, unified_len, STR_PTR("delegate"), STR_LEN("delegate")) { return true; };
+    if str_is(unified_ptr, unified_len, STR_PTR("background_agent"), STR_LEN("background_agent")) { return true; };
+    // endsWith("_task")
+    if unified_len > 5 && str_is(byte_off(unified_ptr, unified_len - 5), 5, STR_PTR("_task"), 5) { return true; };
+    return false;
+}
+
+// commandCodeTaskRole(args)
+fn commandCodeTaskRole(args_doc: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    if args_doc != 0 {
+        if sa_json_object_get_string(args_doc, STR_PTR("agent_type"), STR_LEN("agent_type"), &v_ptr, &v_len) != 0 || v_len == 0 {
+            if sa_json_object_get_string(args_doc, STR_PTR("agentType"), STR_LEN("agentType"), &v_ptr, &v_len) != 0 || v_len == 0 {
+                if sa_json_object_get_string(args_doc, STR_PTR("role"), STR_LEN("role"), &v_ptr, &v_len) != 0 || v_len == 0 {
+                    if sa_json_object_get_string(args_doc, STR_PTR("type"), STR_LEN("type"), &v_ptr, &v_len) != 0 || v_len == 0 {
+                        sa_json_object_get_string(args_doc, STR_PTR("name"), STR_LEN("name"), &v_ptr, &v_len);
+                    };
+                };
+            };
+        };
+    };
+    out_len = buf_copy(out, out_cap, v_ptr, v_len);
+}
+
+// commandCodeTaskPrompt(args)
+fn commandCodeTaskPrompt(args_doc: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    if args_doc != 0 {
+        if sa_json_object_get_string(args_doc, STR_PTR("description"), STR_LEN("description"), &v_ptr, &v_len) != 0 || v_len == 0 {
+            if sa_json_object_get_string(args_doc, STR_PTR("prompt"), STR_LEN("prompt"), &v_ptr, &v_len) != 0 || v_len == 0 {
+                if sa_json_object_get_string(args_doc, STR_PTR("task"), STR_LEN("task"), &v_ptr, &v_len) != 0 || v_len == 0 {
+                    sa_json_object_get_string(args_doc, STR_PTR("message"), STR_LEN("message"), &v_ptr, &v_len);
+                };
+            };
+        };
+    };
+    out_len = buf_copy(out, out_cap, v_ptr, v_len);
+}
+
+// buildCommandCodeCollabItem(args...)
+fn buildCommandCodeCollabItem(thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, has_turn: bool, id_ptr: ptr, id_len: u64, tool_ptr: ptr, tool_len: u64, args_ptr: ptr, args_len: u64, status_ptr: ptr, status_len: u64, output_ptr: ptr, output_len: u64, has_output: bool, out: ptr, out_cap: u64) -> u64 {
+    let args_doc = sa_json_parse(args_ptr, args_len);
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"type\":\"collabAgentToolCall\",\"id\":\""), STR_LEN("{\"type\":\"collabAgentToolCall\",\"id\":\""));
+    n = n + append_bytes(out, out_cap, n, id_ptr, id_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    if has_turn {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"turnId\":\""), STR_LEN(",\"turnId\":\""));
+        n = n + append_bytes(out, out_cap, n, turn_ptr, turn_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"threadId\":\""), STR_LEN(",\"threadId\":\""));
+    n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"tool\":\""), STR_LEN("\",\"tool\":\""));
+    n = n + append_bytes(out, out_cap, n, tool_ptr, tool_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"plannedOperation\":\"sub_agent\",\"status\":\""), STR_LEN("\",\"plannedOperation\":\"sub_agent\",\"status\":\""));
+    n = n + append_bytes(out, out_cap, n, status_ptr, status_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"senderThreadId\":\""), STR_LEN("\",\"senderThreadId\":\""));
+    n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"receiverThreadIds\":[],\"prompt\":\""), STR_LEN("\",\"receiverThreadIds\":[],\"prompt\":\""));
+    let prompt = [0u8; 32768];
+    let prompt_len: u64 = 0;
+    commandCodeTaskPrompt(args_doc, &prompt, 32768, &prompt_len);
+    n = n + append_bytes(out, out_cap, n, &prompt, prompt_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"input\":\""), STR_LEN("\",\"input\":\""));
+    n = n + append_bytes(out, out_cap, n, &prompt, prompt_len);
+    let role = [0u8; 256];
+    let role_len: u64 = 0;
+    commandCodeTaskRole(args_doc, &role, 256, &role_len);
+    if role_len > 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"agentType\":\""), STR_LEN("\",\"agentType\":\""));
+        n = n + append_bytes(out, out_cap, n, &role, role_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"agentNickname\":\""), STR_LEN("\",\"agentNickname\":\""));
+        n = n + append_bytes(out, out_cap, n, &role, role_len);
+    };
+    if has_output {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"output\":\""), STR_LEN("\",\"output\":\""));
+        let take = output_len;
+        if take > 4000 { take = 4000; };
+        n = n + append_bytes(out, out_cap, n, output_ptr, take);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"result\":{\"content\":\""), STR_LEN("\",\"result\":{\"content\":\""));
+        n = n + append_bytes(out, out_cap, n, output_ptr, take);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\"}"), 2);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR("}"), 1);
+    return n;
+}
+
+// extractTurnText(params)
+fn extractTurnText(params: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    out_len = 0;
+    let input_node: u64 = 0;
+    if params == 0 || sa_json_object_get(params, STR_PTR("input"), STR_LEN("input"), &input_node) != 0 { return; };
+    let count: u64 = 0;
+    if sa_json_array_len(input_node, &count) != 0 { return; };
+    for i in 0..count {
+        let item: u64 = 0;
+        sa_json_array_get(input_node, i, &item);
+        if item == 0 { continue; };
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        sa_json_object_get_string(item, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len);
+        if !str_is(t_ptr, t_len, STR_PTR("text"), 4) { continue; };
+        let text_ptr: ptr = PTR_NULL();
+        let text_len: u64 = 0;
+        sa_json_object_get_string(item, STR_PTR("text"), STR_LEN("text"), &text_ptr, &text_len);
+        if out_len > 0 {
+            out_len = out_len + append_bytes(out, out_cap, out_len, STR_PTR("\n"), 1);
+        };
+        out_len = out_len + append_bytes(out, out_cap, out_len, text_ptr, text_len);
+    }
+}
+
+// ---- shims + local helpers ----
+
+// host_event_log_init(errorsFile): createBridgeEventLogger
+// (sdk-backend feature; declared by use in this pass).
+// host_event_log_frame(kind, payloadLen): streamed-chunk log
+// without payload. host_event_log_event(kind, line): full
+// line log. All no-ops when no logger is wired.
+fn host_event_log_init(errors_ptr: ptr, errors_len: u64) -> void {}
+fn host_event_log_frame(kind_ptr: ptr, kind_len: u64, payload_len: u64) -> void {}
+fn host_event_log_event(kind_ptr: ptr, kind_len: u64, line_ptr: ptr, line_len: u64) -> void {}
+
+// json helpers over doc handles used throughout the bridges
+// (sdk-backend json.sla family; declared by use here).
+fn json_object_keys(doc: u64, payload: ptr, out: ptr, out_cap: u64) -> u64 { return 0; }
+fn json_node_string(node: u64, out_ptr: &ptr, out_len: &u64) -> void { out_ptr = PTR_NULL(); out_len = 0; }
+fn json_node_is_string(node: u64, out: &bool) -> void { out = false; }
+fn process_poll_exit(proc: u64, out_code: &i32, out_exited: &bool) -> void { out_code = 0; out_exited = false; }
+fn process_kill(proc: u64, signame_ptr: ptr, signame_len: u64) -> void {}
+fn uuid_new(out: ptr, out_cap: u64) -> u64 {
+    // DEFECT: random UUID unavailable in this pass; emits a
+    // zero UUID (matches the other bridges in this unit).
+    return append_bytes(out, out_cap, 0, STR_PTR("00000000-0000-4000-8000-000000000000"), STR_LEN("00000000-0000-4000-8000-000000000000"));
+}
+fn now_ms() -> u64 { return 0; }
+fn process_cwd(out: ptr, out_cap: u64) -> u64 {
+    let n: u64 = 0;
+    env_get(STR_PTR("PWD"), STR_LEN("PWD"), out, out_cap, &n);
+    return n;
+}
+fn env_get(key_ptr: ptr, key_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> bool {
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    if sa_env_get(key_ptr, key_len, &v_ptr, &v_len) != 0 { out_len = 0; return false; };
+    out_len = buf_copy(out, out_cap, v_ptr, v_len);
+    return true;
+}
+
+// ts_trim_span: String.prototype.trim span — 已绑 sa_std
+// ts 面 (@ts_str_trim in sa_std/ts_string.sa; {ptr,len}
+// handle model — the repair phase aligns the exact macro
+// signature).
+fn ts_trim_span(p: ptr, n: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    @ts_str_trim(out_ptr, out_len, p, n);
+}
+
+fn sa_env_get(key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64) -> i32;
+fn sa_json_parse(text_ptr: ptr, text_len: u64) -> u64;
+fn sa_json_object_get(doc: u64, key_ptr: ptr, key_len: u64, out: &u64) -> i32;
+fn sa_json_object_get_string(doc: u64, key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64) -> i32;
+fn sa_json_object_get_i64(doc: u64, key_ptr: ptr, key_len: u64, out: &i64) -> i32;
+fn sa_json_object_get_bool(doc: u64, key_ptr: ptr, key_len: u64, out: &bool) -> i32;
+fn sa_json_array_len(doc: u64, out: &u64) -> i32;
+fn sa_json_array_get(doc: u64, idx: u64, out: &u64) -> i32;
+fn sa_json_stringify_pretty(node: u64, out: ptr, out_cap: u64, out_len: &u64) -> i32;
+
+fn stringify_into(node: u64, out: ptr, out_cap: u64) -> u64 {
+    if node == 0 { return append_bytes(out, out_cap, 0, STR_PTR("null"), 4); };
+    let n: u64 = 0;
+    if sa_json_stringify_pretty(node, out, out_cap, &n) != 0 { return 0; };
+    return n;
+}
+
+fn slot(base: ptr, off: u64) -> ptr { return byte_off(base, off); }
+
+fn byte_off(base: ptr, off: u64) -> ptr {
+    let arr = base as [u8];
+    return &arr[off];
+}
+
+fn byte_at(base: ptr, idx: u64) -> u8 {
+    if base == PTR_NULL() { return 0; };
+    let arr = base as [u8];
+    return arr[idx];
+}
+
+fn bytes_eq(a: ptr, b: ptr, n: u64) -> bool {
+    if n == 0 { return true; };
+    if a == PTR_NULL() || b == PTR_NULL() { return false; };
+    let i: u64 = 0;
+    while i < n {
+        if byte_at(a, i) != byte_at(b, i) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn str_is(p: ptr, n: u64, lit_ptr: ptr, lit_len: u64) -> bool {
+    return n == lit_len && bytes_eq(p, lit_ptr, lit_len);
+}
+
+fn append_bytes(dst: ptr, dst_cap: u64, used: u64, src: ptr, src_len: u64) -> u64 {
+    let i: u64 = 0;
+    while i < src_len {
+        if used + i >= dst_cap { break; };
+        let a = dst as [u8];
+        a[used + i] = byte_at(src, i);
+        i = i + 1;
+    }
+    return i;
+}
+
+fn buf_copy(dst: ptr, dst_cap: u64, src: ptr, src_len: u64) -> u64 {
+    return append_bytes(dst, dst_cap, 0, src, src_len);
+}
+
+fn append_u64(dst: ptr, dst_cap: u64, used: u64, v: u64) -> u64 {
+    let digits = [0u8; 24];
+    let dn: u64 = 0;
+    let x = v;
+    if x == 0 { digits[0] = 48; dn = 1; } else {
+        let tmp = [0u8; 24];
+        let tn: u64 = 0;
+        while x > 0 {
+            tmp[tn] = (48 + (x % 10)) as u8;
+            tn = tn + 1;
+            x = x / 10;
+        }
+        while tn > 0 { tn = tn - 1; digits[dn] = tmp[tn]; dn = dn + 1; };
+    };
+    return used + append_bytes(dst, dst_cap, used, &digits, dn);
+}
+
+fn append_i64(dst: ptr, dst_cap: u64, used: u64, v: i64) -> u64 {
+    if v < 0 {
+        let n = used + append_bytes(dst, dst_cap, used, STR_PTR("-"), 1);
+        return append_u64(dst, dst_cap, n, (0 - v) as u64);
+    };
+    return append_u64(dst, dst_cap, used, v as u64);
+}
+
+fn find_byte(buf: ptr, len: u64, from: u64, b: u8) -> u64 {
+    let i: u64 = from;
+    while i < len {
+        if byte_at(buf, i) == b { return i; };
+        i = i + 1;
+    }
+    return 4294967295;
+}
+
+fn to_lower(out: ptr, out_cap: u64, src: ptr, src_len: u64) -> u64 {
+    let n = buf_copy(out, out_cap, src, src_len);
+    let i: u64 = 0;
+    while i < n {
+        let b = byte_at(out, i);
+        if b >= 65 && b <= 90 {
+            let a = out as [u8];
+            a[i] = b + 32;
+        };
+        i = i + 1;
+    }
+    return n;
+}
+
+fn date_parse_ms(out: &u64) -> bool { return false; }
+fn sa_io_read(handle: u64, out: ptr, cap: u64, out_len: &u64) -> i32;
+fn fs_read_all(path_ptr: ptr, path_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> i32;
+fn fs_write_all(path_ptr: ptr, path_len: u64, data_ptr: ptr, data_len: u64) -> i32;
+fn fs_mkdir_recursive(path_ptr: ptr, path_len: u64) -> i32;
+fn fs_unlink(path_ptr: ptr, path_len: u64) -> i32;

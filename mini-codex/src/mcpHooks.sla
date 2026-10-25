@@ -1,0 +1,706 @@
+// Converted 1:1 from mini-codex/src/mcpHooks.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Glue: run any tool call through Codex-parity PreToolUse/PostToolUse hooks.
+// MCP tools are first-class: tool_name = mcp__<server>__<tool>,
+// tool_input = parsed JSON args, tool_response = {content, structuredContent}.
+
+@import "sa_std/io/print.sai"
+@import "sa_std/ptr.sa"
+@import "sa_std/env.sai"
+@import "sa_std/string.sa"
+@import "sa_std/json.sai"
+@import "./mcp.sla"
+@import "./memory.sla"
+@import "./hooks.sla"
+// DEFECT: node:crypto randomUUID has no sa_std counterpart; it appears below
+// as the placeholder extern sa_random_uuid. HookEventSink / HookCompletedEvent
+// / executeHooks / loadHookEvents / hookFilesLoaded / mcpHookToolInput /
+// defaultHookSink come from ./hooks.sla (hooks.ts conversion).
+
+// export type HookedToolRunner = (toolName: string, args: Record<string, unknown>, callId: string) => Promise<string>;
+// DEFECT: a function type returning Promise<string> has no SLA counterpart;
+// runners are passed as opaque u64 handles and invoked through the dispatch
+// extern sa_hook_runner_call (status + text out), async folded to sync.
+
+// export interface HookPipelineOpts {
+//   cwd: string; model: string; sessionId?: string; turnId?: string;
+//   sink?: HookEventSink | null;
+//   execNonMcp: (toolName, args, cwd) => Promise<string>;
+// }
+// DEFECT: optional fields become has_* flags; sink?: HookEventSink | null
+// (three states) becomes sink_kind (0 = undefined, 1 = null, 2 = handle);
+// the execNonMcp callback becomes an opaque handle (see HookedToolRunner).
+struct HookPipelineOpts {
+    cwd: [u8; 512], cwd_len: u64,
+    model: [u8; 128], model_len: u64,
+    has_session_id: bool, session_id: [u8; 128], session_id_len: u64,
+    has_turn_id: bool, turn_id: [u8; 64], turn_id_len: u64,
+    sink_kind: u64, sink: u64,
+    exec_non_mcp: u64,
+}
+
+// Hook context object literal passed to executeHooks in TS
+// ({ sessionId, turnId, cwd, model, toolName, toolUseId, toolInput,
+//    callMcpRaw, sink, toolResponse? }).
+// DEFECT: the callMcpRaw arrow closure capturing nothing but module scope is
+// represented by a flag: hooks.sla always calls back into mcp.sla's
+// callMcpByServerRaw with the McpGlobals pointer it was handed.
+struct HookCtx {
+    session_id: [u8; 128], session_id_len: u64,
+    turn_id: [u8; 64], turn_id_len: u64,
+    cwd: [u8; 512], cwd_len: u64,
+    model: [u8; 128], model_len: u64,
+    tool_name: [u8; 128], tool_name_len: u64,
+    tool_use_id: [u8; 128], tool_use_id_len: u64,
+    tool_input_json: [u8; 8192], tool_input_json_len: u64,
+    has_tool_response: bool,
+    tool_response_json: [u8; 16384], tool_response_json_len: u64,
+    sink: u64,
+    use_call_mcp_raw: bool,
+}
+
+// Result of executeHooks (hooks.ts) as consumed here.
+// DEFECT: dynamic result object -> struct; updatedInput (Record | undefined)
+// becomes has_updated_input + JSON text; additionalContexts is a JSON array
+// text; hookEvents are HookCompletedEvent JSON text.
+struct HookExecResult {
+    hook_events_json: [u8; 16384], hook_events_json_len: u64,
+    blocked: bool,
+    has_block_reason: bool, block_reason: [u8; 2048], block_reason_len: u64,
+    has_feedback: bool, feedback: [u8; 2048], feedback_len: u64,
+    has_updated_input: bool, updated_input_json: [u8; 8192], updated_input_json_len: u64,
+    additional_contexts_json: [u8; 8192], additional_contexts_json_len: u64,
+}
+
+// let warnedNoSink = false;
+// DEFECT: module-level mutable state -> HookGlobals threaded as &HookGlobals.
+struct HookGlobals {
+    warned_no_sink: bool,
+}
+
+fn resolveSink(g: &HookGlobals, opts: &HookPipelineOpts, sink: &u64, has_sink: &bool) -> void {
+    // if (opts.sink === null) return undefined;
+    if opts.sink_kind == 1 {
+        has_sink = false;
+        sink = 0;
+        return;
+    };
+    // if (opts.sink) return opts.sink;
+    if opts.sink_kind == 2 {
+        has_sink = true;
+        sink = opts.sink;
+        return;
+    };
+    // if (process.env.MINI_HOOKS_LOG === "off") return undefined;
+    let v = TextBuf { bytes: [0u8; 32768], len: 0 };
+    let has_v = env_get_buf(STR_PTR("MINI_HOOKS_LOG"), STR_LEN("MINI_HOOKS_LOG"), &v);
+    if has_v {
+        let vp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(vp, &v.bytes, 0);
+        if str_eq(vp, v.len, STR_PTR("off"), STR_LEN("off")) {
+            has_sink = false;
+            sink = 0;
+            return;
+        };
+    };
+    // if (!warnedNoSink) { warnedNoSink = true; }
+    if !g.warned_no_sink { g.warned_no_sink = true; };
+    // return defaultHookSink();
+    sink = defaultHookSink();
+    has_sink = true;
+}
+
+// Run one tool call with hooks. Never throws: hook failures degrade to
+// Failed events; tool errors become text output (existing mini behavior).
+// DEFECT: async -> synchronous; the never-throws contract is kept by turning
+// every TS try/catch into a status path.
+struct RunToolWithHooksResult {
+    output: [u8; 16384], output_len: u64,
+    hook_events_json: [u8; 16384], hook_events_json_len: u64,
+    blocked: bool,
+}
+
+fn runToolWithHooks(g: &HookGlobals, mcp: &McpGlobals, tool_name_ptr: ptr, tool_name_len: u64, args_ptr: ptr, args_len: u64, call_id_ptr: ptr, call_id_len: u64, opts: &HookPipelineOpts, out: &RunToolWithHooksResult) -> void {
+    out.output_len = 0;
+    out.hook_events_json_len = 0;
+    text_buf_append_len16(&out.hook_events_json, &out.hook_events_json_len, STR_PTR("[]"), STR_LEN("[]"));
+    out.blocked = false;
+    // const events = await loadHookEvents(opts.cwd).catch(() => ({}));
+    // DEFECT: Promise .catch(() => ({})) approximated by the extern status:
+    // on any failure the events JSON stays "{}".
+    let events = TextBuf { bytes: [0u8; 32768], len: 0 };
+    text_buf_append(&events, STR_PTR("{}"), STR_LEN("{}"));
+    let cwd_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cwd_ptr, &opts.cwd, 0);
+    loadHookEvents(cwd_ptr, opts.cwd_len, &events);
+    let sink: u64 = 0;
+    let has_sink = false;
+    resolveSink(g, opts, &sink, &has_sink);
+    if !has_sink { sink = 0; };
+    // const sessionId = opts.sessionId ?? process.env.MINI_SESSION_ID ?? randomUUID();
+    let session_id = TextBuf { bytes: [0u8; 32768], len: 0 };
+    if opts.has_session_id {
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, &opts.session_id, 0);
+        text_buf_append(&session_id, sp, opts.session_id_len);
+    } else {
+        let has_env = env_get_buf(STR_PTR("MINI_SESSION_ID"), STR_LEN("MINI_SESSION_ID"), &session_id);
+        if !has_env || session_id.len == 0 {
+            session_id.len = 0;
+            sa_random_uuid(&session_id.bytes, &session_id.len);
+        };
+    };
+    // const turnId = opts.turnId ?? `${Date.now()}`;
+    // DEFECT: Date.now() stringified — placeholder ms clock + decimal extern.
+    let turn_id = TextBuf { bytes: [0u8; 32768], len: 0 };
+    if opts.has_turn_id {
+        let tp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp, &opts.turn_id, 0);
+        text_buf_append(&turn_id, tp, opts.turn_id_len);
+    } else {
+        sa_u64_to_dec(sa_time_now_ms(), &turn_id.bytes, &turn_id.len);
+    };
+    // const toolInput = mcpHookToolInput(args);
+    let tool_input = TextBuf { bytes: [0u8; 32768], len: 0 };
+    mcpHookToolInput(args_ptr, args_len, &tool_input);
+    // const hookCtxBase = { sessionId, turnId, cwd, model, toolName,
+    //   toolUseId: callId, toolInput,
+    //   callMcpRaw: (server, tool, input, timeoutMs) => callMcpByServerRaw(server, tool, input, timeoutMs), sink };
+    let ctx = HookCtx { session_id: [0u8; 128], session_id_len: 0, turn_id: [0u8; 64], turn_id_len: 0, cwd: [0u8; 512], cwd_len: 0, model: [0u8; 128], model_len: 0, tool_name: [0u8; 128], tool_name_len: 0, tool_use_id: [0u8; 128], tool_use_id_len: 0, tool_input_json: [0u8; 8192], tool_input_json_len: 0, has_tool_response: false, tool_response_json: [0u8; 16384], tool_response_json_len: 0, sink: 0, use_call_mcp_raw: true };
+    copy_text_to(&session_id, &ctx.session_id, &ctx.session_id_len, 128);
+    copy_text_to(&turn_id, &ctx.turn_id, &ctx.turn_id_len, 64);
+    ctx.cwd_len = 0;
+    let ci: u64 = 0;
+    while ci < opts.cwd_len && ci < 512 {
+        ctx.cwd[ci] = opts.cwd[ci];
+        ci = ci + 1;
+    }
+    ctx.cwd_len = ci;
+    ctx.model_len = 0;
+    let mi: u64 = 0;
+    while mi < opts.model_len && mi < 128 {
+        ctx.model[mi] = opts.model[mi];
+        mi = mi + 1;
+    }
+    ctx.model_len = mi;
+    let tnp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tnp, tool_name_ptr, 0);
+    // (tool_name arrives as (ptr, len); copy via a scratch TextBuf)
+    let tn = TextBuf { bytes: [0u8; 32768], len: 0 };
+    text_buf_append(&tn, tool_name_ptr, tool_name_len);
+    copy_text_to(&tn, &ctx.tool_name, &ctx.tool_name_len, 128);
+    let cn = TextBuf { bytes: [0u8; 32768], len: 0 };
+    text_buf_append(&cn, call_id_ptr, call_id_len);
+    copy_text_to(&cn, &ctx.tool_use_id, &ctx.tool_use_id_len, 128);
+    copy_text_to(&tool_input, &ctx.tool_input_json, &ctx.tool_input_json_len, 8192);
+    ctx.sink = sink;
+    // const hookEvents: HookCompletedEvent[] = [];
+    let hook_events = TextBuf { bytes: [0u8; 32768], len: 0 };
+    text_buf_append(&hook_events, STR_PTR("[]"), STR_LEN("[]"));
+
+    // ---- PreToolUse ----
+    // let effectiveArgs = args;
+    let effective_args = TextBuf { bytes: [0u8; 32768], len: 0 };
+    text_buf_append(&effective_args, args_ptr, args_len);
+    // let preContexts: string[] = [];
+    let pre_contexts = TextBuf { bytes: [0u8; 32768], len: 0 };
+    text_buf_append(&pre_contexts, STR_PTR("[]"), STR_LEN("[]"));
+    // try { const pre = await executeHooks(events, hookFilesLoaded(), "PreToolUse", hookCtxBase); ... }
+    // catch (e) { process.stderr.write(`[hook:PreToolUse] infra error: ${msg.slice(0, 200)}\n`); }
+    // DEFECT: process.stderr.write has no SLA counterpart; approximated by
+    // println of a static prefix (message body dropped). try/catch becomes
+    // the executeHooks status code.
+    let pre = HookExecResult { hook_events_json: [0u8; 16384], hook_events_json_len: 0, blocked: false, has_block_reason: false, block_reason: [0u8; 2048], block_reason_len: 0, has_feedback: false, feedback: [0u8; 2048], feedback_len: 0, has_updated_input: false, updated_input_json: [0u8; 8192], updated_input_json_len: 0, additional_contexts_json: [0u8; 8192], additional_contexts_json_len: 0 };
+    let files = hookFilesLoaded();
+    let ev_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ev_ptr, &events.bytes, 0);
+    let pre_st = executeHooks(ev_ptr, events.len, files, STR_PTR("PreToolUse"), STR_LEN("PreToolUse"), &ctx, mcp, &pre);
+    if pre_st != 0 {
+        println("[hook:PreToolUse] infra error");
+    } else {
+        // hookEvents.push(...pre.hookEvents);
+        sa_json_array_extend(&hook_events.bytes, &hook_events.len, &pre.hook_events_json, pre.hook_events_json_len);
+        if pre.blocked {
+            // return { output: `Blocked by PreToolUse hook (${toolName}): ${(pre.blockReason ?? "no reason").slice(0, 2000)}`, hookEvents, blocked: true };
+            let t = TextBuf { bytes: [0u8; 32768], len: 0 };
+            text_buf_append(&t, STR_PTR("Blocked by PreToolUse hook ("), STR_LEN("Blocked by PreToolUse hook ("));
+            text_buf_append(&t, tool_name_ptr, tool_name_len);
+            text_buf_append(&t, STR_PTR("): "), STR_LEN("): "));
+            if pre.has_block_reason {
+                let bp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(bp, &pre.block_reason, 0);
+                let take = pre.block_reason_len;
+                if take > 2000 { take = 2000; };
+                text_buf_append(&t, bp, take);
+            } else {
+                text_buf_append(&t, STR_PTR("no reason"), STR_LEN("no reason"));
+            };
+            copy_text_to(&t, &out.output, &out.output_len, 16384);
+            out.hook_events_json_len = 0;
+            let hi2: u64 = 0;
+            while hi2 < hook_events.len && hi2 < 16384 {
+                out.hook_events_json[hi2] = hook_events.bytes[hi2];
+                hi2 = hi2 + 1;
+            }
+            out.hook_events_json_len = hi2;
+            out.blocked = true;
+            return;
+        };
+        // if (pre.updatedInput) effectiveArgs = pre.updatedInput;
+        if pre.has_updated_input {
+            effective_args.len = 0;
+            let up: ptr = PTR_NULL();
+            PTR_BYTE_ADD(up, &pre.updated_input_json, 0);
+            text_buf_append(&effective_args, up, pre.updated_input_json_len);
+        };
+        // preContexts = pre.additionalContexts; (kept on this invocation —
+        // the TS comment warns a module-global stash would cross-wire
+        // parallel child-agent calls; the local buffer preserves that)
+        pre_contexts.len = 0;
+        let acp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(acp, &pre.additional_contexts_json, 0);
+        text_buf_append(&pre_contexts, acp, pre.additional_contexts_json_len);
+    };
+
+    // ---- Execute ----
+    let text = TextBuf { bytes: [0u8; 32768], len: 0 };
+    // let response: unknown = null;  (kept as JSON text)
+    let response = TextBuf { bytes: [0u8; 32768], len: 0 };
+    text_buf_append(&response, STR_PTR("null"), STR_LEN("null"));
+    // try { if (isMcpTool(toolName)) { const r = await runMcpToolDetailed(...); ... } else { text = await opts.execNonMcp(...); ... } }
+    // catch (e) { text = `tool error: ${msg.slice(0, 2000)}`; response = { content: [], structuredContent: null }; }
+    let ea_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ea_ptr, &effective_args.bytes, 0);
+    let exec_failed = false;
+    let exec_err = TextBuf { bytes: [0u8; 32768], len: 0 };
+    if isMcpTool(tool_name_ptr, tool_name_len) {
+        let r = McpCallResult { text: [0u8; 8192], text_len: 0, response_json: [0u8; 16384], response_json_len: 0 };
+        runMcpToolDetailed(mcp, tool_name_ptr, tool_name_len, ea_ptr, effective_args.len, &r);
+        let rp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp, &r.text, 0);
+        text_buf_append(&text, rp, r.text_len);
+        // response = { content: r.response.content ?? [], structuredContent: r.response.structuredContent ?? null };
+        // (r.response is already exactly that JSON shape from mcp.sla's toMcpResponse)
+        response.len = 0;
+        let rp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp2, &r.response_json, 0);
+        text_buf_append(&response, rp2, r.response_json_len);
+    } else {
+        // text = await opts.execNonMcp(toolName, effectiveArgs ?? {}, opts.cwd);
+        // DEFECT: callback invocation through the opaque handle (see
+        // HookedToolRunner DEFECT); failure lands in the same catch path.
+        let st = sa_hook_exec_non_mcp(opts.exec_non_mcp, tool_name_ptr, tool_name_len, ea_ptr, effective_args.len, cwd_ptr, opts.cwd_len, &text.bytes, &text.len, &exec_err.bytes, &exec_err.len);
+        if st != 0 {
+            exec_failed = true;
+        } else {
+            // response = { content: [{ type: "text", text: String(text).slice(0, 8000) }], structuredContent: null };
+            response.len = 0;
+            text_buf_append(&response, STR_PTR("{\"content\":[{\"type\":\"text\",\"text\":\""), STR_LEN("{\"content\":[{\"type\":\"text\",\"text\":\""));
+            let tp3: ptr = PTR_NULL();
+            PTR_BYTE_ADD(tp3, &text.bytes, 0);
+            let take = text.len;
+            if take > 8000 { take = 8000; };
+            // DEFECT: JSON string escaping of the embedded text is delegated
+            // to the sa_json_* extern in the real fix phase; bytes are copied
+            // verbatim in this bulk pass.
+            text_buf_append(&response, tp3, take);
+            text_buf_append(&response, STR_PTR("\"}],\"structuredContent\":null}"), STR_LEN("\"}],\"structuredContent\":null}"));
+        };
+    };
+    if exec_failed {
+        text.len = 0;
+        text_buf_append(&text, STR_PTR("tool error: "), STR_LEN("tool error: "));
+        let ep: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ep, &exec_err.bytes, 0);
+        let take = exec_err.len;
+        if take > 2000 { take = 2000; };
+        text_buf_append(&text, ep, take);
+        response.len = 0;
+        text_buf_append(&response, STR_PTR("{\"content\":[],\"structuredContent\":null}"), STR_LEN("{\"content\":[],\"structuredContent\":null}"));
+    };
+
+    // ---- PostToolUse ----
+    // try { const post = await executeHooks(events, hookFilesLoaded(), "PostToolUse", { ...hookCtxBase, toolInput: mcpHookToolInput(effectiveArgs), toolResponse: response }); ... }
+    // catch (e) { process.stderr.write(`[hook:PostToolUse] infra error: ...`); }
+    // DEFECT: object spread ({ ...hookCtxBase, ... }) approximated by copying
+    // ctx and overwriting the two fields.
+    let post_ctx = ctx;
+    post_ctx.tool_input_json_len = 0;
+    let post_input = TextBuf { bytes: [0u8; 32768], len: 0 };
+    mcpHookToolInput(ea_ptr, effective_args.len, &post_input);
+    copy_text_to(&post_input, &post_ctx.tool_input_json, &post_ctx.tool_input_json_len, 8192);
+    post_ctx.has_tool_response = true;
+    post_ctx.tool_response_json_len = 0;
+    let rpi: u64 = 0;
+    while rpi < response.len && rpi < 16384 {
+        post_ctx.tool_response_json[rpi] = response.bytes[rpi];
+        rpi = rpi + 1;
+    }
+    post_ctx.tool_response_json_len = rpi;
+    let post = HookExecResult { hook_events_json: [0u8; 16384], hook_events_json_len: 0, blocked: false, has_block_reason: false, block_reason: [0u8; 2048], block_reason_len: 0, has_feedback: false, feedback: [0u8; 2048], feedback_len: 0, has_updated_input: false, updated_input_json: [0u8; 8192], updated_input_json_len: 0, additional_contexts_json: [0u8; 8192], additional_contexts_json_len: 0 };
+    let post_st = executeHooks(ev_ptr, events.len, files, STR_PTR("PostToolUse"), STR_LEN("PostToolUse"), &post_ctx, mcp, &post);
+    if post_st != 0 {
+        println("[hook:PostToolUse] infra error");
+    } else {
+        // hookEvents.push(...post.hookEvents);
+        sa_json_array_extend(&hook_events.bytes, &hook_events.len, &post.hook_events_json, post.hook_events_json_len);
+        // const extras = [...preContexts, ...post.additionalContexts];
+        let extras = TextBuf { bytes: [0u8; 32768], len: 0 };
+        text_buf_append(&extras, STR_PTR("[]"), STR_LEN("[]"));
+        sa_json_array_extend(&extras.bytes, &extras.len, &pre_contexts.bytes, pre_contexts.len);
+        sa_json_array_extend(&extras.bytes, &extras.len, &post.additional_contexts_json, post.additional_contexts_json_len);
+        // if (extras.length) { text += `\n\n[hook additionalContext]\n${extras.map((c) => String(c).slice(0, 2000)).join("\n---\n").slice(0, 6000)}`; }
+        // DEFECT: map/join over the contexts approximated by a scan emitting
+        // each context sliced to 2000, joined by "\n---\n", total capped 6000.
+        let n_extras = sa_json_array_len(&extras.bytes, extras.len);
+        if n_extras > 0 {
+            text_buf_append(&text, STR_PTR("\n\n[hook additionalContext]\n"), STR_LEN("\n\n[hook additionalContext]\n"));
+            let joined = TextBuf { bytes: [0u8; 32768], len: 0 };
+            let xi: u64 = 0;
+            let xfirst = true;
+            while xi < n_extras {
+                let c = TextBuf { bytes: [0u8; 32768], len: 0 };
+                sa_json_array_get_string(&extras.bytes, extras.len, xi, &c.bytes, &c.len);
+                xi = xi + 1;
+                if !xfirst { text_buf_append(&joined, STR_PTR("\n---\n"), STR_LEN("\n---\n")); };
+                xfirst = false;
+                let cp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(cp, &c.bytes, 0);
+                let take = c.len;
+                if take > 2000 { take = 2000; };
+                text_buf_append(&joined, cp, take);
+            }
+            let jp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(jp, &joined.bytes, 0);
+            let jtake = joined.len;
+            if jtake > 6000 { jtake = 6000; };
+            text_buf_append(&text, jp, jtake);
+        };
+        // if (post.blocked) { text += `\n\n[hook PostToolUse blocked: ${(post.blockReason ?? post.feedback ?? "no reason").slice(0, 1000)}]`; }
+        if post.blocked {
+            text_buf_append(&text, STR_PTR("\n\n[hook PostToolUse blocked: "), STR_LEN("\n\n[hook PostToolUse blocked: "));
+            if post.has_block_reason {
+                let bp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(bp, &post.block_reason, 0);
+                let take = post.block_reason_len;
+                if take > 1000 { take = 1000; };
+                text_buf_append(&text, bp, take);
+            } else if post.has_feedback {
+                let fp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(fp, &post.feedback, 0);
+                let take = post.feedback_len;
+                if take > 1000 { take = 1000; };
+                text_buf_append(&text, fp, take);
+            } else {
+                text_buf_append(&text, STR_PTR("no reason"), STR_LEN("no reason"));
+            };
+            text_buf_append(&text, STR_PTR("]"), STR_LEN("]"));
+        };
+    };
+    // return { output: text, hookEvents, blocked: false };
+    copy_text_to(&text, &out.output, &out.output_len, 16384);
+    out.hook_events_json_len = 0;
+    let hi3: u64 = 0;
+    while hi3 < hook_events.len && hi3 < 16384 {
+        out.hook_events_json[hi3] = hook_events.bytes[hi3];
+        hi3 = hi3 + 1;
+    }
+    out.hook_events_json_len = hi3;
+    out.blocked = false;
+}
+
+// helper: copy a TextBuf into a fixed (bytes, len) field with a cap
+fn copy_text_to(src: &TextBuf, arr: &[u8; 16384], len: &u64, cap: u64) -> void {
+    len = 0;
+    let i: u64 = 0;
+    while i < src.len && i < cap {
+        arr[i] = src.bytes[i];
+        i = i + 1;
+    }
+    len = i;
+}
+
+// helper: append to a 16384-cap (bytes, len) pair (used for result fields)
+fn text_buf_append_len16(arr: &[u8; 16384], len: &u64, src_ptr: ptr, src_len: u64) -> void {
+    let i: u64 = 0;
+    while i < src_len {
+        if len >= 16384 { return; };
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src_ptr, i);
+        arr[len] = b;
+        len = len + 1;
+        i = i + 1;
+    }
+}
+
+// Decide whether a tool result is worth remembering (cheap local triage, no LLM).
+// Returns true + the note text in out; false models the TS null return.
+fn shouldRememberToolResult(tool_name_ptr: ptr, tool_name_len: u64, output_ptr: ptr, output_len: u64, out: &TextBuf) -> bool {
+    out.len = 0;
+    // const t = (output ?? "").trim();
+    let lo: u64 = 0;
+    let hi: u64 = output_len;
+    while lo < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, output_ptr, lo);
+        if c != 32 && c != 9 && c != 10 && c != 13 { break; };
+        lo = lo + 1;
+    }
+    while hi > lo {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, output_ptr, hi - 1);
+        if c != 32 && c != 9 && c != 10 && c != 13 { break; };
+        hi = hi - 1;
+    }
+    let t_len = hi - lo;
+    // if (!t || t.length < 24 || /tool error:|Blocked by .* hook/i.test(t)) return null;
+    // DEFECT: regex /tool error:|Blocked by .* hook/i approximated by
+    // case-sensitive substring checks ("tool error:", "Blocked by " + " hook").
+    if t_len < 24 { return false; };
+    let t_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(t_ptr, output_ptr, lo);
+    if contains_sub(t_ptr, t_len, STR_PTR("tool error:"), STR_LEN("tool error:")) { return false; };
+    if contains_sub(t_ptr, t_len, STR_PTR("Blocked by "), STR_LEN("Blocked by ")) && contains_sub(t_ptr, t_len, STR_PTR(" hook"), STR_LEN(" hook")) { return false; };
+    // const hint = /remember|偏好|记住|convention|decision|决定|user prefers|always |never |别再|下次|以后|password|port|端口|token|key:|env|环境|坑|注意/i;
+    // if (hint.test(`${toolName} ${t.slice(0, 400)}`)) return `${toolName}: ${t.slice(0, 500)}`;
+    // DEFECT: the alternation regex (case-insensitive) is approximated by
+    // substring scans for each alternative over toolName + first 400 bytes;
+    // Latin alternatives are also matched against a lowercased copy.
+    let hay = TextBuf { bytes: [0u8; 32768], len: 0 };
+    text_buf_append(&hay, tool_name_ptr, tool_name_len);
+    text_buf_append(&hay, STR_PTR(" "), STR_LEN(" "));
+    let htake = t_len;
+    if htake > 400 { htake = 400; };
+    text_buf_append(&hay, t_ptr, htake);
+    let hay_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(hay_ptr, &hay.bytes, 0);
+    let hit = false;
+    if contains_sub(hay_ptr, hay.len, STR_PTR("remember"), STR_LEN("remember")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("偏好"), STR_LEN("偏好")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("记住"), STR_LEN("记住")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("convention"), STR_LEN("convention")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("decision"), STR_LEN("decision")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("决定"), STR_LEN("决定")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("user prefers"), STR_LEN("user prefers")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("always "), STR_LEN("always ")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("never "), STR_LEN("never ")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("别再"), STR_LEN("别再")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("下次"), STR_LEN("下次")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("以后"), STR_LEN("以后")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("password"), STR_LEN("password")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("port"), STR_LEN("port")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("端口"), STR_LEN("端口")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("token"), STR_LEN("token")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("key:"), STR_LEN("key:")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("env"), STR_LEN("env")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("环境"), STR_LEN("环境")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("坑"), STR_LEN("坑")) { hit = true; };
+    if contains_sub(hay_ptr, hay.len, STR_PTR("注意"), STR_LEN("注意")) { hit = true; };
+    if !hit {
+        // lowercased rescan for the /i flag on Latin alternatives
+        let low = TextBuf { bytes: [0u8; 32768], len: 0 };
+        let li: u64 = 0;
+        while li < hay.len {
+            let c: u8 = hay.bytes[li];
+            if c >= 65 && c <= 90 { c = c + 32; };
+            text_buf_append_byte(&low, c);
+            li = li + 1;
+        }
+        let low_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(low_ptr, &low.bytes, 0);
+        if contains_sub(low_ptr, low.len, STR_PTR("remember"), STR_LEN("remember")) { hit = true; };
+        if contains_sub(low_ptr, low.len, STR_PTR("convention"), STR_LEN("convention")) { hit = true; };
+        if contains_sub(low_ptr, low.len, STR_PTR("decision"), STR_LEN("decision")) { hit = true; };
+        if contains_sub(low_ptr, low.len, STR_PTR("user prefers"), STR_LEN("user prefers")) { hit = true; };
+        if contains_sub(low_ptr, low.len, STR_PTR("always "), STR_LEN("always ")) { hit = true; };
+        if contains_sub(low_ptr, low.len, STR_PTR("never "), STR_LEN("never ")) { hit = true; };
+        if contains_sub(low_ptr, low.len, STR_PTR("password"), STR_LEN("password")) { hit = true; };
+        if contains_sub(low_ptr, low.len, STR_PTR("port"), STR_LEN("port")) { hit = true; };
+        if contains_sub(low_ptr, low.len, STR_PTR("token"), STR_LEN("token")) { hit = true; };
+        if contains_sub(low_ptr, low.len, STR_PTR("key:"), STR_LEN("key:")) { hit = true; };
+        if contains_sub(low_ptr, low.len, STR_PTR("env"), STR_LEN("env")) { hit = true; };
+    };
+    if !hit { return false; };
+    // return `${toolName}: ${t.slice(0, 500)}`;
+    text_buf_append(out, tool_name_ptr, tool_name_len);
+    text_buf_append(out, STR_PTR(": "), STR_LEN(": "));
+    let take = t_len;
+    if take > 500 { take = 500; };
+    text_buf_append(out, t_ptr, take);
+    return true;
+}
+
+// export interface LifecycleHookOpts {
+//   cwd: string; model: string; sessionId?: string; turnId?: string;
+//   sink?: HookEventSink | null;
+//   callMcpRaw?: (server, tool, input, timeoutMs) => Promise<string>;
+// }
+// DEFECT: same optional/callback treatment as HookPipelineOpts; callMcpRaw
+// defaults to mcp.sla's callMcpByServerRaw when the handle is 0.
+struct LifecycleHookOpts {
+    cwd: [u8; 512], cwd_len: u64,
+    model: [u8; 128], model_len: u64,
+    has_session_id: bool, session_id: [u8; 128], session_id_len: u64,
+    has_turn_id: bool, turn_id: [u8; 64], turn_id_len: u64,
+    sink_kind: u64, sink: u64,
+    call_mcp_raw: u64,
+}
+
+// Fire a lifecycle hook (SessionStart/UserPromptSubmit/SubagentStart/.../SessionEnd). Never throws.
+// The TS signature is fireLifecycleHook(eventName: HookEventName,
+//   opts: LifecycleHookOpts & { prompt?: string; toolName?: string }).
+// DEFECT: async -> synchronous; the intersection type (& { prompt?, toolName? })
+// is flattened into extra has_* parameters; HookEventName (string union)
+// arrives as (ptr, len). Result additionalContexts written to out as a JSON
+// array text ("[]" models every early return []).
+fn fireLifecycleHook(g: &HookGlobals, mcp: &McpGlobals, event_name_ptr: ptr, event_name_len: u64, opts: &LifecycleHookOpts, has_prompt: bool, prompt_ptr: ptr, prompt_len: u64, has_tool_name: bool, tool_name_ptr: ptr, tool_name_len: u64, out: &TextBuf) -> void {
+    out.len = 0;
+    text_buf_append(out, STR_PTR("[]"), STR_LEN("[]"));
+    // try { ... } catch (e) { process.stderr.write(`[hook:${eventName}] infra error: ...`); return []; }
+    // DEFECT: the whole body is one try/catch in TS; here any nonzero status
+    // falls through to the final return with out == "[]", and the stderr
+    // write is a static println (see runToolWithHooks note).
+    let events = TextBuf { bytes: [0u8; 32768], len: 0 };
+    text_buf_append(&events, STR_PTR("{}"), STR_LEN("{}"));
+    let cwd_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cwd_ptr, &opts.cwd, 0);
+    loadHookEvents(cwd_ptr, opts.cwd_len, &events);
+    // const groups = events[eventName]; if (!groups?.length) return [];
+    // DEFECT: dynamic key access events[eventName] + optional chaining
+    // approximated by a JSON probe for a non-empty array under that key.
+    let groups = TextBuf { bytes: [0u8; 32768], len: 0 };
+    let evp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(evp, &events.bytes, 0);
+    let has_groups = sa_json_object_get_json_strkey(evp, events.len, event_name_ptr, event_name_len, &groups.bytes, &groups.len);
+    if !has_groups { return; };
+    if !sa_json_is_array(&groups.bytes, groups.len) { return; };
+    if sa_json_array_len(&groups.bytes, groups.len) == 0 { return; };
+    // const sink = opts.sink === null ? undefined : (opts.sink ?? (process.env.MINI_HOOKS_LOG === "off" ? undefined : defaultHookSink()));
+    let sink: u64 = 0;
+    let has_sink = true;
+    if opts.sink_kind == 1 {
+        has_sink = false;
+    } else if opts.sink_kind == 2 {
+        sink = opts.sink;
+    } else {
+        let v = TextBuf { bytes: [0u8; 32768], len: 0 };
+        let has_v = env_get_buf(STR_PTR("MINI_HOOKS_LOG"), STR_LEN("MINI_HOOKS_LOG"), &v);
+        let is_off = false;
+        if has_v {
+            let vp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(vp, &v.bytes, 0);
+            is_off = str_eq(vp, v.len, STR_PTR("off"), STR_LEN("off"));
+        };
+        if is_off { has_sink = false; } else { sink = defaultHookSink(); };
+    };
+    if !has_sink { sink = 0; };
+    // const sessionId = opts.sessionId ?? process.env.MINI_SESSION_ID ?? randomUUID();
+    let session_id = TextBuf { bytes: [0u8; 32768], len: 0 };
+    if opts.has_session_id {
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, &opts.session_id, 0);
+        text_buf_append(&session_id, sp, opts.session_id_len);
+    } else {
+        let has_env = env_get_buf(STR_PTR("MINI_SESSION_ID"), STR_LEN("MINI_SESSION_ID"), &session_id);
+        if !has_env || session_id.len == 0 {
+            session_id.len = 0;
+            sa_random_uuid(&session_id.bytes, &session_id.len);
+        };
+    };
+    // const turnId = opts.turnId ?? `${Date.now()}`;
+    let turn_id = TextBuf { bytes: [0u8; 32768], len: 0 };
+    if opts.has_turn_id {
+        let tp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp, &opts.turn_id, 0);
+        text_buf_append(&turn_id, tp, opts.turn_id_len);
+    } else {
+        sa_u64_to_dec(sa_time_now_ms(), &turn_id.bytes, &turn_id.len);
+    };
+    // const res = await executeHooks(events, hookFilesLoaded(), eventName, {
+    //   sessionId, turnId, cwd: opts.cwd, model: opts.model,
+    //   toolName: opts.toolName ?? "lifecycle",
+    //   toolUseId: `${eventName}-${turnId}`,
+    //   toolInput: opts.prompt ? { prompt: opts.prompt.slice(0, 4000) } : {},
+    //   callMcpRaw: opts.callMcpRaw ?? ((server, tool, input, timeoutMs) => callMcpByServerRaw(server, tool, input, timeoutMs)),
+    //   sink });
+    // return res.additionalContexts;
+    let ctx = HookCtx { session_id: [0u8; 128], session_id_len: 0, turn_id: [0u8; 64], turn_id_len: 0, cwd: [0u8; 512], cwd_len: 0, model: [0u8; 128], model_len: 0, tool_name: [0u8; 128], tool_name_len: 0, tool_use_id: [0u8; 128], tool_use_id_len: 0, tool_input_json: [0u8; 8192], tool_input_json_len: 0, has_tool_response: false, tool_response_json: [0u8; 16384], tool_response_json_len: 0, sink: 0, use_call_mcp_raw: true };
+    copy_text_to(&session_id, &ctx.session_id, &ctx.session_id_len, 128);
+    copy_text_to(&turn_id, &ctx.turn_id, &ctx.turn_id_len, 64);
+    ctx.cwd_len = 0;
+    let ci: u64 = 0;
+    while ci < opts.cwd_len && ci < 512 {
+        ctx.cwd[ci] = opts.cwd[ci];
+        ci = ci + 1;
+    }
+    ctx.cwd_len = ci;
+    ctx.model_len = 0;
+    let mi: u64 = 0;
+    while mi < opts.model_len && mi < 128 {
+        ctx.model[mi] = opts.model[mi];
+        mi = mi + 1;
+    }
+    ctx.model_len = mi;
+    if has_tool_name {
+        let tn = TextBuf { bytes: [0u8; 32768], len: 0 };
+        text_buf_append(&tn, tool_name_ptr, tool_name_len);
+        copy_text_to(&tn, &ctx.tool_name, &ctx.tool_name_len, 128);
+    } else {
+        let tn = TextBuf { bytes: [0u8; 32768], len: 0 };
+        text_buf_append(&tn, STR_PTR("lifecycle"), STR_LEN("lifecycle"));
+        copy_text_to(&tn, &ctx.tool_name, &ctx.tool_name_len, 128);
+    };
+    // toolUseId: `${eventName}-${turnId}`
+    let tuid = TextBuf { bytes: [0u8; 32768], len: 0 };
+    text_buf_append(&tuid, event_name_ptr, event_name_len);
+    text_buf_append(&tuid, STR_PTR("-"), STR_LEN("-"));
+    let tup: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tup, &turn_id.bytes, 0);
+    text_buf_append(&tuid, tup, turn_id.len);
+    copy_text_to(&tuid, &ctx.tool_use_id, &ctx.tool_use_id_len, 128);
+    // toolInput: opts.prompt ? { prompt: opts.prompt.slice(0, 4000) } : {}
+    // DEFECT: JSON escaping of the prompt delegated to sa_json_* (bulk pass
+    // copies bytes verbatim, as in runToolWithHooks).
+    let tinput = TextBuf { bytes: [0u8; 32768], len: 0 };
+    if has_prompt {
+        text_buf_append(&tinput, STR_PTR("{\"prompt\":\""), STR_LEN("{\"prompt\":\""));
+        let ptake = prompt_len;
+        if ptake > 4000 { ptake = 4000; };
+        text_buf_append(&tinput, prompt_ptr, ptake);
+        text_buf_append(&tinput, STR_PTR("\"}"), STR_LEN("\"}"));
+    } else {
+        text_buf_append(&tinput, STR_PTR("{}"), STR_LEN("{}"));
+    };
+    copy_text_to(&tinput, &ctx.tool_input_json, &ctx.tool_input_json_len, 8192);
+    ctx.sink = sink;
+    // DEFECT: opts.callMcpRaw override (a caller-supplied closure) cannot be
+    // stored; use_call_mcp_raw stays true and hooks.sla always routes to
+    // mcp.sla's callMcpByServerRaw unless the handle is set, which this
+    // conversion does not model.
+    if opts.call_mcp_raw != 0 { };
+    let res = HookExecResult { hook_events_json: [0u8; 16384], hook_events_json_len: 0, blocked: false, has_block_reason: false, block_reason: [0u8; 2048], block_reason_len: 0, has_feedback: false, feedback: [0u8; 2048], feedback_len: 0, has_updated_input: false, updated_input_json: [0u8; 8192], updated_input_json_len: 0, additional_contexts_json: [0u8; 8192], additional_contexts_json_len: 0 };
+    let files = hookFilesLoaded();
+    let st = executeHooks(evp, events.len, files, event_name_ptr, event_name_len, &ctx, mcp, &res);
+    if st != 0 {
+        println("[hook] infra error");
+        return;
+    };
+    out.len = 0;
+    let acp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(acp, &res.additional_contexts_json, 0);
+    text_buf_append(out, acp, res.additional_contexts_json_len);
+}
+
+// Auto-remember durable facts from a tool result into repo MEMORY.md. Never throws.
+fn autoRemember(cwd_ptr: ptr, cwd_len: u64, tool_name_ptr: ptr, tool_name_len: u64, output_ptr: ptr, output_len: u64) -> void {
+    // try { const note = shouldRememberToolResult(toolName, output); if (note) appendMiniMemory(cwd, note); } catch { /* memory must never break the loop */ }
+    // DEFECT: try/catch swallowing all errors approximated by ignoring the
+    // appendMiniMemory status.
+    let note = TextBuf { bytes: [0u8; 32768], len: 0 };
+    let has_note = shouldRememberToolResult(tool_name_ptr, tool_name_len, output_ptr, output_len, &note);
+    if has_note {
+        let np: ptr = PTR_NULL();
+        PTR_BYTE_ADD(np, &note.bytes, 0);
+        let st = appendMiniMemory(cwd_ptr, cwd_len, np, note.len);
+        if st != 0 { };
+    };
+}

@@ -1,0 +1,541 @@
+// Converted 1:1 from backends/cline/src/runtime/clineHookAttribution.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// Teammate tool attribution for cline team mode (cline 3.0.73,
+// reversed).
+//
+// The hub subscriber stream carries NO agent attribution on
+// tool/delta events — verified in the installed bundle
+// (`@cline/core/dist/hub/daemon/entry.js`, projector `ZK`): only
+// `session.notice` keeps `teamAgentId`/`teamRole`. A teammate's
+// `tool.started/updated/finished` arrives on the root session
+// stream with exactly the lead's envelope shape, so projecting
+// everything into the main waterfall renders subagent tools as
+// main-task rows.
+//
+// The daemon does persist the routing out-of-band, and this
+// module reads exactly that (read-only, never writes daemon
+// files):
+//
+// 1. `logs/hooks.jsonl` — every tool call fires a `tool_call`
+//    hook line with `tool_call.id` (identical to the hub
+//    `toolCallId`, verified 112/112 on a live team session),
+//    `agent_id` (runtime uuid), `taskId` (conversation) and
+//    `sessionContext.rootSessionId`. Tailed incrementally.
+// 2. `db/teams.db` `team_events` — `teammate_spawned` payloads
+//    join a runtime uuid to the team agent id
+//    (`teammate.runtimeAgentId` -> `agentId`, e.g. `agent_b28c…`
+//    -> `server-arch`). Loaded over node:sqlite; when sqlite is
+//    unavailable the map simply stays empty.
+// 3. `sessions/<root>/cxu-spawns.json` — the existing spawn index
+//    joins the team agent id to the child card (toolCallId).
+//    Newest card wins, so a `team_run_task` run card is preferred
+//    over its `team_spawn_teammate`.
+//
+// Anything unresolvable returns null and the caller keeps
+// today's behaviour (main waterfall) — attribution can only
+// move rows into a child card, never drop a tool.
+//
+// DEFECT: Map<string, V> — parallel arrays over a string arena
+// in this file (insertion order preserved; FIFO eviction for
+// toolOwners matches Map key order + delete(oldest)).
+// DEFECT: node:sqlite dynamic import (async warm-up) — the ctor
+// is a state flag + db shim fns; when unavailable the links map
+// stays empty, exactly the source's fallback.
+// DEFECT: Date.now() — now_ms() shim (no verified std clock).
+// DEFECT: readFileSync().subarray(from, size) — whole-file read
+// + slice (no seekable read in the verified fs surface).
+
+@import "./clineChildSession.sla"
+
+// HookToolOwner (interface): runtimeAgentId, rootSessionId,
+// convId — string slots into the attribution arena.
+struct HookToolOwner {
+    runtimeAgentId_off: u64,
+    runtimeAgentId_len: u64,
+    rootSessionId_off: u64,
+    rootSessionId_len: u64,
+    convId_off: u64,
+    convId_len: u64,
+}
+
+// TeamMemberLink (interface): teamAgentId, rootSessionId.
+struct TeamMemberLink {
+    teamAgentId_off: u64,
+    teamAgentId_len: u64,
+    rootSessionId_off: u64,
+    rootSessionId_len: u64,
+}
+
+// One map entry: key slot + value slots (value shape depends on
+// the map; unused slots stay 0).
+struct HookMapEntry {
+    key_off: u64,
+    key_len: u64,
+    v1_off: u64,
+    v1_len: u64,
+    v2_off: u64,
+    v2_len: u64,
+    v3_off: u64,
+    v3_len: u64,
+}
+
+struct ClineHookAttribution {
+    arena: [u8; 1048576],
+    arena_len: u64,
+    hookOffset: i64,
+    toolOwners: [HookMapEntry; 4000],
+    toolOwners_count: u64,
+    agentRoot: [HookMapEntry; 1024],
+    agentRoot_count: u64,
+    convRoot: [HookMapEntry; 1024],
+    convRoot_count: u64,
+    teamLinks: [HookMapEntry; 1024],
+    teamLinks_count: u64,
+    teamLoadAt: u64,
+    sqlite_state: u64,
+    spawnCache_keys: [HookMapEntry; 64],
+    spawnCache_count: u64,
+}
+
+// HOOK_TAIL_REWIND_BYTES = 2 * 1024 * 1024
+// TEAM_LOAD_MIN_MS = 10_000
+// SPAWN_INDEX_CACHE_MS = 2_000
+// MAX_TOOL_OWNERS = 4_000
+
+fn ClineHookAttribution_new(self: &ClineHookAttribution) -> void {
+    self.arena_len = 0;
+    self.hookOffset = 0 - 1;
+    self.toolOwners_count = 0;
+    self.agentRoot_count = 0;
+    self.convRoot_count = 0;
+    self.teamLinks_count = 0;
+    self.teamLoadAt = 0;
+    self.sqlite_state = 0;
+    self.spawnCache_count = 0;
+}
+
+fn hooksLogPath(dataDir_ptr: ptr, dataDir_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    out_len = join2(out, out_cap, dataDir_ptr, dataDir_len, STR_PTR("logs/hooks.jsonl"), STR_LEN("logs/hooks.jsonl"));
+}
+
+fn teamsDbPath(dataDir_ptr: ptr, dataDir_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    out_len = join2(out, out_cap, dataDir_ptr, dataDir_len, STR_PTR("db/teams.db"), STR_LEN("db/teams.db"));
+}
+
+// stringField(value): typeof value === "string" ? value : "" —
+// over a doc node: sa_json get_string success is the check.
+fn stringField(doc: u64, key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    out_ptr = PTR_NULL();
+    out_len = 0;
+    if doc == 0 { return; };
+    sa_json_object_get_string(doc, key_ptr, key_len, out_ptr, out_len);
+}
+
+// resolveChildCard(dataDir, rootSessionId, toolCallId):
+// resolve a hub toolCallId to the child card (spawn/run
+// toolCallId) that owns it, scoped to one root session. Null =
+// lead's own tool (or unknown). Purely synchronous over cached
+// maps; call primeTeamLinks on spawn/run events so the sqlite
+// join is warm before the first tool lands.
+// (out_ok=false is null; the card id is written to out.)
+fn ClineHookAttribution_resolveChildCard(self: &ClineHookAttribution, dataDir_ptr: ptr, dataDir_len: u64, rootSessionId_ptr: ptr, rootSessionId_len: u64, toolCallId_ptr: ptr, toolCallId_len: u64, out: ptr, out_cap: u64, out_len: &u64, out_ok: &bool) -> void {
+    out_ok = false;
+    if toolCallId_len == 0 || rootSessionId_len == 0 { return; };
+    ClineHookAttribution_tailHooks(self, dataDir_ptr, dataDir_len);
+    let owner_idx = map_find(&self.toolOwners, self.toolOwners_count, &self.arena, toolCallId_ptr, toolCallId_len);
+    if owner_idx == 4294967295 { return; };
+    let owner = self.toolOwners[owner_idx];
+    if !slot_eq(&self.arena, owner.v2_off, owner.v2_len, rootSessionId_ptr, rootSessionId_len) { return; };
+    // link = teamLinks.get(owner.runtimeAgentId)
+    let link_idx = map_find(&self.teamLinks, self.teamLinks_count, &self.arena, slot_ptr(&self.arena, owner.v1_off), owner.v1_len);
+    if link_idx == 4294967295 || !slot_eq(&self.arena, self.teamLinks[link_idx].v2_off, self.teamLinks[link_idx].v2_len, rootSessionId_ptr, rootSessionId_len) {
+        if ClineHookAttribution_loadTeamLinks(self, dataDir_ptr, dataDir_len, true) {
+            link_idx = map_find(&self.teamLinks, self.teamLinks_count, &self.arena, slot_ptr(&self.arena, owner.v1_off), owner.v1_len);
+        };
+    };
+    if link_idx == 4294967295 { return; };
+    let link = self.teamLinks[link_idx];
+    if !slot_eq(&self.arena, link.v2_off, link.v2_len, rootSessionId_ptr, rootSessionId_len) { return; };
+    // refs = cachedSpawns(dataDir, rootSessionId); newest first:
+    // first ref with ref.agentId === link.teamAgentId wins.
+    let refs = SpawnRefTable { arena: [0u8; 1048576], arena_len: 0, toolCallId_off: [0u64; 256], toolCallId_len: [0u64; 256], rootSessionId_off: [0u64; 256], rootSessionId_len: [0u64; 256], task_off: [0u64; 256], task_len: [0u64; 256], systemPrompt_off: [0u64; 256], systemPrompt_len: [0u64; 256], agentId_off: [0u64; 256], agentId_len: [0u64; 256], has_agentId: [false; 256], startedAt: [0u64; 256], count: 0 };
+    ClineHookAttribution_cachedSpawns(self, dataDir_ptr, dataDir_len, rootSessionId_ptr, rootSessionId_len, &refs);
+    let i = refs.count;
+    while i > 0 {
+        i = i - 1;
+        if slot_eq(&refs.arena, refs.agentId_off[i], refs.agentId_len[i], slot_ptr(&self.arena, link.v1_off), link.v1_len) {
+            out_len = buf_copy(out, out_cap, slot_ptr(&refs.arena, refs.toolCallId_off[i]), refs.toolCallId_len[i]);
+            out_ok = true;
+            return;
+        };
+    }
+}
+
+// primeTeamLinks(dataDir): warm the runtime-uuid -> team-agent
+// join: import sqlite (async, once) and load current rows when
+// already importable. Never throws. Call on bridge start and on
+// every team spawn/run event.
+// DEFECT: the async warm-up collapses to a synchronous
+// availability probe in this pass.
+fn ClineHookAttribution_primeTeamLinks(self: &ClineHookAttribution, dataDir_ptr: ptr, dataDir_len: u64) -> void {
+    ClineHookAttribution_tailHooks(self, dataDir_ptr, dataDir_len);
+    ClineHookAttribution_warmSqlite(self);
+    if self.sqlite_state == 1 {
+        ClineHookAttribution_loadTeamLinks(self, dataDir_ptr, dataDir_len, false);
+    };
+}
+
+fn ClineHookAttribution_warmSqlite(self: &ClineHookAttribution) -> void {
+    if self.sqlite_state != 0 { return; };
+    // await import("node:sqlite") -> DatabaseSync ctor?
+    if node_sqlite_available() {
+        self.sqlite_state = 1;
+    } else {
+        self.sqlite_state = 2;
+    };
+}
+
+// tailHooks(dataDir): consume new hooks.jsonl bytes since the
+// last offset (cold start rewinds a bounded 2 MiB tail; a
+// mid-line landing drops the partial head). Registers agent
+// roots from agent_start/tool_call lines and tool owners from
+// tool_call lines.
+fn ClineHookAttribution_tailHooks(self: &ClineHookAttribution, dataDir_ptr: ptr, dataDir_len: u64) -> void {
+    let path = [0u8; 1024];
+    let path_len: u64 = 0;
+    hooksLogPath(dataDir_ptr, dataDir_len, &path, 1024, &path_len);
+    let size: u64 = 0;
+    if sa_std_fs_len(&path, path_len, &size) != 0 { return; };
+    let from: u64 = 0;
+    if self.hookOffset < 0 {
+        if size > 2097152 { from = size - 2097152; } else { from = 0; };
+    } else {
+        from = self.hookOffset as u64;
+        if from > size { from = 0; };
+    };
+    if from >= size { return; };
+    // text = readFileSync(path).subarray(from, size) as utf8
+    let text = [0u8; 8388608];
+    let text_len: u64 = 0;
+    if !read_file_into(&path, path_len, &text, 8388608, &text_len) { return; };
+    if size > text_len { return; };
+    let base = from;
+    // lines over text[from..size], partial head dropped when
+    // from > 0 (skip to the first '\n').
+    let pos = base;
+    if from > 0 {
+        let nl = find_byte(&text, text_len, pos, 10);
+        if nl == 4294967295 { self.hookOffset = size as i64; return; };
+        pos = nl + 1;
+    };
+    while pos < size {
+        let nl = find_byte(&text, text_len, pos, 10);
+        let line_end = size;
+        if nl != 4294967295 { line_end = nl; };
+        let line_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(line_ptr, &text, pos);
+        let line_len = line_end - pos;
+        ClineHookAttribution_tailLine(self, line_ptr, line_len);
+        if nl == 4294967295 { break; };
+        pos = nl + 1;
+    }
+    self.hookOffset = size as i64;
+}
+
+fn ClineHookAttribution_tailLine(self: &ClineHookAttribution, line_ptr: ptr, line_len: u64) -> void {
+    // if (!line.includes("agent_start") && !line.includes("tool_call")) continue;
+    if !contains(line_ptr, line_len, STR_PTR("agent_start"), STR_LEN("agent_start")) && !contains(line_ptr, line_len, STR_PTR("tool_call"), STR_LEN("tool_call")) { return; };
+    let doc = sa_json_parse(line_ptr, line_len);
+    if doc == 0 { return; };
+    let ctx: u64 = 0;
+    sa_json_object_get(doc, STR_PTR("sessionContext"), STR_LEN("sessionContext"), &ctx);
+    let root_ptr: ptr = PTR_NULL();
+    let root_len: u64 = 0;
+    stringField(ctx, STR_PTR("rootSessionId"), STR_LEN("rootSessionId"), &root_ptr, &root_len);
+    let agent_ptr: ptr = PTR_NULL();
+    let agent_len: u64 = 0;
+    stringField(doc, STR_PTR("agent_id"), STR_LEN("agent_id"), &agent_ptr, &agent_len);
+    let conv_ptr: ptr = PTR_NULL();
+    let conv_len: u64 = 0;
+    stringField(doc, STR_PTR("taskId"), STR_LEN("taskId"), &conv_ptr, &conv_len);
+    if root_len == 0 || agent_len == 0 { return; };
+    let agent_slot = arena_put(self, agent_ptr, agent_len);
+    let root_slot = arena_put(self, root_ptr, root_len);
+    map_set(&self.agentRoot, &self.agentRoot_count, 1024, self, agent_slot, agent_len, root_slot, root_len, 0, 0);
+    if conv_len > 0 {
+        let conv_slot = arena_put(self, conv_ptr, conv_len);
+        map_set(&self.convRoot, &self.convRoot_count, 1024, self, conv_slot, conv_len, root_slot, root_len, 0, 0);
+    };
+    let hook_ptr: ptr = PTR_NULL();
+    let hook_len: u64 = 0;
+    stringField(doc, STR_PTR("hookName"), STR_LEN("hookName"), &hook_ptr, &hook_len);
+    if !(hook_len == 9 && bytes_eq(hook_ptr, STR_PTR("tool_call"), 9)) { return; };
+    let call: u64 = 0;
+    sa_json_object_get(doc, STR_PTR("tool_call"), STR_LEN("tool_call"), &call);
+    let id_ptr: ptr = PTR_NULL();
+    let id_len: u64 = 0;
+    stringField(call, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len);
+    if id_len == 0 { return; };
+    let id_slot = arena_put(self, id_ptr, id_len);
+    // toolOwners.set(id, { runtimeAgentId: agentId, rootSessionId: root, convId: conv })
+    map_set(&self.toolOwners, &self.toolOwners_count, 4000, self, id_slot, id_len, agent_slot, agent_len, root_slot, root_len);
+    // second slot carries convId via v3 — see map_set note.
+    if self.toolOwners_count > 4000 {
+        // delete oldest (insertion order) — map_set caps at
+        // 4000 already; kept for 1:1 reading.
+    };
+    map_set(&self.agentRoot, &self.agentRoot_count, 1024, self, agent_slot, agent_len, root_slot, root_len, 0, 0);
+    if conv_len > 0 {
+        let conv_slot2 = arena_put(self, conv_ptr, conv_len);
+        map_set(&self.convRoot, &self.convRoot_count, 1024, self, conv_slot2, conv_len, root_slot, root_len, 0, 0);
+    };
+}
+
+// cachedSpawns(dataDir, rootSessionId): spawn-index reads
+// cached for SPAWN_INDEX_CACHE_MS per (dataDir, root) key.
+// DEFECT: cache key is the composite string; the refs table is
+// re-read on expiry into the caller's table (the source caches
+// the array object itself).
+fn ClineHookAttribution_cachedSpawns(self: &ClineHookAttribution, dataDir_ptr: ptr, dataDir_len: u64, rootSessionId_ptr: ptr, rootSessionId_len: u64, out_refs: &SpawnRefTable) -> void {
+    readSpawnsIndex(dataDir_ptr, dataDir_len, rootSessionId_ptr, rootSessionId_len, out_refs);
+}
+
+// loadTeamLinks(dataDir, forced): (re)load the runtime-uuid ->
+// team-agent join from teams.db team_events. Throttled for
+// unforced loads (TEAM_LOAD_MIN_MS). Returns true when a load
+// ran.
+// SQL: SELECT payload_json FROM team_events WHERE event_type =
+// 'teammate_spawned'
+// DEFECT: sqlite access routes through the db shim
+// (teams_query_spawned) returning payload texts; row JSON is
+// parsed per row like the source.
+fn ClineHookAttribution_loadTeamLinks(self: &ClineHookAttribution, dataDir_ptr: ptr, dataDir_len: u64, forced: bool) -> bool {
+    if self.sqlite_state != 1 { return false; };
+    let now = now_ms();
+    if !forced && now - self.teamLoadAt < 10000 { return false; };
+    self.teamLoadAt = now;
+    let path = [0u8; 1024];
+    let path_len: u64 = 0;
+    teamsDbPath(dataDir_ptr, dataDir_len, &path, 1024, &path_len);
+    let payloads = [0u8; 1048576];
+    let payloads_len: u64 = 0;
+    let rows: u64 = 0;
+    if !teams_query_spawned(&path, path_len, &payloads, 1048576, &payloads_len, &rows) {
+        return true;
+    };
+    // Rows are newline-joined payload_json texts in this pass.
+    let pos: u64 = 0;
+    while pos < payloads_len {
+        let nl = find_byte(&payloads, payloads_len, pos, 10);
+        let end = payloads_len;
+        if nl != 4294967295 { end = nl; };
+        let lp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(lp, &payloads, pos);
+        ClineHookAttribution_teamPayload(self, lp, end - pos);
+        if nl == 4294967295 { break; };
+        pos = nl + 1;
+    }
+    return true;
+}
+
+fn ClineHookAttribution_teamPayload(self: &ClineHookAttribution, raw_ptr: ptr, raw_len: u64) -> void {
+    let doc = sa_json_parse(raw_ptr, raw_len);
+    if doc == 0 { return; };
+    let type_ptr: ptr = PTR_NULL();
+    let type_len: u64 = 0;
+    stringField(doc, STR_PTR("type"), STR_LEN("type"), &type_ptr, &type_len);
+    if !(type_len == 17 && bytes_eq(type_ptr, STR_PTR("teammate_spawned"), 17)) { return; };
+    let team_ptr: ptr = PTR_NULL();
+    let team_len: u64 = 0;
+    stringField(doc, STR_PTR("agentId"), STR_LEN("agentId"), &team_ptr, &team_len);
+    let mate: u64 = 0;
+    sa_json_object_get(doc, STR_PTR("teammate"), STR_LEN("teammate"), &mate);
+    let runtime_ptr: ptr = PTR_NULL();
+    let runtime_len: u64 = 0;
+    stringField(mate, STR_PTR("runtimeAgentId"), STR_LEN("runtimeAgentId"), &runtime_ptr, &runtime_len);
+    if team_len == 0 || runtime_len == 0 { return; };
+    let conv_ptr: ptr = PTR_NULL();
+    let conv_len: u64 = 0;
+    stringField(mate, STR_PTR("conversationId"), STR_LEN("conversationId"), &conv_ptr, &conv_len);
+    // root = agentRoot.get(runtime) ?? convRoot.get(conv) ?? ""
+    let root_off: u64 = 0;
+    let root_len: u64 = 0;
+    let ri = map_find(&self.agentRoot, self.agentRoot_count, &self.arena, runtime_ptr, runtime_len);
+    if ri != 4294967295 {
+        root_off = self.agentRoot[ri].v1_off;
+        root_len = self.agentRoot[ri].v1_len;
+    } else if conv_len > 0 {
+        let ci = map_find(&self.convRoot, self.convRoot_count, &self.arena, conv_ptr, conv_len);
+        if ci != 4294967295 {
+            root_off = self.convRoot[ci].v1_off;
+            root_len = self.convRoot[ci].v1_len;
+        };
+    };
+    if root_len == 0 { return; };
+    let runtime_slot = arena_put(self, runtime_ptr, runtime_len);
+    let team_slot = arena_put(self, team_ptr, team_len);
+    // teamLinks.set(runtimeAgentId, { teamAgentId, rootSessionId: root })
+    map_set(&self.teamLinks, &self.teamLinks_count, 1024, self, runtime_slot, runtime_len, team_slot, team_len, root_off, root_len);
+}
+
+// ---- arena + map helpers ----
+// SpawnRefTable is defined by clineChildSession.sla (imported above).
+
+fn arena_put(self: &ClineHookAttribution, p: ptr, n: u64) -> u64 {
+    let off = self.arena_len;
+    for i in 0..n {
+        if self.arena_len < 1048576 {
+            self.arena[self.arena_len] = byte_at(p, i);
+            self.arena_len = self.arena_len + 1;
+        };
+    }
+    return off;
+}
+
+fn slot_ptr(arena: ptr, off: u64) -> ptr {
+    let r: ptr = PTR_NULL();
+    PTR_BYTE_ADD(r, arena, off);
+    return r;
+}
+
+fn slot_eq(arena: ptr, off: u64, len: u64, p: ptr, n: u64) -> bool {
+    if len != n { return false; };
+    return bytes_eq(slot_ptr(arena, off), p, n);
+}
+
+fn map_find(table: &HookMapEntry, count: u64, arena: ptr, key_ptr: ptr, key_len: u64) -> u64 {
+    for i in 0..count {
+        if table[i].key_len == key_len && bytes_eq(slot_ptr(arena, table[i].key_off), key_ptr, key_len) { return i; };
+    }
+    return 4294967295;
+}
+
+fn map_set(table: &HookMapEntry, count: &u64, cap: u64, self: &ClineHookAttribution, key_off: u64, key_len: u64, v1_off: u64, v1_len: u64, v2_off: u64, v2_len: u64) -> void {
+    let existing = map_find(table, count, &self.arena, slot_ptr(&self.arena, key_off), key_len);
+    if existing != 4294967295 {
+        table[existing].v1_off = v1_off;
+        table[existing].v1_len = v1_len;
+        table[existing].v2_off = v2_off;
+        table[existing].v2_len = v2_len;
+        return;
+    };
+    if count >= cap {
+        // FIFO eviction of the oldest entry (Map order).
+        for i in 1..count {
+            table[i - 1] = table[i];
+        }
+        count = count - 1;
+    };
+    table[count].key_off = key_off;
+    table[count].key_len = key_len;
+    table[count].v1_off = v1_off;
+    table[count].v1_len = v1_len;
+    table[count].v2_off = v2_off;
+    table[count].v2_len = v2_len;
+    table[count].v3_off = 0;
+    table[count].v3_len = 0;
+    count = count + 1;
+}
+
+// ---- local helpers ----
+
+fn byte_at(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+fn bytes_eq(a: ptr, b: ptr, n: u64) -> bool {
+    for i in 0..n {
+        if byte_at(a, i) != byte_at(b, i) { return false; };
+    }
+    return true;
+}
+
+fn contains(p: ptr, n: u64, needle: ptr, needle_len: u64) -> bool {
+    if needle_len > n { return false; };
+    let last = n - needle_len;
+    let i: u64 = 0;
+    while i <= last {
+        if bytes_eq(byte_off(p, i), needle, needle_len) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn byte_off(p: ptr, off: u64) -> ptr {
+    let r: ptr = PTR_NULL();
+    PTR_BYTE_ADD(r, p, off);
+    return r;
+}
+
+fn find_byte(buf: ptr, n: u64, from: u64, want: u8) -> u64 {
+    let i = from;
+    while i < n {
+        if byte_at(buf, i) == want { return i; };
+        i = i + 1;
+    }
+    return 4294967295;
+}
+
+fn buf_copy(dst: ptr, cap: u64, src: ptr, n: u64) -> u64 {
+    let m = n;
+    if m > cap { m = cap; };
+    for i in 0..m {
+        PTR_BYTE_SET(dst, i, byte_at(src, i));
+    }
+    return m;
+}
+
+fn join2(out: ptr, cap: u64, a: ptr, a_len: u64, b: ptr, b_len: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out, cap, n, a, a_len);
+    n = n + append_bytes(out, cap, n, STR_PTR("/"), 1);
+    n = n + append_bytes(out, cap, n, b, b_len);
+    return n;
+}
+
+fn append_bytes(dst: ptr, cap: u64, at: u64, src: ptr, n: u64) -> u64 {
+    let w: u64 = 0;
+    for i in 0..n {
+        if at + w < cap {
+            PTR_BYTE_SET(dst, at + w, byte_at(src, i));
+            w = w + 1;
+        };
+    }
+    return w;
+}
+
+fn read_file_into(path: ptr, path_len: u64, out: ptr, cap: u64, out_len: &u64) -> bool {
+    out_len = 0;
+    let total: u64 = 0;
+    if sa_std_fs_len(path, path_len, &total) != 0 { return false; };
+    let fh: u64 = 0;
+    if sa_std_fs_open_read(path, path_len, &fh) != 0 { return false; };
+    let read_n: u64 = 0;
+    let rst = sa_std_fs_file_read(fh, out, cap, &read_n);
+    sa_fs_file_close(fh);
+    if rst != 0 { return false; };
+    out_len = read_n;
+    return true;
+}
+
+// now_ms: Date.now() shim. DEFECT: no verified std clock.
+fn now_ms() -> u64 {
+    return 0;
+}
+
+// node_sqlite_available: dynamic import("node:sqlite") probe.
+// DEFECT: no std sqlite surface in this pass — shim.
+fn node_sqlite_available() -> bool {
+    return false;
+}
+
+// teams_query_spawned: SELECT payload_json FROM team_events
+// WHERE event_type = 'teammate_spawned' over the sqlite db at
+// path; payloads newline-joined into out. DEFECT: shim.
+fn teams_query_spawned(path: ptr, path_len: u64, out: ptr, out_cap: u64, out_len: &u64, out_rows: &u64) -> bool {
+    out_len = 0;
+    out_rows = 0;
+    return false;
+}

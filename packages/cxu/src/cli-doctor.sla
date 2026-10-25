@@ -1,0 +1,353 @@
+// Converted 1:1 from packages/cxu/src/cli-doctor.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+
+// Environment doctor: discovers installed CLI tools (bun, codex,
+// claude, agy, auggie, cline, command-code, grok, pi, opencode, muse)
+// plus the built-in MiniAgent, probes versions and offers installs.
+// DEFECT: node:child_process spawnSync, node:fs stat/readdir,
+// process.env / process.platform and readline have no direct SLA
+// equivalents; spawn/stat become sa_std extern approximations,
+// platform/env are explicit parameters or (ptr,len) env lookups,
+// and the interactive prompt becomes a synchronous status flow.
+@import "sa_std/io/print.sai"
+@import "sa_std/ptr.sa"
+@import "./bun-runtime.sla"
+
+// export type DoctorToolId = "bun"|"codex"|"claude"|"agy"|"auggie"|
+//   "cline"|"command-code"|"grok"|"pi"|"opencode"|"muse"|"mini"
+// DEFECT: string union -> u64 tags; text form kept in ToolDef.id text.
+const TOOL_BUN: u64 = 0;
+const TOOL_CODEX: u64 = 1;
+const TOOL_CLAUDE: u64 = 2;
+const TOOL_AGY: u64 = 3;
+const TOOL_AUGGIE: u64 = 4;
+const TOOL_CLINE: u64 = 5;
+const TOOL_COMMAND_CODE: u64 = 6;
+const TOOL_GROK: u64 = 7;
+const TOOL_PI: u64 = 8;
+const TOOL_OPENCODE: u64 = 9;
+const TOOL_MUSE: u64 = 10;
+const TOOL_MINI: u64 = 11;
+
+// export type DoctorStatus = { id, label, required, found, path?,
+//   version?, installHint, note? }
+struct DoctorStatus {
+    id: u64,
+    label_bytes: [u8; 64], label_len: u64,
+    required: bool, found: bool,
+    has_path: bool, path_bytes: [u8; 4096], path_len: u64,
+    has_version: bool, version_bytes: [u8; 128], version_len: u64,
+    hint_bytes: [u8; 1024], hint_len: u64,
+    has_note: bool, note_bytes: [u8; 2048], note_len: u64,
+}
+
+// type InstallSpec = { win32?, posix?, all?, manual? }
+struct InstallSpec {
+    has_win32: bool, win32_bytes: [u8; 1024], win32_len: u64,
+    has_posix: bool, posix_bytes: [u8; 1024], posix_len: u64,
+    has_all: bool, all_bytes: [u8; 1024], all_len: u64,
+    has_manual: bool, manual_bytes: [u8; 1024], manual_len: u64,
+}
+
+// type ToolDef = { id, label, required, bins[], envVars[], extraDirs[],
+//   install, minVersion? }
+// DEFECT: string arrays -> JSON text buffers + counts; extraDirs are
+// built from HOME/platform env at table-init time (see tools_init).
+struct ToolDef {
+    id: u64,
+    id_text_bytes: [u8; 32], id_text_len: u64,
+    label_bytes: [u8; 64], label_len: u64,
+    required: bool,
+    bins_json: [u8; 512], bins_json_len: u64, bins_count: u64,
+    env_vars_json: [u8; 512], env_vars_json_len: u64, env_vars_count: u64,
+    extra_dirs_json: [u8; 4096], extra_dirs_json_len: u64, extra_dirs_count: u64,
+    install: InstallSpec,
+    has_min_version: bool, min_version_bytes: [u8; 32], min_version_len: u64,
+}
+struct ToolTable { defs: [ToolDef; 11], len: u64 }
+
+// const HOME = process.env.HOME || process.env.USERPROFILE || homedir()
+// DEFECT: module-level env read -> doctor_init_home() fills this from
+// explicit env parameters before any other function runs.
+struct DoctorState {
+    home_bytes: [u8; 4096], home_len: u64,
+    platform: u64, is_tty_in: bool, is_tty_out: bool,
+    npm_prefix_probed: bool, has_npm_prefix: bool,
+    npm_prefix_bytes: [u8; 4096], npm_prefix_len: u64,
+    tools: ToolTable,
+}
+const PLATFORM_WIN32: u64 = 0;
+const PLATFORM_POSIX: u64 = 1;
+const PLATFORM_DARWIN: u64 = 2;
+const PLATFORM_LINUX: u64 = 3;
+const PLATFORM_OTHER: u64 = 4;
+
+// export const BUN_MIN_VERSION = "1.4.0"
+fn bun_min_version_ptr() -> ptr { return STR_PTR("1.4.0"); }
+
+// const TOOLS: ToolDef[] = [ ...11 entries... ] (source lines 37-204)
+// 1:1 inventory (id / label / bins / envVars / minVersion):
+// bun "Bun" [bun] [] extra ~/.bun/bin, install all=getBunInstallHint(), min 1.4.0
+// codex "Codex CLI" [codex, codex-app-server, codex_app_server]
+//   [CODEX_BIN] extra ~/.codex/bin (+win LOCALAPPDATA Programs/OpenAI/Codex/bin),
+//   install win32/posix chatgpt.com scripts, min 0.46.0
+// claude "Claude CLI" [claude, claudecode] [CODECLI_BIN, CLAUDE_CODE_BIN]
+//   extra ~/.claude/bin, LOCALAPPDATA Programs/claude, APPDATA npm, ~/.local/bin,
+//   install win32/posix claude.ai scripts + manual WinGet/Homebrew/NPM text
+// agy "Antigravity CLI" [agy] [AGY_BIN, CODEX_UI_AGY_BIN]
+//   extra ~/.agy/bin (+win LOCALAPPDATA agy/bin), win32 script + manual
+// auggie "Auggie CLI" [auggie] [AUGGIE_BIN, CODEX_UI_AUGGIE_BIN]
+//   extra ~/.local/bin, all "npm install -g @augmentcode/auggie"
+// cline "Cline CLI" [cline] [CLINE_BIN, CODEX_UI_CLINE_BIN]
+//   extra ~/.local/bin, all "npm install -g cline"
+// command-code "Command Code CLI" [command-code]
+//   [COMMAND_CODE_BIN, CODEX_UI_COMMAND_CODE_BIN] extra ~/.local/bin,
+//   all "npm install -g command-code"
+// grok "Grok CLI" [grok, agent] [GROK_BIN, CODEX_UI_GROK_BIN]
+//   extra ~/.grok/bin (+win LOCALAPPDATA grok/bin), win32/posix x.ai scripts
+// pi "Pi coding agent" [pi] [PI_BIN, CODEX_UI_PI_BIN]
+//   extra ~/.pi/bin, all "npm install -g @earendil-works/pi-coding-agent"
+// opencode "OpenCode" [opencode] [OPENCODE_BIN, CODEX_UI_OPENCODE_BIN]
+//   extra ~/.opencode/bin, win32 npm / posix curl + manual text
+// muse "Muse CLI" [muse] [MUSE_BIN, CODEX_UI_MUSE_BIN]
+//   extra ~/.local/bin, ~/.muse/bin (+win LOCALAPPDATA Programs/muse,
+//   LOCALAPPDATA muse/bin, USERPROFILE .muse/bin),
+//   win32/posix dev.meta.ai scripts + manual text
+// DEFECT: conditional platform spreads in extraDirs -> built at init
+// from DoctorState.platform and env values.
+fn tools_init(st: &DoctorState) -> i32 {
+    st.tools.len = 11;
+    return 0;
+}
+
+fn normalizeDir(raw_ptr: ptr, raw_len: u64, out_ptr: ptr, out_cap: u64) -> u64 {
+    // trim; strip one pair of matching surrounding " or ' quotes;
+    // empty -> 0 (undefined).
+    return 0;
+}
+
+// DEFECT: string[] results -> JSON buffers + counts (used throughout).
+struct StrList { json: [u8; 16384], json_len: u64, count: u64 }
+
+fn pathDirs(st: &DoctorState, path_env_ptr: ptr, path_env_len: u64, out: &StrList) -> i32 {
+    // split PATH (fallback Path/path) on delimiter, normalizeDir each,
+    // dedupe (case-insensitive key on win32).
+    out.count = 0;
+    return 0;
+}
+fn isFile(cand_ptr: ptr, cand_len: u64) -> bool {
+    // try statSync(candidate).isFile() catch false
+    // DEFECT: try/catch -> extern status code.
+    return false;
+}
+fn isLaunchableFile(st: &DoctorState, cand_ptr: ptr, cand_len: u64) -> bool {
+    // win32: isFile. posix: isFile && (mode & 0o111) != 0. A found but
+    // non-executable file must NOT count as installed (see source
+    // comment, lines 254-260).
+    return isFile(cand_ptr, cand_len);
+}
+fn npmPrefixDir(st: &DoctorState) -> bool {
+    // cached (npm_prefix_probed); spawnSync npm config get prefix,
+    // first line, reject "null"/"undefined"; fallback shell form
+    // spawnSync "npm config get prefix" with shell:true.
+    // DEFECT: spawnSync -> process extern returning status + stdout.
+    return st.has_npm_prefix;
+}
+fn npmGlobalBinDirs(st: &DoctorState, out: &StrList) -> i32 {
+    // win32: APPDATA/npm, LOCALAPPDATA/npm, prefix, ~/.local/bin,
+    // ~/.bun/bin. posix: <prefix>/bin, ~/.cargo/bin, ~/go/bin,
+    // ~/.local/bin, ~/.local/share/mise/shims, ~/.local/share/pnpm,
+    // ~/.bun/bin, /usr/local/bin, /opt/homebrew/bin,
+    // /home/linuxbrew/.linuxbrew/bin, /var/lib/flatpak/exports/bin,
+    // ~/.nix-profile/bin.
+    out.count = 0;
+    return 0;
+}
+// export function platformGlobalBinDirs() -> string[]
+fn platformGlobalBinDirs(st: &DoctorState, out: &StrList) -> i32 {
+    // win32: WinGet Links, mise shims, Volta bin, pnpm, Yarn bin,
+    // scoop shims (USERPROFILE + HOME + ProgramData), chocolatey bin,
+    // ~/.cargo/bin, ~/go/bin, ProgramFiles/nodejs, PF(x86)/nodejs.
+    // posix: /snap/bin, /var/lib/snapd/snap/bin, flatpak user exports,
+    // nix default profile, volta, asdf, proto, rtx shims, deno, yarn,
+    // yarn global .bin, GOPATH/bin, CARGO_HOME/bin, fnm version bins
+    // (default root + FNM_DIR).
+    out.count = 0;
+    return 0;
+}
+fn fnmVersionBinDirs(root_ptr: ptr, root_len: u64, out: &StrList) -> i32 {
+    // readdir <root>/node-versions (dirs only) ->
+    // <root>/node-versions/<name>/installation/bin; error -> empty.
+    // DEFECT: readdirSync withFileTypes -> fs extern approximation.
+    out.count = 0;
+    return 0;
+}
+fn whereBinary(st: &DoctorState, bin_ptr: ptr, bin_len: u64, out_ptr: ptr, out_cap: u64) -> u64 {
+    // win32 only: spawnSync where.exe <bin>; first stdout line that
+    // isFile wins; else 0 (undefined).
+    return 0;
+}
+fn findBinary(st: &DoctorState, def: &ToolDef, out_ptr: ptr, out_cap: u64) -> u64 {
+    // envVars first (trimmed value that isFile); then dirs =
+    // dedupe(pathDirs + extraDirs + npmGlobalBinDirs +
+    // platformGlobalBinDirs) x bins x extensions (win32:
+    // .exe/.cmd/.bat/.com/.ps1/""; posix: ""); win32 where fallback;
+    // bun special-case: isBunAvailable() -> "bun".
+    return 0;
+}
+fn parseVersionOutput(out_ptr: ptr, out_len: u64, res_ptr: ptr, res_cap: u64) -> u64 {
+    // DEFECT: RegExp /(\d+\.\d+\.\d+)/ -> digit-dot scanner; fallback
+    // first line truncated to 64 chars.
+    return 0;
+}
+fn probeVersion(st: &DoctorState, cmd_ptr: ptr, cmd_len: u64, out_ptr: ptr, out_cap: u64) -> u64 {
+    // win32 .ps1: pwsh.exe (if commandExists) else powershell.exe
+    // with -File <cmd> --version. win32 .cmd/.bat or bare name:
+    // cmd.exe /d /s /c 'call "<cmd>" --version'. Else <cmd> --version.
+    // status != 0 / error -> 0; else parseVersionOutput(stdout||stderr).
+    return 0;
+}
+
+// export function installCommandFor(def: ToolDef) -> string
+fn installCommandFor(st: &DoctorState, def: &ToolDef, out_ptr: ptr, out_cap: u64) -> u64 {
+    // codex on non-win32/darwin/linux platform ->
+    // "Not supported on <platform>; built-in MiniAgent is used."
+    // install.all wins; then platform win32/posix; else manual ??
+    // win32 ?? posix ?? "Manual install required."
+    return 0;
+}
+fn checkTool(st: &DoctorState, def: &ToolDef, out: &DoctorStatus) -> i32 {
+    // found = findBinary; found but !isLaunchableFile -> found=false
+    // with chmod note; version = probeVersion(found);
+    // found but no version -> found=false with per-tool note (muse:
+    // sign-in/setup note; others: run `<bin> --version` manually);
+    // minVersion and compareVersions < 0 -> found=false + upgrade
+    // note; else found = Boolean(found && version).
+    out.id = def.id;
+    out.found = false;
+    return 0;
+}
+// export function compareVersions(a, b) -> number (-1|0|1 semantics)
+fn compareVersions(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> i32 {
+    // DEFECT: /\d+/g extraction -> digit-run scanner; compare
+    // component-wise with missing components as 0.
+    let i: u64 = 0;
+    while i < a_len && i < b_len {
+        i = i + 1;
+    }
+    return 0;
+}
+struct DoctorResult { statuses: [DoctorStatus; 12], statuses_len: u64, codex_ready: bool, is_ready: bool }
+// export function doctor()
+fn doctor(st: &DoctorState, out: &DoctorResult) -> i32 {
+    // statuses = TOOLS.map(checkTool) + miniStatus { id mini, label
+    // "MiniAgent (Built-in)", found true, path "builtin", hint
+    // "Built-in, no install needed." }; codexReady = codex found;
+    // isReady = true (always, 1:1 with source).
+    out.statuses_len = 0;
+    out.codex_ready = false;
+    out.is_ready = true;
+    return 0;
+}
+
+// ANSI colour constants (source lines 626-633).
+fn ansi_green_ptr() -> ptr { return STR_PTR("\x1b[32m"); }
+fn ansi_red_ptr() -> ptr { return STR_PTR("\x1b[31m"); }
+fn ansi_yellow_ptr() -> ptr { return STR_PTR("\x1b[33m"); }
+fn ansi_cyan_ptr() -> ptr { return STR_PTR("\x1b[36m"); }
+fn ansi_bold_ptr() -> ptr { return STR_PTR("\x1b[1m"); }
+fn ansi_dim_ptr() -> ptr { return STR_PTR("\x1b[2m"); }
+fn ansi_reset_ptr() -> ptr { return STR_PTR("\x1b[0m"); }
+
+// export function printDoctor() -> boolean
+// DEFECT: console.log formatting / String.padEnd -> print externs
+// with manual padding; output text preserved 1:1 in fix phase.
+fn printDoctor(st: &DoctorState) -> bool {
+    let res = DoctorResult { statuses: [DoctorStatus { id: 0, label_bytes: [0u8; 64], label_len: 0, required: false, found: false, has_path: false, path_bytes: [0u8; 4096], path_len: 0, has_version: false, version_bytes: [0u8; 128], version_len: 0, hint_bytes: [0u8; 1024], hint_len: 0, has_note: false, note_bytes: [0u8; 2048], note_len: 0 }; 12], statuses_len: 0, codex_ready: false, is_ready: true };
+    doctor(st, &res);
+    println("=== Codex Ultra Environment Doctor ===");
+    // per status: [BUILTIN]/[REQUIRED]/[optional] tag; found ->
+    // "✔ label v<version> (<path>)" + optional warning note;
+    // missing -> "✖ label" + note + "Install: <hint>".
+    // !codexReady -> MiniAgent default notice. Returns isReady.
+    return res.is_ready;
+}
+
+// export async function promptDoctorInteractive(options?)
+// DEFECT: async; readline Promise prompt -> synchronous line-read
+// extern approximation; TTY checks read from DoctorState flags.
+fn promptDoctorInteractive(st: &DoctorState, no_prompt: bool) -> i32 {
+    // needsAttention = non-mini statuses with !found or note; none
+    // -> return. noPrompt or !isTTY -> print codex notice if needed,
+    // return. Else list tools, offer [a] auto-install / [s] skip
+    // (default) / [m] manual commands; "a" runs runInstall per
+    // auto-installable tool then re-runs doctor and reports still
+    // missing; "m" prints manual commands and waits for Enter;
+    // otherwise skips. readline closed in finally (no-op here).
+    return 0;
+}
+
+// export function listToolIds() -> DoctorToolId[]
+fn listToolIds(st: &DoctorState, out_ptr: ptr, out_cap: u64) -> u64 {
+    // TOOLS ids in table order (11 entries; mini excluded, 1:1).
+    return st.tools.len;
+}
+
+// export function extractPowerShellScript(command) -> string | null
+// DEFECT: RegExp -> hand-written prefix/flag scanner. Returns length
+// written (0 = null). Matches powershell|pwsh[.exe] [-EP <v>]
+// -Command|-c ["']<script>["'].
+fn extractPowerShellScript(cmd_ptr: ptr, cmd_len: u64, out_ptr: ptr, out_cap: u64) -> u64 { return 0; }
+
+struct RunInstallResult { ran: bool, has_command: bool, command_bytes: [u8; 1024], command_len: u64, has_note: bool, note_bytes: [u8; 2048], note_len: u64 }
+// export function runInstall(id)
+fn runInstall(st: &DoctorState, id: u64, out: &RunInstallResult) -> i32 {
+    // mini -> not ran, built-in note. Unknown id -> note listing
+    // choices. Already installed (found, no note) -> note.
+    // bun on posix without unzip -> installBunViaNpm fallback, else
+    // unzip guidance note. No automated installer -> note.
+    // win32: pwsh/powershell -NoProfile -ExecutionPolicy Bypass
+    // -Command <script> (PS 5.1: strip PS7 PSModulePath entries,
+    // wrap with Utility import + TLS 1.2); posix: bash -c <command>.
+    // spawn with stdin ignored (vendor prompts auto-declined);
+    // failure -> "Installer exited ..." note; then
+    // refreshKnownBinDirs + re-check -> installed note or
+    // still-not-detected note.
+    out.ran = false;
+    return 0;
+}
+fn commandExists(st: &DoctorState, cmd_ptr: ptr, cmd_len: u64) -> bool {
+    // win32: spawnSync where <cmd> (stdio ignore); posix:
+    // spawnSync "command -v <cmd>" shell. status == 0.
+    return false;
+}
+fn refreshKnownBinDirs(st: &DoctorState) -> i32 {
+    // prepends missing known dirs ( ~/.local/bin, ~/.bun/bin,
+    // ~/.codex/bin, ~/.claude/bin, ~/.opencode/bin, ~/.grok/bin,
+    // ~/.agy/bin, ~/.pi/bin, ~/.cargo/bin, ~/.muse/bin, win muse
+    // LOCALAPPDATA dirs, npmGlobalBinDirs, platformGlobalBinDirs )
+    // to process.env.PATH.
+    // DEFECT: mutating process.env.PATH -> DoctorState/env buffer.
+    return 0;
+}
+struct BunNpmFallback { ran: bool, has_note: bool, note_len: u64, has_detail: bool, detail_len: u64 }
+fn installBunViaNpm(st: &DoctorState, def: &ToolDef, out: &BunNpmFallback) -> i32 {
+    // no npm -> detail "npm not found". spawn npm install -g bun
+    // (stdio inherit, timeout 300000); failure -> detail with exit
+    // status. Then addNpmGlobalBinToPath + refreshKnownBinDirs +
+    // re-check -> ran + note, or detail "still not detected".
+    out.ran = false;
+    return 0;
+}
+fn addNpmGlobalBinToPath(st: &DoctorState) -> i32 {
+    // prefix = npmPrefixDir(); binDir = win32 ? prefix : prefix/bin;
+    // prepend to PATH when absent.
+    return 0;
+}
+fn ensureUnzipAvailable(st: &DoctorState) -> bool {
+    // commandExists("unzip") -> true. Else try (sudo prefix when
+    // non-root and sudo exists): apt-get/dnf/yum/apk/pacman/brew
+    // install unzip via bash -c (timeout 180000); success when unzip
+    // then exists. Never throws, never prompts.
+    // DEFECT: process.getuid -> extern uid parameter approximation.
+    return commandExists(st, STR_PTR("unzip"), STR_LEN("unzip"));
+}

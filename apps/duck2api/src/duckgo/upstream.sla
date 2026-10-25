@@ -1,0 +1,701 @@
+// Converted 1:1 from apps/duck2api/src/duckgo/upstream.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/ts_math.sa"
+@import "convert.sla"
+@import "vqd.sla"
+
+// Port of E:\projects\duck2api\internal\duckgo\request.go (upstream half).
+// Differences from Go (documented):
+// - HTTP via fetch + manual cookie jar per proxy session; the Go build uses a
+//   TLS-fingerprint client (bogdanfinn/tls-client). Fingerprint parity is a
+//   known gap: expect more 418/429 until impersonation lands.
+// - Proxy: honors HTTP(S)_PROXY env via fetch; explicit per-request proxyUrl
+//   sessions keep separate cookie jars but share the process egress.
+//
+// DEFECT: upstream.ts is built on async fetch / Promises / dynamic
+// import("fetch-impersonate") / setTimeout sleeps / a promise-chain mutex
+// (waitSlot). SLA has no async runtime in this conversion: every step is a
+// synchronous fn, sleeps and the serialized queue collapse into intent
+// externs (sa_sleep_ms, sa_http_fetch_*), and the TLS-impersonation fetch
+// (fetch-impersonate chrome146 preset) is an intent extern
+// sa_http_fetch_impersonated — sa_std has no TLS-fingerprint client.
+// DEFECT: module-level mutable state (fetchImpl, duckFetchDegraded,
+// sessions Map, lastConversationEnd, rateLimitUntil, rateLimitFails,
+// queue) is collected into one UpstreamState struct the caller owns.
+// DEFECT: Response bodies are ReadableStream<Uint8Array> in TS; here a
+// body is an opaque handle (u64, 0 = none) consumed by stream.sla.
+
+// TS: export const DUCK_BASE_URL / DUCK_STATUS_URL / DUCK_CHAT_URL / DUCK_HOME_URL
+fn duck_base_url() -> ptr { return STR_PTR("https://duck.ai"); }
+fn duck_base_url_len() -> u64 { return STR_LEN("https://duck.ai"); }
+fn duck_status_url() -> ptr { return STR_PTR("https://duck.ai/duckchat/v1/status"); }
+fn duck_status_url_len() -> u64 { return STR_LEN("https://duck.ai/duckchat/v1/status"); }
+fn duck_chat_url() -> ptr { return STR_PTR("https://duck.ai/duckchat/v1/chat"); }
+fn duck_chat_url_len() -> u64 { return STR_LEN("https://duck.ai/duckchat/v1/chat"); }
+fn duck_home_url() -> ptr { return STR_PTR("https://duck.ai/"); }
+fn duck_home_url_len() -> u64 { return STR_LEN("https://duck.ai/"); }
+
+// TS: export const DUCK_UA
+fn duck_ua() -> ptr { return STR_PTR("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"); }
+fn duck_ua_len() -> u64 { return STR_LEN("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"); }
+
+// TS: const REQUEST_INTERVAL_MS = 10_000; CHALLENGE_RETRIES = 1;
+//      RETRY_STEP_MS = 10_000; RETRY_MAX_MS = 120_000
+fn request_interval_ms() -> u64 { return 10000; }
+fn challenge_retries() -> u64 { return 1; }
+fn retry_step_ms() -> u64 { return 10000; }
+fn retry_max_ms() -> u64 { return 120000; }
+
+// TS: function backoff(retryNumber: number): number
+fn backoff_ms(retry_number: u64) -> u64 {
+    // Math.max(1, retryNumber) / Math.min(n * STEP, MAX) bound to
+    // @ts_math_minmax (sa_std ts_math.sa; values fit i32 by construction).
+    let n = ts_math_minmax(retry_number, 1, 1);
+    let ms = ts_math_minmax(n * retry_step_ms(), retry_max_ms(), 0);
+    return ms;
+}
+
+// TS: export function randomHex(byteLength: number): string
+// randomBytes failure falls back to Date.now().toString(16) in TS; the
+// intent extern reports failure via its return code and the fallback is
+// reproduced here.
+fn random_hex(out: &ByteBuf, byte_length: u64) -> void {
+    buf_reset(out);
+    if sa_crypto_random_hex(&out.bytes, byte_length, &out.len) != 0 {
+        // DEFECT: Date.now().toString(16) — lowercase hex of epoch ms.
+        buf_append_hex_u64(out, sa_time_now_ms());
+    };
+}
+
+// TS: class Jar — minimal cookie jar: name=value pairs per proxy session.
+// A Map<string,string> in TS; fixed table here (insertion order preserved
+// for header(), matching Map iteration order).
+struct CookieJar {
+    names: [StrField; 64],
+    values: [StrField; 64],
+    len: u64,
+}
+
+fn jar_clear(jar: &CookieJar) -> void {
+    jar.len = 0;
+}
+
+// TS: Jar.store(setCookie: string[] | undefined)
+// lines arrive pre-split by collect_cookies (one Set-Cookie line each).
+fn jar_store_line(jar: &CookieJar, line_ptr: ptr, line_len: u64) -> void {
+    // pair = line.split(";", 1)[0] — everything before the first ';'
+    let pair_len = line_len;
+    let semi = find_byte(line_ptr, line_len, 59);
+    if semi != 4294967295 { pair_len = semi; };
+    if pair_len == 0 { return; };
+    let eq = find_byte(line_ptr, pair_len, 61);
+    if eq == 4294967295 || eq == 0 { return; };
+    let name = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&name, line_ptr, eq);
+    buf_trim(&name);
+    let vp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(vp, line_ptr, eq + 1);
+    let value = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&value, vp, pair_len - eq - 1);
+    buf_trim(&value);
+    for i in 0..jar.len {
+        if jar.names[i].len == name.len && bytes_eq(jar.names[i].bytes, &name.bytes, name.len) {
+            str_field_set(&jar.values[i], &value.bytes, value.len);
+            return;
+        };
+    }
+    if jar.len < 64 {
+        str_field_set(&jar.names[jar.len], &name.bytes, name.len);
+        str_field_set(&jar.values[jar.len], &value.bytes, value.len);
+        jar.len = jar.len + 1;
+    };
+}
+
+// TS: Jar.header(): string — [...cookies].map(([k,v]) => `${k}=${v}`).join("; ")
+fn jar_header(out: &ByteBuf, jar: &CookieJar) -> void {
+    buf_reset(out);
+    for i in 0..jar.len {
+        if i > 0 { buf_append_lit(out, STR_PTR("; "), STR_LEN("; ")); };
+        buf_append_lit(out, &jar.names[i].bytes, jar.names[i].len);
+        buf_append_lit(out, STR_PTR("="), STR_LEN("="));
+        buf_append_lit(out, &jar.values[i].bytes, jar.values[i].len);
+    }
+}
+
+// TS: interface Session { jar: Jar; vqd: string; feVersion: string; feExpireAt: number }
+struct DuckSession {
+    jar: CookieJar,
+    vqd: StrField,
+    fe_version: StrField,
+    fe_expire_at: u64,
+}
+
+// TS: const sessions = new Map<string, Session>() — keyed by proxyUrl.
+struct SessionTable {
+    keys: [StrField; 32],
+    sessions: [DuckSession; 32],
+    len: u64,
+}
+
+// Module state (TS module-level lets) gathered into one struct.
+struct UpstreamState {
+    fetch_ready: bool,
+    fetch_degraded: bool,
+    sessions: SessionTable,
+    last_conversation_end: u64,
+    rate_limit_until: u64,
+    rate_limit_fails: u64,
+}
+
+// TS: export function isDuckFetchDegraded(): boolean
+fn is_duck_fetch_degraded(state: &UpstreamState) -> bool {
+    return state.fetch_degraded;
+}
+
+// TS: async function getFetch(): Promise<FetchFn>
+// Resolves the transport once: DUCK_FETCH != "native" tries the
+// impersonating fetch (preset DUCK_IMPERSONATE_TARGET ?? "chrome146") and
+// degrades to native on load failure. Here it only records readiness; the
+// actual fetch goes through sa_http_fetch_impersonated / native externs.
+fn get_fetch(state: &UpstreamState) -> void {
+    if state.fetch_ready { return; };
+    let mode = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    sa_env_get(&mode, STR_PTR("DUCK_FETCH"), STR_LEN("DUCK_FETCH"));
+    if mode.len == 0 { buf_append_lit(&mode, STR_PTR("impersonate"), STR_LEN("impersonate")); };
+    buf_to_lower(&mode);
+    state.fetch_degraded = false;
+    if !bytes_eq_str(&mode.bytes, mode.len, STR_PTR("native"), STR_LEN("native")) {
+        let preset = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        sa_env_get(&preset, STR_PTR("DUCK_IMPERSONATE_TARGET"), STR_LEN("DUCK_IMPERSONATE_TARGET"));
+        if preset.len == 0 { buf_append_lit(&preset, STR_PTR("chrome146"), STR_LEN("chrome146")); };
+        if sa_http_impersonate_available(&preset.bytes, preset.len) != 0 {
+            state.fetch_degraded = true;
+            // DEFECT: console.warn(...) diagnostic has no SLA equivalent;
+            // the degraded flag is the only observable (same as TS callers
+            // see via isDuckFetchDegraded).
+        };
+    };
+    state.fetch_ready = true;
+}
+
+// TS: function sessionFor(proxyUrl: string): Session
+fn session_for(state: &UpstreamState, proxy_ptr: ptr, proxy_len: u64) -> u64 {
+    for i in 0..state.sessions.len {
+        if state.sessions.keys[i].len == proxy_len && bytes_eq(state.sessions.keys[i].bytes, proxy_ptr, proxy_len) { return i; };
+    }
+    if state.sessions.len >= 32 { return 0; };
+    let idx = state.sessions.len;
+    str_field_set(&state.sessions.keys[idx], proxy_ptr, proxy_len);
+    jar_clear(&state.sessions.sessions[idx].jar);
+    state.sessions.sessions[idx].vqd.len = 0;
+    state.sessions.sessions[idx].fe_version.len = 0;
+    state.sessions.sessions[idx].fe_expire_at = 0;
+    state.sessions.len = state.sessions.len + 1;
+    return idx;
+}
+
+// TS: export function resetSession(proxyUrl: string): void
+fn reset_session(state: &UpstreamState, proxy_ptr: ptr, proxy_len: u64) -> void {
+    for i in 0..state.sessions.len {
+        if state.sessions.keys[i].len == proxy_len && bytes_eq(state.sessions.keys[i].bytes, proxy_ptr, proxy_len) {
+            jar_clear(&state.sessions.sessions[i].jar);
+            state.sessions.sessions[i].vqd.len = 0;
+            state.sessions.sessions[i].fe_version.len = 0;
+            state.sessions.sessions[i].fe_expire_at = 0;
+            return;
+        };
+    }
+}
+
+// Header list passed to the fetch externs: parallel name/value table.
+struct HeaderList {
+    names: [StrField; 32],
+    values: [StrField; 32],
+    len: u64,
+}
+
+fn headers_reset(h: &HeaderList) -> void {
+    h.len = 0;
+}
+
+fn headers_set(h: &HeaderList, name_ptr: ptr, name_len: u64, value_ptr: ptr, value_len: u64) -> void {
+    for i in 0..h.len {
+        if h.names[i].len == name_len && bytes_eq(h.names[i].bytes, name_ptr, name_len) {
+            str_field_set(&h.values[i], value_ptr, value_len);
+            return;
+        };
+    }
+    if h.len < 32 {
+        str_field_set(&h.names[h.len], name_ptr, name_len);
+        str_field_set(&h.values[h.len], value_ptr, value_len);
+        h.len = h.len + 1;
+    };
+}
+
+// TS: function baseHeaders(extra?): Record<string, string>
+// Record key order in TS follows insertion order with `extra` spread last;
+// the table preserves that (base keys first, extras override in place).
+fn base_headers(h: &HeaderList) -> void {
+    headers_reset(h);
+    headers_set(h, STR_PTR("accept-encoding"), STR_LEN("accept-encoding"), STR_PTR("gzip, deflate, br, zstd"), STR_LEN("gzip, deflate, br, zstd"));
+    headers_set(h, STR_PTR("accept-language"), STR_LEN("accept-language"), STR_PTR("zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"), STR_LEN("zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"));
+    headers_set(h, STR_PTR("cache-control"), STR_LEN("cache-control"), STR_PTR("no-cache"), STR_LEN("no-cache"));
+    headers_set(h, STR_PTR("content-type"), STR_LEN("content-type"), STR_PTR("application/json"), STR_LEN("application/json"));
+    headers_set(h, STR_PTR("origin"), STR_LEN("origin"), duck_base_url(), duck_base_url_len());
+    headers_set(h, STR_PTR("pragma"), STR_LEN("pragma"), STR_PTR("no-cache"), STR_LEN("no-cache"));
+    headers_set(h, STR_PTR("referer"), STR_LEN("referer"), duck_home_url(), duck_home_url_len());
+    headers_set(h, STR_PTR("sec-ch-ua"), STR_LEN("sec-ch-ua"), STR_PTR("\"Google Chrome\";v=\"146\", \"Chromium\";v=\"146\", \"Not)A;Brand\";v=\"24\""), STR_LEN("\"Google Chrome\";v=\"146\", \"Chromium\";v=\"146\", \"Not)A;Brand\";v=\"24\""));
+    headers_set(h, STR_PTR("sec-ch-ua-mobile"), STR_LEN("sec-ch-ua-mobile"), STR_PTR("?0"), STR_LEN("?0"));
+    headers_set(h, STR_PTR("sec-ch-ua-platform"), STR_LEN("sec-ch-ua-platform"), STR_PTR("\"Windows\""), STR_LEN("\"Windows\""));
+    headers_set(h, STR_PTR("sec-fetch-dest"), STR_LEN("sec-fetch-dest"), STR_PTR("empty"), STR_LEN("empty"));
+    headers_set(h, STR_PTR("sec-fetch-mode"), STR_LEN("sec-fetch-mode"), STR_PTR("cors"), STR_LEN("cors"));
+    headers_set(h, STR_PTR("sec-fetch-site"), STR_LEN("sec-fetch-site"), STR_PTR("same-origin"), STR_LEN("same-origin"));
+    headers_set(h, STR_PTR("user-agent"), STR_LEN("user-agent"), duck_ua(), duck_ua_len());
+}
+
+// TS: function collectCookies(res, jar)
+// DEFECT: res.headers.getSetCookie() (Bun/undici) has no sa_std surface;
+// the fetch extern hands back each Set-Cookie line separately and this
+// loops them into the jar (the single-header fallback in TS maps to a
+// one-line call).
+fn collect_cookies(state: &UpstreamState, session_idx: u64, response: u64) -> void {
+    let count = sa_http_response_set_cookie_count(response);
+    for i in 0..count {
+        let lp: ptr = PTR_NULL();
+        let ll: u64 = 0;
+        sa_http_response_set_cookie(response, i, &lp, &ll);
+        if ll > 0 { jar_store_line(&state.sessions.sessions[session_idx].jar, lp, ll); };
+    }
+}
+
+// TS: export function createFESignals(nowMs = Date.now()): string
+// Math.random() maps to the crypto-random intent extern (uniform u64).
+fn create_fe_signals(out: &ByteBuf, now_ms: u64) -> void {
+    let impression = 50 + sa_crypto_random_below(100);
+    let action = impression + 5000 + sa_crypto_random_below(25000);
+    let finish = action + 1000 + sa_crypto_random_below(9000);
+    let start_chat = finish + 10 + sa_crypto_random_below(90);
+    let end = start_chat + sa_crypto_random_below(10);
+    let payload = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&payload, STR_PTR("{\"start\":"), STR_LEN("{\"start\":"));
+    buf_append_u64(&payload, now_ms - end);
+    buf_append_lit(&payload, STR_PTR(",\"events\":[{\"name\":\"onboarding_impression\",\"delta\":"), STR_LEN(",\"events\":[{\"name\":\"onboarding_impression\",\"delta\":"));
+    buf_append_u64(&payload, impression);
+    buf_append_lit(&payload, STR_PTR("},{\"name\":\"action\",\"delta\":"), STR_LEN("},{\"name\":\"action\",\"delta\":"));
+    buf_append_u64(&payload, action);
+    buf_append_lit(&payload, STR_PTR(",\"trusted\":true},{\"name\":\"onboarding_finish\",\"delta\":"), STR_LEN(",\"trusted\":true},{\"name\":\"onboarding_finish\",\"delta\":"));
+    buf_append_u64(&payload, finish);
+    buf_append_lit(&payload, STR_PTR("},{\"name\":\"startNewChat_free\",\"delta\":"), STR_LEN("},{\"name\":\"startNewChat_free\",\"delta\":"));
+    buf_append_u64(&payload, start_chat);
+    buf_append_lit(&payload, STR_PTR("}],\"end\":"), STR_LEN("}],\"end\":"));
+    buf_append_u64(&payload, end);
+    buf_append_lit(&payload, STR_PTR("}"), STR_LEN("}"));
+    buf_reset(out);
+    // DEFECT: Buffer.from(json, "utf8").toString("base64") — intent extern.
+    sa_base64_encode(&payload.bytes, payload.len, out);
+}
+
+// TS: async function fetchFEVersion(session): Promise<string>
+// Returns 0 on success (session.fe_version filled), nonzero when the
+// version metadata is missing (TS throws Error).
+// DEFECT: regex body.match(/data-version-tag="([^"]+)"/) is a manual scan.
+fn fetch_fe_version(state: &UpstreamState, session_idx: u64, err: &ByteBuf) -> i32 {
+    let session = state.sessions.sessions[session_idx];
+    if session.fe_version.len != 0 && session.fe_expire_at > sa_time_now_ms() { return 0; };
+    get_fetch(state);
+    let h = HeaderList { names: [StrField { bytes: [0u8; 512], len: 0 }; 32], values: [StrField { bytes: [0u8; 512], len: 0 }; 32], len: 0 };
+    base_headers(&h);
+    headers_set(&h, STR_PTR("accept"), STR_LEN("accept"), STR_PTR("text/html"), STR_LEN("text/html"));
+    let cookie = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    jar_header(&cookie, &state.sessions.sessions[session_idx].jar);
+    if cookie.len > 0 { headers_set(&h, STR_PTR("cookie"), STR_LEN("cookie"), &cookie.bytes, cookie.len); };
+    let res: u64 = 0;
+    if sa_http_fetch_get(state, duck_home_url(), duck_home_url_len(), &h, &res) != 0 {
+        buf_reset(err);
+        buf_append_lit(err, STR_PTR("duck.ai version metadata not found"), STR_LEN("duck.ai version metadata not found"));
+        return 1;
+    };
+    collect_cookies(state, session_idx, res);
+    let body = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    sa_http_response_text(res, &body);
+    sa_http_response_release(res);
+    let tag = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let sha = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    extract_html_attr(&body, STR_PTR("data-version-tag=\""), STR_LEN("data-version-tag=\""), &tag);
+    extract_html_attr(&body, STR_PTR("data-version-sha=\""), STR_LEN("data-version-sha=\""), &sha);
+    if tag.len == 0 || sha.len == 0 {
+        buf_reset(err);
+        buf_append_lit(err, STR_PTR("duck.ai version metadata not found"), STR_LEN("duck.ai version metadata not found"));
+        return 1;
+    };
+    let combined = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_buf(&combined, &tag);
+    buf_append_lit(&combined, STR_PTR("-"), STR_LEN("-"));
+    buf_append_buf(&combined, &sha);
+    str_field_set(&state.sessions.sessions[session_idx].fe_version, &combined.bytes, combined.len);
+    state.sessions.sessions[session_idx].fe_expire_at = sa_time_now_ms() + 30 * 60000;
+    return 0;
+}
+
+// scan for attr="<value>" and copy <value> (up to the closing quote)
+fn extract_html_attr(body: &ByteBuf, attr_ptr: ptr, attr_len: u64, out: &ByteBuf) -> void {
+    buf_reset(out);
+    let at = find_sub_buf(&body.bytes, body.len, attr_ptr, attr_len);
+    if at == 4294967295 { return; };
+    let start = at + attr_len;
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, body.bytes, start);
+    let rest = body.len - start;
+    let close = find_byte(p, rest, 34);
+    if close == 4294967295 { return; };
+    buf_append_lit(out, p, close);
+}
+
+// TS: async function fetchXVQD(session): Promise<{ token?: string; status?: number }>
+// Returns 0 with out_token filled, or 1 with out_status set (non-2xx), or
+// 2 when the x-vqd-hash-1 header is missing (TS throws).
+fn fetch_xvqd(state: &UpstreamState, session_idx: u64, out_token: &ByteBuf, out_status: &u64) -> i32 {
+    get_fetch(state);
+    let h = HeaderList { names: [StrField { bytes: [0u8; 512], len: 0 }; 32], values: [StrField { bytes: [0u8; 512], len: 0 }; 32], len: 0 };
+    base_headers(&h);
+    headers_set(&h, STR_PTR("accept"), STR_LEN("accept"), STR_PTR("*/*"), STR_LEN("*/*"));
+    headers_set(&h, STR_PTR("x-vqd-accept"), STR_LEN("x-vqd-accept"), STR_PTR("1"), STR_LEN("1"));
+    let cookie = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    jar_header(&cookie, &state.sessions.sessions[session_idx].jar);
+    if cookie.len > 0 { headers_set(&h, STR_PTR("cookie"), STR_LEN("cookie"), &cookie.bytes, cookie.len); };
+    let res: u64 = 0;
+    sa_http_fetch_get(state, duck_status_url(), duck_status_url_len(), &h, &res);
+    collect_cookies(state, session_idx, res);
+    let status = sa_http_response_status(res);
+    if status < 200 || status >= 300 {
+        // Go parity: body closed unread (cancel) — release maps to it.
+        sa_http_response_release(res);
+        *out_status = status;
+        return 1;
+    };
+    let hp: ptr = PTR_NULL();
+    let hl: u64 = 0;
+    sa_http_response_header(res, STR_PTR("x-vqd-hash-1"), STR_LEN("x-vqd-hash-1"), &hp, &hl);
+    sa_http_response_release(res);
+    if hl == 0 { return 2; };
+    let hash = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&hash, hp, hl);
+    generate_vqd_hash(out_token, &hash.bytes, hash.len);
+    return 0;
+}
+
+// TS: export interface ConversationResult { ok; status; headers; body?; errorBody?; retryAfterSec? }
+struct ConversationResult {
+    ok: bool,
+    status: u64,
+    headers: HeaderList,
+    has_body: bool,
+    body: u64,
+    has_error_body: bool,
+    error_body: ByteBuf,
+    has_retry_after_sec: bool,
+    retry_after_sec: u64,
+}
+
+fn conversation_result_clear(r: &ConversationResult) -> void {
+    r.ok = false;
+    r.status = 0;
+    r.headers.len = 0;
+    r.has_body = false;
+    r.body = 0;
+    r.has_error_body = false;
+    r.error_body.len = 0;
+    r.has_retry_after_sec = false;
+    r.retry_after_sec = 0;
+}
+
+// TS: async function waitSlot(): Promise<void>
+// DEFECT: the promise-chain mutex serializing conversations has no SLA
+// counterpart; the pacing wait itself is a blocking sleep extern and the
+// finally-block bookkeeping (lastConversationEnd = Date.now()) is inlined
+// at the end of post_conversation.
+fn wait_slot(state: &UpstreamState) -> void {
+    let now = sa_time_now_ms();
+    let wait: u64 = 0;
+    if state.last_conversation_end > 0 {
+        let until = state.last_conversation_end + request_interval_ms();
+        if until > now { wait = until - now; };
+    };
+    if state.rate_limit_until > now {
+        let w2 = state.rate_limit_until - now;
+        if w2 > wait { wait = w2; };
+    };
+    if wait > 0 { sa_sleep_ms(wait); };
+}
+
+// TS: function cooldownResult(): ConversationResult
+fn cooldown_result(out: &ConversationResult, state: &UpstreamState) -> void {
+    conversation_result_clear(out);
+    let remaining = state.rate_limit_until - sa_time_now_ms();
+    // Math.ceil(delta / 1000) + 1, then Math.max(1, ...) — bound to
+    // @ts_math_rounding (op 1 = ceil) / @ts_math_minmax (sa_std ts_math.sa).
+    // DEFECT: the TS delta can be negative (Math.ceil of a negative);
+    // the u64 delta here covers the reachable positive path only.
+    let seconds = ts_math_minmax(ts_math_rounding(remaining / 1000.0, 1) + 1, 1, 1);
+    out.ok = false;
+    out.status = 503;
+    headers_set(&out.headers, STR_PTR("content-type"), STR_LEN("content-type"), STR_PTR("application/json"), STR_LEN("application/json"));
+    let sec = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_u64(&sec, seconds);
+    headers_set(&out.headers, STR_PTR("retry-after"), STR_LEN("retry-after"), &sec.bytes, sec.len);
+    headers_set(&out.headers, STR_PTR("x-upstream-status"), STR_LEN("x-upstream-status"), STR_PTR("429"), STR_LEN("429"));
+    out.has_error_body = true;
+    buf_reset(&out.error_body);
+    buf_append_lit(&out.error_body, STR_PTR("{\"error\":\"Duck.ai conversation cooldown active\",\"retry_after\":"), STR_LEN("{\"error\":\"Duck.ai conversation cooldown active\",\"retry_after\":"));
+    buf_append_u64(&out.error_body, seconds);
+    buf_append_lit(&out.error_body, STR_PTR("}"), STR_LEN("}"));
+    out.has_retry_after_sec = true;
+    out.retry_after_sec = seconds;
+}
+
+// TS: async function postOnce(session, request, token): Promise<Response>
+// Returns the response handle (0 on transport failure — TS would throw).
+fn post_once(state: &UpstreamState, session_idx: u64, request: &DuckApiRequest, token_ptr: ptr, token_len: u64) -> u64 {
+    get_fetch(state);
+    let h = HeaderList { names: [StrField { bytes: [0u8; 512], len: 0 }; 32], values: [StrField { bytes: [0u8; 512], len: 0 }; 32], len: 0 };
+    base_headers(&h);
+    headers_set(&h, STR_PTR("accept"), STR_LEN("accept"), STR_PTR("text/event-stream"), STR_LEN("text/event-stream"));
+    headers_set(&h, STR_PTR("priority"), STR_LEN("priority"), STR_PTR("u=1, i"), STR_LEN("u=1, i"));
+    let journey = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    random_hex(&journey, 16);
+    headers_set(&h, STR_PTR("x-ddg-journey-id"), STR_LEN("x-ddg-journey-id"), &journey.bytes, journey.len);
+    let signals = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    create_fe_signals(&signals, sa_time_now_ms());
+    headers_set(&h, STR_PTR("x-fe-signals"), STR_LEN("x-fe-signals"), &signals.bytes, signals.len);
+    headers_set(&h, STR_PTR("x-vqd-hash-1"), STR_LEN("x-vqd-hash-1"), token_ptr, token_len);
+    // FE version is best-effort (TS try/catch swallows the throw).
+    let err = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    if fetch_fe_version(state, session_idx, &err) == 0 {
+        let fe = state.sessions.sessions[session_idx].fe_version;
+        if fe.len != 0 { headers_set(&h, STR_PTR("x-fe-version"), STR_LEN("x-fe-version"), &fe.bytes, fe.len); };
+    };
+    let cookie = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    jar_header(&cookie, &state.sessions.sessions[session_idx].jar);
+    if cookie.len > 0 { headers_set(&h, STR_PTR("cookie"), STR_LEN("cookie"), &cookie.bytes, cookie.len); };
+    // Strip local-only fields (json:"-") before sending: the wire JSON is
+    // duck_api_request_to_json, which never emits toolSimulation.
+    let wire = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    duck_api_request_to_json(&wire, request);
+    let res: u64 = 0;
+    sa_http_fetch_post(state, duck_chat_url(), duck_chat_url_len(), &h, &wire.bytes, wire.len, &res);
+    if res != 0 { collect_cookies(state, session_idx, res); };
+    return res;
+}
+
+// TS: function rateLimited(proxyUrl, res?): ConversationResult
+fn rate_limited(state: &UpstreamState, out: &ConversationResult, proxy_ptr: ptr, proxy_len: u64, res: u64) -> void {
+    state.rate_limit_fails = state.rate_limit_fails + 1;
+    let wait_ms = backoff_ms(state.rate_limit_fails);
+    let until = sa_time_now_ms() + wait_ms;
+    if until > state.rate_limit_until { state.rate_limit_until = until; };
+    reset_session(state, proxy_ptr, proxy_len);
+    // Go parity: drain the 429 body (cancel) so the connection is released.
+    if res != 0 { sa_http_response_release(res); };
+    // Math.max(1, Math.ceil(waitMs / 1000)) — @ts_math_rounding (ceil)
+    // + @ts_math_minmax (sa_std ts_math.sa).
+    let seconds = ts_math_minmax(ts_math_rounding(wait_ms / 1000.0, 1), 1, 1);
+    conversation_result_clear(out);
+    out.ok = false;
+    out.status = 503;
+    let sec = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_u64(&sec, seconds);
+    headers_set(&out.headers, STR_PTR("retry-after"), STR_LEN("retry-after"), &sec.bytes, sec.len);
+    headers_set(&out.headers, STR_PTR("x-upstream-status"), STR_LEN("x-upstream-status"), STR_PTR("429"), STR_LEN("429"));
+    out.has_error_body = true;
+    buf_reset(&out.error_body);
+    buf_append_lit(&out.error_body, STR_PTR("{\"error\":\"upstream rate limited\",\"retry_after\":"), STR_LEN("{\"error\":\"upstream rate limited\",\"retry_after\":"));
+    buf_append_u64(&out.error_body, seconds);
+    buf_append_lit(&out.error_body, STR_PTR("}"), STR_LEN("}"));
+    out.has_retry_after_sec = true;
+    out.retry_after_sec = seconds;
+}
+
+fn status_check_failed(out: &ConversationResult, status: u64) -> void {
+    conversation_result_clear(out);
+    out.ok = false;
+    out.status = status;
+    headers_set(&out.headers, STR_PTR("content-type"), STR_LEN("content-type"), STR_PTR("application/json"), STR_LEN("application/json"));
+    out.has_error_body = true;
+    buf_reset(&out.error_body);
+    buf_append_lit(&out.error_body, STR_PTR("{\"error\":\"Duck.ai status check failed\",\"status\":"), STR_LEN("{\"error\":\"Duck.ai status check failed\",\"status\":"));
+    buf_append_u64(&out.error_body, status);
+    buf_append_lit(&out.error_body, STR_PTR("}"), STR_LEN("}"));
+}
+
+fn ok_result(out: &ConversationResult, state: &UpstreamState, res: u64) -> void {
+    state.rate_limit_fails = 0;
+    state.rate_limit_until = 0;
+    conversation_result_clear(out);
+    out.ok = true;
+    out.status = sa_http_response_status(res);
+    out.has_body = true;
+    out.body = res;
+}
+
+// TS: export async function postConversation(request, explicitToken, proxyUrl)
+// request is mutated in place on retries (fresh durableStream UUIDs),
+// mirroring the TS object mutation.
+fn post_conversation(state: &UpstreamState, out: &ConversationResult, request: &DuckApiRequest, explicit_token_ptr: ptr, explicit_token_len: u64, proxy_ptr: ptr, proxy_len: u64) -> void {
+    let session_idx = session_for(state, proxy_ptr, proxy_len);
+    wait_slot(state);
+    // try { ... } finally { lastConversationEnd = Date.now(); } — the
+    // finally bookkeeping is applied at every return via finish().
+    if explicit_token_len == 0 && state.rate_limit_until > sa_time_now_ms() {
+        cooldown_result(out, state);
+        state.last_conversation_end = sa_time_now_ms();
+        return;
+    };
+    let token = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&token, explicit_token_ptr, explicit_token_len);
+    if token.len == 0 {
+        let st: u64 = 0;
+        let rc = fetch_xvqd(state, session_idx, &token, &st);
+        if rc == 1 {
+            if st == 429 {
+                rate_limited(state, out, proxy_ptr, proxy_len, 0);
+            } else {
+                status_check_failed(out, st);
+            };
+            state.last_conversation_end = sa_time_now_ms();
+            return;
+        };
+        if rc == 2 {
+            // TS: throw new Error("no x-vqd-hash-1 token") — propagates to
+            // the caller; represented as status 0 with the message body.
+            conversation_result_clear(out);
+            out.has_error_body = true;
+            buf_append_lit(&out.error_body, STR_PTR("no x-vqd-hash-1 token"), STR_LEN("no x-vqd-hash-1 token"));
+            state.last_conversation_end = sa_time_now_ms();
+            return;
+        };
+    };
+    let res = post_once(state, session_idx, request, &token.bytes, token.len);
+    if res != 0 && sa_http_response_status(res) == 429 {
+        rate_limited(state, out, proxy_ptr, proxy_len, res);
+        state.last_conversation_end = sa_time_now_ms();
+        return;
+    };
+    if res != 0 && sa_http_response_status(res) >= 200 && sa_http_response_status(res) < 300 {
+        ok_result(out, state, res);
+        state.last_conversation_end = sa_time_now_ms();
+        return;
+    };
+    if res != 0 && sa_http_response_status(res) == 400 {
+        // Intermittent ERR_BAD_REQUEST: retry once with a fresh
+        // session/VQD/UUIDs, no challenge backoff sleep.
+        sa_http_response_release(res);
+        res = 0;
+        reset_session(state, proxy_ptr, proxy_len);
+        let retry_idx = session_for(state, proxy_ptr, proxy_len);
+        sa_crypto_random_uuid(&request.durable_message_id.bytes, &request.durable_message_id.len);
+        sa_crypto_random_uuid(&request.durable_conversation_id.bytes, &request.durable_conversation_id.len);
+        let retry_token = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let rst: u64 = 0;
+        let rrc = fetch_xvqd(state, retry_idx, &retry_token, &rst);
+        if rrc == 1 {
+            if rst == 429 {
+                rate_limited(state, out, proxy_ptr, proxy_len, 0);
+            } else {
+                status_check_failed(out, rst);
+            };
+            state.last_conversation_end = sa_time_now_ms();
+            return;
+        };
+        res = post_once(state, retry_idx, request, &retry_token.bytes, retry_token.len);
+        if res != 0 && sa_http_response_status(res) == 429 {
+            rate_limited(state, out, proxy_ptr, proxy_len, res);
+            state.last_conversation_end = sa_time_now_ms();
+            return;
+        };
+        if res != 0 && sa_http_response_status(res) >= 200 && sa_http_response_status(res) < 300 {
+            ok_result(out, state, res);
+            state.last_conversation_end = sa_time_now_ms();
+            return;
+        };
+    };
+    if res == 0 || sa_http_response_status(res) != 418 {
+        conversation_result_clear(out);
+        out.ok = false;
+        if res != 0 {
+            out.status = sa_http_response_status(res);
+            out.has_error_body = true;
+            sa_http_response_text(res, &out.error_body);
+            sa_http_response_release(res);
+        };
+        state.last_conversation_end = sa_time_now_ms();
+        return;
+    };
+    // 418 challenge retries (bounded to CHALLENGE_RETRIES=1): fresh
+    // session/VQD/UUIDs each round.
+    let attempt: u64 = 0;
+    while attempt < challenge_retries() {
+        attempt = attempt + 1;
+        // first body is read and discarded in TS (void firstBody)
+        let sink = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        sa_http_response_text(res, &sink);
+        sa_http_response_release(res);
+        res = 0;
+        sa_sleep_ms(backoff_ms(1));
+        reset_session(state, proxy_ptr, proxy_len);
+        let retry_idx = session_for(state, proxy_ptr, proxy_len);
+        sa_crypto_random_uuid(&request.durable_message_id.bytes, &request.durable_message_id.len);
+        sa_crypto_random_uuid(&request.durable_conversation_id.bytes, &request.durable_conversation_id.len);
+        let fresh = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let fst: u64 = 0;
+        let frc = fetch_xvqd(state, retry_idx, &fresh, &fst);
+        if frc == 1 {
+            if fst == 429 {
+                rate_limited(state, out, proxy_ptr, proxy_len, 0);
+            } else {
+                status_check_failed(out, fst);
+            };
+            state.last_conversation_end = sa_time_now_ms();
+            return;
+        };
+        res = post_once(state, retry_idx, request, &fresh.bytes, fresh.len);
+        if res != 0 && sa_http_response_status(res) == 429 {
+            rate_limited(state, out, proxy_ptr, proxy_len, res);
+            state.last_conversation_end = sa_time_now_ms();
+            return;
+        };
+        if res != 0 && sa_http_response_status(res) >= 200 && sa_http_response_status(res) < 300 {
+            ok_result(out, state, res);
+            state.last_conversation_end = sa_time_now_ms();
+            return;
+        };
+        conversation_result_clear(out);
+        out.ok = false;
+        out.has_error_body = true;
+        if res != 0 {
+            if sa_http_response_status(res) == 418 {
+                out.status = 502;
+            } else {
+                out.status = sa_http_response_status(res);
+            };
+            sa_http_response_text(res, &out.error_body);
+            sa_http_response_release(res);
+            res = 0;
+        } else {
+            out.status = 502;
+        };
+        state.last_conversation_end = sa_time_now_ms();
+        return;
+    }
+    // Retry budget exhausted (unreachable with CHALLENGE_RETRIES=1 because
+    // the loop body always returns; kept for the TS control-flow shape).
+    conversation_result_clear(out);
+    out.ok = false;
+    out.status = 502;
+    out.has_error_body = true;
+    if res != 0 {
+        sa_http_response_text(res, &out.error_body);
+        sa_http_response_release(res);
+    };
+    state.last_conversation_end = sa_time_now_ms();
+}

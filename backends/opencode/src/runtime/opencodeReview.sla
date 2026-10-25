@@ -1,0 +1,477 @@
+// Converted 1:1 from backends/opencode/src/runtime/opencodeReview.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/ptr.sa"
+
+// `/review` support for the opencode backend (mini parity).
+//
+// Mini implements review with VM-enforced read-only tools (`sa_vm ...`); the
+// opencode backend has no such hard sandbox, so the constraint here is
+// prompt-level only: review with the native `read` / `grep` / `glob` tools
+// plus `bash` for `git status` / `git diff`, and never write, edit, or
+// commit. Callers must not present this as hard-enforced read-only.
+
+// ---- local byte buffer helpers ----
+struct ByteBuf {
+    bytes: [u8; 16384],
+    len: u64,
+}
+
+fn buf_reset(b: &ByteBuf) -> void { b.len = 0; }
+
+fn buf_append(b: &ByteBuf, src: ptr, src_len: u64) -> void {
+    let dst: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dst, &b.bytes, b.len);
+    let n = src_len;
+    if b.len + n > 16384 { n = 16384 - b.len; };
+    let i: u64 = 0;
+    while i < n {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, src, i);
+        PTR_BYTE_SET(dst, i, c);
+        i = i + 1;
+    }
+    b.len = b.len + n;
+}
+
+fn buf_append_lit(b: &ByteBuf, lit: ptr, lit_len: u64) -> void { buf_append(b, lit, lit_len); }
+
+fn buf_append_buf(b: &ByteBuf, other: &ByteBuf) -> void {
+    let src: ptr = PTR_NULL();
+    PTR_BYTE_ADD(src, &other.bytes, 0);
+    buf_append(b, src, other.len);
+}
+
+// Case-insensitive equality of (a) against a lowercase literal.
+fn bytes_equal_lower(a_ptr: ptr, a_len: u64, lit_ptr: ptr, lit_len: u64) -> bool {
+    if a_len != lit_len { return false; };
+    let i: u64 = 0;
+    while i < a_len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a_ptr, i);
+        PTR_BYTE_AT(y, lit_ptr, i);
+        if x >= 65 && x <= 90 { x = x + 32; };
+        if x != y { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn bytes_equal(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    let i: u64 = 0;
+    while i < a_len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a_ptr, i);
+        PTR_BYTE_AT(y, b_ptr, i);
+        if x != y { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn is_space(b: u8) -> bool { return b == 32 || b == 9 || b == 10 || b == 13; }
+
+// TS: String(x).trim() — returns trimmed span via out params.
+fn trim_span(s_ptr: ptr, s_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    let start: u64 = 0;
+    while start < s_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, s_ptr, start);
+        if !is_space(b) { break; };
+        start = start + 1;
+    }
+    let end = s_len;
+    while end > start {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, s_ptr, end - 1);
+        if !is_space(b) { break; };
+        end = end - 1;
+    }
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, s_ptr, start);
+    *out_ptr = p;
+    *out_len = end - start;
+}
+
+// ---- TS: export type OpencodeReviewTarget = union ----
+//   { type: "uncommittedChanges" }
+//   { type: "baseBranch"; branch: string }
+//   { type: "commit"; sha: string; title?: string | null }
+//   { type: "custom"; instructions: string }
+// DEFECT: discriminated union -> kind tag (0=uncommittedChanges,
+// 1=baseBranch, 2=commit, 3=custom) + fixed buffers.
+struct OpencodeReviewTarget {
+    kind: u32,
+    branch: [u8; 512],
+    branch_len: u64,
+    sha: [u8; 128],
+    sha_len: u64,
+    // title: string | null — has_title=false is null/absent
+    title: [u8; 1024],
+    title_len: u64,
+    has_title: bool,
+    instructions: [u8; 8192],
+    instructions_len: u64,
+}
+
+fn target_init(t: &OpencodeReviewTarget) -> void {
+    t.kind = 0;
+    t.branch_len = 0;
+    t.sha_len = 0;
+    t.title_len = 0;
+    t.has_title = false;
+    t.instructions_len = 0;
+}
+
+fn target_set_field(dst: ptr, cap: u64, src: ptr, src_len: u64) -> u64 {
+    let n = src_len;
+    if n > cap { n = cap; };
+    let i: u64 = 0;
+    while i < n {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, src, i);
+        PTR_BYTE_SET(dst, i, c);
+        i = i + 1;
+    }
+    return n;
+}
+
+// TS: export const OPENCODE_REVIEW_SLASH_RE = /^\s*\/review\b([\s\S]*)$/;
+// DEFECT: RegExp constant has no SLA value form; the pattern is applied by
+// hand in callers (leading-whitespace skip, "/review" literal, word
+// boundary). Kept here as the literal pattern text for reference parity.
+fn opencode_review_slash_re_pattern(out_len: &u64) -> ptr {
+    *out_len = STR_LEN("^\\s*\\/review\\b([\\s\\S]*)$");
+    return STR_PTR("^\\s*\\/review\\b([\\s\\S]*)$");
+}
+
+// TS: const REVIEW_RUBRIC = [ ...6 lines... ].join("\n");
+// Stored as one literal with \n separators (same joined text).
+fn review_rubric(out_len: &u64) -> ptr {
+    let s = "You are acting as a code reviewer for a proposed change made by another engineer. Review the change, do NOT implement anything.\nRules: read-only review - use the read tool to read files, grep/glob to search, and bash ONLY for `git status` and `git diff` (never run any other command, never write, edit, or commit files, never work around this via scripts or temp files).\nFlag an issue only when it meaningfully impacts accuracy, performance, security, or maintainability; it is discrete and actionable; it was introduced by this change (never flag pre-existing issues); and it does not rely on unstated assumptions - cite the affected code as evidence, no speculation.\nEach finding gets one comment: severity, file:line, why it is a bug, and the scenario needed to trigger it. Keep each finding to one short paragraph, matter-of-fact tone.\nUse ```suggestion blocks ONLY for concrete minimal replacement code, preserving exact leading whitespace.\nOutput: one scope line, then prioritized findings. If nothing meets the bar, say so plainly instead of inventing findings.";
+    *out_len = STR_LEN("You are acting as a code reviewer for a proposed change made by another engineer. Review the change, do NOT implement anything.\nRules: read-only review - use the read tool to read files, grep/glob to search, and bash ONLY for `git status` and `git diff` (never run any other command, never write, edit, or commit files, never work around this via scripts or temp files).\nFlag an issue only when it meaningfully impacts accuracy, performance, security, or maintainability; it is discrete and actionable; it was introduced by this change (never flag pre-existing issues); and it does not rely on unstated assumptions - cite the affected code as evidence, no speculation.\nEach finding gets one comment: severity, file:line, why it is a bug, and the scenario needed to trigger it. Keep each finding to one short paragraph, matter-of-fact tone.\nUse ```suggestion blocks ONLY for concrete minimal replacement code, preserving exact leading whitespace.\nOutput: one scope line, then prioritized findings. If nothing meets the bar, say so plainly instead of inventing findings.");
+    return STR_PTR("You are acting as a code reviewer for a proposed change made by another engineer. Review the change, do NOT implement anything.\nRules: read-only review - use the read tool to read files, grep/glob to search, and bash ONLY for `git status` and `git diff` (never run any other command, never write, edit, or commit files, never work around this via scripts or temp files).\nFlag an issue only when it meaningfully impacts accuracy, performance, security, or maintainability; it is discrete and actionable; it was introduced by this change (never flag pre-existing issues); and it does not rely on unstated assumptions - cite the affected code as evidence, no speculation.\nEach finding gets one comment: severity, file:line, why it is a bug, and the scenario needed to trigger it. Keep each finding to one short paragraph, matter-of-fact tone.\nUse ```suggestion blocks ONLY for concrete minimal replacement code, preserving exact leading whitespace.\nOutput: one scope line, then prioritized findings. If nothing meets the bar, say so plainly instead of inventing findings.");
+}
+
+// ---- TS: export function parseOpencodeReviewTarget(value: unknown) ----
+// DEFECT: `unknown` dynamic value -> the caller passes either JSON object
+// text (first non-space byte '{') or plain text; JSON field access goes
+// through intent externs sa_json_* (MISSING surface check). String()
+// coercion of non-string JSON scalars is not reproduced.
+// Object-branch field read: returns trimmed string span of rec[key].
+fn json_rec_string(node: u64, key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64, found: &bool) -> void {
+    *found = false;
+    *out_len = 0;
+    let child: u64 = 0;
+    if sa_json_object_get(node, key_ptr, key_len, &child) != 0 { return; };
+    let p: ptr = PTR_NULL();
+    let n: u64 = 0;
+    // DEFECT: sa_json_node_string intent extern; non-string nodes in TS go
+    // through String(...) coercion — here they read as not-found.
+    if sa_json_node_string(child, &p, &n) != 0 { return; };
+    trim_span(p, n, out_ptr, out_len);
+    *found = true;
+}
+
+fn parseOpencodeReviewTarget(value_ptr: ptr, value_len: u64, out: &OpencodeReviewTarget) -> void {
+    target_init(out);
+    // Detect the object form: first non-space byte is '{'.
+    let first: u8 = 0;
+    let fi: u64 = 0;
+    while fi < value_len {
+        PTR_BYTE_AT(first, value_ptr, fi);
+        if !is_space(first) { break; };
+        fi = fi + 1;
+    }
+    if value_len > 0 && fi < value_len && first == 123 {
+        // ---- object branch: const rec = value as Record<string, unknown> ----
+        let node: u64 = 0;
+        // DEFECT: JSON parse failure in TS cannot happen (value is already
+        // an object); here a parse failure falls back to uncommittedChanges.
+        if sa_json_parse(value_ptr, value_len, &node) != 0 { return; };
+        // const kind = String(rec.type ?? rec.kind ?? "").trim().toLowerCase();
+        let kind_ptr: ptr = PTR_NULL();
+        let kind_len: u64 = 0;
+        let has_kind = false;
+        json_rec_string(node, STR_PTR("type"), STR_LEN("type"), &kind_ptr, &kind_len, &has_kind);
+        if !has_kind {
+            json_rec_string(node, STR_PTR("kind"), STR_LEN("kind"), &kind_ptr, &kind_len, &has_kind);
+        };
+        if !has_kind { kind_len = 0; };
+        // if (kind === "uncommittedchanges" || "uncommitted" || "changes" || "")
+        if kind_len == 0
+            || bytes_equal_lower(kind_ptr, kind_len, STR_PTR("uncommittedchanges"), STR_LEN("uncommittedchanges"))
+            || bytes_equal_lower(kind_ptr, kind_len, STR_PTR("uncommitted"), STR_LEN("uncommitted"))
+            || bytes_equal_lower(kind_ptr, kind_len, STR_PTR("changes"), STR_LEN("changes")) {
+            out.kind = 0;
+            return;
+        };
+        // if (kind === "basebranch" || "branch" || "base")
+        if bytes_equal_lower(kind_ptr, kind_len, STR_PTR("basebranch"), STR_LEN("basebranch"))
+            || bytes_equal_lower(kind_ptr, kind_len, STR_PTR("branch"), STR_LEN("branch"))
+            || bytes_equal_lower(kind_ptr, kind_len, STR_PTR("base"), STR_LEN("base")) {
+            let br_ptr: ptr = PTR_NULL();
+            let br_len: u64 = 0;
+            let has_br = false;
+            json_rec_string(node, STR_PTR("branch"), STR_LEN("branch"), &br_ptr, &br_len, &has_br);
+            if has_br && br_len > 0 {
+                out.kind = 1;
+                let dst: ptr = PTR_NULL();
+                PTR_BYTE_ADD(dst, &out.branch, 0);
+                out.branch_len = target_set_field(dst, 512, br_ptr, br_len);
+                return;
+            };
+            out.kind = 0;
+            return;
+        };
+        // if (kind === "commit")
+        if bytes_equal_lower(kind_ptr, kind_len, STR_PTR("commit"), STR_LEN("commit")) {
+            let sha_ptr: ptr = PTR_NULL();
+            let sha_len: u64 = 0;
+            let has_sha = false;
+            json_rec_string(node, STR_PTR("sha"), STR_LEN("sha"), &sha_ptr, &sha_len, &has_sha);
+            if has_sha && sha_len > 0 {
+                out.kind = 2;
+                let dst: ptr = PTR_NULL();
+                PTR_BYTE_ADD(dst, &out.sha, 0);
+                out.sha_len = target_set_field(dst, 128, sha_ptr, sha_len);
+                // const title = rec.title == null ? null : String(rec.title).trim() || null;
+                let t_ptr: ptr = PTR_NULL();
+                let t_len: u64 = 0;
+                let has_t = false;
+                json_rec_string(node, STR_PTR("title"), STR_LEN("title"), &t_ptr, &t_len, &has_t);
+                if has_t && t_len > 0 {
+                    out.has_title = true;
+                    let td: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(td, &out.title, 0);
+                    out.title_len = target_set_field(td, 1024, t_ptr, t_len);
+                } else {
+                    out.has_title = false;
+                    out.title_len = 0;
+                };
+                return;
+            };
+            out.kind = 0;
+            return;
+        };
+        // const instructions = String(rec.instructions ?? rec.value ?? rec.text ?? rec.prompt ?? "").trim();
+        let ins_ptr: ptr = PTR_NULL();
+        let ins_len: u64 = 0;
+        let has_ins = false;
+        json_rec_string(node, STR_PTR("instructions"), STR_LEN("instructions"), &ins_ptr, &ins_len, &has_ins);
+        if !has_ins { json_rec_string(node, STR_PTR("value"), STR_LEN("value"), &ins_ptr, &ins_len, &has_ins); };
+        if !has_ins { json_rec_string(node, STR_PTR("text"), STR_LEN("text"), &ins_ptr, &ins_len, &has_ins); };
+        if !has_ins { json_rec_string(node, STR_PTR("prompt"), STR_LEN("prompt"), &ins_ptr, &ins_len, &has_ins); };
+        if has_ins && ins_len > 0 {
+            out.kind = 3;
+            let dst: ptr = PTR_NULL();
+            PTR_BYTE_ADD(dst, &out.instructions, 0);
+            out.instructions_len = target_set_field(dst, 8192, ins_ptr, ins_len);
+            return;
+        };
+        out.kind = 0;
+        return;
+    };
+    // ---- string branch: const rest = String(value ?? "").trim(); ----
+    let rest_ptr: ptr = PTR_NULL();
+    let rest_len: u64 = 0;
+    trim_span(value_ptr, value_len, &rest_ptr, &rest_len);
+    // const normalized = rest.toLowerCase();
+    // if (!rest || ["changes","uncommitted","uncommitted changes"].includes(normalized))
+    if rest_len == 0
+        || bytes_equal_lower(rest_ptr, rest_len, STR_PTR("changes"), STR_LEN("changes"))
+        || bytes_equal_lower(rest_ptr, rest_len, STR_PTR("uncommitted"), STR_LEN("uncommitted"))
+        || bytes_equal_lower(rest_ptr, rest_len, STR_PTR("uncommitted changes"), STR_LEN("uncommitted changes")) {
+        out.kind = 0;
+        return;
+    };
+    // const branch = /^(?:branch|base|base-branch)\s+(.+)$/i.exec(rest);
+    // Hand scan: prefix word (branch|base-branch|base) + whitespace + rest.
+    let kw_len: u64 = 0;
+    if rest_len > 11 && bytes_equal_lower(rest_ptr, 11, STR_PTR("base-branch"), STR_LEN("base-branch")) {
+        kw_len = 11;
+    } else if rest_len > 6 && bytes_equal_lower(rest_ptr, 6, STR_PTR("branch"), STR_LEN("branch")) {
+        kw_len = 6;
+    } else if rest_len > 4 && bytes_equal_lower(rest_ptr, 4, STR_PTR("base"), STR_LEN("base")) {
+        kw_len = 4;
+    };
+    if kw_len > 0 {
+        let after: u64 = kw_len;
+        let saw_space = false;
+        while after < rest_len {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, rest_ptr, after);
+            if !is_space(b) { break; };
+            saw_space = true;
+            after = after + 1;
+        }
+        // branch?.[1]?.trim()
+        if saw_space && after < rest_len {
+            let arg_ptr: ptr = PTR_NULL();
+            let arg_len: u64 = 0;
+            let arg_full: ptr = PTR_NULL();
+            PTR_BYTE_ADD(arg_full, rest_ptr, after);
+            trim_span(arg_full, rest_len - after, &arg_ptr, &arg_len);
+            if arg_len > 0 {
+                out.kind = 1;
+                let dst: ptr = PTR_NULL();
+                PTR_BYTE_ADD(dst, &out.branch, 0);
+                out.branch_len = target_set_field(dst, 512, arg_ptr, arg_len);
+                return;
+            };
+        };
+    };
+    // const commit = /^commit\s+([0-9a-fA-F]{6,64})(?:\s+(.+))?$/i.exec(rest);
+    if rest_len > 6 && bytes_equal_lower(rest_ptr, 6, STR_PTR("commit"), STR_LEN("commit")) {
+        let pos: u64 = 6;
+        let saw_space = false;
+        while pos < rest_len {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, rest_ptr, pos);
+            if !is_space(b) { break; };
+            saw_space = true;
+            pos = pos + 1;
+        }
+        if saw_space {
+            // hex run
+            let hex_start = pos;
+            while pos < rest_len {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, rest_ptr, pos);
+                let is_hex = (b >= 48 && b <= 57) || (b >= 97 && b <= 102) || (b >= 65 && b <= 70);
+                if !is_hex { break; };
+                pos = pos + 1;
+            }
+            let hex_len = pos - hex_start;
+            if hex_len >= 6 && hex_len <= 64 {
+                // optional title: \s+(.+) anchored to end
+                let title_ok = true;
+                let t_start = pos;
+                if pos < rest_len {
+                    let b: u8 = 0;
+                    PTR_BYTE_AT(b, rest_ptr, pos);
+                    if !is_space(b) { title_ok = false; };
+                    while t_start < rest_len {
+                        let c: u8 = 0;
+                        PTR_BYTE_AT(c, rest_ptr, t_start);
+                        if !is_space(c) { break; };
+                        t_start = t_start + 1;
+                    }
+                    if t_start >= rest_len { title_ok = false; };
+                };
+                if title_ok {
+                    out.kind = 2;
+                    let sha_full: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(sha_full, rest_ptr, hex_start);
+                    let dst: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(dst, &out.sha, 0);
+                    out.sha_len = target_set_field(dst, 128, sha_full, hex_len);
+                    // title: commit[2]?.trim() || null
+                    if t_start < rest_len {
+                        let tp: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(tp, rest_ptr, t_start);
+                        let tt_ptr: ptr = PTR_NULL();
+                        let tt_len: u64 = 0;
+                        trim_span(tp, rest_len - t_start, &tt_ptr, &tt_len);
+                        if tt_len > 0 {
+                            out.has_title = true;
+                            let td: ptr = PTR_NULL();
+                            PTR_BYTE_ADD(td, &out.title, 0);
+                            out.title_len = target_set_field(td, 1024, tt_ptr, tt_len);
+                        };
+                    };
+                    return;
+                };
+            };
+        };
+    };
+    // return { type: "custom", instructions: rest };
+    out.kind = 3;
+    let dst2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dst2, &out.instructions, 0);
+    out.instructions_len = target_set_field(dst2, 8192, rest_ptr, rest_len);
+}
+
+// ---- TS: export function buildOpencodeReviewPrompt(target): string ----
+// DEFECT: template literals -> ByteBuf appends; switch -> kind dispatch.
+fn buildOpencodeReviewPrompt(target: &OpencodeReviewTarget, out: &ByteBuf) -> void {
+    buf_reset(out);
+    let target_prompt = ByteBuf { bytes: [0u8; 16384], len: 0 };
+    if target.kind == 1 {
+        // `Review the code changes against the base branch '${target.branch}'. Use bash 'git diff' for the range and the read tool for file context. Provide prioritized, actionable findings.`
+        buf_append_lit(&target_prompt, STR_PTR("Review the code changes against the base branch '"), STR_LEN("Review the code changes against the base branch '"));
+        let bp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(bp, &target.branch, 0);
+        buf_append(&target_prompt, bp, target.branch_len);
+        buf_append_lit(&target_prompt, STR_PTR("'. Use bash 'git diff' for the range and the read tool for file context. Provide prioritized, actionable findings."), STR_LEN("'. Use bash 'git diff' for the range and the read tool for file context. Provide prioritized, actionable findings."));
+    } else if target.kind == 2 {
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, &target.sha, 0);
+        if target.has_title {
+            // `Review the code changes introduced by commit ${sha} ("${title}"). Use bash 'git diff' (stat overview first, then full diff) and the read tool for file context. Provide prioritized, actionable findings.`
+            buf_append_lit(&target_prompt, STR_PTR("Review the code changes introduced by commit "), STR_LEN("Review the code changes introduced by commit "));
+            buf_append(&target_prompt, sp, target.sha_len);
+            buf_append_lit(&target_prompt, STR_PTR(" (\""), STR_LEN(" (\""));
+            let tp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(tp, &target.title, 0);
+            buf_append(&target_prompt, tp, target.title_len);
+            buf_append_lit(&target_prompt, STR_PTR("\"). Use bash 'git diff' (stat overview first, then full diff) and the read tool for file context. Provide prioritized, actionable findings."), STR_LEN("\"). Use bash 'git diff' (stat overview first, then full diff) and the read tool for file context. Provide prioritized, actionable findings."));
+        } else {
+            buf_append_lit(&target_prompt, STR_PTR("Review the code changes introduced by commit "), STR_LEN("Review the code changes introduced by commit "));
+            buf_append(&target_prompt, sp, target.sha_len);
+            buf_append_lit(&target_prompt, STR_PTR(". Use bash 'git diff' (stat overview first, then full diff) and the read tool for file context. Provide prioritized, actionable findings."), STR_LEN(". Use bash 'git diff' (stat overview first, then full diff) and the read tool for file context. Provide prioritized, actionable findings."));
+        };
+    } else if target.kind == 3 {
+        // targetPrompt = target.instructions;
+        let ip: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ip, &target.instructions, 0);
+        buf_append(&target_prompt, ip, target.instructions_len);
+    } else {
+        // default (uncommittedChanges)
+        buf_append_lit(&target_prompt, STR_PTR("Review the current uncommitted changes (staged, unstaged, and untracked files). Start with bash `git status`, then bash `git diff`, and read untracked files with the read tool. Provide prioritized, actionable findings."), STR_LEN("Review the current uncommitted changes (staged, unstaged, and untracked files). Start with bash `git status`, then bash `git diff`, and read untracked files with the read tool. Provide prioritized, actionable findings."));
+    };
+    // return `${REVIEW_RUBRIC}\n\n${targetPrompt}`;
+    let rubric_len: u64 = 0;
+    let rubric = review_rubric(&rubric_len);
+    buf_append(out, rubric, rubric_len);
+    buf_append_lit(out, STR_PTR("\n\n"), STR_LEN("\n\n"));
+    buf_append_buf(out, &target_prompt);
+}
+
+// ---- TS: export function formatOpencodeReviewSlash(target): string ----
+// Re-encode a target as `/review ...` text so `review/start` can delegate
+// to `turn/start`.
+fn formatOpencodeReviewSlash(target: &OpencodeReviewTarget, out: &ByteBuf) -> void {
+    buf_reset(out);
+    if target.kind == 1 {
+        // `/review branch ${target.branch}`
+        buf_append_lit(out, STR_PTR("/review branch "), STR_LEN("/review branch "));
+        let bp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(bp, &target.branch, 0);
+        buf_append(out, bp, target.branch_len);
+    } else if target.kind == 2 {
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, &target.sha, 0);
+        if target.has_title {
+            // `/review commit ${target.sha} ${target.title}`
+            buf_append_lit(out, STR_PTR("/review commit "), STR_LEN("/review commit "));
+            buf_append(out, sp, target.sha_len);
+            buf_append_lit(out, STR_PTR(" "), STR_LEN(" "));
+            let tp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(tp, &target.title, 0);
+            buf_append(out, tp, target.title_len);
+        } else {
+            buf_append_lit(out, STR_PTR("/review commit "), STR_LEN("/review commit "));
+            buf_append(out, sp, target.sha_len);
+        };
+    } else if target.kind == 3 {
+        // `/review ${target.instructions}`
+        buf_append_lit(out, STR_PTR("/review "), STR_LEN("/review "));
+        let ip: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ip, &target.instructions, 0);
+        buf_append(out, ip, target.instructions_len);
+    } else {
+        buf_append_lit(out, STR_PTR("/review"), STR_LEN("/review"));
+    };
+}

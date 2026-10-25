@@ -1,0 +1,492 @@
+// Converted 1:1 from backends/relay-config/src/relay/freebuffSession.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/io/print.sai"
+@import "sa_std/ptr.sa"
+
+// Node imports in source (freebuffSession.ts:1-4): node:fs existsSync/readFileSync,
+// node:os homedir, node:path join, node:crypto randomUUID.
+// DEFECT: Node API — fs/os/path/crypto have only partial sa_std counterparts;
+// file reads go through sa_std_fs_*, homedir/join are string ops, randomUUID
+// has no sa_std equivalent and is approximated by a counter-based id.
+
+// ---------------------------------------------------------------------------
+// Constants (freebuffSession.ts:6-39)
+// ---------------------------------------------------------------------------
+
+// export const FREEBUFF_BASE_URL = "https://www.codebuff.com/api/v1";
+// export const FREEBUFF_SESSION_URL = `${FREEBUFF_BASE_URL}/freebuff/session`;
+// export const FREEBUFF_AGENT_RUNS_URL = `${FREEBUFF_BASE_URL}/agent-runs`;
+// export const FREEBUFF_CHAT_COMPLETIONS_URL = `${FREEBUFF_BASE_URL}/chat/completions`;
+// DEFECT: template literals — URLs are pre-concatenated literals here.
+const FREEBUFF_BASE_URL: ptr = STR_PTR("https://www.codebuff.com/api/v1");
+const FREEBUFF_BASE_URL_LEN: u64 = 31;
+const FREEBUFF_SESSION_URL: ptr = STR_PTR("https://www.codebuff.com/api/v1/freebuff/session");
+const FREEBUFF_SESSION_URL_LEN: u64 = 47;
+const FREEBUFF_AGENT_RUNS_URL: ptr = STR_PTR("https://www.codebuff.com/api/v1/agent-runs");
+const FREEBUFF_AGENT_RUNS_URL_LEN: u64 = 41;
+const FREEBUFF_CHAT_COMPLETIONS_URL: ptr = STR_PTR("https://www.codebuff.com/api/v1/chat/completions");
+const FREEBUFF_CHAT_COMPLETIONS_URL_LEN: u64 = 48;
+
+// export const FREEBUFF_SYSTEM_PROMPT_PREFIX (freebuffSession.ts:11-12)
+const FREEBUFF_SYSTEM_PROMPT_PREFIX: ptr = STR_PTR("You are Buffy, the coding agent behind Codebuff. You help users with software engineering tasks: fixing bugs, adding functionality, refactoring, and explaining code.");
+const FREEBUFF_SYSTEM_PROMPT_PREFIX_LEN: u64 = 157;
+
+// export const FREEBUFF_SIGNATURE_TOOL (freebuffSession.ts:14-21)
+// DEFECT: dynamic object — the tool literal is kept verbatim as JSON text:
+//   {"type":"function","function":{"name":"decide","description":"Internal agent decision helper","parameters":{"type":"object","properties":{}}}}
+const FREEBUFF_SIGNATURE_TOOL_JSON: ptr = STR_PTR("{\"type\":\"function\",\"function\":{\"name\":\"decide\",\"description\":\"Internal agent decision helper\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}");
+const FREEBUFF_SIGNATURE_TOOL_JSON_LEN: u64 = 143;
+
+// export const FREEBUFF_MODEL_AGENT_MAP: Record<string, string> (freebuffSession.ts:23-33)
+// DEFECT: dynamic object / Record — kept as parallel (model, agentId) string
+// pairs in lookup order:
+//   "z-ai/glm-5.3-flash"        -> "base3-free-glm-5-3-flash"
+//   "mimo/mimo-v2.5"            -> "base3-free-mimo"
+//   "deepseek/deepseek-v4-flash"-> "base3-free-deepseek-flash"
+//   "openai/gpt-5.6-luna"       -> "base3-free-luna"
+//   "openai/gpt-5.6-luna-es"    -> "base3-free-luna-es"
+//   "minimax/minimax-m3"        -> "base3-free-minimax-m3"
+//   "upstage/solar-pro-4"       -> "base3-free-solar-pro4"
+//   "meta/muse-spark-1.3"       -> "base3-free-muse-spark-1-3"
+//   "anthropic/claude-fable-5"  -> "base3-free-fable"
+const FREEBUFF_MODEL_AGENT_MAP_COUNT: u64 = 9;
+
+// export const DEFAULT_FREEBUFF_MODELS (freebuffSession.ts:35-43)
+//   "z-ai/glm-5.3-flash", "mimo/mimo-v2.5", "deepseek/deepseek-v4-flash",
+//   "openai/gpt-5.6-luna", "openai/gpt-5.6-luna-es", "minimax/minimax-m3",
+//   "upstage/solar-pro-4"
+const DEFAULT_FREEBUFF_MODELS_COUNT: u64 = 7;
+
+// Case-insensitive substring helper (same approximation style as freeOllama).
+fn fb_contains_ci(hay_ptr: ptr, hay_len: u64, needle_ptr: ptr, needle_len: u64) -> bool {
+    if needle_len == 0 || hay_len < needle_len { return false; };
+    let last = hay_len - needle_len;
+    let i: u64 = 0;
+    while i <= last {
+        let ok = true;
+        let j: u64 = 0;
+        while j < needle_len {
+            let a: u8 = 0;
+            let b: u8 = 0;
+            PTR_BYTE_AT(a, hay_ptr, i + j);
+            PTR_BYTE_AT(b, needle_ptr, j);
+            if a >= 65 && a <= 90 { a = a + 32; };
+            if b >= 65 && b <= 90 { b = b + 32; };
+            if a != b { ok = false; break; };
+            j = j + 1;
+        }
+        if ok { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn fb_streq_ci(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    let i: u64 = 0;
+    while i < a_len {
+        let a: u8 = 0;
+        let b: u8 = 0;
+        PTR_BYTE_AT(a, a_ptr, i);
+        PTR_BYTE_AT(b, b_ptr, i);
+        if a >= 65 && a <= 90 { a = a + 32; };
+        if b >= 65 && b <= 90 { b = b + 32; };
+        if a != b { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// export function getFreebuffAgentId(model: string): string (freebuffSession.ts:45-61)
+// DEFECT: Object.entries iteration over the Record — the map walk is a fixed
+// 9-branch chain in source insertion order (see map comment above).
+// DEFECT: string -> (ptr,len) out-param instead of a returned string.
+// ---------------------------------------------------------------------------
+fn getFreebuffAgentId(model_ptr: ptr, model_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
+    // normalized = model.trim().toLowerCase() — caller supplies normalized text.
+    // Exact map hits first (case-insensitive key compare):
+    if fb_streq_ci(model_ptr, model_len, STR_PTR("z-ai/glm-5.3-flash"), STR_LEN("z-ai/glm-5.3-flash")) { out_len = STR_LEN("base3-free-glm-5-3-flash"); return 0; };
+    if fb_streq_ci(model_ptr, model_len, STR_PTR("mimo/mimo-v2.5"), STR_LEN("mimo/mimo-v2.5")) { out_len = STR_LEN("base3-free-mimo"); return 0; };
+    if fb_streq_ci(model_ptr, model_len, STR_PTR("deepseek/deepseek-v4-flash"), STR_LEN("deepseek/deepseek-v4-flash")) { out_len = STR_LEN("base3-free-deepseek-flash"); return 0; };
+    if fb_streq_ci(model_ptr, model_len, STR_PTR("openai/gpt-5.6-luna"), STR_LEN("openai/gpt-5.6-luna")) { out_len = STR_LEN("base3-free-luna"); return 0; };
+    if fb_streq_ci(model_ptr, model_len, STR_PTR("openai/gpt-5.6-luna-es"), STR_LEN("openai/gpt-5.6-luna-es")) { out_len = STR_LEN("base3-free-luna-es"); return 0; };
+    if fb_streq_ci(model_ptr, model_len, STR_PTR("minimax/minimax-m3"), STR_LEN("minimax/minimax-m3")) { out_len = STR_LEN("base3-free-minimax-m3"); return 0; };
+    if fb_streq_ci(model_ptr, model_len, STR_PTR("upstage/solar-pro-4"), STR_LEN("upstage/solar-pro-4")) { out_len = STR_LEN("base3-free-solar-pro4"); return 0; };
+    if fb_streq_ci(model_ptr, model_len, STR_PTR("meta/muse-spark-1.3"), STR_LEN("meta/muse-spark-1.3")) { out_len = STR_LEN("base3-free-muse-spark-1-3"); return 0; };
+    if fb_streq_ci(model_ptr, model_len, STR_PTR("anthropic/claude-fable-5"), STR_LEN("anthropic/claude-fable-5")) { out_len = STR_LEN("base3-free-fable"); return 0; };
+    // DEFECT: out_ptr is not written — the caller maps the returned length's
+    // known literal; pointer materialization of the chosen literal is pending.
+    // Substring fallbacks, in source order:
+    if fb_contains_ci(model_ptr, model_len, STR_PTR("glm"), STR_LEN("glm")) { out_len = STR_LEN("base3-free-glm-5-3-flash"); return 0; };
+    if fb_contains_ci(model_ptr, model_len, STR_PTR("mimo"), STR_LEN("mimo")) { out_len = STR_LEN("base3-free-mimo"); return 0; };
+    if fb_contains_ci(model_ptr, model_len, STR_PTR("deepseek"), STR_LEN("deepseek")) { out_len = STR_LEN("base3-free-deepseek-flash"); return 0; };
+    if fb_contains_ci(model_ptr, model_len, STR_PTR("luna-es"), STR_LEN("luna-es")) { out_len = STR_LEN("base3-free-luna-es"); return 0; };
+    if fb_contains_ci(model_ptr, model_len, STR_PTR("luna"), STR_LEN("luna")) { out_len = STR_LEN("base3-free-luna"); return 0; };
+    if fb_contains_ci(model_ptr, model_len, STR_PTR("minimax"), STR_LEN("minimax")) { out_len = STR_LEN("base3-free-minimax-m3"); return 0; };
+    if fb_contains_ci(model_ptr, model_len, STR_PTR("solar"), STR_LEN("solar")) { out_len = STR_LEN("base3-free-solar-pro4"); return 0; };
+    if fb_contains_ci(model_ptr, model_len, STR_PTR("fable"), STR_LEN("fable")) { out_len = STR_LEN("base3-free-fable"); return 0; };
+    if fb_contains_ci(model_ptr, model_len, STR_PTR("muse-spark"), STR_LEN("muse-spark")) { out_len = STR_LEN("base3-free-muse-spark-1-3"); return 0; };
+    out_len = STR_LEN("base3-free-glm-5-3-flash");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// export function resolveFreebuffCredentialsPath(): string (freebuffSession.ts:63-71)
+//   FREEBUFF_CREDENTIALS_PATH env, else MANICODE_CREDENTIALS_PATH env,
+//   else join(homedir(), ".config", "manicode", "credentials.json")
+// DEFECT: process.env access — no SLA env map; env lookup goes through a
+// sa_std env extern approximated here. Path join is string concatenation.
+// ---------------------------------------------------------------------------
+fn resolveFreebuffCredentialsPath(out_ptr: ptr, out_len: &u64) -> i32 {
+    // DEFECT: env reads + homedir + join not implemented in this pass;
+    // out receives the default suffix ".config/manicode/credentials.json".
+    out_len = STR_LEN(".config/manicode/credentials.json");
+    return 0;
+}
+
+// export type FreebuffCredentials (freebuffSession.ts:73-76)
+struct FreebuffCredentials {
+    token_bytes: [0u8; 1024],
+    token_len: u64,
+    userId_bytes: [0u8; 256],
+    userId_len: u64,
+}
+
+// FreebuffCredentials | null result: status 0 = found, 1 = null.
+// export async function resolveLocalFreebuffCredentials(options = {}): Promise<...> (freebuffSession.ts:78-106)
+// DEFECT: async — synchronous + status code (0 found / 1 null).
+// DEFECT: dynamic JSON — credentials.json parsed via JSON text lookups
+// (parsed?.default?.authToken / ?.id optional chaining has no counterpart).
+// DEFECT: try/catch — read/parse errors are status branches; source swallows
+// them and returns null.
+fn resolveLocalFreebuffCredentials(credentials_path_ptr: ptr, credentials_path_len: u64, has_path: bool, out: &FreebuffCredentials) -> i32 {
+    // 1. FREEBUFF_API_KEY env -> { token, userId: FREEBUFF_USER_ID || "freebuff-user" }
+    // 2. CODEBUFF_API_KEY env  -> same shape
+    // 3. filePath = options.credentialsPath || resolveFreebuffCredentialsPath()
+    //    !existsSync(filePath) -> null
+    //    raw = readFileSync(filePath, "utf8"); parsed = JSON.parse(raw)
+    //    token = parsed.default.authToken (string, trimmed)
+    //    userId = parsed.default.id (string, trimmed) || "freebuff-user"
+    //    token non-empty -> { token, userId }; else / on error -> null
+    // DEFECT: env + fs + JSON steps not implemented in this pass.
+    return 1;
+}
+
+// export type FreebuffSessionInfo (freebuffSession.ts:108-116)
+struct FreebuffSessionInfo {
+    instanceId_bytes: [0u8; 256],
+    instanceId_len: u64,
+    model_bytes: [0u8; 256],
+    model_len: u64,
+    expiresAt: u64, // number (epoch ms)
+    token_bytes: [0u8; 1024],
+    token_len: u64,
+    userId_bytes: [0u8; 256],
+    userId_len: u64,
+    agentId_bytes: [0u8; 256],
+    agentId_len: u64,
+    isOwned: bool, // isOwned?: boolean
+    has_is_owned: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Module state (freebuffSession.ts:118-157)
+//   const ownedInstanceIds = new Set<string>();
+//   const activeSessions = new Map<string, FreebuffSessionInfo>();
+//   const activeAdmissionPromises = new Map<string, Promise<FreebuffSessionInfo>>();
+// DEFECT: module-level mutable Set/Map — SLA has no module globals in this
+// dialect; all three live in one state struct passed by &FreebuffState.
+// DEFECT: Promise-valued map — in-flight admissions cannot be represented;
+// the promise map is dropped and admission is sequential (see below).
+// ---------------------------------------------------------------------------
+struct FreebuffState {
+    owned_ids_bytes: [0u8; 16384],
+    owned_id_lens: [0u64; 64],
+    owned_count: u64,
+    session_models_bytes: [0u8; 16384],
+    session_model_lens: [0u64; 64],
+    sessions_bytes: [0u8; 262144], // flattened FreebuffSessionInfo storage
+    session_count: u64,
+    // activeAdmissionPromises intentionally absent — DEFECT: Promise map.
+    admission_count: u64,
+}
+
+// Track instances created by Codex Ultra to avoid deleting external sessions (P0 protection)
+// export function isOwnedFreebuffInstance(instanceId: string): boolean (freebuffSession.ts:121-123)
+fn isOwnedFreebuffInstance(state: &FreebuffState, instance_id_ptr: ptr, instance_id_len: u64) -> bool {
+    for i in 0..state.owned_count {
+        // DEFECT: per-entry (ptr,len) recovery from flattened storage +
+        // byte compare not implemented in this pass.
+        if state.owned_id_lens[i] == instance_id_len { return true; };
+    }
+    return false;
+}
+
+// export function recordOwnedFreebuffInstance(instanceId: string): void (freebuffSession.ts:125-127)
+fn recordOwnedFreebuffInstance(state: &FreebuffState, instance_id_ptr: ptr, instance_id_len: u64) {
+    // ownedInstanceIds.add(instanceId)
+    // DEFECT: byte copy into flattened storage not implemented in this pass.
+    if state.owned_count < 64 {
+        state.owned_id_lens[state.owned_count] = instance_id_len;
+        state.owned_count = state.owned_count + 1;
+    };
+}
+
+// export function forgetOwnedFreebuffInstance(instanceId: string): void (freebuffSession.ts:129-131)
+fn forgetOwnedFreebuffInstance(state: &FreebuffState, instance_id_ptr: ptr, instance_id_len: u64) {
+    // ownedInstanceIds.delete(instanceId)
+    // DEFECT: removal from flattened storage not implemented in this pass.
+}
+
+// export function clearOwnedFreebuffInstances(): void (freebuffSession.ts:133-135)
+fn clearOwnedFreebuffInstances(state: &FreebuffState) {
+    state.owned_count = 0;
+}
+
+// export function clearFreebuffSession(model?: string): void (freebuffSession.ts:140-148)
+// Per-model session cache clear; no argument clears both maps entirely.
+fn clearFreebuffSession(state: &FreebuffState, model_ptr: ptr, model_len: u64, has_model: bool) {
+    if has_model {
+        // activeSessions.delete(model); activeAdmissionPromises.delete(model);
+        // DEFECT: keyed delete from flattened storage not implemented here.
+    } else {
+        state.session_count = 0;
+        state.admission_count = 0;
+    };
+}
+
+// export function getCachedFreebuffSession(model?: string): FreebuffSessionInfo | null (freebuffSession.ts:150-157)
+// DEFECT: Map.values().next() iterator — first-entry access is an index-0
+// read of the flattened storage; null represented by status 1.
+fn getCachedFreebuffSession(state: &FreebuffState, model_ptr: ptr, model_len: u64, has_model: bool, out: &FreebuffSessionInfo) -> i32 {
+    // model given: activeSessions.get(model) || null
+    // else: first value of activeSessions, or null when empty
+    // DEFECT: keyed/first lookup over flattened storage not implemented here.
+    if state.session_count == 0 { return 1; };
+    return 1;
+}
+
+// export type FreebuffSessionStatus (freebuffSession.ts:159-185)
+// DEFECT: dynamic object — nested freebucks / rateLimitsByModel records are
+// JSON text buffers; optional fields get has_* flags.
+struct FreebuffSessionStatus {
+    configured: bool,
+    active: bool,
+    model_bytes: [0u8; 256],
+    model_len: u64,
+    has_model: bool,
+    instanceId_bytes: [0u8; 256],
+    instanceId_len: u64,
+    has_instance_id: bool,
+    expiresAt: u64,
+    has_expires_at: bool,
+    remainingSeconds: u64,
+    has_remaining_seconds: bool,
+    isOwned: bool,
+    has_is_owned: bool,
+    freebucks_json_bytes: [0u8; 8192], // DEFECT: dynamic object as JSON text
+    freebucks_json_len: u64,
+    has_freebucks: bool,
+    rate_limits_json_bytes: [0u8; 8192], // DEFECT: dynamic object as JSON text
+    rate_limits_json_len: u64,
+    has_rate_limits: bool,
+}
+
+// ---------------------------------------------------------------------------
+// export async function getFreebuffSessionStatus(options = {}): Promise<FreebuffSessionStatus> (freebuffSession.ts:187-275)
+// DEFECT: async — synchronous + status code.
+// DEFECT: fetch injection (options.fetchImpl ?? fetch) + AbortSignal.timeout —
+// no function values / abort signals; sa_std HTTP client approximation.
+// DEFECT: dynamic JSON — response body read via JSON text lookups
+// (body.freebucks, body.rateLimitsByModel, body.status/instanceId/model/expiresAt).
+// DEFECT: Date.now / new Date(...).getTime — epoch-ms via a sa_std time
+// extern approximation; ISO-8601 parse has no direct counterpart.
+// ---------------------------------------------------------------------------
+fn getFreebuffSessionStatus(state: &FreebuffState, credentials_path_ptr: ptr, credentials_path_len: u64, has_path: bool, timeout_ms: u64, has_timeout: bool, out: &FreebuffSessionStatus) -> i32 {
+    // timeoutMs = options.timeoutMs ?? 10_000
+    // creds = await resolveLocalFreebuffCredentials(...); token = creds?.token
+    // if (!token) return { configured: false, active: false };
+    // try {
+    //   res = GET FREEBUFF_SESSION_URL (Bearer + x-codebuff-api-key)
+    //   if (res.ok) {
+    //     body = await res.json().catch(() => null)
+    //     if (body?.status === "active" && typeof body.instanceId === "string") {
+    //       expiresAt = Date.now() + 3600_000, or parsed body.expiresAt
+    //       remainingSeconds = max(0, round((expiresAt - now)/1000))
+    //       isOwned = ownedInstanceIds.has(instanceId)
+    //       if (model && expiresAt > now) activeSessions.set(model, {...})
+    //       return { configured: true, active: true, model, instanceId,
+    //                expiresAt, remainingSeconds, isOwned, freebucks, rateLimitsByModel }
+    //     }
+    //     return { configured: true, active: false, freebucks, rateLimitsByModel }
+    //   }
+    // } catch {
+    //   cached = getCachedFreebuffSession()
+    //   if (cached && cached.expiresAt > Date.now()) return { ...cached view }
+    // }
+    // return { configured: true, active: false };
+    // DEFECT: HTTP + JSON + cache steps not implemented in this pass.
+    out.configured = false;
+    out.active = false;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// export function findBestFreebuffFallback(currentModel, status) (freebuffSession.ts:277-322)
+// Returns { id, name, price } | null; null represented by status 1.
+// DEFECT: dynamic object — the price table merges a literal record with
+// status.freebucks?.prices (JSON text); spread merge has no counterpart.
+// ---------------------------------------------------------------------------
+struct FreebuffFallback {
+    id_bytes: [0u8; 256],
+    id_len: u64,
+    name_bytes: [0u8; 256],
+    name_len: u64,
+    price: f64,
+}
+
+fn findBestFreebuffFallback(current_model_ptr: ptr, current_model_len: u64, status: &FreebuffSessionStatus, out: &FreebuffFallback) -> i32 {
+    // Price table (source literals, before freebucks.prices override):
+    //   "upstage/solar-pro4": 0, "upstage/solar-pro-4": 0,
+    //   "z-ai/glm-5.3-flash": 5, "mimo/mimo-v2.5": 10, "minimax/minimax-m3": 10,
+    //   "openai/gpt-5.6-luna": 20, "openai/gpt-5.6-luna-es": 20,
+    //   "deepseek/deepseek-v4-flash": 25, ...(status.freebucks?.prices || {})
+    // currentPrice = prices[currentModel] ?? 25
+    // balance = status.freebucks?.balance ?? 0
+    // Candidates in order: gpt-5.6-luna "GPT-5.6 Luna", mimo-v2.5 "Mimo 2.5",
+    //   minimax-m3 "MiniMax M3", glm-5.3-flash "GLM-5.3 Flash",
+    //   solar-pro-4 "Solar Pro 4".
+    // For each candidate != currentModel:
+    //   price = prices[id] ?? 999
+    //   Security Rule 1: skip if price > currentPrice (never upgrade)
+    //   Security Rule 2: skip if price > balance (must be affordable)
+    //   skip if rateLimitsByModel[id] has limit>0 && recentCount >= limit
+    //   else return { id, name, price }
+    // Final fallback: solar-pro-4 when solarPrice <= balance and current is
+    // neither solar spelling; else null.
+    // DEFECT: JSON price/rate-limit lookups not implemented in this pass.
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// export async function releaseFreebuffSession(options = {}): Promise<{ released, message? }> (freebuffSession.ts:324-353)
+// DEFECT: async — synchronous + status code; result struct below.
+// DEFECT: fetch injection + AbortSignal.timeout — see status fn DEFECT.
+// DEFECT: try/catch — error message extraction (error instanceof Error ?
+// error.message : String(error)) has no counterpart; message stays empty.
+// ---------------------------------------------------------------------------
+struct FreebuffReleaseResult {
+    released: bool,
+    message_bytes: [0u8; 512],
+    message_len: u64,
+    has_message: bool,
+}
+
+fn releaseFreebuffSession(state: &FreebuffState, credentials_path_ptr: ptr, credentials_path_len: u64, has_path: bool, timeout_ms: u64, has_timeout: bool, explicit_token_ptr: ptr, explicit_token_len: u64, has_explicit_token: bool, out: &FreebuffReleaseResult) -> i32 {
+    // token = explicitToken?.trim() || creds?.token
+    // if (!token) return { released: false, message: "No token configured" };
+    // try { res = DELETE FREEBUFF_SESSION_URL (auth headers)
+    //   clear activeSessions + activeAdmissionPromises + ownedInstanceIds
+    //   return { released: res.ok, message: res.ok ? "Session released" : `HTTP ${res.status}` }
+    // } catch (error) { clear all three; return { released: false, message } }
+    // DEFECT: HTTP call not implemented in this pass; caches are cleared to
+    // mirror the source's unconditional clear on the attempt path.
+    out.released = false;
+    out.has_message = false;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// export async function getOrEnsureFreebuffSession(targetModel, explicitToken?, options = {}): Promise<FreebuffSessionInfo> (freebuffSession.ts:355-527)
+// DEFECT: async — synchronous + status code; failure (throw) is a nonzero code:
+//   1 = no token ("Freebuff requires an authentication token. ...")
+//   2 = FREEBUFF_MODEL_LOCKED (external session for another model; source
+//       attaches code/currentModel/targetModel/remainingSeconds/instanceId
+//       to the Error object via Object.assign — DEFECT: dynamic object error
+//       properties have no counterpart; fields are dropped)
+//   3 = admission failed (409 locked by external session, or non-active body)
+// DEFECT: Promise dedup — the activeAdmissionPromises.get/set + IIFE pattern
+// ((async () => { ... })()) has no counterpart; concurrent callers are NOT
+// deduplicated here, each call runs the admission flow sequentially.
+// DEFECT: closure — the admission IIFE capturing token/userId/agentId becomes
+// this function body directly.
+// DEFECT: fetch injection + AbortSignal.timeout + dynamic JSON bodies —
+// sa_std HTTP + JSON text lookups, as above.
+// DEFECT: throw/rethrow discrimination (`error.message.includes("Freebuff
+// active session is currently owned")`) — status-code branch instead.
+// ---------------------------------------------------------------------------
+fn getOrEnsureFreebuffSession(state: &FreebuffState, target_model_ptr: ptr, target_model_len: u64, explicit_token_ptr: ptr, explicit_token_len: u64, has_explicit_token: bool, credentials_path_ptr: ptr, credentials_path_len: u64, has_path: bool, timeout_ms: u64, has_timeout: bool, force_switch: bool, out: &FreebuffSessionInfo) -> i32 {
+    // timeoutMs = options.timeoutMs ?? 15_000
+    // token = explicitToken?.trim() || creds?.token; !token -> code 1
+    // userId = creds?.userId || "freebuff-user"
+    // agentId = getFreebuffAgentId(targetModel); now = Date.now()
+    // cached = activeSessions.get(targetModel)
+    // if (cached && cached.token === token && cached.expiresAt - now > 60_000)
+    //   return cached;
+    // existingPromise -> (dropped, see DEFECT above)
+    // Admission flow:
+    //   1. GET session: if active with instanceId:
+    //        currentModel == targetModel && serverExpiresAt > now
+    //          -> adopt (instanceId, expiresAt, isOwned)
+    //        currentModel != targetModel:
+    //          owned || forceSwitch -> DELETE, forget owned, drop cached
+    //          else if not expired -> code 2 (FREEBUFF_MODEL_LOCKED)
+    //          else fall through to admission
+    //      (GET errors fall through, except the locked error rethrows)
+    //   2. If no instanceId: POST session with x-freebuff-model header.
+    //        409: if conflict instance owned || forceSwitch -> DELETE + POST again
+    //             else -> code 3
+    //        body must be ok + status "active" + string instanceId else code 3
+    //        instanceId set; isOwned = true; ownedInstanceIds.add(instanceId)
+    //        expiresAt from body.expiresAt when valid and > now
+    //   sessionInfo = { instanceId, model: targetModel, expiresAt, token,
+    //                   userId, agentId, isOwned }
+    //   activeSessions.set(targetModel, sessionInfo); return sessionInfo
+    //   finally: activeAdmissionPromises.delete(targetModel) — no-op here.
+    // DEFECT: HTTP + JSON + cache steps not implemented in this pass.
+    return 3;
+}
+
+// ---------------------------------------------------------------------------
+// export async function createFreebuffRunId(agentId, token, options = {}): Promise<string> (freebuffSession.ts:529-561)
+// DEFECT: async — synchronous + status code; run id via out (ptr,len).
+// DEFECT: randomUUID (node:crypto) — no sa_std UUID; fallback `run_${...}`
+// uses a counter approximation, not a UUID.
+// DEFECT: dynamic JSON — request/response bodies are JSON text.
+// ---------------------------------------------------------------------------
+fn createFreebuffRunId(agent_id_ptr: ptr, agent_id_len: u64, token_ptr: ptr, token_len: u64, timeout_ms: u64, has_timeout: bool, out_ptr: ptr, out_len: &u64) -> i32 {
+    // fallbackRunId = `run_${randomUUID()}`
+    // try { POST FREEBUFF_AGENT_RUNS_URL, body {"action":"START","agentId":...,"ancestorRunIds":[]}
+    //   if (runRes.ok) { runBody.runId string non-empty -> return trimmed }
+    // } catch { /* fall back */ }
+    // return fallbackRunId
+    // DEFECT: HTTP + JSON + UUID not implemented in this pass; out stays empty
+    // and the caller must treat it as the fallback path.
+    out_len = 0;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// export async function fetchFreebuffFreeModels(options = {}): Promise<{ models: string[]; fetchedModels: number }> (freebuffSession.ts:563-603)
+// DEFECT: async — synchronous + status code; models via out array + count.
+// DEFECT: dynamic JSON — freebucks.prices keys read from JSON text.
+// DEFECT: Set dedup ([...new Set(models)]) — O(n^2) scan approximation.
+// ---------------------------------------------------------------------------
+fn fetchFreebuffFreeModels(credentials_path_ptr: ptr, credentials_path_len: u64, has_path: bool, timeout_ms_in: u64, has_timeout: bool, token_ptr: ptr, token_len: u64, has_token: bool, out_ptr: ptr, out_lens: &u64, out_count: &u64, fetched_models: &u64) -> i32 {
+    // timeoutMs = Math.max(1_000, options.timeoutMs ?? 10_000)
+    let timeout_ms: u64 = 10000;
+    if has_timeout { timeout_ms = timeout_ms_in; };
+    if timeout_ms < 1000 { timeout_ms = 1000; };
+    // token = options.token || creds?.token
+    // if (!token) return { models: [...DEFAULT_FREEBUFF_MODELS], fetchedModels: 7 };
+    // try { GET session; if ok: prices = data.freebucks.prices
+    //   models = Object.keys(prices) (non-empty strings)
+    //   if (models.length > 0) return { models: dedup(models), fetchedModels: models.length }
+    // } catch { /* fall back */ }
+    // return { models: [...DEFAULT_FREEBUFF_MODELS], fetchedModels: 7 };
+    // DEFECT: HTTP + JSON steps not implemented in this pass; default-model
+    // fallback is reported with the default count.
+    out_count = DEFAULT_FREEBUFF_MODELS_COUNT;
+    fetched_models = DEFAULT_FREEBUFF_MODELS_COUNT;
+    return 0;
+}

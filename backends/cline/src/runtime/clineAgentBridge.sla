@@ -1,0 +1,3585 @@
+// Converted 1:1 from backends/cline/src/runtime/clineAgentBridge.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// Cline backend bridge — a CodexRuntimeClient over the
+// Cline CLI's own hub daemon (see clineHubClient.sla for
+// the reverse-engineered protocol).
+//
+// Design notes (from the source):
+//  - NOT ACP (user decision 2026-10-24: too restrictive,
+//    and its session gate demands a vendor login). The hub
+//    path is fully BYOK: providers are configured in the
+//    data dir (clineProviders.sla) and selected per session
+//    through create metadata — no Cline account involved.
+//  - NOT embedded either: the hub is a detached daemon
+//    process of the user's own external `cline` binary
+//    (like `opencode serve`).
+//  - The workbench thread id IS the hub session id, so
+//    history survives bridge restarts through session.list
+//    / session.get / session.messages.
+//  - Sessions are created with autoApproveTools=true — the
+//    same posture as the CLI's own headless mode. If an
+//    approval event still arrives it is answered
+//    "approved" via approval.respond; the manifest
+//    honestly declares permissionRoundTrips=false.
+//
+// Shape notes: EventEmitter -> owner-pumped eventQueue
+// ("message"/"status"/"stderr" records); hub commands are
+// synchronous in this pass via the hub_command_sync shim
+// over clineHubClient.sla's pending table (the pump model
+// is a repair-phase item); Map/Set members become fixed
+// tables; child-session lookups call the canonical fns in
+// clineChildSession.sla through local wrappers.
+
+@import "sa_std/fs.sai"
+@import "sa_std/json.sai"
+@import "sa_std/process.sai"
+@import "sa_std/env.sai"
+@import "./clineHubClient.sla"
+@import "./clineCommand.sla"
+@import "./clineChildSession.sla"
+@import "../../../../../sdk-backend/src/json.sla"
+@import "../../../../../sdk-backend/src/process.sla"
+
+// ClineUpstreamConfig (interface): providers.json entry id
+// written by writeClineRelayProvider + model.
+struct ClineUpstreamConfig {
+    providerEntryId_ptr: ptr,
+    providerEntryId_len: u64,
+    model_ptr: ptr,
+    model_len: u64,
+}
+
+// ClineHubEvent: one queued hub event (produced by
+// ClineHubClient_pollEvent in clineHubClient.sla).
+struct ClineHubEvent {
+    event_ptr: ptr,
+    event_len: u64,
+    sessionId_ptr: ptr,
+    sessionId_len: u64,
+    has_sessionId: bool,
+    eventId_ptr: ptr,
+    eventId_len: u64,
+    has_eventId: bool,
+    payload: u64,
+}
+
+struct ClinePlanStep {
+    step: [u8; 512],
+    step_len: u64,
+    status: [u8; 32],
+    status_len: u64,
+    key: [u8; 128],
+    key_len: u64,
+}
+
+struct ClinePendingTeamRun {
+    runId: [u8; 128],
+    runId_len: u64,
+    toolCallId: [u8; 128],
+    toolCallId_len: u64,
+    turnId: [u8; 64],
+    turnId_len: u64,
+    threadId: [u8; 128],
+    threadId_len: u64,
+    agentId: [u8; 128],
+    agentId_len: u64,
+    has_agentId: bool,
+}
+
+struct ClineTurnRow {
+    id: [u8; 64],
+    id_len: u64,
+    status: [u8; 32],
+    status_len: u64,
+}
+
+struct ClineSessionState {
+    threadId_ptr: ptr,
+    threadId_len: u64,
+    cwd_ptr: ptr,
+    cwd_len: u64,
+    has_cwd: bool,
+    model_ptr: ptr,
+    model_len: u64,
+    has_model: bool,
+    providerEntryId_ptr: ptr,
+    providerEntryId_len: u64,
+    has_providerEntryId: bool,
+    createdAt: u64,
+    activeTurnId: [u8; 64],
+    activeTurnId_len: u64,
+    has_activeTurnId: bool,
+    activeRunId: [u8; 128],
+    activeRunId_len: u64,
+    has_activeRunId: bool,
+    activeItemId: [u8; 160],
+    activeItemId_len: u64,
+    has_activeItemId: bool,
+    streamedText: [u8; 262144],
+    streamedText_len: u64,
+    itemStarted: bool,
+    textSegIndex: u64,
+    reasoningSeq: u64,
+    planSteps: [ClinePlanStep; 128],
+    planSteps_count: u64,
+    pendingTeamRuns: [ClinePendingTeamRun; 64],
+    pendingTeamRuns_count: u64,
+    lastUsage: u64,
+    has_lastUsage: bool,
+    turns: [ClineTurnRow; 128],
+    turns_count: u64,
+    messages: [u8; 1048576],
+    messages_len: u64,
+    msg_off: [u64; 2048],
+    msg_len_arr: [u64; 2048],
+    msg_count: u64,
+    scratch: [u8; 524288],
+    scratch_len: u64,
+}
+
+struct ChildCacheEntry {
+    id: [u8; 128],
+    id_len: u64,
+    file: [u8; 1024],
+    file_len: u64,
+    root: [u8; 128],
+    root_len: u64,
+    at_ms: u64,
+}
+
+struct ClineAgentBridge {
+    dataDir_ptr: ptr,
+    dataDir_len: u64,
+    env_ptr: ptr,
+    env_len: u64,
+    status_phase: [u8; 32],
+    status_phase_len: u64,
+    status_message: [u8; 1024],
+    status_message_len: u64,
+    has_status_message: bool,
+    hub: ClineHubClient,
+    has_hub: bool,
+    sessions: [ClineSessionState; 16],
+    sessions_count: u64,
+    pendingUpstream_thread: [u8; 8192],
+    pendingUpstream_off: [u64; 64],
+    pendingUpstream_klen: [u64; 64],
+    pendingUpstream_cfg: [ClineUpstreamConfig; 64],
+    pendingUpstream_count: u64,
+    pendingUpstream_used: u64,
+    defaultUpstream: ClineUpstreamConfig,
+    has_defaultUpstream: bool,
+    seenEventIds: [u8; 262144],
+    seen_off: [u64; 5120],
+    seen_len_arr: [u64; 5120],
+    seen_count: u64,
+    seen_used: u64,
+    loggedHubEvents: [u8; 8192],
+    logged_off: [u64; 128],
+    logged_len_arr: [u64; 128],
+    logged_count: u64,
+    logged_used: u64,
+    openSpawnIds: [u8; 16384],
+    open_off: [u64; 256],
+    open_len_arr: [u64; 256],
+    open_count: u64,
+    open_used: u64,
+    childFileCache: [ChildCacheEntry; 128],
+    childFileCache_count: u64,
+    versionCache: ClineVersionCache,
+    childState: ClineChildSessionState,
+    eventQueue: [u8; 1048576],
+    eventQueue_len: u64,
+}
+
+// ClineAgentBridge_new(self, dataDir, envSnapshot): the
+// runtimeEnv callback collapses to a caller-supplied env
+// snapshot in this pass. createBridgeEventLogger ->
+// host_event_log_init shim.
+fn ClineAgentBridge_new(self: &ClineAgentBridge, dataDir_ptr: ptr, dataDir_len: u64, env_ptr: ptr, env_len: u64) -> void {
+    self.dataDir_ptr = dataDir_ptr;
+    self.dataDir_len = dataDir_len;
+    self.env_ptr = env_ptr;
+    self.env_len = env_len;
+    self.status_phase_len = buf_copy(&self.status_phase, 32, STR_PTR("stopped"), STR_LEN("stopped"));
+    self.status_message_len = 0;
+    self.has_status_message = false;
+    self.has_hub = false;
+    self.sessions_count = 0;
+    self.pendingUpstream_count = 0;
+    self.pendingUpstream_used = 0;
+    self.has_defaultUpstream = false;
+    self.seen_count = 0;
+    self.seen_used = 0;
+    self.logged_count = 0;
+    self.logged_used = 0;
+    self.open_count = 0;
+    self.open_used = 0;
+    self.childFileCache_count = 0;
+    self.eventQueue_len = 0;
+    self.versionCache.count = 0;
+    cline_child_state_init(&self.childState);
+    host_event_log_init(STR_PTR("cline"), STR_LEN("cline"), dataDir_ptr, dataDir_len);
+}
+
+// applyUpstream(config, threadId?)
+fn ClineAgentBridge_applyUpstream(self: &ClineAgentBridge, cfg: &ClineUpstreamConfig, thread_ptr: ptr, thread_len: u64, has_thread: bool) -> void {
+    if has_thread {
+        if self.pendingUpstream_count < 64 {
+            let i = self.pendingUpstream_count;
+            self.pendingUpstream_off[i] = self.pendingUpstream_used;
+            self.pendingUpstream_klen[i] = thread_len;
+            for k in 0..thread_len {
+                if self.pendingUpstream_used < 8192 { self.pendingUpstream_thread[self.pendingUpstream_used] = byte_at(thread_ptr, k); self.pendingUpstream_used = self.pendingUpstream_used + 1; };
+            }
+            self.pendingUpstream_cfg[i] = *cfg;
+            self.pendingUpstream_count = self.pendingUpstream_count + 1;
+        };
+    } else {
+        self.defaultUpstream = *cfg;
+        self.has_defaultUpstream = true;
+    };
+}
+
+fn pending_upstream_of(self: &ClineAgentBridge, thread_ptr: ptr, thread_len: u64, out: &ClineUpstreamConfig, out_found: &bool) -> void {
+    out_found = false;
+    for i in 0..self.pendingUpstream_count {
+        if self.pendingUpstream_klen[i] == thread_len && bytes_eq(slot(&self.pendingUpstream_thread, self.pendingUpstream_off[i]), thread_ptr, thread_len) {
+            out = self.pendingUpstream_cfg[i];
+            out_found = true;
+            return;
+        };
+    }
+}
+
+// getStatus / setStatus (+ "status" emit)
+fn ClineAgentBridge_setStatus(self: &ClineAgentBridge, phase_ptr: ptr, phase_len: u64, msg_ptr: ptr, msg_len: u64, has_msg: bool) -> void {
+    self.status_phase_len = buf_copy(&self.status_phase, 32, phase_ptr, phase_len);
+    self.has_status_message = has_msg;
+    self.status_message_len = 0;
+    if has_msg { self.status_message_len = buf_copy(&self.status_message, 1024, msg_ptr, msg_len); };
+    let frame = [0u8; 2048];
+    let frame_len: u64 = 0;
+    frame_len = frame_len + append_bytes(&frame, 2048, frame_len, STR_PTR("{\"phase\":\""), STR_LEN("{\"phase\":\""));
+    frame_len = frame_len + append_bytes(&frame, 2048, frame_len, phase_ptr, phase_len);
+    if has_msg {
+        frame_len = frame_len + append_bytes(&frame, 2048, frame_len, STR_PTR("\",\"message\":\""), STR_LEN("\",\"message\":\""));
+        frame_len = frame_len + append_bytes(&frame, 2048, frame_len, msg_ptr, msg_len);
+    };
+    frame_len = frame_len + append_bytes(&frame, 2048, frame_len, STR_PTR("\"}"), 2);
+    bridge_emit(self, STR_PTR("status"), STR_LEN("status"), &frame, frame_len);
+}
+
+fn bridge_emit(self: &ClineAgentBridge, kind_ptr: ptr, kind_len: u64, payload_ptr: ptr, payload_len: u64) -> void {
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, kind_ptr, kind_len);
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, STR_PTR("\t"), 1);
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, payload_ptr, payload_len);
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, STR_PTR("\n"), 1);
+}
+
+fn emit_message(self: &ClineAgentBridge, payload_ptr: ptr, payload_len: u64) -> void {
+    bridge_emit(self, STR_PTR("message"), STR_LEN("message"), payload_ptr, payload_len);
+}
+
+// start(): findClineBin -> hub client -> connect. The
+// startPromise de-dup collapses to the phase check.
+fn ClineAgentBridge_start(self: &ClineAgentBridge, out_err: ptr, out_err_len: &u64) -> i32 {
+    out_err_len = 0;
+    if str_is(&self.status_phase, self.status_phase_len, STR_PTR("ready"), 5) || str_is(&self.status_phase, self.status_phase_len, STR_PTR("starting"), STR_LEN("starting")) {
+        return 0;
+    };
+    ClineAgentBridge_setStatus(self, STR_PTR("starting"), STR_LEN("starting"), PTR_NULL(), 0, false);
+    let bin = [0u8; 1024];
+    let bin_len: u64 = 0;
+    let has_bin = false;
+    findClineBin(false, &bin, 1024, &bin_len, &has_bin);
+    if !has_bin {
+        let msg_ptr = STR_PTR("Cline backend could not resolve a cline binary (install cline or set CLINE_BIN).");
+        let msg_len = STR_LEN("Cline backend could not resolve a cline binary (install cline or set CLINE_BIN).");
+        ClineAgentBridge_setStatus(self, STR_PTR("error"), STR_LEN("error"), msg_ptr, msg_len, true);
+        out_err_len = buf_copy(out_err, 4096, msg_ptr, msg_len);
+        return 1;
+    };
+    ClineHubClient_new(&self.hub, &bin, bin_len, self.dataDir_ptr, self.dataDir_len, self.env_ptr, self.env_len, true);
+    self.has_hub = true;
+    let err_buf = [0u8; 4096];
+    let err_len: u64 = 0;
+    if ClineHubClient_connect(&self.hub, &self.versionCache, &err_buf, 4096, &err_len) != 0 {
+        ClineAgentBridge_setStatus(self, STR_PTR("error"), STR_LEN("error"), &err_buf, err_len, true);
+        out_err_len = buf_copy(out_err, 4096, &err_buf, err_len);
+        return 1;
+    };
+    ClineAgentBridge_setStatus(self, STR_PTR("ready"), STR_LEN("ready"), PTR_NULL(), 0, false);
+    return 0;
+}
+
+fn ClineAgentBridge_restart(self: &ClineAgentBridge, out_err: ptr, out_err_len: &u64) -> i32 {
+    ClineAgentBridge_stop(self);
+    return ClineAgentBridge_start(self, out_err, out_err_len);
+}
+
+// stop(): the hub daemon is shared and detached; the
+// bridge only disconnects.
+fn ClineAgentBridge_stop(self: &ClineAgentBridge) -> void {
+    if self.has_hub {
+        ClineHubClient_close(&self.hub);
+        self.has_hub = false;
+    };
+    ClineAgentBridge_setStatus(self, STR_PTR("stopped"), STR_LEN("stopped"), PTR_NULL(), 0, false);
+}
+
+// hasSession(threadId)
+fn ClineAgentBridge_hasSession(self: &ClineAgentBridge, thread_ptr: ptr, thread_len: u64) -> bool {
+    return cline_find(self, thread_ptr, thread_len) != 4294967295;
+}
+
+// requireHub check
+fn require_hub(self: &ClineAgentBridge, out_err: ptr, out_err_len: &u64) -> bool {
+    if !self.has_hub {
+        out_err_len = buf_copy(out_err, 4096, STR_PTR("Cline bridge is not started"), STR_LEN("Cline bridge is not started"));
+        return false;
+    };
+    return true;
+}
+
+// ---- session helpers ----
+
+fn cline_find(self: &ClineAgentBridge, thread_ptr: ptr, thread_len: u64) -> u64 {
+    for i in 0..self.sessions_count {
+        if self.sessions[i].threadId_len == thread_len && bytes_eq(self.sessions[i].threadId_ptr, thread_ptr, thread_len) { return i; };
+    }
+    return 4294967295;
+}
+
+fn session_init(s: &ClineSessionState, thread_ptr: ptr, thread_len: u64) -> void {
+    s.threadId_ptr = thread_ptr;
+    s.threadId_len = thread_len;
+    s.has_cwd = false;
+    s.cwd_len = 0;
+    s.has_model = false;
+    s.model_len = 0;
+    s.has_providerEntryId = false;
+    s.providerEntryId_len = 0;
+    s.createdAt = 0;
+    s.has_activeTurnId = false;
+    s.activeTurnId_len = 0;
+    s.has_activeRunId = false;
+    s.activeRunId_len = 0;
+    s.has_activeItemId = false;
+    s.activeItemId_len = 0;
+    s.streamedText_len = 0;
+    s.itemStarted = false;
+    s.textSegIndex = 0;
+    s.reasoningSeq = 0;
+    s.planSteps_count = 0;
+    s.pendingTeamRuns_count = 0;
+    s.lastUsage = 0;
+    s.has_lastUsage = false;
+    s.turns_count = 0;
+    s.messages_len = 0;
+    s.msg_count = 0;
+    s.scratch_len = 0;
+}
+
+fn cline_msg_ptr(s: &ClineSessionState, i: u64) -> ptr {
+    return byte_off(&s.messages, s.msg_off[i]);
+}
+
+fn cline_push_message(s: &ClineSessionState, item_ptr: ptr, item_len: u64) -> void {
+    if s.msg_count >= 2048 { return; };
+    s.msg_off[s.msg_count] = s.messages_len;
+    s.msg_len_arr[s.msg_count] = item_len;
+    s.messages_len = s.messages_len + append_bytes(&s.messages, 1048576, s.messages_len, item_ptr, item_len);
+    s.msg_count = s.msg_count + 1;
+}
+
+fn cline_replace_message(s: &ClineSessionState, idx: u64, item_ptr: ptr, item_len: u64) -> void {
+    if item_len <= s.msg_len_arr[idx] {
+        let dst = cline_msg_ptr(s, idx);
+        buf_copy(dst, s.msg_len_arr[idx], item_ptr, item_len);
+        s.msg_len_arr[idx] = item_len;
+        return;
+    };
+    s.msg_off[idx] = s.messages_len;
+    s.msg_len_arr[idx] = item_len;
+    s.messages_len = s.messages_len + append_bytes(&s.messages, 1048576, s.messages_len, item_ptr, item_len);
+}
+
+// find a message index by type + id over parsed docs.
+fn cline_find_message(s: &ClineSessionState, type_ptr: ptr, type_len: u64, id_ptr: ptr, id_len: u64) -> u64 {
+    for i in 0..s.msg_count {
+        let doc = sa_json_parse(cline_msg_ptr(s, i), s.msg_len_arr[i]);
+        if doc == 0 { continue; };
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len) != 0 { continue; };
+        if !str_is(t_ptr, t_len, type_ptr, type_len) { continue; };
+        let v_ptr: ptr = PTR_NULL();
+        let v_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("id"), STR_LEN("id"), &v_ptr, &v_len) == 0 && v_len == id_len && bytes_eq(v_ptr, id_ptr, id_len) { return i; };
+    }
+    return 4294967295;
+}
+
+// find a tool/collab card index by id (either type).
+fn cline_find_card(s: &ClineSessionState, id_ptr: ptr, id_len: u64) -> u64 {
+    for i in 0..s.msg_count {
+        let doc = sa_json_parse(cline_msg_ptr(s, i), s.msg_len_arr[i]);
+        if doc == 0 { continue; };
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len) != 0 { continue; };
+        if !str_is(t_ptr, t_len, STR_PTR("toolCall"), STR_LEN("toolCall")) && !str_is(t_ptr, t_len, STR_PTR("collabAgentToolCall"), STR_LEN("collabAgentToolCall")) { continue; };
+        let v_ptr: ptr = PTR_NULL();
+        let v_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("id"), STR_LEN("id"), &v_ptr, &v_len) == 0 && v_len == id_len && bytes_eq(v_ptr, id_ptr, id_len) { return i; };
+    }
+    return 4294967295;
+}
+
+// ---- string-set helpers (seenEventIds / logged / open) ----
+
+fn set_has(arena: ptr, offs: ptr, lens: ptr, count: u64, p: ptr, n: u64) -> bool {
+    for i in 0..count {
+        let off = u64_at(offs, i);
+        let ln = u64_at(lens, i);
+        if ln == n && bytes_eq(byte_off(arena, off), p, n) { return true; };
+    }
+    return false;
+}
+
+fn u64_at(base: ptr, i: u64) -> u64 {
+    let arr = base as [u64];
+    return arr[i];
+}
+
+// ---- hub command (sync wrapper over the pending table) ----
+
+// hub_command_sync: ClineHubClient_command + pump until
+// the pending entry resolves (hub_pending_take shim reads
+// it before the next handleMessage compacts the table).
+fn hub_command_sync(self: &ClineAgentBridge, name_ptr: ptr, name_len: u64, payload_ptr: ptr, payload_len: u64, session_ptr: ptr, session_len: u64, has_session: bool, timeout_ms: u64, out_doc: &u64, out_err: ptr, out_err_len: &u64) -> i32 {
+    out_doc = 0;
+    out_err_len = 0;
+    let rid = [0u8; 128];
+    let rid_len: u64 = 0;
+    let err_buf = [0u8; 4096];
+    let err_len: u64 = 0;
+    let rc = ClineHubClient_command(&self.hub, &self.versionCache, name_ptr, name_len, payload_ptr, payload_len, session_ptr, session_len, has_session, timeout_ms, &rid, 128, &rid_len, &err_buf, 4096, &err_len);
+    if rc != 0 {
+        out_err_len = buf_copy(out_err, 4096, &err_buf, err_len);
+        return rc;
+    };
+    // pump + take loop (bounded by the caller's timeout at
+    // the repair phase; single drain in this pass)
+    ClineHubClient_pump(&self.hub);
+    let status: u64 = 0;
+    let doc: u64 = 0;
+    let e_len: u64 = 0;
+    hub_pending_take(&self.hub, &rid, rid_len, &status, &doc, out_err, 4096, &e_len);
+    if status == 1 {
+        out_doc = doc;
+        return 0;
+    };
+    if status == 2 {
+        out_err_len = e_len;
+        return 2;
+    };
+    out_err_len = buf_copy(out_err, 4096, STR_PTR("cline hub command timed out"), STR_LEN("cline hub command timed out"));
+    return 3;
+}
+
+// ---- request dispatch ----
+
+struct ClineBuild {
+    payload: [u8; 1048576],
+    payload_len: u64,
+    is_error: bool,
+    err: [u8; 1024],
+    err_len: u64,
+}
+
+fn build_error(msg_ptr: ptr, msg_len: u64) -> ClineBuild {
+    let err = [0u8; 1024];
+    let err_len = buf_copy(&err, 1024, msg_ptr, msg_len);
+    return ClineBuild{ payload: [0u8; 1048576], payload_len: 0, is_error: true, err: err, err_len: err_len };
+}
+
+fn build_ok(payload_ptr: ptr, payload_len: u64) -> ClineBuild {
+    let payload = [0u8; 1048576];
+    let payload_len = buf_copy(&payload, 1048576, payload_ptr, payload_len);
+    return ClineBuild{ payload: payload, payload_len: payload_len, is_error: false, err: [0u8; 1024], err_len: 0 };
+}
+
+// request(method, params, timeoutMs)
+fn ClineAgentBridge_request(self: &ClineAgentBridge, method_ptr: ptr, method_len: u64, params: u64) -> ClineBuild {
+    if str_is(method_ptr, method_len, STR_PTR("initialize"), STR_LEN("initialize")) || str_is(method_ptr, method_len, STR_PTR("config/read"), STR_LEN("config/read")) {
+        return request_initialize(self);
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/start"), STR_LEN("thread/start")) {
+        return request_thread_start(self, params);
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/resume"), STR_LEN("thread/resume")) {
+        return request_thread_resume(self, params);
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/list"), STR_LEN("thread/list")) {
+        return request_thread_list(self, params);
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/turns/list"), STR_LEN("thread/turns/list")) {
+        return request_turns_list(self, params);
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/items/list"), STR_LEN("thread/items/list")) {
+        return request_items_list(self, params);
+    };
+    if str_is(method_ptr, method_len, STR_PTR("turn/start"), STR_LEN("turn/start")) || str_is(method_ptr, method_len, STR_PTR("turn/steer"), STR_LEN("turn/steer")) {
+        return request_turn_start(self, params, str_is(method_ptr, method_len, STR_PTR("turn/steer"), STR_LEN("turn/steer")));
+    };
+    if str_is(method_ptr, method_len, STR_PTR("turn/interrupt"), STR_LEN("turn/interrupt")) {
+        return request_turn_interrupt(self, params);
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/delete"), STR_LEN("thread/delete")) || str_is(method_ptr, method_len, STR_PTR("thread/archive"), STR_LEN("thread/archive")) || str_is(method_ptr, method_len, STR_PTR("thread/closed"), STR_LEN("thread/closed")) || str_is(method_ptr, method_len, STR_PTR("thread/unsubscribe"), STR_LEN("thread/unsubscribe")) {
+        return request_thread_delete(self, params, str_is(method_ptr, method_len, STR_PTR("thread/delete"), STR_LEN("thread/delete")));
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/fork"), STR_LEN("thread/fork")) {
+        return build_error(STR_PTR("Cline backend does not support thread/fork"), STR_LEN("Cline backend does not support thread/fork"));
+    };
+    return build_ok(STR_PTR("{}"), 2);
+}
+
+// notify: the hub protocol has no client->server
+// notification channel we need. respond: this bridge emits
+// no host-routed server requests in v1 (approvals are
+// auto-answered at the hub).
+fn ClineAgentBridge_notify(self: &ClineAgentBridge, method_ptr: ptr, method_len: u64, params: u64) -> void {}
+fn ClineAgentBridge_respond(self: &ClineAgentBridge, id: u64, has_result: bool, result: u64, has_error: bool) -> void {}
+
+fn request_initialize(self: &ClineAgentBridge) -> ClineBuild {
+    let bin = [0u8; 1024];
+    let bin_len: u64 = 0;
+    let has_bin = false;
+    findClineBin(false, &bin, 1024, &bin_len, &has_bin);
+    let version = [0u8; 128];
+    let version_len: u64 = 0;
+    let has_version = false;
+    if has_bin {
+        probeClineVersion(&self.versionCache, &bin, bin_len, &version, 128, &version_len, &has_version);
+    };
+    let home = [0u8; 1024];
+    let home_len: u64 = 0;
+    env_get(STR_PTR("CODEX_HOME"), STR_LEN("CODEX_HOME"), &home, 1024, &home_len);
+    let out = [0u8; 4096];
+    let n: u64 = 0;
+    n = n + append_bytes(&out, 4096, n, STR_PTR("{\"userAgent\":\"cline/"), STR_LEN("{\"userAgent\":\"cline/"));
+    if has_version {
+        n = n + append_bytes(&out, 4096, n, &version, version_len);
+    } else {
+        n = n + append_bytes(&out, 4096, n, STR_PTR("external"), STR_LEN("external"));
+    };
+    n = n + append_bytes(&out, 4096, n, STR_PTR(" codex-react-ui/0.1.0\",\"codexHome\":\""), STR_LEN(" codex-react-ui/0.1.0\",\"codexHome\":\""));
+    n = n + append_bytes(&out, 4096, n, &home, home_len);
+    n = n + append_bytes(&out, 4096, n, STR_PTR("\",\"capabilities\":{\"experimentalApi\":true}}"), STR_LEN("\",\"capabilities\":{\"experimentalApi\":true}}"));
+    return build_ok(&out, n);
+}
+
+fn request_thread_start(self: &ClineAgentBridge, params: u64) -> ClineBuild {
+    let err = [0u8; 4096];
+    let err_len: u64 = 0;
+    if ClineAgentBridge_start(self, &err, &err_len) != 0 { return build_error(&err, err_len); };
+    if !require_hub(self, &err, &err_len) { return build_error(&err, err_len); };
+    let cwd_ptr: ptr = PTR_NULL();
+    let cwd_len: u64 = 0;
+    let has_cwd = params != 0 && sa_json_object_get_string(params, STR_PTR("cwd"), STR_LEN("cwd"), &cwd_ptr, &cwd_len) == 0;
+    if !has_cwd {
+        let cwd_buf = [0u8; 1024];
+        cwd_len = process_cwd(&cwd_buf, 1024);
+        cwd_ptr = &cwd_buf;
+        // NOTE: points into the stack buffer in this pass
+        // (the session copies it at bind time in repair).
+        let keep = [0u8; 1024];
+        cwd_len = buf_copy(&keep, 1024, cwd_ptr, cwd_len);
+        cwd_ptr = &keep;
+    };
+    let req_thread_ptr: ptr = PTR_NULL();
+    let req_thread_len: u64 = 0;
+    let has_req_thread = params != 0 && sa_json_object_get_string(params, STR_PTR("threadId"), STR_LEN("threadId"), &req_thread_ptr, &req_thread_len) == 0;
+    let upstream = ClineUpstreamConfig{ providerEntryId_ptr: PTR_NULL(), providerEntryId_len: 0, model_ptr: PTR_NULL(), model_len: 0 };
+    let has_upstream = false;
+    if has_req_thread {
+        pending_upstream_of(self, req_thread_ptr, req_thread_len, &upstream, &has_upstream);
+    };
+    if !has_upstream && self.has_defaultUpstream {
+        upstream = self.defaultUpstream;
+        has_upstream = true;
+    };
+    let model_ptr: ptr = PTR_NULL();
+    let model_len: u64 = 0;
+    let has_model = params != 0 && sa_json_object_get_string(params, STR_PTR("model"), STR_LEN("model"), &model_ptr, &model_len) == 0;
+    if !has_model && has_upstream {
+        model_ptr = upstream.model_ptr;
+        model_len = upstream.model_len;
+        has_model = model_len > 0;
+    };
+    // hub.command("session.create", {cwd, metadata})
+    let payload = [0u8; 8192];
+    let payload_len: u64 = 0;
+    payload_len = payload_len + append_bytes(&payload, 8192, payload_len, STR_PTR("{\"cwd\":\""), STR_LEN("{\"cwd\":\""));
+    payload_len = payload_len + append_bytes(&payload, 8192, payload_len, cwd_ptr, cwd_len);
+    payload_len = payload_len + append_bytes(&payload, 8192, payload_len, STR_PTR("\",\"metadata\":{"), STR_LEN("\",\"metadata\":{"));
+    let first = true;
+    if has_upstream {
+        payload_len = payload_len + append_bytes(&payload, 8192, payload_len, STR_PTR("\"provider\":\""), STR_LEN("\"provider\":\""));
+        payload_len = payload_len + append_bytes(&payload, 8192, payload_len, upstream.providerEntryId_ptr, upstream.providerEntryId_len);
+        payload_len = payload_len + append_bytes(&payload, 8192, payload_len, STR_PTR("\""), 1);
+        first = false;
+    };
+    if has_model {
+        if !first { payload_len = payload_len + append_bytes(&payload, 8192, payload_len, STR_PTR(","), 1); };
+        payload_len = payload_len + append_bytes(&payload, 8192, payload_len, STR_PTR("\"model\":\""), STR_LEN("\"model\":\""));
+        payload_len = payload_len + append_bytes(&payload, 8192, payload_len, model_ptr, model_len);
+        payload_len = payload_len + append_bytes(&payload, 8192, payload_len, STR_PTR("\""), 1);
+        first = false;
+    };
+    if !first { payload_len = payload_len + append_bytes(&payload, 8192, payload_len, STR_PTR(","), 1); };
+    payload_len = payload_len + append_bytes(&payload, 8192, payload_len, STR_PTR("\"autoApproveTools\":true}}"), STR_LEN("\"autoApproveTools\":true}}"));
+    let created: u64 = 0;
+    if hub_command_sync(self, STR_PTR("session.create"), STR_LEN("session.create"), &payload, payload_len, PTR_NULL(), 0, false, 60000, &created, &err, &err_len) != 0 {
+        return build_error(&err, err_len);
+    };
+    let session: u64 = 0;
+    if created != 0 { sa_json_object_get(created, STR_PTR("session"), STR_LEN("session"), &session); };
+    let thread_ptr: ptr = PTR_NULL();
+    let thread_len: u64 = 0;
+    if session == 0 || sa_json_object_get_string(session, STR_PTR("sessionId"), STR_LEN("sessionId"), &thread_ptr, &thread_len) != 0 || thread_len == 0 {
+        return build_error(STR_PTR("cline hub session.create returned no sessionId"), STR_LEN("cline hub session.create returned no sessionId"));
+    };
+    if self.sessions_count >= 16 { return build_error(STR_PTR("cline session table full"), STR_LEN("cline session table full")); };
+    let idx = self.sessions_count;
+    self.sessions_count = self.sessions_count + 1;
+    let s = &self.sessions[idx];
+    session_init(s, thread_ptr, thread_len);
+    s.cwd_ptr = cwd_ptr;
+    s.cwd_len = cwd_len;
+    s.has_cwd = true;
+    if has_model { s.model_ptr = model_ptr; s.model_len = model_len; s.has_model = true; };
+    if has_upstream { s.providerEntryId_ptr = upstream.providerEntryId_ptr; s.providerEntryId_len = upstream.providerEntryId_len; s.has_providerEntryId = true; };
+    let created_at: i64 = 0;
+    if sa_json_object_get_i64(session, STR_PTR("createdAt"), STR_LEN("createdAt"), &created_at) == 0 {
+        s.createdAt = created_at as u64;
+    } else {
+        s.createdAt = now_ms();
+    };
+    ClineHubClient_subscribe(&self.hub, thread_ptr, thread_len, true);
+    let frame = [0u8; 4096];
+    let frame_len: u64 = 0;
+    frame_len = frame_len + append_bytes(&frame, 4096, frame_len, STR_PTR("{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\""), STR_LEN("{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\""));
+    frame_len = frame_len + append_bytes(&frame, 4096, frame_len, thread_ptr, thread_len);
+    frame_len = frame_len + append_bytes(&frame, 4096, frame_len, STR_PTR("\",\"model\":"), STR_LEN("\",\"model\":"));
+    if has_model {
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, STR_PTR("\""), 1);
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, model_ptr, model_len);
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, STR_PTR("\""), 1);
+    } else {
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, STR_PTR("null"), 4);
+    };
+    frame_len = frame_len + append_bytes(&frame, 4096, frame_len, STR_PTR(",\"cliBackend\":\"cline\",\"status\":{\"type\":\"idle\"},\"cwd\":\""), STR_LEN(",\"cliBackend\":\"cline\",\"status\":{\"type\":\"idle\"},\"cwd\":\""));
+    frame_len = frame_len + append_bytes(&frame, 4096, frame_len, cwd_ptr, cwd_len);
+    frame_len = frame_len + append_bytes(&frame, 4096, frame_len, STR_PTR("\"}}}"), 4);
+    emit_message(self, &frame, frame_len);
+    let out = [0u8; 4096];
+    let n: u64 = 0;
+    n = n + append_bytes(&out, 4096, n, STR_PTR("{\"thread\":{\"id\":\""), STR_LEN("{\"thread\":{\"id\":\""));
+    n = n + append_bytes(&out, 4096, n, thread_ptr, thread_len);
+    n = n + append_bytes(&out, 4096, n, STR_PTR("\",\"model\":"), STR_LEN("\",\"model\":"));
+    if has_model {
+        n = n + append_bytes(&out, 4096, n, STR_PTR("\""), 1);
+        n = n + append_bytes(&out, 4096, n, model_ptr, model_len);
+        n = n + append_bytes(&out, 4096, n, STR_PTR("\""), 1);
+    } else {
+        n = n + append_bytes(&out, 4096, n, STR_PTR("null"), 4);
+    };
+    n = n + append_bytes(&out, 4096, n, STR_PTR(",\"cliBackend\":\"cline\",\"status\":{\"type\":\"idle\"}}}"), STR_LEN(",\"cliBackend\":\"cline\",\"status\":{\"type\":\"idle\"}}}"));
+    return build_ok(&out, n);
+}
+
+// bindSession(session record) -> session index (existing
+// returned as-is).
+fn bind_session(self: &ClineAgentBridge, session: u64, out_idx: &u64) -> bool {
+    let thread_ptr: ptr = PTR_NULL();
+    let thread_len: u64 = 0;
+    sa_json_object_get_string(session, STR_PTR("sessionId"), STR_LEN("sessionId"), &thread_ptr, &thread_len);
+    if thread_len == 0 { return false; };
+    let existing = cline_find(self, thread_ptr, thread_len);
+    if existing != 4294967295 {
+        out_idx = existing;
+        return true;
+    };
+    if self.sessions_count >= 16 { return false; };
+    let idx = self.sessions_count;
+    self.sessions_count = self.sessions_count + 1;
+    let s = &self.sessions[idx];
+    session_init(s, thread_ptr, thread_len);
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    if sa_json_object_get_string(session, STR_PTR("cwd"), STR_LEN("cwd"), &v_ptr, &v_len) == 0 { s.cwd_ptr = v_ptr; s.cwd_len = v_len; s.has_cwd = true; };
+    let metadata: u64 = 0;
+    sa_json_object_get(session, STR_PTR("metadata"), STR_LEN("metadata"), &metadata);
+    if metadata != 0 {
+        if sa_json_object_get_string(metadata, STR_PTR("model"), STR_LEN("model"), &v_ptr, &v_len) == 0 { s.model_ptr = v_ptr; s.model_len = v_len; s.has_model = true; };
+        if sa_json_object_get_string(metadata, STR_PTR("provider"), STR_LEN("provider"), &v_ptr, &v_len) == 0 { s.providerEntryId_ptr = v_ptr; s.providerEntryId_len = v_len; s.has_providerEntryId = true; };
+    };
+    let created_at: i64 = 0;
+    if sa_json_object_get_i64(session, STR_PTR("createdAt"), STR_LEN("createdAt"), &created_at) == 0 {
+        s.createdAt = created_at as u64;
+    } else {
+        s.createdAt = now_ms();
+    };
+    out_idx = idx;
+    return true;
+}
+
+fn request_thread_resume(self: &ClineAgentBridge, params: u64) -> ClineBuild {
+    let err = [0u8; 4096];
+    let err_len: u64 = 0;
+    if ClineAgentBridge_start(self, &err, &err_len) != 0 { return build_error(&err, err_len); };
+    if !require_hub(self, &err, &err_len) { return build_error(&err, err_len); };
+    let thread_ptr: ptr = PTR_NULL();
+    let thread_len: u64 = 0;
+    if params != 0 { sa_json_object_get_string(params, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len); };
+    // child session short-circuit
+    if cline_find(self, thread_ptr, thread_len) == 4294967295 {
+        let proj = ClineChildProjection{ childId_off: 0, childId_len: 0, rootSessionId_off: 0, rootSessionId_len: 0, agentFile_off: 0, agentFile_len: 0, items_json: [0u8; 1048576], items_json_len: 0, running: false, startedAt: 0 };
+        let proj_ok = false;
+        read_child_session(self, thread_ptr, thread_len, &proj, &proj_ok);
+        if proj_ok {
+            let cwd_buf = [0u8; 1024];
+            let cwd_len = process_cwd(&cwd_buf, 1024);
+            let out = [0u8; 4096];
+            let n: u64 = 0;
+            n = n + append_bytes(&out, 4096, n, STR_PTR("{\"thread\":{\"id\":\""), STR_LEN("{\"thread\":{\"id\":\""));
+            n = n + append_bytes(&out, 4096, n, thread_ptr, thread_len);
+            n = n + append_bytes(&out, 4096, n, STR_PTR("\",\"cliBackend\":\"cline\",\"status\":{\"type\":\""), STR_LEN("\",\"cliBackend\":\"cline\",\"status\":{\"type\":\""));
+            if proj.running {
+                n = n + append_bytes(&out, 4096, n, STR_PTR("running"), STR_LEN("running"));
+            } else {
+                n = n + append_bytes(&out, 4096, n, STR_PTR("idle"), 4);
+            };
+            n = n + append_bytes(&out, 4096, n, STR_PTR("\"},\"cwd\":\""), STR_LEN("\"},\"cwd\":\""));
+            n = n + append_bytes(&out, 4096, n, &cwd_buf, cwd_len);
+            n = n + append_bytes(&out, 4096, n, STR_PTR("\"}}"), 3);
+            return build_ok(&out, n);
+        };
+    };
+    let got: u64 = 0;
+    if hub_command_sync(self, STR_PTR("session.get"), STR_LEN("session.get"), STR_PTR("{}"), 2, thread_ptr, thread_len, true, 60000, &got, &err, &err_len) != 0 {
+        return build_error(&err, err_len);
+    };
+    let session: u64 = 0;
+    if got != 0 { sa_json_object_get(got, STR_PTR("session"), STR_LEN("session"), &session); };
+    let sid_ptr: ptr = PTR_NULL();
+    let sid_len: u64 = 0;
+    if session == 0 || sa_json_object_get_string(session, STR_PTR("sessionId"), STR_LEN("sessionId"), &sid_ptr, &sid_len) != 0 || sid_len == 0 {
+        let msg = [0u8; 2048];
+        let msg_len: u64 = 0;
+        msg_len = msg_len + append_bytes(&msg, 2048, msg_len, STR_PTR("Unknown thread: "), STR_LEN("Unknown thread: "));
+        msg_len = msg_len + append_bytes(&msg, 2048, msg_len, thread_ptr, thread_len);
+        return build_error(&msg, msg_len);
+    };
+    let idx: u64 = 0;
+    if !bind_session(self, session, &idx) { return build_error(STR_PTR("cline session table full"), STR_LEN("cline session table full")); };
+    let s = &self.sessions[idx];
+    ClineHubClient_subscribe(&self.hub, thread_ptr, thread_len, true);
+    let out = [0u8; 4096];
+    let n: u64 = 0;
+    n = n + append_bytes(&out, 4096, n, STR_PTR("{\"thread\":{\"id\":\""), STR_LEN("{\"thread\":{\"id\":\""));
+    n = n + append_bytes(&out, 4096, n, s.threadId_ptr, s.threadId_len);
+    n = n + append_bytes(&out, 4096, n, STR_PTR("\",\"model\":"), STR_LEN("\",\"model\":"));
+    if s.has_model {
+        n = n + append_bytes(&out, 4096, n, STR_PTR("\""), 1);
+        n = n + append_bytes(&out, 4096, n, s.model_ptr, s.model_len);
+        n = n + append_bytes(&out, 4096, n, STR_PTR("\""), 1);
+    } else {
+        n = n + append_bytes(&out, 4096, n, STR_PTR("null"), 4);
+    };
+    n = n + append_bytes(&out, 4096, n, STR_PTR(",\"cliBackend\":\"cline\",\"status\":{\"type\":\"idle\"},\"cwd\":"), STR_LEN(",\"cliBackend\":\"cline\",\"status\":{\"type\":\"idle\"},\"cwd\":"));
+    if s.has_cwd {
+        n = n + append_bytes(&out, 4096, n, STR_PTR("\""), 1);
+        n = n + append_bytes(&out, 4096, n, s.cwd_ptr, s.cwd_len);
+        n = n + append_bytes(&out, 4096, n, STR_PTR("\""), 1);
+    } else {
+        n = n + append_bytes(&out, 4096, n, STR_PTR("null"), 4);
+    };
+    n = n + append_bytes(&out, 4096, n, STR_PTR("}}"), 2);
+    return build_ok(&out, n);
+}
+
+fn request_thread_list(self: &ClineAgentBridge, params: u64) -> ClineBuild {
+    let err = [0u8; 4096];
+    let err_len: u64 = 0;
+    if ClineAgentBridge_start(self, &err, &err_len) != 0 { return build_error(&err, err_len); };
+    let listed: u64 = 0;
+    if hub_command_sync(self, STR_PTR("session.list"), STR_LEN("session.list"), STR_PTR("{}"), 2, PTR_NULL(), 0, false, 60000, &listed, &err, &err_len) != 0 {
+        return build_error(&err, err_len);
+    };
+    let sessions: u64 = 0;
+    if listed != 0 {
+        if sa_json_object_get(listed, STR_PTR("sessions"), STR_LEN("sessions"), &sessions) != 0 {
+            sa_json_object_get(listed, STR_PTR("data"), STR_LEN("data"), &sessions);
+        };
+    };
+    let out = [0u8; 262144];
+    let n: u64 = 0;
+    n = n + append_bytes(&out, 262144, n, STR_PTR("{\"data\":["), STR_LEN("{\"data\":["));
+    let count: u64 = 0;
+    let written: u64 = 0;
+    if sessions != 0 && sa_json_array_len(sessions, &count) == 0 {
+        for i in 0..count {
+            let entry: u64 = 0;
+            sa_json_array_get(sessions, i, &entry);
+            let session = entry;
+            let id_ptr: ptr = PTR_NULL();
+            let id_len: u64 = 0;
+            if session == 0 || sa_json_object_get_string(session, STR_PTR("sessionId"), STR_LEN("sessionId"), &id_ptr, &id_len) != 0 || id_len == 0 { continue; };
+            let metadata: u64 = 0;
+            sa_json_object_get(session, STR_PTR("metadata"), STR_LEN("metadata"), &metadata);
+            let created: i64 = 0;
+            let has_created = sa_json_object_get_i64(session, STR_PTR("createdAt"), STR_LEN("createdAt"), &created) == 0;
+            if !has_created { created = now_ms() as i64; };
+            let updated: i64 = 0;
+            if sa_json_object_get_i64(session, STR_PTR("updatedAt"), STR_LEN("updatedAt"), &updated) != 0 { updated = created; };
+            if written > 0 { n = n + append_bytes(&out, 262144, n, STR_PTR(","), 1); };
+            written = written + 1;
+            n = n + append_bytes(&out, 262144, n, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+            n = n + append_bytes(&out, 262144, n, id_ptr, id_len);
+            n = n + append_bytes(&out, 262144, n, STR_PTR("\",\"preview\":"), STR_LEN("\",\"preview\":"));
+            let title_ptr: ptr = PTR_NULL();
+            let title_len: u64 = 0;
+            let has_title = metadata != 0 && sa_json_object_get_string(metadata, STR_PTR("title"), STR_LEN("title"), &title_ptr, &title_len) == 0;
+            if has_title {
+                n = n + append_bytes(&out, 262144, n, STR_PTR("\""), 1);
+                n = n + append_bytes(&out, 262144, n, title_ptr, title_len);
+                n = n + append_bytes(&out, 262144, n, STR_PTR("\""), 1);
+            } else {
+                n = n + append_bytes(&out, 262144, n, STR_PTR("null"), 4);
+            };
+            n = n + append_bytes(&out, 262144, n, STR_PTR(",\"model\":"), STR_LEN(",\"model\":"));
+            let m_ptr: ptr = PTR_NULL();
+            let m_len: u64 = 0;
+            let has_m = metadata != 0 && sa_json_object_get_string(metadata, STR_PTR("model"), STR_LEN("model"), &m_ptr, &m_len) == 0;
+            if has_m {
+                n = n + append_bytes(&out, 262144, n, STR_PTR("\""), 1);
+                n = n + append_bytes(&out, 262144, n, m_ptr, m_len);
+                n = n + append_bytes(&out, 262144, n, STR_PTR("\""), 1);
+            } else {
+                n = n + append_bytes(&out, 262144, n, STR_PTR("null"), 4);
+            };
+            n = n + append_bytes(&out, 262144, n, STR_PTR(",\"cliBackend\":\"cline\",\"status\":{\"type\":\"idle\"},\"cwd\":"), STR_LEN(",\"cliBackend\":\"cline\",\"status\":{\"type\":\"idle\"},\"cwd\":"));
+            let cwd_ptr: ptr = PTR_NULL();
+            let cwd_len: u64 = 0;
+            let has_cwd = sa_json_object_get_string(session, STR_PTR("cwd"), STR_LEN("cwd"), &cwd_ptr, &cwd_len) == 0;
+            if has_cwd {
+                n = n + append_bytes(&out, 262144, n, STR_PTR("\""), 1);
+                n = n + append_bytes(&out, 262144, n, cwd_ptr, cwd_len);
+                n = n + append_bytes(&out, 262144, n, STR_PTR("\""), 1);
+            } else {
+                n = n + append_bytes(&out, 262144, n, STR_PTR("null"), 4);
+            };
+            n = n + append_bytes(&out, 262144, n, STR_PTR(",\"createdAt\":"), STR_LEN(",\"createdAt\":"));
+            n = n + append_i64(&out, 262144, n, created / 1000);
+            n = n + append_bytes(&out, 262144, n, STR_PTR(",\"updatedAt\":"), STR_LEN(",\"updatedAt\":"));
+            n = n + append_i64(&out, 262144, n, updated / 1000);
+            n = n + append_bytes(&out, 262144, n, STR_PTR(",\"recencyAt\":"), STR_LEN(",\"recencyAt\":"));
+            n = n + append_i64(&out, 262144, n, updated / 1000);
+            n = n + append_bytes(&out, 262144, n, STR_PTR(",\"source\":\"appServer\",\"turns\":[]}"), STR_LEN(",\"source\":\"appServer\",\"turns\":[]}"));
+        }
+    };
+    n = n + append_bytes(&out, 262144, n, STR_PTR("]}"), 2);
+    return build_ok(&out, n);
+}
+
+// ---- child sessions ----
+
+// resolveChildFile(childId): 30 s cache over
+// findClineChildFile (clineChildSession.sla canonical).
+fn resolve_child_file(self: &ClineAgentBridge, child_ptr: ptr, child_len: u64, out_file: ptr, out_file_cap: u64, out_file_len: &u64, out_root: ptr, out_root_cap: u64, out_root_len: &u64, out_ok: &bool) -> void {
+    out_ok = false;
+    out_file_len = 0;
+    out_root_len = 0;
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    ts_trim_span(child_ptr, child_len, &tp, &tl);
+    if tl == 0 { return; };
+    let now = now_ms();
+    for i in 0..self.childFileCache_count {
+        let e = &self.childFileCache[i];
+        if e.id_len == tl && bytes_eq(&e.id, tp, tl) && now - e.at_ms < 30000 {
+            out_file_len = buf_copy(out_file, out_file_cap, &e.file, e.file_len);
+            out_root_len = buf_copy(out_root, out_root_cap, &e.root, e.root_len);
+            out_ok = true;
+            return;
+        };
+    }
+    // claimed = every cached file (newline-joined)
+    let claimed = [0u8; 65536];
+    let claimed_len: u64 = 0;
+    for i in 0..self.childFileCache_count {
+        let e = &self.childFileCache[i];
+        claimed_len = claimed_len + append_bytes(&claimed, 65536, claimed_len, &e.file, e.file_len);
+        claimed_len = claimed_len + append_bytes(&claimed, 65536, claimed_len, STR_PTR("\n"), 1);
+    };
+    let root_buf = [0u8; 1024];
+    let root_len: u64 = 0;
+    let file_buf = [0u8; 2048];
+    let file_len: u64 = 0;
+    let found = false;
+    findClineChildFile(&self.childState, self.dataDir_ptr, self.dataDir_len, tp, tl, &claimed, claimed_len, &root_buf, 1024, &root_len, &file_buf, 2048, &file_len, &found);
+    if found && self.childFileCache_count < 128 {
+        let e = &self.childFileCache[self.childFileCache_count];
+        e.id_len = buf_copy(&e.id, 128, tp, tl);
+        e.file_len = buf_copy(&e.file, 1024, &file_buf, file_len);
+        e.root_len = buf_copy(&e.root, 128, &root_buf, root_len);
+        e.at_ms = now;
+        self.childFileCache_count = self.childFileCache_count + 1;
+    };
+    // re-read through the cache (source returns the cached
+    // entry even when stale)
+    for i in 0..self.childFileCache_count {
+        let e = &self.childFileCache[i];
+        if e.id_len == tl && bytes_eq(&e.id, tp, tl) {
+            out_file_len = buf_copy(out_file, out_file_cap, &e.file, e.file_len);
+            out_root_len = buf_copy(out_root, out_root_cap, &e.root, e.root_len);
+            out_ok = true;
+            return;
+        };
+    }
+}
+
+// hasChildThread(childId)
+fn ClineAgentBridge_hasChildThread(self: &ClineAgentBridge, child_ptr: ptr, child_len: u64) -> bool {
+    let file = [0u8; 2048];
+    let file_len: u64 = 0;
+    let root = [0u8; 128];
+    let root_len: u64 = 0;
+    let ok = false;
+    resolve_child_file(self, child_ptr, child_len, &file, 2048, &file_len, &root, 128, &root_len, &ok);
+    return ok;
+}
+
+// readChildSession(childId) -> projection
+fn read_child_session(self: &ClineAgentBridge, child_ptr: ptr, child_len: u64, out: &ClineChildProjection, out_ok: &bool) -> void {
+    out_ok = false;
+    let file = [0u8; 2048];
+    let file_len: u64 = 0;
+    let root = [0u8; 128];
+    let root_len: u64 = 0;
+    let found = false;
+    resolve_child_file(self, child_ptr, child_len, &file, 2048, &file_len, &root, 128, &root_len, &found);
+    if !found { return; };
+    let running = set_has(&self.openSpawnIds, &self.open_off, &self.open_len_arr, self.open_count, child_ptr, child_len);
+    let arena = [0u8; 1048576];
+    projectClineChildFile(&file, file_len, child_ptr, child_len, running, out, &arena, out_ok);
+}
+
+// open-spawn set add/remove
+fn open_spawn_add(self: &ClineAgentBridge, p: ptr, n: u64) -> void {
+    if set_has(&self.openSpawnIds, &self.open_off, &self.open_len_arr, self.open_count, p, n) { return; };
+    if self.open_count >= 256 { return; };
+    self.open_off[self.open_count] = self.open_used;
+    self.open_len_arr[self.open_count] = n;
+    for i in 0..n {
+        if self.open_used < 16384 { self.openSpawnIds[self.open_used] = byte_at(p, i); self.open_used = self.open_used + 1; };
+    }
+    self.open_count = self.open_count + 1;
+}
+
+fn open_spawn_remove(self: &ClineAgentBridge, p: ptr, n: u64) -> void {
+    for i in 0..self.open_count {
+        if self.open_len_arr[i] == n && bytes_eq(slot(&self.openSpawnIds, self.open_off[i]), p, n) {
+            // tombstone: zero the length (set scans skip it
+            // unless n == 0, which never matches an id)
+            self.open_len_arr[i] = 0;
+            return;
+        };
+    }
+}
+
+// ---- history ----
+
+// ensureSessionWithHistory(threadId) -> session index or
+// 4294967295. History is best-effort: an unreachable hub
+// yields the (possibly empty) state rather than an error.
+fn ensure_session_with_history(self: &ClineAgentBridge, thread_ptr: ptr, thread_len: u64) -> u64 {
+    if thread_len == 0 { return 4294967295; };
+    let idx = cline_find(self, thread_ptr, thread_len);
+    if idx != 4294967295 && self.sessions[idx].msg_count > 0 { return idx; };
+    let err = [0u8; 4096];
+    let err_len: u64 = 0;
+    if ClineAgentBridge_start(self, &err, &err_len) != 0 { return idx; };
+    if !self.has_hub { return idx; };
+    if idx == 4294967295 {
+        let got: u64 = 0;
+        if hub_command_sync(self, STR_PTR("session.get"), STR_LEN("session.get"), STR_PTR("{}"), 2, thread_ptr, thread_len, true, 60000, &got, &err, &err_len) != 0 { return 4294967295; };
+        let session: u64 = 0;
+        if got != 0 { sa_json_object_get(got, STR_PTR("session"), STR_LEN("session"), &session); };
+        let sid_ptr: ptr = PTR_NULL();
+        let sid_len: u64 = 0;
+        if session == 0 || sa_json_object_get_string(session, STR_PTR("sessionId"), STR_LEN("sessionId"), &sid_ptr, &sid_len) != 0 || sid_len == 0 { return 4294967295; };
+        if !bind_session(self, session, &idx) { return 4294967295; };
+    };
+    let s = &self.sessions[idx];
+    let result: u64 = 0;
+    if hub_command_sync(self, STR_PTR("session.messages"), STR_LEN("session.messages"), STR_PTR("{}"), 2, thread_ptr, thread_len, true, 60000, &result, &err, &err_len) == 0 && result != 0 {
+        let messages: u64 = 0;
+        sa_json_object_get(result, STR_PTR("messages"), STR_LEN("messages"), &messages);
+        s.msg_count = 0;
+        s.messages_len = 0;
+        let mc: u64 = 0;
+        if messages != 0 && sa_json_array_len(messages, &mc) == 0 {
+            for i in 0..mc {
+                let entry: u64 = 0;
+                sa_json_array_get(messages, i, &entry);
+                map_hub_message(self, s, entry, thread_ptr, thread_len);
+            }
+        };
+        build_turns_from_items(s);
+        // Backfill the spawn index from persisted collab
+        // cards so child cards keep resolving after bridge
+        // restarts.
+        for i in 0..s.msg_count {
+            let doc = sa_json_parse(cline_msg_ptr(s, i), s.msg_len_arr[i]);
+            if doc == 0 { continue; };
+            let t_ptr: ptr = PTR_NULL();
+            let t_len: u64 = 0;
+            if sa_json_object_get_string(doc, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len) != 0 || !str_is(t_ptr, t_len, STR_PTR("collabAgentToolCall"), STR_LEN("collabAgentToolCall")) { continue; };
+            let id_ptr: ptr = PTR_NULL();
+            let id_len: u64 = 0;
+            if sa_json_object_get_string(doc, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len) != 0 { continue; };
+            let prompt_ptr: ptr = PTR_NULL();
+            let prompt_len: u64 = 0;
+            if sa_json_object_get_string(doc, STR_PTR("prompt"), STR_LEN("prompt"), &prompt_ptr, &prompt_len) != 0 || prompt_len == 0 {
+                sa_json_object_get_string(doc, STR_PTR("message"), STR_LEN("message"), &prompt_ptr, &prompt_len);
+            };
+            if prompt_len == 0 { continue; };
+            let take = prompt_len;
+            if take > 4000 { take = 4000; };
+            recordClineSpawn(self.dataDir_ptr, self.dataDir_len, id_ptr, id_len, thread_ptr, thread_len, prompt_ptr, take, PTR_NULL(), 0, s.createdAt, PTR_NULL(), 0, false);
+        }
+    };
+    return idx;
+}
+
+// buildTurnsFromItems(state): group messages into turns
+// (a userMessage opens a turn). The bridge's turn rows
+// carry id/status only; items stay in the message list.
+fn build_turns_from_items(s: &ClineSessionState) -> void {
+    s.turns_count = 0;
+    let have_current = false;
+    for i in 0..s.msg_count {
+        let doc = sa_json_parse(cline_msg_ptr(s, i), s.msg_len_arr[i]);
+        if doc == 0 { continue; };
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len) != 0 { continue; };
+        if str_is(t_ptr, t_len, STR_PTR("userMessage"), STR_LEN("userMessage")) {
+            if s.turns_count < 128 {
+                let row = &s.turns[s.turns_count];
+                let uid = [0u8; 64];
+                let uid_len = uuid_new(&uid, 64);
+                row.id_len = buf_copy(&row.id, 64, &uid, uid_len);
+                row.status_len = buf_copy(&row.status, 32, STR_PTR("completed"), STR_LEN("completed"));
+                s.turns_count = s.turns_count + 1;
+            };
+            have_current = true;
+        };
+    }
+}
+
+fn request_turns_list(self: &ClineAgentBridge, params: u64) -> ClineBuild {
+    let thread_ptr: ptr = PTR_NULL();
+    let thread_len: u64 = 0;
+    if params != 0 { sa_json_object_get_string(params, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len); };
+    if cline_find(self, thread_ptr, thread_len) == 4294967295 {
+        let proj = ClineChildProjection{ childId_off: 0, childId_len: 0, rootSessionId_off: 0, rootSessionId_len: 0, agentFile_off: 0, agentFile_len: 0, items_json: [0u8; 1048576], items_json_len: 0, running: false, startedAt: 0 };
+        let proj_ok = false;
+        read_child_session(self, thread_ptr, thread_len, &proj, &proj_ok);
+        if proj_ok {
+            let out = [0u8; 4096];
+            let n: u64 = 0;
+            n = n + append_bytes(&out, 4096, n, STR_PTR("{\"turns\":[{\"id\":\""), STR_LEN("{\"turns\":[{\"id\":\""));
+            n = n + append_bytes(&out, 4096, n, thread_ptr, thread_len);
+            n = n + append_bytes(&out, 4096, n, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+            n = n + append_bytes(&out, 4096, n, thread_ptr, thread_len);
+            n = n + append_bytes(&out, 4096, n, STR_PTR("\",\"status\":\""), STR_LEN("\",\"status\":\""));
+            if proj.running {
+                n = n + append_bytes(&out, 4096, n, STR_PTR("inProgress"), STR_LEN("inProgress"));
+            } else {
+                n = n + append_bytes(&out, 4096, n, STR_PTR("completed"), STR_LEN("completed"));
+            };
+            n = n + append_bytes(&out, 4096, n, STR_PTR("\",\"items\":[]}]}"), STR_LEN("\",\"items\":[]}]}"));
+            return build_ok(&out, n);
+        };
+    };
+    let idx = ensure_session_with_history(self, thread_ptr, thread_len);
+    let out = [0u8; 262144];
+    let n: u64 = 0;
+    n = n + append_bytes(&out, 262144, n, STR_PTR("{\"turns\":["), STR_LEN("{\"turns\":["));
+    if idx != 4294967295 {
+        let s = &self.sessions[idx];
+        for i in 0..s.turns_count {
+            if i > 0 { n = n + append_bytes(&out, 262144, n, STR_PTR(","), 1); };
+            n = n + append_bytes(&out, 262144, n, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+            n = n + append_bytes(&out, 262144, n, &s.turns[i].id, s.turns[i].id_len);
+            n = n + append_bytes(&out, 262144, n, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+            n = n + append_bytes(&out, 262144, n, s.threadId_ptr, s.threadId_len);
+            n = n + append_bytes(&out, 262144, n, STR_PTR("\",\"status\":\""), STR_LEN("\",\"status\":\""));
+            n = n + append_bytes(&out, 262144, n, &s.turns[i].status, s.turns[i].status_len);
+            n = n + append_bytes(&out, 262144, n, STR_PTR("\",\"items\":[]}"), STR_LEN("\",\"items\":[]}"));
+        }
+    };
+    n = n + append_bytes(&out, 262144, n, STR_PTR("]}"), 2);
+    return build_ok(&out, n);
+}
+
+fn request_items_list(self: &ClineAgentBridge, params: u64) -> ClineBuild {
+    let thread_ptr: ptr = PTR_NULL();
+    let thread_len: u64 = 0;
+    if params != 0 { sa_json_object_get_string(params, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len); };
+    if cline_find(self, thread_ptr, thread_len) == 4294967295 {
+        let proj = ClineChildProjection{ childId_off: 0, childId_len: 0, rootSessionId_off: 0, rootSessionId_len: 0, agentFile_off: 0, agentFile_len: 0, items_json: [0u8; 1048576], items_json_len: 0, running: false, startedAt: 0 };
+        let proj_ok = false;
+        read_child_session(self, thread_ptr, thread_len, &proj, &proj_ok);
+        if proj_ok {
+            let out = [0u8; 1048576];
+            let n: u64 = 0;
+            n = n + append_bytes(&out, 1048576, n, STR_PTR("{\"items\":"), STR_LEN("{\"items\":"));
+            n = n + append_bytes(&out, 1048576, n, &proj.items_json, proj.items_json_len);
+            n = n + append_bytes(&out, 1048576, n, STR_PTR("}"), 1);
+            return build_ok(&out, n);
+        };
+    };
+    let idx = ensure_session_with_history(self, thread_ptr, thread_len);
+    let out = [0u8; 1048576];
+    let n: u64 = 0;
+    n = n + append_bytes(&out, 1048576, n, STR_PTR("{\"items\":["), STR_LEN("{\"items\":["));
+    if idx != 4294967295 {
+        let s = &self.sessions[idx];
+        for i in 0..s.msg_count {
+            if i > 0 { n = n + append_bytes(&out, 1048576, n, STR_PTR(","), 1); };
+            n = n + append_bytes(&out, 1048576, n, cline_msg_ptr(s, i), s.msg_len_arr[i]);
+        }
+    };
+    n = n + append_bytes(&out, 1048576, n, STR_PTR("]}"), 2);
+    return build_ok(&out, n);
+}
+
+// ---- turns ----
+
+fn request_turn_start(self: &ClineAgentBridge, params: u64, is_steer: bool) -> ClineBuild {
+    let thread_ptr: ptr = PTR_NULL();
+    let thread_len: u64 = 0;
+    if params != 0 { sa_json_object_get_string(params, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len); };
+    let idx = cline_find(self, thread_ptr, thread_len);
+    if idx == 4294967295 {
+        let msg = [0u8; 2048];
+        let msg_len: u64 = 0;
+        msg_len = msg_len + append_bytes(&msg, 2048, msg_len, STR_PTR("Unknown thread: "), STR_LEN("Unknown thread: "));
+        msg_len = msg_len + append_bytes(&msg, 2048, msg_len, thread_ptr, thread_len);
+        return build_error(&msg, msg_len);
+    };
+    let s = &self.sessions[idx];
+    if !is_steer && s.has_activeTurnId {
+        let msg = [0u8; 2048];
+        let msg_len: u64 = 0;
+        msg_len = msg_len + append_bytes(&msg, 2048, msg_len, STR_PTR("Turn is already active: "), STR_LEN("Turn is already active: "));
+        msg_len = msg_len + append_bytes(&msg, 2048, msg_len, &s.activeTurnId, s.activeTurnId_len);
+        return build_error(&msg, msg_len);
+    };
+    let text = [0u8; 262144];
+    let text_len = extract_turn_text(params, &text, 262144);
+    if text_len == 0 {
+        return build_error(STR_PTR("Cline turns require a text prompt in v1"), STR_LEN("Cline turns require a text prompt in v1"));
+    };
+    let turn_id = [0u8; 64];
+    let turn_id_len: u64 = 0;
+    if is_steer && s.has_activeTurnId {
+        turn_id_len = buf_copy(&turn_id, 64, &s.activeTurnId, s.activeTurnId_len);
+    } else {
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        if params != 0 && sa_json_object_get_string(params, STR_PTR("turnId"), STR_LEN("turnId"), &tp, &tl) == 0 && tl > 0 {
+            turn_id_len = buf_copy(&turn_id, 64, tp, tl);
+        } else {
+            turn_id_len = uuid_new(&turn_id, 64);
+        };
+    };
+    let err = [0u8; 4096];
+    let err_len: u64 = 0;
+    if !require_hub(self, &err, &err_len) { return build_error(&err, err_len); };
+    if ClineHubClient_connect(&self.hub, &self.versionCache, &err, 4096, &err_len) != 0 { return build_error(&err, err_len); };
+    // user item
+    let item = [0u8; 262144];
+    let item_len: u64 = 0;
+    item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("{\"type\":\"userMessage\",\"id\":\"cline-"), STR_LEN("{\"type\":\"userMessage\",\"id\":\"cline-"));
+    item_len = item_len + append_bytes(&item, 262144, item_len, &turn_id, turn_id_len);
+    item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("-user\",\"turnId\":\""), STR_LEN("-user\",\"turnId\":\""));
+    item_len = item_len + append_bytes(&item, 262144, item_len, &turn_id, turn_id_len);
+    item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    item_len = item_len + append_bytes(&item, 262144, item_len, thread_ptr, thread_len);
+    item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"content\":[{\"type\":\"text\",\"text\":\""), STR_LEN("\",\"content\":[{\"type\":\"text\",\"text\":\""));
+    item_len = item_len + append_bytes(&item, 262144, item_len, &text, text_len);
+    item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\"}],\"status\":\"completed\"}"), STR_LEN("\"}],\"status\":\"completed\"}"));
+    cline_push_message(s, &item, item_len);
+    let frame = [0u8; 262144];
+    let frame_len: u64 = 0;
+    frame_len = wrap_item_message(&frame, 262144, STR_PTR("item/completed"), STR_LEN("item/completed"), thread_ptr, thread_len, &turn_id, turn_id_len, &item, item_len);
+    emit_message(self, &frame, frame_len);
+    if !is_steer {
+        s.activeTurnId_len = buf_copy(&s.activeTurnId, 64, &turn_id, turn_id_len);
+        s.has_activeTurnId = true;
+        s.streamedText_len = 0;
+        s.itemStarted = false;
+        s.has_lastUsage = false;
+        s.lastUsage = 0;
+        if s.turns_count < 128 {
+            let row = &s.turns[s.turns_count];
+            row.id_len = buf_copy(&row.id, 64, &turn_id, turn_id_len);
+            row.status_len = buf_copy(&row.status, 32, STR_PTR("inProgress"), STR_LEN("inProgress"));
+            s.turns_count = s.turns_count + 1;
+        };
+    };
+    let payload = [0u8; 262144];
+    let payload_len: u64 = 0;
+    payload_len = payload_len + append_bytes(&payload, 262144, payload_len, STR_PTR("{\"prompt\":\""), STR_LEN("{\"prompt\":\""));
+    payload_len = payload_len + append_bytes(&payload, 262144, payload_len, &text, text_len);
+    payload_len = payload_len + append_bytes(&payload, 262144, payload_len, STR_PTR("\"}"), 2);
+    let enqueued: u64 = 0;
+    if hub_command_sync(self, STR_PTR("run.enqueue"), STR_LEN("run.enqueue"), &payload, payload_len, thread_ptr, thread_len, true, 30000, &enqueued, &err, &err_len) != 0 {
+        return build_error(&err, err_len);
+    };
+    let run_ptr: ptr = PTR_NULL();
+    let run_len: u64 = 0;
+    if enqueued != 0 && sa_json_object_get_string(enqueued, STR_PTR("runId"), STR_LEN("runId"), &run_ptr, &run_len) == 0 {
+        s.activeRunId_len = buf_copy(&s.activeRunId, 128, run_ptr, run_len);
+        s.has_activeRunId = true;
+    };
+    let out = [0u8; 2048];
+    let n: u64 = 0;
+    n = n + append_bytes(&out, 2048, n, STR_PTR("{\"turn\":{\"id\":\""), STR_LEN("{\"turn\":{\"id\":\""));
+    n = n + append_bytes(&out, 2048, n, &turn_id, turn_id_len);
+    n = n + append_bytes(&out, 2048, n, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    n = n + append_bytes(&out, 2048, n, thread_ptr, thread_len);
+    n = n + append_bytes(&out, 2048, n, STR_PTR("\",\"status\":\"inProgress\"}}"), STR_LEN("\",\"status\":\"inProgress\"}}"));
+    return build_ok(&out, n);
+}
+
+fn request_turn_interrupt(self: &ClineAgentBridge, params: u64) -> ClineBuild {
+    let thread_ptr: ptr = PTR_NULL();
+    let thread_len: u64 = 0;
+    if params != 0 { sa_json_object_get_string(params, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len); };
+    let idx = cline_find(self, thread_ptr, thread_len);
+    if idx != 4294967295 && self.sessions[idx].has_activeTurnId && self.has_hub {
+        let result: u64 = 0;
+        let err = [0u8; 4096];
+        let err_len: u64 = 0;
+        if hub_command_sync(self, STR_PTR("session.abort"), STR_LEN("session.abort"), STR_PTR("{}"), 2, thread_ptr, thread_len, true, 10000, &result, &err, &err_len) != 0 {
+            let frame = [0u8; 8192];
+            let frame_len: u64 = 0;
+            frame_len = frame_len + append_bytes(&frame, 8192, frame_len, STR_PTR("cline session.abort failed: "), STR_LEN("cline session.abort failed: "));
+            frame_len = frame_len + append_bytes(&frame, 8192, frame_len, &err, err_len);
+            frame_len = frame_len + append_bytes(&frame, 8192, frame_len, STR_PTR("\n"), 1);
+            bridge_emit(self, STR_PTR("stderr"), STR_LEN("stderr"), &frame, frame_len);
+        };
+    };
+    return build_ok(STR_PTR("{}"), 2);
+}
+
+fn request_thread_delete(self: &ClineAgentBridge, params: u64, is_delete: bool) -> ClineBuild {
+    let thread_ptr: ptr = PTR_NULL();
+    let thread_len: u64 = 0;
+    if params != 0 { sa_json_object_get_string(params, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len); };
+    if thread_len > 0 {
+        if is_delete && self.has_hub {
+            let result: u64 = 0;
+            let err = [0u8; 4096];
+            let err_len: u64 = 0;
+            hub_command_sync(self, STR_PTR("session.delete"), STR_LEN("session.delete"), STR_PTR("{}"), 2, thread_ptr, thread_len, true, 10000, &result, &err, &err_len);
+        };
+        let idx = cline_find(self, thread_ptr, thread_len);
+        if idx != 4294967295 {
+            // compact the session table
+            let i = idx;
+            while i + 1 < self.sessions_count {
+                self.sessions[i] = self.sessions[i + 1];
+                i = i + 1;
+            }
+            self.sessions_count = self.sessions_count - 1;
+        };
+    };
+    return build_ok(STR_PTR("{}"), 2);
+}
+
+// wrap_item_message: {method, params:{threadId, turnId,
+// item}} frame text.
+fn wrap_item_message(out: ptr, out_cap: u64, method_ptr: ptr, method_len: u64, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, item_ptr: ptr, item_len: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"method\":\""), STR_LEN("{\"method\":\""));
+    n = n + append_bytes(out, out_cap, n, method_ptr, method_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"params\":{\"threadId\":\""), STR_LEN("\",\"params\":{\"threadId\":\""));
+    n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    n = n + append_bytes(out, out_cap, n, turn_ptr, turn_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"item\":"), STR_LEN("\",\"item\":"));
+    n = n + append_bytes(out, out_cap, n, item_ptr, item_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("}}"), 2);
+    return n;
+}
+
+// closeOpenTextSegment(state, threadId)
+fn close_open_text_segment(self: &ClineAgentBridge, s: &ClineSessionState, thread_ptr: ptr, thread_len: u64) -> void {
+    if !s.has_activeTurnId || !s.has_activeItemId { return; };
+    let turn_id = [0u8; 64];
+    let turn_len = buf_copy(&turn_id, 64, &s.activeTurnId, s.activeTurnId_len);
+    let item_id = [0u8; 160];
+    let item_id_len = buf_copy(&item_id, 160, &s.activeItemId, s.activeItemId_len);
+    let text_len = s.streamedText_len;
+    s.has_activeItemId = false;
+    s.activeItemId_len = 0;
+    s.streamedText_len = 0;
+    s.itemStarted = false;
+    if text_len == 0 { return; };
+    let item = [0u8; 262144];
+    let item_len: u64 = 0;
+    item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("{\"type\":\"agentMessage\",\"id\":\""), STR_LEN("{\"type\":\"agentMessage\",\"id\":\""));
+    item_len = item_len + append_bytes(&item, 262144, item_len, &item_id, item_id_len);
+    item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    item_len = item_len + append_bytes(&item, 262144, item_len, &turn_id, turn_len);
+    item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    item_len = item_len + append_bytes(&item, 262144, item_len, thread_ptr, thread_len);
+    item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"content\":\""), STR_LEN("\",\"content\":\""));
+    item_len = item_len + append_bytes(&item, 262144, item_len, &s.streamedText, text_len);
+    item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"role\":\"assistant\",\"status\":\"completed\"}"), STR_LEN("\",\"role\":\"assistant\",\"status\":\"completed\"}"));
+    let found = cline_find_message(s, STR_PTR("agentMessage"), STR_LEN("agentMessage"), &item_id, item_id_len);
+    if found != 4294967295 {
+        cline_replace_message(s, found, &item, item_len);
+    } else {
+        cline_push_message(s, &item, item_len);
+    };
+    let frame = [0u8; 262144];
+    let frame_len = wrap_item_message(&frame, 262144, STR_PTR("item/completed"), STR_LEN("item/completed"), thread_ptr, thread_len, &turn_id, turn_len, &item, item_len);
+    emit_message(self, &frame, frame_len);
+}
+
+// ---- hub event pump + handling ----
+
+// ClineAgentBridge_pump: drain the hub client's event
+// queue into handleHubEvent (owner-driven; the source's
+// hub.on("event") subscription).
+fn ClineAgentBridge_pump(self: &ClineAgentBridge) -> void {
+    ClineHubClient_pump(&self.hub);
+    let ev = ClineHubEvent{ event_ptr: PTR_NULL(), event_len: 0, sessionId_ptr: PTR_NULL(), sessionId_len: 0, has_sessionId: false, eventId_ptr: PTR_NULL(), eventId_len: 0, has_eventId: false, payload: 0 };
+    while ClineHubClient_pollEvent(&self.hub, &ev) {
+        handle_hub_event(self, &ev);
+    }
+}
+
+// seen-set helpers
+fn seen_has(self: &ClineAgentBridge, p: ptr, n: u64) -> bool {
+    return set_has(&self.seenEventIds, &self.seen_off, &self.seen_len_arr, self.seen_count, p, n);
+}
+
+fn seen_add(self: &ClineAgentBridge, p: ptr, n: u64) -> void {
+    if self.seen_count >= 5000 {
+        // source clears the whole set past 5000
+        self.seen_count = 0;
+        self.seen_used = 0;
+    };
+    if self.seen_count >= 5120 { return; };
+    self.seen_off[self.seen_count] = self.seen_used;
+    self.seen_len_arr[self.seen_count] = n;
+    for i in 0..n {
+        if self.seen_used < 262144 { self.seenEventIds[self.seen_used] = byte_at(p, i); self.seen_used = self.seen_used + 1; };
+    }
+    self.seen_count = self.seen_count + 1;
+}
+
+fn logged_has(self: &ClineAgentBridge, p: ptr, n: u64) -> bool {
+    return set_has(&self.loggedHubEvents, &self.logged_off, &self.logged_len_arr, self.logged_count, p, n);
+}
+
+fn logged_add(self: &ClineAgentBridge, p: ptr, n: u64) -> void {
+    if self.logged_count >= 128 { return; };
+    self.logged_off[self.logged_count] = self.logged_used;
+    self.logged_len_arr[self.logged_count] = n;
+    for i in 0..n {
+        if self.logged_used < 8192 { self.loggedHubEvents[self.logged_used] = byte_at(p, i); self.logged_used = self.logged_used + 1; };
+    }
+    self.logged_count = self.logged_count + 1;
+}
+
+fn handle_hub_event(self: &ClineAgentBridge, ev: &ClineHubEvent) -> void {
+    if ev.has_eventId {
+        if seen_has(self, ev.eventId_ptr, ev.eventId_len) { return; };
+        seen_add(self, ev.eventId_ptr, ev.eventId_len);
+    };
+    let payload = ev.payload;
+    // diagnostic event log
+    if str_is(ev.event_ptr, ev.event_len, STR_PTR("assistant.delta"), STR_LEN("assistant.delta")) || str_is(ev.event_ptr, ev.event_len, STR_PTR("reasoning.delta"), STR_LEN("reasoning.delta")) {
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        if payload != 0 { sa_json_object_get_string(payload, STR_PTR("text"), STR_LEN("text"), &t_ptr, &t_len); };
+        host_event_log_hub(ev.event_ptr, ev.event_len, ev.sessionId_ptr, ev.sessionId_len, ev.has_sessionId, t_len, true);
+    } else {
+        host_event_log_hub_full(ev.event_ptr, ev.event_len, ev.sessionId_ptr, ev.sessionId_len, ev.has_sessionId, ev.eventId_ptr, ev.eventId_len, ev.has_eventId, payload);
+    };
+    if !ev.has_sessionId { return; };
+    let idx = cline_find(self, ev.sessionId_ptr, ev.sessionId_len);
+    if idx == 4294967295 { return; };
+    let s = &self.sessions[idx];
+    let thread_ptr = s.threadId_ptr;
+    let thread_len = s.threadId_len;
+    if str_is(ev.event_ptr, ev.event_len, STR_PTR("assistant.delta"), STR_LEN("assistant.delta")) {
+        hub_ev_assistant_delta(self, s, thread_ptr, thread_len, payload);
+        return;
+    };
+    if str_is(ev.event_ptr, ev.event_len, STR_PTR("assistant.finished"), STR_LEN("assistant.finished")) {
+        // The terminal run event flushes the completed
+        // item; the finished event only carries the same
+        // full text we already streamed.
+        return;
+    };
+    if str_is(ev.event_ptr, ev.event_len, STR_PTR("approval.requested"), STR_LEN("approval.requested")) || str_is(ev.event_ptr, ev.event_len, STR_PTR("permission.asked"), STR_LEN("permission.asked")) {
+        // Sessions run with autoApproveTools=true, so this
+        // is a defensive answer, not the normal path.
+        if self.has_hub {
+            let result: u64 = 0;
+            let err = [0u8; 1024];
+            let err_len: u64 = 0;
+            hub_command_sync(self, STR_PTR("approval.respond"), STR_LEN("approval.respond"), STR_PTR("{\"decision\":\"approved\",\"approved\":true}"), STR_LEN("{\"decision\":\"approved\",\"approved\":true}"), thread_ptr, thread_len, true, 10000, &result, &err, &err_len);
+        };
+        return;
+    };
+    if str_is(ev.event_ptr, ev.event_len, STR_PTR("run.completed"), STR_LEN("run.completed")) {
+        let result: u64 = 0;
+        if payload != 0 { sa_json_object_get(payload, STR_PTR("result"), STR_LEN("result"), &result); };
+        let text_ptr: ptr = PTR_NULL();
+        let text_len: u64 = 0;
+        let has_text = result != 0 && sa_json_object_get_string(result, STR_PTR("text"), STR_LEN("text"), &text_ptr, &text_len) == 0;
+        if s.has_activeTurnId && result != 0 {
+            let messages_node: u64 = 0;
+            sa_json_object_get(result, STR_PTR("messages"), STR_LEN("messages"), &messages_node);
+            let items = [0u8; 524288];
+            let items_count: u64 = 0;
+            let items_len = project_hub_result_tool_items(messages_node, thread_ptr, thread_len, &s.activeTurnId, s.activeTurnId_len, true, &items, 524288, &items_count);
+            // skip ids already present as toolCall rows
+            let arr = sa_json_parse(&items, items_len);
+            let ac: u64 = 0;
+            if arr != 0 && sa_json_array_len(arr, &ac) == 0 {
+                for i in 0..ac {
+                    let item: u64 = 0;
+                    sa_json_array_get(arr, i, &item);
+                    let id_ptr: ptr = PTR_NULL();
+                    let id_len: u64 = 0;
+                    if item != 0 { sa_json_object_get_string(item, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len); };
+                    if cline_find_message(s, STR_PTR("toolCall"), STR_LEN("toolCall"), id_ptr, id_len) != 4294967295 { continue; };
+                    let item_text = [0u8; 65536];
+                    let item_text_len = stringify_into(item, &item_text, 65536);
+                    cline_push_message(s, &item_text, item_text_len);
+                    let frame = [0u8; 65536];
+                    let frame_len = wrap_item_message(&frame, 65536, STR_PTR("item/completed"), STR_LEN("item/completed"), thread_ptr, thread_len, &s.activeTurnId, s.activeTurnId_len, &item_text, item_text_len);
+                    emit_message(self, &frame, frame_len);
+                }
+            };
+        };
+        let usage: u64 = 0;
+        let has_usage = false;
+        if result != 0 && sa_json_object_get(result, STR_PTR("usage"), STR_LEN("usage"), &usage) == 0 && usage != 0 { has_usage = true; };
+        if has_text {
+            finish_turn(self, s, thread_ptr, thread_len, STR_PTR("completed"), STR_LEN("completed"), text_ptr, text_len, usage, has_usage, PTR_NULL(), 0, false);
+        } else {
+            // finalText = state.streamedText (copy first —
+            // finish_turn clears it)
+            let saved = [0u8; 262144];
+            let saved_len = buf_copy(&saved, 262144, &s.streamedText, s.streamedText_len);
+            finish_turn(self, s, thread_ptr, thread_len, STR_PTR("completed"), STR_LEN("completed"), &saved, saved_len, usage, has_usage, PTR_NULL(), 0, false);
+        };
+        return;
+    };
+    if str_is(ev.event_ptr, ev.event_len, STR_PTR("run.failed"), STR_LEN("run.failed")) {
+        let msg_ptr: ptr = PTR_NULL();
+        let msg_len: u64 = 0;
+        if payload == 0 || sa_json_object_get_string(payload, STR_PTR("error"), STR_LEN("error"), &msg_ptr, &msg_len) != 0 {
+            msg_ptr = STR_PTR("Cline run failed");
+            msg_len = STR_LEN("Cline run failed");
+        };
+        let saved = [0u8; 262144];
+        let saved_len = buf_copy(&saved, 262144, &s.streamedText, s.streamedText_len);
+        finish_turn(self, s, thread_ptr, thread_len, STR_PTR("failed"), STR_LEN("failed"), &saved, saved_len, 0, false, msg_ptr, msg_len, true);
+        return;
+    };
+    if str_is(ev.event_ptr, ev.event_len, STR_PTR("run.aborted"), STR_LEN("run.aborted")) || str_is(ev.event_ptr, ev.event_len, STR_PTR("run.interrupted"), STR_LEN("run.interrupted")) {
+        let saved = [0u8; 262144];
+        let saved_len = buf_copy(&saved, 262144, &s.streamedText, s.streamedText_len);
+        finish_turn(self, s, thread_ptr, thread_len, STR_PTR("interrupted"), STR_LEN("interrupted"), &saved, saved_len, 0, false, PTR_NULL(), 0, false);
+        return;
+    };
+    if str_is(ev.event_ptr, ev.event_len, STR_PTR("agent.done"), STR_LEN("agent.done")) {
+        // Team mode ends the run with agent.done instead of
+        // run.completed: payload carries the final text
+        // directly.
+        let reason = [0u8; 64];
+        let reason_len: u64 = 0;
+        let r_ptr: ptr = PTR_NULL();
+        let r_len: u64 = 0;
+        if payload != 0 && sa_json_object_get_string(payload, STR_PTR("reason"), STR_LEN("reason"), &r_ptr, &r_len) == 0 {
+            reason_len = to_lower(&reason, 64, r_ptr, r_len);
+        };
+        let failed = str_is(&reason, reason_len, STR_PTR("failed"), STR_LEN("failed")) || str_is(&reason, reason_len, STR_PTR("error"), STR_LEN("error"));
+        let text_ptr: ptr = PTR_NULL();
+        let text_len: u64 = 0;
+        let has_text = payload != 0 && sa_json_object_get_string(payload, STR_PTR("text"), STR_LEN("text"), &text_ptr, &text_len) == 0 && text_len > 0;
+        let usage: u64 = 0;
+        let has_usage = false;
+        if s.has_lastUsage { usage = s.lastUsage; has_usage = true; };
+        if has_text {
+            finish_turn(self, s, thread_ptr, thread_len, if failed { STR_PTR("failed") } else { STR_PTR("completed") }, if failed { STR_LEN("failed") } else { STR_LEN("completed") }, text_ptr, text_len, usage, has_usage, PTR_NULL(), 0, false);
+        } else {
+            let saved = [0u8; 262144];
+            let saved_len = buf_copy(&saved, 262144, &s.streamedText, s.streamedText_len);
+            finish_turn(self, s, thread_ptr, thread_len, if failed { STR_PTR("failed") } else { STR_PTR("completed") }, if failed { STR_LEN("failed") } else { STR_LEN("completed") }, &saved, saved_len, usage, has_usage, PTR_NULL(), 0, false);
+        };
+        return;
+    };
+    if str_is(ev.event_ptr, ev.event_len, STR_PTR("usage.updated"), STR_LEN("usage.updated")) {
+        // Stash the latest totals; the terminal agent.done
+        // event carries no usage of its own.
+        let totals: u64 = 0;
+        if payload != 0 {
+            if sa_json_object_get(payload, STR_PTR("totals"), STR_LEN("totals"), &totals) != 0 {
+                if sa_json_object_get(payload, STR_PTR("usage"), STR_LEN("usage"), &totals) != 0 {
+                    sa_json_object_get(payload, STR_PTR("aggregateUsage"), STR_LEN("aggregateUsage"), &totals);
+                };
+            };
+        };
+        if totals != 0 {
+            let keys_len = json_object_keys_len(totals);
+            if keys_len > 0 {
+                s.lastUsage = totals;
+                s.has_lastUsage = true;
+            };
+        };
+        return;
+    };
+    if str_is(ev.event_ptr, ev.event_len, STR_PTR("iteration.started"), STR_LEN("iteration.started")) || str_is(ev.event_ptr, ev.event_len, STR_PTR("iteration.finished"), STR_LEN("iteration.finished")) || str_is(ev.event_ptr, ev.event_len, STR_PTR("run.heartbeat"), STR_LEN("run.heartbeat")) || str_is(ev.event_ptr, ev.event_len, STR_PTR("team.progress"), STR_LEN("team.progress")) {
+        // Team-mode keepalives and per-step markers: no
+        // projection today.
+        return;
+    };
+    if str_is(ev.event_ptr, ev.event_len, STR_PTR("reasoning.finished"), STR_LEN("reasoning.finished")) {
+        hub_ev_reasoning_finished(self, s, thread_ptr, thread_len, payload);
+        return;
+    };
+    if str_is(ev.event_ptr, ev.event_len, STR_PTR("tool.started"), STR_LEN("tool.started")) || str_is(ev.event_ptr, ev.event_len, STR_PTR("tool.updated"), STR_LEN("tool.updated")) || str_is(ev.event_ptr, ev.event_len, STR_PTR("tool.finished"), STR_LEN("tool.finished")) {
+        hub_ev_tool(self, s, thread_ptr, thread_len, payload, ev.event_ptr, ev.event_len);
+        return;
+    };
+    // default: log each unknown kind once
+    let kind_ptr = ev.event_ptr;
+    let kind_len = ev.event_len;
+    if kind_len == 0 { kind_ptr = STR_PTR("unknown"); kind_len = STR_LEN("unknown"); };
+    if !logged_has(self, kind_ptr, kind_len) {
+        logged_add(self, kind_ptr, kind_len);
+        host_event_log_unknown(kind_ptr, kind_len);
+    };
+}
+
+fn hub_ev_assistant_delta(self: &ClineAgentBridge, s: &ClineSessionState, thread_ptr: ptr, thread_len: u64, payload: u64) -> void {
+    let text_ptr: ptr = PTR_NULL();
+    let text_len: u64 = 0;
+    if payload == 0 || sa_json_object_get_string(payload, STR_PTR("text"), STR_LEN("text"), &text_ptr, &text_len) != 0 || text_len == 0 || !s.has_activeTurnId { return; };
+    if !s.has_activeItemId {
+        s.textSegIndex = s.textSegIndex + 1;
+        s.activeItemId_len = 0;
+        s.activeItemId_len = s.activeItemId_len + append_bytes(&s.activeItemId, 160, s.activeItemId_len, STR_PTR("cline-"), STR_LEN("cline-"));
+        s.activeItemId_len = s.activeItemId_len + append_bytes(&s.activeItemId, 160, s.activeItemId_len, &s.activeTurnId, s.activeTurnId_len);
+        s.activeItemId_len = s.activeItemId_len + append_bytes(&s.activeItemId, 160, s.activeItemId_len, STR_PTR("-text-"), STR_LEN("-text-"));
+        s.activeItemId_len = s.activeItemId_len + append_u64(&s.activeItemId, 160, s.activeItemId_len, s.textSegIndex);
+        s.has_activeItemId = true;
+    };
+    s.streamedText_len = s.streamedText_len + append_bytes(&s.streamedText, 262144, s.streamedText_len, text_ptr, text_len);
+    if !s.itemStarted {
+        s.itemStarted = true;
+        let item = [0u8; 1024];
+        let item_len: u64 = 0;
+        item_len = item_len + append_bytes(&item, 1024, item_len, STR_PTR("{\"type\":\"agentMessage\",\"id\":\""), STR_LEN("{\"type\":\"agentMessage\",\"id\":\""));
+        item_len = item_len + append_bytes(&item, 1024, item_len, &s.activeItemId, s.activeItemId_len);
+        item_len = item_len + append_bytes(&item, 1024, item_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        item_len = item_len + append_bytes(&item, 1024, item_len, &s.activeTurnId, s.activeTurnId_len);
+        item_len = item_len + append_bytes(&item, 1024, item_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        item_len = item_len + append_bytes(&item, 1024, item_len, thread_ptr, thread_len);
+        item_len = item_len + append_bytes(&item, 1024, item_len, STR_PTR("\",\"status\":\"inProgress\"}"), STR_LEN("\",\"status\":\"inProgress\"}"));
+        cline_push_message(s, &item, item_len);
+        let frame = [0u8; 2048];
+        let frame_len = wrap_item_message(&frame, 2048, STR_PTR("item/started"), STR_LEN("item/started"), thread_ptr, thread_len, &s.activeTurnId, s.activeTurnId_len, &item, item_len);
+        emit_message(self, &frame, frame_len);
+    };
+    let frame = [0u8; 262144];
+    let frame_len: u64 = 0;
+    frame_len = frame_len + append_bytes(&frame, 262144, frame_len, STR_PTR("{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\""));
+    frame_len = frame_len + append_bytes(&frame, 262144, frame_len, thread_ptr, thread_len);
+    frame_len = frame_len + append_bytes(&frame, 262144, frame_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    frame_len = frame_len + append_bytes(&frame, 262144, frame_len, &s.activeTurnId, s.activeTurnId_len);
+    frame_len = frame_len + append_bytes(&frame, 262144, frame_len, STR_PTR("\",\"itemId\":\""), STR_LEN("\",\"itemId\":\""));
+    frame_len = frame_len + append_bytes(&frame, 262144, frame_len, &s.activeItemId, s.activeItemId_len);
+    frame_len = frame_len + append_bytes(&frame, 262144, frame_len, STR_PTR("\",\"delta\":\""), STR_LEN("\",\"delta\":\""));
+    frame_len = frame_len + append_bytes(&frame, 262144, frame_len, text_ptr, text_len);
+    frame_len = frame_len + append_bytes(&frame, 262144, frame_len, STR_PTR("\"}}"), 3);
+    emit_message(self, &frame, frame_len);
+}
+
+fn hub_ev_reasoning_finished(self: &ClineAgentBridge, s: &ClineSessionState, thread_ptr: ptr, thread_len: u64, payload: u64) -> void {
+    let raw_ptr: ptr = PTR_NULL();
+    let raw_len: u64 = 0;
+    if payload == 0 || sa_json_object_get_string(payload, STR_PTR("reasoning"), STR_LEN("reasoning"), &raw_ptr, &raw_len) != 0 { return; };
+    let text_ptr: ptr = PTR_NULL();
+    let text_len: u64 = 0;
+    ts_trim_span(raw_ptr, raw_len, &text_ptr, &text_len);
+    if text_len == 0 || !s.has_activeTurnId { return; };
+    s.reasoningSeq = s.reasoningSeq + 1;
+    let take = text_len;
+    if take > 8000 { take = 8000; };
+    let item = [0u8; 16384];
+    let item_len: u64 = 0;
+    item_len = item_len + append_bytes(&item, 16384, item_len, STR_PTR("{\"type\":\"reasoning\",\"id\":\"cline-"), STR_LEN("{\"type\":\"reasoning\",\"id\":\"cline-"));
+    item_len = item_len + append_bytes(&item, 16384, item_len, &s.activeTurnId, s.activeTurnId_len);
+    item_len = item_len + append_bytes(&item, 16384, item_len, STR_PTR("-reasoning-"), STR_LEN("-reasoning-"));
+    item_len = item_len + append_u64(&item, 16384, item_len, s.reasoningSeq);
+    item_len = item_len + append_bytes(&item, 16384, item_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    item_len = item_len + append_bytes(&item, 16384, item_len, &s.activeTurnId, s.activeTurnId_len);
+    item_len = item_len + append_bytes(&item, 16384, item_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    item_len = item_len + append_bytes(&item, 16384, item_len, thread_ptr, thread_len);
+    item_len = item_len + append_bytes(&item, 16384, item_len, STR_PTR("\",\"content\":\""), STR_LEN("\",\"content\":\""));
+    item_len = item_len + append_bytes(&item, 16384, item_len, text_ptr, take);
+    item_len = item_len + append_bytes(&item, 16384, item_len, STR_PTR("\",\"status\":\"completed\"}"), STR_LEN("\",\"status\":\"completed\"}"));
+    cline_push_message(s, &item, item_len);
+    let frame = [0u8; 16384];
+    let frame_len = wrap_item_message(&frame, 16384, STR_PTR("item/completed"), STR_LEN("item/completed"), thread_ptr, thread_len, &s.activeTurnId, s.activeTurnId_len, &item, item_len);
+    emit_message(self, &frame, frame_len);
+}
+
+// hub_ev_tool: tool.started / tool.updated / tool.finished.
+fn hub_ev_tool(self: &ClineAgentBridge, s: &ClineSessionState, thread_ptr: ptr, thread_len: u64, payload: u64, ev_ptr: ptr, ev_len: u64) -> void {
+    // Late arrivals fall back to the most recent turn
+    // instead of being dropped.
+    let turn_id = [0u8; 64];
+    let turn_id_len: u64 = 0;
+    if s.has_activeTurnId {
+        turn_id_len = buf_copy(&turn_id, 64, &s.activeTurnId, s.activeTurnId_len);
+    } else {
+        if s.turns_count == 0 { return; };
+        turn_id_len = buf_copy(&turn_id, 64, &s.turns[s.turns_count - 1].id, s.turns[s.turns_count - 1].id_len);
+    };
+    let is_started = str_is(ev_ptr, ev_len, STR_PTR("tool.started"), STR_LEN("tool.started"));
+    let is_finished = str_is(ev_ptr, ev_len, STR_PTR("tool.finished"), STR_LEN("tool.finished"));
+    let is_updated = str_is(ev_ptr, ev_len, STR_PTR("tool.updated"), STR_LEN("tool.updated"));
+    if is_started { close_open_text_segment(self, s, thread_ptr, thread_len); };
+    // toolId: payload.toolCallId || payload.id ||
+    // payload.toolId || generated
+    let tool_id = [0u8; 128];
+    let tool_id_len: u64 = 0;
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    if payload != 0 && sa_json_object_get_string(payload, STR_PTR("toolCallId"), STR_LEN("toolCallId"), &v_ptr, &v_len) == 0 && v_len > 0 {
+        tool_id_len = buf_copy(&tool_id, 128, v_ptr, v_len);
+    } else if payload != 0 && sa_json_object_get_string(payload, STR_PTR("id"), STR_LEN("id"), &v_ptr, &v_len) == 0 && v_len > 0 {
+        tool_id_len = buf_copy(&tool_id, 128, v_ptr, v_len);
+    } else if payload != 0 && sa_json_object_get_string(payload, STR_PTR("toolId"), STR_LEN("toolId"), &v_ptr, &v_len) == 0 && v_len > 0 {
+        tool_id_len = buf_copy(&tool_id, 128, v_ptr, v_len);
+    } else {
+        tool_id_len = tool_id_len + append_bytes(&tool_id, 128, tool_id_len, STR_PTR("cline-"), STR_LEN("cline-"));
+        tool_id_len = tool_id_len + append_bytes(&tool_id, 128, tool_id_len, &turn_id, turn_id_len);
+        tool_id_len = tool_id_len + append_bytes(&tool_id, 128, tool_id_len, STR_PTR("-tool-"), STR_LEN("-tool-"));
+        let uid = [0u8; 64];
+        let uid_len = uuid_new(&uid, 64);
+        tool_id_len = tool_id_len + append_bytes(&tool_id, 128, tool_id_len, &uid, uid_len);
+    };
+    // toolName: name || tool || toolName || title || "Tool"
+    let tool_name = [0u8; 256];
+    let tool_name_len: u64 = 0;
+    if payload != 0 && sa_json_object_get_string(payload, STR_PTR("name"), STR_LEN("name"), &v_ptr, &v_len) == 0 && v_len > 0 {
+        tool_name_len = buf_copy(&tool_name, 256, v_ptr, v_len);
+    } else if payload != 0 && sa_json_object_get_string(payload, STR_PTR("tool"), STR_LEN("tool"), &v_ptr, &v_len) == 0 && v_len > 0 {
+        tool_name_len = buf_copy(&tool_name, 256, v_ptr, v_len);
+    } else if payload != 0 && sa_json_object_get_string(payload, STR_PTR("toolName"), STR_LEN("toolName"), &v_ptr, &v_len) == 0 && v_len > 0 {
+        tool_name_len = buf_copy(&tool_name, 256, v_ptr, v_len);
+    } else if payload != 0 && sa_json_object_get_string(payload, STR_PTR("title"), STR_LEN("title"), &v_ptr, &v_len) == 0 && v_len > 0 {
+        tool_name_len = buf_copy(&tool_name, 256, v_ptr, v_len);
+    } else {
+        tool_name_len = buf_copy(&tool_name, 256, STR_PTR("Tool"), 4);
+    };
+    // toolInput = recordOf(input ?? arguments ?? args)
+    let tool_input: u64 = 0;
+    if payload != 0 {
+        if sa_json_object_get(payload, STR_PTR("input"), STR_LEN("input"), &tool_input) != 0 {
+            if sa_json_object_get(payload, STR_PTR("arguments"), STR_LEN("arguments"), &tool_input) != 0 {
+                sa_json_object_get(payload, STR_PTR("args"), STR_LEN("args"), &tool_input);
+            };
+        };
+    };
+    let input_keys = json_object_keys_len(tool_input);
+    // team_task: plan projection, not a raw card
+    if str_is(&tool_name, tool_name_len, STR_PTR("team_task"), STR_LEN("team_task")) {
+        let action = [0u8; 64];
+        let action_len: u64 = 0;
+        let a_ptr: ptr = PTR_NULL();
+        let a_len: u64 = 0;
+        if tool_input != 0 && sa_json_object_get_string(tool_input, STR_PTR("action"), STR_LEN("action"), &a_ptr, &a_len) == 0 {
+            action_len = to_lower(&action, 64, a_ptr, a_len);
+        };
+        if str_is(&action, action_len, STR_PTR("create"), STR_LEN("create")) || str_is(&action, action_len, STR_PTR("complete"), STR_LEN("complete")) {
+            let output: u64 = 0;
+            if payload != 0 { sa_json_object_get(payload, STR_PTR("output"), STR_LEN("output"), &output); };
+            apply_cline_team_task(self, s, thread_ptr, thread_len, &turn_id, turn_id_len, &action, action_len, tool_input, output);
+            return;
+        };
+    };
+    let status_text = [0u8; 64];
+    let status_text_len: u64 = 0;
+    if payload != 0 && sa_json_object_get_string(payload, STR_PTR("status"), STR_LEN("status"), &v_ptr, &v_len) == 0 {
+        status_text_len = to_lower(&status_text, 64, v_ptr, v_len);
+    };
+    let done = is_finished || str_is(&status_text, status_text_len, STR_PTR("completed"), STR_LEN("completed")) || str_is(&status_text, status_text_len, STR_PTR("failed"), STR_LEN("failed")) || str_is(&status_text, status_text_len, STR_PTR("done"), 4) || str_is(&status_text, status_text_len, STR_PTR("error"), STR_LEN("error"));
+    let error_text_ptr: ptr = PTR_NULL();
+    let error_text_len: u64 = 0;
+    if payload != 0 && sa_json_object_get_string(payload, STR_PTR("error"), STR_LEN("error"), &error_text_ptr, &error_text_len) == 0 {
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        ts_trim_span(error_text_ptr, error_text_len, &tp, &tl);
+        if tl == 0 { error_text_len = 0; } else { error_text_ptr = tp; error_text_len = tl; };
+    } else {
+        error_text_len = 0;
+    };
+    let is_error_flag = false;
+    if payload != 0 { sa_json_object_get_bool(payload, STR_PTR("is_error"), STR_LEN("is_error"), &is_error_flag); };
+    let failed = error_text_len > 0 || str_is(&status_text, status_text_len, STR_PTR("failed"), STR_LEN("failed")) || str_is(&status_text, status_text_len, STR_PTR("error"), STR_LEN("error")) || is_error_flag;
+    // rawOutput = output ?? result ?? update(tool.updated)
+    // ?? text ?? errorText
+    let raw_output: u64 = 0;
+    let raw_is_text = false;
+    let raw_text_ptr: ptr = PTR_NULL();
+    let raw_text_len: u64 = 0;
+    if payload != 0 && sa_json_object_get(payload, STR_PTR("output"), STR_LEN("output"), &raw_output) != 0 {
+        if sa_json_object_get(payload, STR_PTR("result"), STR_LEN("result"), &raw_output) != 0 {
+            if is_updated {
+                sa_json_object_get(payload, STR_PTR("update"), STR_LEN("update"), &raw_output);
+            };
+        };
+    };
+    if raw_output == 0 && payload != 0 {
+        let t_node: u64 = 0;
+        if sa_json_object_get(payload, STR_PTR("text"), STR_LEN("text"), &t_node) == 0 && t_node != 0 {
+            raw_output = t_node;
+        };
+    };
+    if raw_output != 0 {
+        let is_str = false;
+        json_node_is_string(raw_output, &is_str);
+        if is_str {
+            raw_is_text = true;
+            json_node_string(raw_output, &raw_text_ptr, &raw_text_len);
+        };
+    };
+    // outputText = string | record.text | stringify
+    let output_text = [0u8; 262144];
+    let output_text_len: u64 = 0;
+    if raw_is_text {
+        output_text_len = buf_copy(&output_text, 262144, raw_text_ptr, raw_text_len);
+    } else if raw_output != 0 {
+        let rec_text_ptr: ptr = PTR_NULL();
+        let rec_text_len: u64 = 0;
+        if sa_json_object_get_string(raw_output, STR_PTR("text"), STR_LEN("text"), &rec_text_ptr, &rec_text_len) == 0 && rec_text_len > 0 {
+            output_text_len = buf_copy(&output_text, 262144, rec_text_ptr, rec_text_len);
+        } else {
+            output_text_len = stringify_into(raw_output, &output_text, 262144);
+        };
+    } else if error_text_len > 0 {
+        output_text_len = buf_copy(&output_text, 262144, error_text_ptr, error_text_len);
+    };
+    // team_run_task async queue detection
+    let run_output: u64 = 0;
+    if payload != 0 { sa_json_object_get(payload, STR_PTR("output"), STR_LEN("output"), &run_output); };
+    let run_status = [0u8; 64];
+    let run_status_len: u64 = 0;
+    let run_id = [0u8; 128];
+    let run_id_len: u64 = 0;
+    let dispatched = false;
+    if run_output != 0 {
+        let rs_ptr: ptr = PTR_NULL();
+        let rs_len: u64 = 0;
+        if sa_json_object_get_string(run_output, STR_PTR("status"), STR_LEN("status"), &rs_ptr, &rs_len) == 0 {
+            run_status_len = to_lower(&run_status, 64, rs_ptr, rs_len);
+        };
+        if sa_json_object_get_string(run_output, STR_PTR("runId"), STR_LEN("runId"), &rs_ptr, &rs_len) == 0 && rs_len > 0 {
+            run_id_len = buf_copy(&run_id, 128, rs_ptr, rs_len);
+        } else if sa_json_object_get_string(run_output, STR_PTR("run_id"), STR_LEN("run_id"), &rs_ptr, &rs_len) == 0 {
+            run_id_len = buf_copy(&run_id, 128, rs_ptr, rs_len);
+        };
+        sa_json_object_get_bool(run_output, STR_PTR("dispatched"), STR_LEN("dispatched"), &dispatched);
+    };
+    let async_queued = str_is(&tool_name, tool_name_len, STR_PTR("team_run_task"), STR_LEN("team_run_task")) && is_finished && (dispatched || run_id_len > 0) && !str_is(&run_status, run_status_len, STR_PTR("completed"), STR_LEN("completed")) && !str_is(&run_status, run_status_len, STR_PTR("failed"), STR_LEN("failed")) && !str_is(&run_status, run_status_len, STR_PTR("error"), STR_LEN("error")) && !str_is(&run_status, run_status_len, STR_PTR("done"), 4);
+    let effective_done = done && !async_queued;
+    if async_queued {
+        let key_ptr: ptr = &run_id;
+        let key_len = run_id_len;
+        if key_len == 0 { key_ptr = &tool_id; key_len = tool_id_len; };
+        team_run_set(s, key_ptr, key_len, &tool_id, tool_id_len, &turn_id, turn_id_len, thread_ptr, thread_len, tool_input);
+    };
+    if str_is(&tool_name, tool_name_len, STR_PTR("team_list_runs"), STR_LEN("team_list_runs")) || str_is(&tool_name, tool_name_len, STR_PTR("team_status"), STR_LEN("team_status")) || str_is(&tool_name, tool_name_len, STR_PTR("team_await_runs"), STR_LEN("team_await_runs")) {
+        let out_node: u64 = 0;
+        if payload != 0 { sa_json_object_get(payload, STR_PTR("output"), STR_LEN("output"), &out_node); };
+        reconcile_team_runs(self, s, thread_ptr, thread_len, &turn_id, turn_id_len, out_node);
+    };
+    if str_is(&tool_name, tool_name_len, STR_PTR("team_await_runs"), STR_LEN("team_await_runs")) && is_finished {
+        settle_pending_team_runs(self, s, failed);
+    };
+    // existing card
+    let existing_idx = cline_find_card(s, &tool_id, tool_id_len);
+    let existing: u64 = 0;
+    if existing_idx != 4294967295 {
+        existing = sa_json_parse(cline_msg_ptr(s, existing_idx), s.msg_len_arr[existing_idx]);
+    };
+    let task_call = isClineTaskTool(&tool_name, tool_name_len);
+    // prompt for task calls
+    let prompt = [0u8; 8192];
+    let prompt_len: u64 = 0;
+    if task_call {
+        prompt_len = cline_task_prompt(tool_input, existing, &prompt, 8192);
+    };
+    // index the delegation at tool.started
+    if task_call && is_started && tool_id_len > 0 {
+        let ref_agent_ptr: ptr = PTR_NULL();
+        let ref_agent_len: u64 = 0;
+        let has_ref_agent = false;
+        if tool_input != 0 && sa_json_object_get_string(tool_input, STR_PTR("agentId"), STR_LEN("agentId"), &ref_agent_ptr, &ref_agent_len) == 0 && ref_agent_len > 0 {
+            has_ref_agent = true;
+        } else if tool_input != 0 && sa_json_object_get_string(tool_input, STR_PTR("subagent"), STR_LEN("subagent"), &ref_agent_ptr, &ref_agent_len) == 0 {
+            has_ref_agent = ref_agent_len > 0;
+        };
+        let sp_ptr: ptr = PTR_NULL();
+        let sp_len: u64 = 0;
+        if tool_input != 0 { sa_json_object_get_string(tool_input, STR_PTR("systemPrompt"), STR_LEN("systemPrompt"), &sp_ptr, &sp_len); };
+        if sp_len > 4000 { sp_len = 4000; };
+        let task_take = prompt_len;
+        if task_take > 4000 { task_take = 4000; };
+        recordClineSpawn(self.dataDir_ptr, self.dataDir_len, &tool_id, tool_id_len, thread_ptr, thread_len, &prompt, task_take, sp_ptr, sp_len, now_ms(), ref_agent_ptr, ref_agent_len, has_ref_agent);
+    };
+    // agent role
+    let role = [0u8; 256];
+    let role_len: u64 = 0;
+    if task_call {
+        let existing_role_ptr: ptr = PTR_NULL();
+        let existing_role_len: u64 = 0;
+        if existing != 0 {
+            if sa_json_object_get_string(existing, STR_PTR("agentName"), STR_LEN("agentName"), &existing_role_ptr, &existing_role_len) != 0 || existing_role_len == 0 {
+                sa_json_object_get_string(existing, STR_PTR("agentRole"), STR_LEN("agentRole"), &existing_role_ptr, &existing_role_len);
+            };
+        };
+        if input_keys > 0 {
+            role_len = cline_task_role(tool_input, &tool_name, tool_name_len, &role, 256);
+        };
+        if role_len == 0 && existing_role_len > 0 {
+            role_len = buf_copy(&role, 256, existing_role_ptr, existing_role_len);
+        };
+        if role_len == 0 {
+            if !str_is(&tool_name, tool_name_len, STR_PTR("Tool"), 4) {
+                role_len = buf_copy(&role, 256, &tool_name, tool_name_len);
+            } else {
+                role_len = buf_copy(&role, 256, STR_PTR("subagent"), STR_LEN("subagent"));
+            };
+        };
+    };
+    // collab output shaping
+    let collab_output = [0u8; 262144];
+    let collab_output_len: u64 = 0;
+    if task_call && done {
+        let receipt = [0u8; 8192];
+        let receipt_len: u64 = 0;
+        let has_receipt = collab_receipt_line(run_output, &receipt, 8192, &receipt_len);
+        if async_queued {
+            if has_receipt { collab_output_len = buf_copy(&collab_output, 262144, &receipt, receipt_len); };
+        } else if has_receipt {
+            collab_output_len = buf_copy(&collab_output, 262144, &receipt, receipt_len);
+        } else {
+            collab_output_len = summarize_collab_output(&output_text, output_text_len, &collab_output, 262144);
+        };
+    } else {
+        collab_output_len = buf_copy(&collab_output, 262144, &output_text, output_text_len);
+    };
+    // build the item
+    let item = [0u8; 262144];
+    let item_len: u64 = 0;
+    if task_call {
+        item_len = build_collab_item(&item, 262144, &tool_id, tool_id_len, thread_ptr, thread_len, &turn_id, turn_id_len, &tool_name, tool_name_len, &role, role_len, &prompt, prompt_len, existing, &collab_output, collab_output_len, effective_done, failed);
+    } else {
+        item_len = build_tool_item(&item, 262144, &tool_id, tool_id_len, thread_ptr, thread_len, &turn_id, turn_id_len, &tool_name, tool_name_len, tool_input, input_keys, existing, &output_text, output_text_len, done, failed);
+    };
+    if existing_idx != 4294967295 {
+        cline_replace_message(s, existing_idx, &item, item_len);
+    } else {
+        cline_push_message(s, &item, item_len);
+    };
+    if task_call {
+        if effective_done {
+            open_spawn_remove(self, &tool_id, tool_id_len);
+        } else {
+            open_spawn_add(self, &tool_id, tool_id_len);
+        };
+    };
+    let frame = [0u8; 262144];
+    let frame_len = wrap_item_message(&frame, 262144, if effective_done { STR_PTR("item/completed") } else { STR_PTR("item/started") }, if effective_done { STR_LEN("item/completed") } else { STR_LEN("item/started") }, thread_ptr, thread_len, &turn_id, turn_id_len, &item, item_len);
+    emit_message(self, &frame, frame_len);
+}
+
+// pendingTeamRuns table ops
+fn team_run_set(s: &ClineSessionState, run_ptr: ptr, run_len: u64, tool_ptr: ptr, tool_len: u64, turn_ptr: ptr, turn_len: u64, thread_ptr: ptr, thread_len: u64, tool_input: u64) -> void {
+    let idx = s.pendingTeamRuns_count;
+    for i in 0..s.pendingTeamRuns_count {
+        if s.pendingTeamRuns[i].runId_len == run_len && bytes_eq(&s.pendingTeamRuns[i].runId, run_ptr, run_len) { idx = i; break; };
+    }
+    if idx >= 64 { return; };
+    if idx == s.pendingTeamRuns_count { s.pendingTeamRuns_count = s.pendingTeamRuns_count + 1; };
+    let r = &s.pendingTeamRuns[idx];
+    r.runId_len = buf_copy(&r.runId, 128, run_ptr, run_len);
+    r.toolCallId_len = buf_copy(&r.toolCallId, 128, tool_ptr, tool_len);
+    r.turnId_len = buf_copy(&r.turnId, 64, turn_ptr, turn_len);
+    r.threadId_len = buf_copy(&r.threadId, 128, thread_ptr, thread_len);
+    let a_ptr: ptr = PTR_NULL();
+    let a_len: u64 = 0;
+    r.has_agentId = false;
+    r.agentId_len = 0;
+    if tool_input != 0 && sa_json_object_get_string(tool_input, STR_PTR("agentId"), STR_LEN("agentId"), &a_ptr, &a_len) == 0 && a_len > 0 {
+        r.agentId_len = buf_copy(&r.agentId, 128, a_ptr, a_len);
+        r.has_agentId = true;
+    };
+}
+
+fn team_run_remove(s: &ClineSessionState, run_ptr: ptr, run_len: u64) -> void {
+    for i in 0..s.pendingTeamRuns_count {
+        if s.pendingTeamRuns[i].runId_len == run_len && bytes_eq(&s.pendingTeamRuns[i].runId, run_ptr, run_len) {
+            let j = i;
+            while j + 1 < s.pendingTeamRuns_count {
+                s.pendingTeamRuns[j] = s.pendingTeamRuns[j + 1];
+                j = j + 1;
+            }
+            s.pendingTeamRuns_count = s.pendingTeamRuns_count - 1;
+            return;
+        };
+    }
+}
+
+// settle_pending_team_runs: the team_await_runs barrier
+// closing settles every run it was waiting on.
+fn settle_pending_team_runs(self: &ClineAgentBridge, s: &ClineSessionState, failed: bool) -> void {
+    while s.pendingTeamRuns_count > 0 {
+        let ref_tool = [0u8; 128];
+        let ref_tool_len = buf_copy(&ref_tool, 128, &s.pendingTeamRuns[0].toolCallId, s.pendingTeamRuns[0].toolCallId_len);
+        let ref_turn = [0u8; 64];
+        let ref_turn_len = buf_copy(&ref_turn, 64, &s.pendingTeamRuns[0].turnId, s.pendingTeamRuns[0].turnId_len);
+        let ref_thread = [0u8; 128];
+        let ref_thread_len = buf_copy(&ref_thread, 128, &s.pendingTeamRuns[0].threadId, s.pendingTeamRuns[0].threadId_len);
+        let run_id = [0u8; 128];
+        let run_id_len = buf_copy(&run_id, 128, &s.pendingTeamRuns[0].runId, s.pendingTeamRuns[0].runId_len);
+        team_run_remove(s, &run_id, run_id_len);
+        let card_idx = cline_find_card(s, &ref_tool, ref_tool_len);
+        if card_idx != 4294967295 {
+            let doc = sa_json_parse(cline_msg_ptr(s, card_idx), s.msg_len_arr[card_idx]);
+            let is_collab = false;
+            if doc != 0 {
+                let t_ptr: ptr = PTR_NULL();
+                let t_len: u64 = 0;
+                if sa_json_object_get_string(doc, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len) == 0 {
+                    is_collab = str_is(t_ptr, t_len, STR_PTR("collabAgentToolCall"), STR_LEN("collabAgentToolCall"));
+                };
+            };
+            // rebuild the card settled, dropping output/
+            // result for collab cards (dispatch receipt)
+            let item_text = [0u8; 262144];
+            let item_text_len = settle_card_text(cline_msg_ptr(s, card_idx), s.msg_len_arr[card_idx], failed, is_collab, &item_text, 262144);
+            cline_replace_message(s, card_idx, &item_text, item_text_len);
+            let frame = [0u8; 262144];
+            let frame_len = wrap_item_message(&frame, 262144, STR_PTR("item/completed"), STR_LEN("item/completed"), &ref_thread, ref_thread_len, &ref_turn, ref_turn_len, &item_text, item_text_len);
+            emit_message(self, &frame, frame_len);
+        };
+        open_spawn_remove(self, &ref_tool, ref_tool_len);
+    }
+}
+
+// settle_card_text: re-emit a stored card with a terminal
+// status (and agentStatus for collab). Field-level patch
+// via parse + rebuild is approximated by a status splice
+// in this pass.
+fn settle_card_text(item_ptr: ptr, item_len: u64, failed: bool, is_collab: bool, out: ptr, out_cap: u64) -> u64 {
+    let doc = sa_json_parse(item_ptr, item_len);
+    if doc == 0 { return buf_copy(out, out_cap, item_ptr, item_len); };
+    let status_ptr = if failed { STR_PTR("failed") } else { STR_PTR("completed") };
+    let status_len = if failed { STR_LEN("failed") } else { STR_LEN("completed") };
+    sa_json_object_set_string(doc, STR_PTR("status"), STR_LEN("status"), status_ptr, status_len);
+    if is_collab {
+        sa_json_object_set_string(doc, STR_PTR("agentStatus"), STR_LEN("agentStatus"), status_ptr, status_len);
+        sa_json_object_delete(doc, STR_PTR("output"), STR_LEN("output"));
+        sa_json_object_delete(doc, STR_PTR("result"), STR_LEN("result"));
+    };
+    return stringify_into(doc, out, out_cap);
+}
+
+// build_collab_item: collabAgentToolCall JSON.
+fn build_collab_item(out: ptr, out_cap: u64, id_ptr: ptr, id_len: u64, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, name_ptr: ptr, name_len: u64, role_ptr: ptr, role_len: u64, prompt_ptr: ptr, prompt_len: u64, existing: u64, output_ptr: ptr, output_len: u64, done_flag: bool, failed: bool) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"type\":\"collabAgentToolCall\",\"id\":\""), STR_LEN("{\"type\":\"collabAgentToolCall\",\"id\":\""));
+    n = n + append_bytes(out, out_cap, n, id_ptr, id_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    n = n + append_bytes(out, out_cap, n, turn_ptr, turn_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"name\":\""), STR_LEN("\",\"name\":\""));
+    n = n + append_bytes(out, out_cap, n, name_ptr, name_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"tool\":\"task\",\"toolName\":\""), STR_LEN("\",\"tool\":\"task\",\"toolName\":\""));
+    n = n + append_bytes(out, out_cap, n, name_ptr, name_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"agentId\":\""), STR_LEN("\",\"agentId\":\""));
+    n = n + append_bytes(out, out_cap, n, id_ptr, id_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"agentName\":\""), STR_LEN("\",\"agentName\":\""));
+    n = n + append_bytes(out, out_cap, n, role_ptr, role_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"agentRole\":\""), STR_LEN("\",\"agentRole\":\""));
+    n = n + append_bytes(out, out_cap, n, role_ptr, role_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"taskName\":\""), STR_LEN("\",\"taskName\":\""));
+    n = n + append_bytes(out, out_cap, n, role_ptr, role_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    if prompt_len > 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"prompt\":\""), STR_LEN(",\"prompt\":\""));
+        n = n + append_bytes(out, out_cap, n, prompt_ptr, prompt_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"message\":\""), STR_LEN("\",\"message\":\""));
+        n = n + append_bytes(out, out_cap, n, prompt_ptr, prompt_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"senderThreadId\":\""), STR_LEN(",\"senderThreadId\":\""));
+    n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"receiverThreadIds\":[\""), STR_LEN("\",\"receiverThreadIds\":[\""));
+    n = n + append_bytes(out, out_cap, n, id_ptr, id_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\"]"), 2);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"agentStatus\":\""), STR_LEN(",\"agentStatus\":\""));
+    if done_flag {
+        if failed { n = n + append_bytes(out, out_cap, n, STR_PTR("failed"), STR_LEN("failed")); } else { n = n + append_bytes(out, out_cap, n, STR_PTR("completed"), STR_LEN("completed")); };
+    } else {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("running"), STR_LEN("running"));
+    };
+    if output_len > 0 {
+        let take = output_len;
+        if take > 4000 { take = 4000; };
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"output\":\""), STR_LEN("\",\"output\":\""));
+        n = n + append_bytes(out, out_cap, n, output_ptr, take);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"result\":{\"content\":\""), STR_LEN("\",\"result\":{\"content\":\""));
+        n = n + append_bytes(out, out_cap, n, output_ptr, take);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\"}"), 2);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"status\":\""), STR_LEN(",\"status\":\""));
+    if done_flag {
+        if failed { n = n + append_bytes(out, out_cap, n, STR_PTR("failed"), STR_LEN("failed")); } else { n = n + append_bytes(out, out_cap, n, STR_PTR("completed"), STR_LEN("completed")); };
+    } else {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("inProgress"), STR_LEN("inProgress"));
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\"}"), 2);
+    return n;
+}
+
+// build_tool_item: plain toolCall JSON (name/tool/toolName
+// fall back to the existing card's values, then "Tool";
+// input/arguments fall back likewise).
+fn build_tool_item(out: ptr, out_cap: u64, id_ptr: ptr, id_len: u64, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, name_ptr: ptr, name_len: u64, tool_input: u64, input_keys: u64, existing: u64, output_ptr: ptr, output_len: u64, done_flag: bool, failed: bool) -> u64 {
+    let name_use_ptr = name_ptr;
+    let name_use_len = name_len;
+    if str_is(name_ptr, name_len, STR_PTR("Tool"), 4) && existing != 0 {
+        let v_ptr: ptr = PTR_NULL();
+        let v_len: u64 = 0;
+        if sa_json_object_get_string(existing, STR_PTR("name"), STR_LEN("name"), &v_ptr, &v_len) == 0 && v_len > 0 { name_use_ptr = v_ptr; name_use_len = v_len; };
+    };
+    let input_text = [0u8; 65536];
+    let input_text_len: u64 = 0;
+    if input_keys > 0 {
+        input_text_len = stringify_into(tool_input, &input_text, 65536);
+    } else if existing != 0 {
+        let node: u64 = 0;
+        if sa_json_object_get(existing, STR_PTR("input"), STR_LEN("input"), &node) == 0 && node != 0 {
+            input_text_len = stringify_into(node, &input_text, 65536);
+        } else if sa_json_object_get(existing, STR_PTR("arguments"), STR_LEN("arguments"), &node) == 0 && node != 0 {
+            input_text_len = stringify_into(node, &input_text, 65536);
+        };
+    };
+    if input_text_len == 0 { input_text_len = buf_copy(&input_text, 65536, STR_PTR("{}"), 2); };
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"type\":\"toolCall\",\"id\":\""), STR_LEN("{\"type\":\"toolCall\",\"id\":\""));
+    n = n + append_bytes(out, out_cap, n, id_ptr, id_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    n = n + append_bytes(out, out_cap, n, turn_ptr, turn_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"name\":\""), STR_LEN("\",\"name\":\""));
+    n = n + append_bytes(out, out_cap, n, name_use_ptr, name_use_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"tool\":\""), STR_LEN("\",\"tool\":\""));
+    n = n + append_bytes(out, out_cap, n, name_use_ptr, name_use_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"toolName\":\""), STR_LEN("\",\"toolName\":\""));
+    n = n + append_bytes(out, out_cap, n, name_use_ptr, name_use_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"input\":"), STR_LEN("\",\"input\":"));
+    n = n + append_bytes(out, out_cap, n, &input_text, input_text_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"arguments\":"), STR_LEN(",\"arguments\":"));
+    n = n + append_bytes(out, out_cap, n, &input_text, input_text_len);
+    if output_len > 0 {
+        let take = output_len;
+        if take > 4000 { take = 4000; };
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"output\":\""), STR_LEN(",\"output\":\""));
+        n = n + append_bytes(out, out_cap, n, output_ptr, take);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"result\":{\"content\":\""), STR_LEN("\",\"result\":{\"content\":\""));
+        n = n + append_bytes(out, out_cap, n, output_ptr, take);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\"}"), 2);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"status\":\""), STR_LEN(",\"status\":\""));
+    if done_flag {
+        if failed { n = n + append_bytes(out, out_cap, n, STR_PTR("failed"), STR_LEN("failed")); } else { n = n + append_bytes(out, out_cap, n, STR_PTR("completed"), STR_LEN("completed")); };
+    } else {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("inProgress"), STR_LEN("inProgress"));
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\"}"), 2);
+    return n;
+}
+
+// settleOpenToolItems(state, threadId, turnId, status)
+fn settle_open_tool_items(self: &ClineAgentBridge, s: &ClineSessionState, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, status_ptr: ptr, status_len: u64) -> void {
+    for i in 0..s.msg_count {
+        let doc = sa_json_parse(cline_msg_ptr(s, i), s.msg_len_arr[i]);
+        if doc == 0 { continue; };
+        let row_turn_ptr: ptr = PTR_NULL();
+        let row_turn_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("turnId"), STR_LEN("turnId"), &row_turn_ptr, &row_turn_len) != 0 || row_turn_len != turn_len || !bytes_eq(row_turn_ptr, turn_ptr, turn_len) { continue; };
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len) != 0 { continue; };
+        let is_tool = str_is(t_ptr, t_len, STR_PTR("toolCall"), STR_LEN("toolCall"));
+        let is_collab = str_is(t_ptr, t_len, STR_PTR("collabAgentToolCall"), STR_LEN("collabAgentToolCall"));
+        if !is_tool && !is_collab { continue; };
+        let st_ptr: ptr = PTR_NULL();
+        let st_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("status"), STR_LEN("status"), &st_ptr, &st_len) != 0 || !str_is(st_ptr, st_len, STR_PTR("inProgress"), STR_LEN("inProgress")) { continue; };
+        let item_text = [0u8; 262144];
+        let item_text_len = settle_card_text(cline_msg_ptr(s, i), s.msg_len_arr[i], str_is(status_ptr, status_len, STR_PTR("failed"), STR_LEN("failed")), is_collab, &item_text, 262144);
+        // settle_card_text writes completed/failed; the
+        // interrupted case needs its own status splice
+        if str_is(status_ptr, status_len, STR_PTR("interrupted"), STR_LEN("interrupted")) {
+            let doc2 = sa_json_parse(&item_text, item_text_len);
+            if doc2 != 0 {
+                sa_json_object_set_string(doc2, STR_PTR("status"), STR_LEN("status"), STR_PTR("interrupted"), STR_LEN("interrupted"));
+                if is_collab { sa_json_object_set_string(doc2, STR_PTR("agentStatus"), STR_LEN("agentStatus"), STR_PTR("interrupted"), STR_LEN("interrupted")); };
+                item_text_len = stringify_into(doc2, &item_text, 262144);
+            };
+        };
+        cline_replace_message(s, i, &item_text, item_text_len);
+        let id_ptr: ptr = PTR_NULL();
+        let id_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len) == 0 {
+            open_spawn_remove(self, id_ptr, id_len);
+            // drop pending team runs pointing at this card
+            let j: u64 = 0;
+            while j < s.pendingTeamRuns_count {
+                if s.pendingTeamRuns[j].toolCallId_len == id_len && bytes_eq(&s.pendingTeamRuns[j].toolCallId, id_ptr, id_len) {
+                    let rid = [0u8; 128];
+                    let rid_len = buf_copy(&rid, 128, &s.pendingTeamRuns[j].runId, s.pendingTeamRuns[j].runId_len);
+                    team_run_remove(s, &rid, rid_len);
+                } else {
+                    j = j + 1;
+                };
+            }
+        };
+        let frame = [0u8; 262144];
+        let frame_len = wrap_item_message(&frame, 262144, STR_PTR("item/completed"), STR_LEN("item/completed"), thread_ptr, thread_len, turn_ptr, turn_len, &item_text, item_text_len);
+        emit_message(self, &frame, frame_len);
+    }
+}
+
+// meaningfulTeamActivity(run): first non-placeholder
+// progress line of lastProgressMessage / currentActivity.
+fn meaningful_team_activity(run: u64, out: ptr, out_cap: u64) -> u64 {
+    let keys = [STR_PTR("lastProgressMessage"), STR_PTR("currentActivity")];
+    let key_lens = [STR_LEN("lastProgressMessage"), STR_LEN("currentActivity")];
+    for ki in 0..2 {
+        let v_ptr: ptr = PTR_NULL();
+        let v_len: u64 = 0;
+        if run == 0 || sa_json_object_get_string(run, keys[ki], key_lens[ki], &v_ptr, &v_len) != 0 { continue; };
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        ts_trim_span(v_ptr, v_len, &tp, &tl);
+        if tl == 0 { continue; };
+        let lowered = [0u8; 512];
+        let lowered_len = to_lower(&lowered, 512, tp, tl);
+        if str_is(&lowered, lowered_len, STR_PTR("heartbeat"), STR_LEN("heartbeat")) || str_is(&lowered, lowered_len, STR_PTR("idle"), 4) || str_is(&lowered, lowered_len, STR_PTR("queued"), STR_LEN("queued")) || str_is(&lowered, lowered_len, STR_PTR("running"), STR_LEN("running")) || str_is(&lowered, lowered_len, STR_PTR("pending"), STR_LEN("pending")) || str_is(&lowered, lowered_len, STR_PTR("pong"), 4) { continue; };
+        return buf_copy(out, out_cap, tp, tl);
+    }
+    return 0;
+}
+
+// reconcileTeamRuns(state, threadId, turnId, rawOutput)
+fn reconcile_team_runs(self: &ClineAgentBridge, s: &ClineSessionState, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, raw_output: u64) -> void {
+    if s.pendingTeamRuns_count == 0 { return; };
+    let parsed: u64 = 0;
+    parse_json_loose_node(raw_output, &parsed);
+    // runs[] collection: array form or {runs:[...]}
+    let runs_node: u64 = 0;
+    let is_arr = false;
+    json_node_is_array(parsed, &is_arr);
+    if is_arr {
+        runs_node = parsed;
+    } else if parsed != 0 {
+        sa_json_object_get(parsed, STR_PTR("runs"), STR_LEN("runs"), &runs_node);
+    };
+    let rc: u64 = 0;
+    if runs_node == 0 || sa_json_array_len(runs_node, &rc) != 0 { return; };
+    for ri in 0..rc {
+        let run: u64 = 0;
+        sa_json_array_get(runs_node, ri, &run);
+        if run == 0 { continue; };
+        let run_id_ptr: ptr = PTR_NULL();
+        let run_id_len: u64 = 0;
+        if sa_json_object_get_string(run, STR_PTR("id"), STR_LEN("id"), &run_id_ptr, &run_id_len) != 0 || run_id_len == 0 { continue; };
+        let agent_ptr: ptr = PTR_NULL();
+        let agent_len: u64 = 0;
+        sa_json_object_get_string(run, STR_PTR("agentId"), STR_LEN("agentId"), &agent_ptr, &agent_len);
+        let status = [0u8; 64];
+        let status_len: u64 = 0;
+        let st_ptr: ptr = PTR_NULL();
+        let st_len: u64 = 0;
+        if sa_json_object_get_string(run, STR_PTR("status"), STR_LEN("status"), &st_ptr, &st_len) == 0 {
+            status_len = to_lower(&status, 64, st_ptr, st_len);
+        };
+        if status_len == 0 { continue; };
+        // find the pending ref by runId, else by agentId
+        let ref_idx: u64 = 4294967295;
+        for pi in 0..s.pendingTeamRuns_count {
+            if s.pendingTeamRuns[pi].runId_len == run_id_len && bytes_eq(&s.pendingTeamRuns[pi].runId, run_id_ptr, run_id_len) { ref_idx = pi; break; };
+        }
+        if ref_idx == 4294967295 && agent_len > 0 {
+            for pi in 0..s.pendingTeamRuns_count {
+                if s.pendingTeamRuns[pi].has_agentId && s.pendingTeamRuns[pi].agentId_len == agent_len && bytes_eq(&s.pendingTeamRuns[pi].agentId, agent_ptr, agent_len) { ref_idx = pi; break; };
+            }
+        };
+        if ref_idx == 4294967295 { continue; };
+        let tool_id = [0u8; 128];
+        let tool_id_len = buf_copy(&tool_id, 128, &s.pendingTeamRuns[ref_idx].toolCallId, s.pendingTeamRuns[ref_idx].toolCallId_len);
+        let card_idx = cline_find_card(s, &tool_id, tool_id_len);
+        if card_idx == 4294967295 { continue; };
+        let card = sa_json_parse(cline_msg_ptr(s, card_idx), s.msg_len_arr[card_idx]);
+        if card == 0 { continue; };
+        let cur_ptr: ptr = PTR_NULL();
+        let cur_len: u64 = 0;
+        if sa_json_object_get_string(card, STR_PTR("status"), STR_LEN("status"), &cur_ptr, &cur_len) == 0 {
+            if str_is(cur_ptr, cur_len, STR_PTR("completed"), STR_LEN("completed")) || str_is(cur_ptr, cur_len, STR_PTR("failed"), STR_LEN("failed")) { continue; };
+        };
+        let failed_status = str_is(&status, status_len, STR_PTR("failed"), STR_LEN("failed")) || str_is(&status, status_len, STR_PTR("error"), STR_LEN("error")) || str_is(&status, status_len, STR_PTR("cancelled"), STR_LEN("cancelled")) || str_is(&status, status_len, STR_PTR("interrupted"), STR_LEN("interrupted")) || str_is(&status, status_len, STR_PTR("stopped"), STR_LEN("stopped"));
+        let terminal = failed_status || str_is(&status, status_len, STR_PTR("completed"), STR_LEN("completed")) || str_is(&status, status_len, STR_PTR("done"), 4);
+        // patch the card doc + re-emit
+        let new_status_ptr = STR_PTR("inProgress");
+        let new_status_len = STR_LEN("inProgress");
+        if terminal {
+            if failed_status { new_status_ptr = STR_PTR("failed"); new_status_len = STR_LEN("failed"); } else { new_status_ptr = STR_PTR("completed"); new_status_len = STR_LEN("completed"); };
+        };
+        sa_json_object_set_string(card, STR_PTR("status"), STR_LEN("status"), new_status_ptr, new_status_len);
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        let is_collab = false;
+        if sa_json_object_get_string(card, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len) == 0 {
+            is_collab = str_is(t_ptr, t_len, STR_PTR("collabAgentToolCall"), STR_LEN("collabAgentToolCall"));
+        };
+        if is_collab {
+            let agent_status_ptr = new_status_ptr;
+            let agent_status_len = new_status_len;
+            if !terminal { agent_status_ptr = STR_PTR("running"); agent_status_len = STR_LEN("running"); };
+            sa_json_object_set_string(card, STR_PTR("agentStatus"), STR_LEN("agentStatus"), agent_status_ptr, agent_status_len);
+        };
+        if terminal {
+            sa_json_object_delete(card, STR_PTR("output"), STR_LEN("output"));
+            sa_json_object_delete(card, STR_PTR("result"), STR_LEN("result"));
+        } else {
+            let activity = [0u8; 8192];
+            let activity_len = meaningful_team_activity(run, &activity, 8192);
+            if activity_len > 0 {
+                let take = activity_len;
+                if take > 4000 { take = 4000; };
+                sa_json_object_set_string(card, STR_PTR("output"), STR_LEN("output"), &activity, take);
+                let result_doc = json_object_new();
+                sa_json_object_set_string(result_doc, STR_PTR("content"), STR_LEN("content"), &activity, take);
+                sa_json_object_set(card, STR_PTR("result"), STR_LEN("result"), result_doc);
+            };
+        };
+        let item_text = [0u8; 262144];
+        let item_text_len = stringify_into(card, &item_text, 262144);
+        cline_replace_message(s, card_idx, &item_text, item_text_len);
+        let ref_turn = [0u8; 64];
+        let ref_turn_len = buf_copy(&ref_turn, 64, &s.pendingTeamRuns[ref_idx].turnId, s.pendingTeamRuns[ref_idx].turnId_len);
+        let ref_thread = [0u8; 128];
+        let ref_thread_len = buf_copy(&ref_thread, 128, &s.pendingTeamRuns[ref_idx].threadId, s.pendingTeamRuns[ref_idx].threadId_len);
+        let frame = [0u8; 262144];
+        let frame_len = wrap_item_message(&frame, 262144, if terminal { STR_PTR("item/completed") } else { STR_PTR("item/started") }, if terminal { STR_LEN("item/completed") } else { STR_LEN("item/started") }, &ref_thread, ref_thread_len, &ref_turn, ref_turn_len, &item_text, item_text_len);
+        emit_message(self, &frame, frame_len);
+        if terminal {
+            open_spawn_remove(self, &tool_id, tool_id_len);
+            team_run_remove(s, run_id_ptr, run_id_len);
+        };
+    }
+}
+
+// applyClineTeamTask(state, threadId, turnId, action,
+// input, output)
+fn apply_cline_team_task(self: &ClineAgentBridge, s: &ClineSessionState, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, action_ptr: ptr, action_len: u64, input: u64, output: u64) -> void {
+    if str_is(action_ptr, action_len, STR_PTR("create"), STR_LEN("create")) {
+        let title = [0u8; 512];
+        let title_len: u64 = 0;
+        let t_ptr: ptr = PTR_NULL();
+        let t_len: u64 = 0;
+        if input != 0 && sa_json_object_get_string(input, STR_PTR("title"), STR_LEN("title"), &t_ptr, &t_len) == 0 {
+            let tp: ptr = PTR_NULL();
+            let tl: u64 = 0;
+            ts_trim_span(t_ptr, t_len, &tp, &tl);
+            if tl > 0 {
+                if tl > 200 { tl = 200; };
+                title_len = buf_copy(&title, 512, tp, tl);
+            };
+        };
+        if title_len == 0 { title_len = buf_copy(&title, 512, STR_PTR("Untitled task"), STR_LEN("Untitled task")); };
+        let assignee = [0u8; 128];
+        let assignee_len: u64 = 0;
+        if input != 0 && sa_json_object_get_string(input, STR_PTR("assignee"), STR_LEN("assignee"), &t_ptr, &t_len) == 0 {
+            let tp: ptr = PTR_NULL();
+            let tl: u64 = 0;
+            ts_trim_span(t_ptr, t_len, &tp, &tl);
+            if tl > 0 {
+                if tl > 60 { tl = 60; };
+                assignee_len = assignee_len + append_bytes(&assignee, 128, assignee_len, STR_PTR(" ("), 2);
+                assignee_len = assignee_len + append_bytes(&assignee, 128, assignee_len, tp, tl);
+                assignee_len = assignee_len + append_bytes(&assignee, 128, assignee_len, STR_PTR(")"), 1);
+            };
+        };
+        let key = [0u8; 128];
+        let key_len: u64 = 0;
+        if output != 0 && sa_json_object_get_string(output, STR_PTR("taskId"), STR_LEN("taskId"), &t_ptr, &t_len) == 0 && t_len > 0 {
+            key_len = buf_copy(&key, 128, t_ptr, t_len);
+        } else if output != 0 && sa_json_object_get_string(output, STR_PTR("task_id"), STR_LEN("task_id"), &t_ptr, &t_len) == 0 && t_len > 0 {
+            key_len = buf_copy(&key, 128, t_ptr, t_len);
+        };
+        if key_len == 0 {
+            // ordinal: count of task_* keys + 1, padded 4
+            let ordinal: u64 = 1;
+            for i in 0..s.planSteps_count {
+                if starts_with(&s.planSteps[i].key, s.planSteps[i].key_len, STR_PTR("task_"), 5) { ordinal = ordinal + 1; };
+            }
+            key_len = key_len + append_bytes(&key, 128, key_len, STR_PTR("task_"), 5);
+            // padStart(4, "0")
+            let digits = [0u8; 24];
+            let dn: u64 = 0;
+            let x = ordinal;
+            if x == 0 { digits[0] = 48; dn = 1; } else {
+                let tmp = [0u8; 24];
+                let tn: u64 = 0;
+                while x > 0 { tmp[tn] = (48 + (x % 10)) as u8; tn = tn + 1; x = x / 10; };
+                while tn > 0 { tn = tn - 1; digits[dn] = tmp[tn]; dn = dn + 1; };
+            };
+            let pad = 0;
+            if dn < 4 { pad = 4 - dn; };
+            for i in 0..pad { key_len = key_len + append_bytes(&key, 128, key_len, STR_PTR("0"), 1); };
+            key_len = key_len + append_bytes(&key, 128, key_len, &digits, dn);
+        };
+        let exists = false;
+        for i in 0..s.planSteps_count {
+            if s.planSteps[i].key_len == key_len && bytes_eq(&s.planSteps[i].key, &key, key_len) { exists = true; break; };
+        }
+        if !exists && s.planSteps_count < 128 {
+            let step = &s.planSteps[s.planSteps_count];
+            step.step_len = 0;
+            step.step_len = step.step_len + append_bytes(&step.step, 512, step.step_len, &title, title_len);
+            step.step_len = step.step_len + append_bytes(&step.step, 512, step.step_len, &assignee, assignee_len);
+            step.status_len = buf_copy(&step.status, 32, STR_PTR("in_progress"), STR_LEN("in_progress"));
+            step.key_len = buf_copy(&step.key, 128, &key, key_len);
+            s.planSteps_count = s.planSteps_count + 1;
+        };
+    } else {
+        let task_id_ptr: ptr = PTR_NULL();
+        let task_id_len: u64 = 0;
+        if input != 0 && sa_json_object_get_string(input, STR_PTR("taskId"), STR_LEN("taskId"), &task_id_ptr, &task_id_len) != 0 || task_id_len == 0 {
+            if input != 0 { sa_json_object_get_string(input, STR_PTR("task_id"), STR_LEN("task_id"), &task_id_ptr, &task_id_len); };
+        };
+        let target: u64 = 4294967295;
+        if task_id_len > 0 {
+            for i in 0..s.planSteps_count {
+                if s.planSteps[i].key_len == task_id_len && bytes_eq(&s.planSteps[i].key, task_id_ptr, task_id_len) { target = i; break; };
+            }
+        };
+        if target != 4294967295 {
+            s.planSteps[target].status_len = buf_copy(&s.planSteps[target].status, 32, STR_PTR("completed"), STR_LEN("completed"));
+        } else if task_id_len > 0 && s.planSteps_count < 128 {
+            let summary = [0u8; 512];
+            let summary_len: u64 = 0;
+            let sm_ptr: ptr = PTR_NULL();
+            let sm_len: u64 = 0;
+            if input != 0 && sa_json_object_get_string(input, STR_PTR("summary"), STR_LEN("summary"), &sm_ptr, &sm_len) == 0 {
+                let tp: ptr = PTR_NULL();
+                let tl: u64 = 0;
+                ts_trim_span(sm_ptr, sm_len, &tp, &tl);
+                if tl > 0 {
+                    if tl > 200 { tl = 200; };
+                    summary_len = buf_copy(&summary, 512, tp, tl);
+                };
+            };
+            if summary_len == 0 { summary_len = buf_copy(&summary, 512, task_id_ptr, task_id_len); };
+            let step = &s.planSteps[s.planSteps_count];
+            step.step_len = buf_copy(&step.step, 512, &summary, summary_len);
+            step.status_len = buf_copy(&step.status, 32, STR_PTR("completed"), STR_LEN("completed"));
+            step.key_len = buf_copy(&step.key, 128, task_id_ptr, task_id_len);
+            s.planSteps_count = s.planSteps_count + 1;
+        };
+    };
+    emit_cline_plan(self, s, thread_ptr, thread_len, turn_ptr, turn_len);
+}
+
+// emitClinePlan(state, threadId, turnId)
+fn emit_cline_plan(self: &ClineAgentBridge, s: &ClineSessionState, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64) -> void {
+    let text = [0u8; 65536];
+    let text_len: u64 = 0;
+    for i in 0..s.planSteps_count {
+        if i > 0 { text_len = text_len + append_bytes(&text, 65536, text_len, STR_PTR("\n"), 1); };
+        if str_is(&s.planSteps[i].status, s.planSteps[i].status_len, STR_PTR("completed"), STR_LEN("completed")) {
+            text_len = text_len + append_bytes(&text, 65536, text_len, STR_PTR("- [x] "), STR_LEN("- [x] "));
+        } else {
+            text_len = text_len + append_bytes(&text, 65536, text_len, STR_PTR("- [ ] "), STR_LEN("- [ ] "));
+        };
+        text_len = text_len + append_bytes(&text, 65536, text_len, &s.planSteps[i].step, s.planSteps[i].step_len);
+    }
+    if s.planSteps_count == 0 {
+        text_len = buf_copy(&text, 65536, STR_PTR("No tasks yet"), STR_LEN("No tasks yet"));
+    };
+    let all_done = s.planSteps_count > 0;
+    for i in 0..s.planSteps_count {
+        if !str_is(&s.planSteps[i].status, s.planSteps[i].status_len, STR_PTR("completed"), STR_LEN("completed")) { all_done = false; break; };
+    }
+    let item = [0u8; 131072];
+    let item_len: u64 = 0;
+    item_len = item_len + append_bytes(&item, 131072, item_len, STR_PTR("{\"type\":\"plan\",\"id\":\"cline-"), STR_LEN("{\"type\":\"plan\",\"id\":\"cline-"));
+    item_len = item_len + append_bytes(&item, 131072, item_len, turn_ptr, turn_len);
+    item_len = item_len + append_bytes(&item, 131072, item_len, STR_PTR("-plan\",\"turnId\":\""), STR_LEN("-plan\",\"turnId\":\""));
+    item_len = item_len + append_bytes(&item, 131072, item_len, turn_ptr, turn_len);
+    item_len = item_len + append_bytes(&item, 131072, item_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    item_len = item_len + append_bytes(&item, 131072, item_len, thread_ptr, thread_len);
+    item_len = item_len + append_bytes(&item, 131072, item_len, STR_PTR("\",\"title\":\"Plan\",\"text\":\""), STR_LEN("\",\"title\":\"Plan\",\"text\":\""));
+    item_len = item_len + append_bytes(&item, 131072, item_len, &text, text_len);
+    item_len = item_len + append_bytes(&item, 131072, item_len, STR_PTR("\",\"plan\":["), STR_LEN("\",\"plan\":["));
+    for i in 0..s.planSteps_count {
+        if i > 0 { item_len = item_len + append_bytes(&item, 131072, item_len, STR_PTR(","), 1); };
+        item_len = item_len + append_bytes(&item, 131072, item_len, STR_PTR("{\"step\":\""), STR_LEN("{\"step\":\""));
+        item_len = item_len + append_bytes(&item, 131072, item_len, &s.planSteps[i].step, s.planSteps[i].step_len);
+        item_len = item_len + append_bytes(&item, 131072, item_len, STR_PTR("\",\"status\":\""), STR_LEN("\",\"status\":\""));
+        item_len = item_len + append_bytes(&item, 131072, item_len, &s.planSteps[i].status, s.planSteps[i].status_len);
+        item_len = item_len + append_bytes(&item, 131072, item_len, STR_PTR("\"}"), 2);
+    }
+    item_len = item_len + append_bytes(&item, 131072, item_len, STR_PTR("],\"status\":\""), STR_LEN("],\"status\":\""));
+    if all_done {
+        item_len = item_len + append_bytes(&item, 131072, item_len, STR_PTR("completed"), STR_LEN("completed"));
+    } else {
+        item_len = item_len + append_bytes(&item, 131072, item_len, STR_PTR("inProgress"), STR_LEN("inProgress"));
+    };
+    item_len = item_len + append_bytes(&item, 131072, item_len, STR_PTR("\"}"), 2);
+    let plan_id = [0u8; 192];
+    let plan_id_len: u64 = 0;
+    plan_id_len = plan_id_len + append_bytes(&plan_id, 192, plan_id_len, STR_PTR("cline-"), STR_LEN("cline-"));
+    plan_id_len = plan_id_len + append_bytes(&plan_id, 192, plan_id_len, turn_ptr, turn_len);
+    plan_id_len = plan_id_len + append_bytes(&plan_id, 192, plan_id_len, STR_PTR("-plan"), STR_LEN("-plan"));
+    let found = cline_find_message(s, STR_PTR("plan"), STR_LEN("plan"), &plan_id, plan_id_len);
+    if found != 4294967295 {
+        cline_replace_message(s, found, &item, item_len);
+    } else {
+        cline_push_message(s, &item, item_len);
+    };
+    let frame = [0u8; 131072];
+    let frame_len = wrap_item_message(&frame, 131072, STR_PTR("item/completed"), STR_LEN("item/completed"), thread_ptr, thread_len, turn_ptr, turn_len, &item, item_len);
+    emit_message(self, &frame, frame_len);
+}
+
+// finishTurn(state, threadId, status, finalText, usage?,
+// errorMessage?)
+fn finish_turn(self: &ClineAgentBridge, s: &ClineSessionState, thread_ptr: ptr, thread_len: u64, status_ptr: ptr, status_len: u64, final_ptr: ptr, final_len: u64, usage: u64, has_usage: bool, err_ptr: ptr, err_len: u64, has_err: bool) -> void {
+    if !s.has_activeTurnId { return; };
+    let turn_id = [0u8; 64];
+    let turn_len = buf_copy(&turn_id, 64, &s.activeTurnId, s.activeTurnId_len);
+    s.has_activeTurnId = false;
+    s.activeTurnId_len = 0;
+    s.has_activeRunId = false;
+    s.activeRunId_len = 0;
+    settle_open_tool_items(self, s, thread_ptr, thread_len, &turn_id, turn_len, status_ptr, status_len);
+    if final_len > 0 {
+        let item_id = [0u8; 192];
+        let item_id_len: u64 = 0;
+        if s.has_activeItemId {
+            item_id_len = buf_copy(&item_id, 192, &s.activeItemId, s.activeItemId_len);
+        } else {
+            item_id_len = item_id_len + append_bytes(&item_id, 192, item_id_len, STR_PTR("cline-"), STR_LEN("cline-"));
+            item_id_len = item_id_len + append_bytes(&item_id, 192, item_id_len, &turn_id, turn_len);
+            item_id_len = item_id_len + append_bytes(&item_id, 192, item_id_len, STR_PTR("-text"), STR_LEN("-text"));
+        };
+        let item = [0u8; 262144];
+        let item_len: u64 = 0;
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("{\"type\":\"agentMessage\",\"id\":\""), STR_LEN("{\"type\":\"agentMessage\",\"id\":\""));
+        item_len = item_len + append_bytes(&item, 262144, item_len, &item_id, item_id_len);
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        item_len = item_len + append_bytes(&item, 262144, item_len, &turn_id, turn_len);
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        item_len = item_len + append_bytes(&item, 262144, item_len, thread_ptr, thread_len);
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"content\":\""), STR_LEN("\",\"content\":\""));
+        item_len = item_len + append_bytes(&item, 262144, item_len, final_ptr, final_len);
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"role\":\"assistant\",\"status\":\"completed\"}"), STR_LEN("\",\"role\":\"assistant\",\"status\":\"completed\"}"));
+        let frame = [0u8; 262144];
+        let frame_len = wrap_item_message(&frame, 262144, STR_PTR("item/completed"), STR_LEN("item/completed"), thread_ptr, thread_len, &turn_id, turn_len, &item, item_len);
+        emit_message(self, &frame, frame_len);
+        let found = cline_find_message(s, STR_PTR("agentMessage"), STR_LEN("agentMessage"), &item_id, item_id_len);
+        if found != 4294967295 {
+            cline_replace_message(s, found, &item, item_len);
+        } else {
+            let has_text = false;
+            for i in 0..s.msg_count {
+                let doc = sa_json_parse(cline_msg_ptr(s, i), s.msg_len_arr[i]);
+                if doc == 0 { continue; };
+                let t_ptr: ptr = PTR_NULL();
+                let t_len: u64 = 0;
+                if sa_json_object_get_string(doc, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len) != 0 { continue; };
+                if !str_is(t_ptr, t_len, STR_PTR("agentMessage"), STR_LEN("agentMessage")) { continue; };
+                let v_ptr: ptr = PTR_NULL();
+                let v_len: u64 = 0;
+                if sa_json_object_get_string(doc, STR_PTR("turnId"), STR_LEN("turnId"), &v_ptr, &v_len) == 0 && v_len == turn_len && bytes_eq(v_ptr, &turn_id, turn_len) { has_text = true; break; };
+            }
+            if !has_text { cline_push_message(s, &item, item_len); };
+        };
+    };
+    s.has_activeItemId = false;
+    s.activeItemId_len = 0;
+    s.streamedText_len = 0;
+    s.itemStarted = false;
+    for i in 0..s.turns_count {
+        if s.turns[i].id_len == turn_len && bytes_eq(&s.turns[i].id, &turn_id, turn_len) {
+            s.turns[i].status_len = buf_copy(&s.turns[i].status, 32, status_ptr, status_len);
+            break;
+        };
+    }
+    if has_usage && usage != 0 {
+        let prompt_tokens: i64 = 0;
+        let completion_tokens: i64 = 0;
+        let has_prompt = number_of(usage, STR_PTR("inputTokens"), STR_LEN("inputTokens"), &prompt_tokens);
+        let has_completion = number_of(usage, STR_PTR("outputTokens"), STR_LEN("outputTokens"), &completion_tokens);
+        if has_prompt || has_completion {
+            let cache_tokens: i64 = 0;
+            let has_cache = number_of(usage, STR_PTR("cacheReadTokens"), STR_LEN("cacheReadTokens"), &cache_tokens);
+            let frame = [0u8; 2048];
+            let frame_len: u64 = 0;
+            frame_len = frame_len + append_bytes(&frame, 2048, frame_len, STR_PTR("{\"method\":\"thread/tokenUsage/requestUpdated\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"thread/tokenUsage/requestUpdated\",\"params\":{\"threadId\":\""));
+            frame_len = frame_len + append_bytes(&frame, 2048, frame_len, thread_ptr, thread_len);
+            frame_len = frame_len + append_bytes(&frame, 2048, frame_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+            frame_len = frame_len + append_bytes(&frame, 2048, frame_len, &turn_id, turn_len);
+            frame_len = frame_len + append_bytes(&frame, 2048, frame_len, STR_PTR("\",\"requestId\":\"cline-turn-"), STR_LEN("\",\"requestId\":\"cline-turn-"));
+            frame_len = frame_len + append_bytes(&frame, 2048, frame_len, &turn_id, turn_len);
+            frame_len = frame_len + append_bytes(&frame, 2048, frame_len, STR_PTR("\",\"usage\":{\"prompt_tokens\":"), STR_LEN("\",\"usage\":{\"prompt_tokens\":"));
+            frame_len = frame_len + append_i64(&frame, 2048, frame_len, if has_prompt { prompt_tokens } else { 0 });
+            frame_len = frame_len + append_bytes(&frame, 2048, frame_len, STR_PTR(",\"completion_tokens\":"), STR_LEN(",\"completion_tokens\":"));
+            frame_len = frame_len + append_i64(&frame, 2048, frame_len, if has_completion { completion_tokens } else { 0 });
+            frame_len = frame_len + append_bytes(&frame, 2048, frame_len, STR_PTR(",\"total_tokens\":"), STR_LEN(",\"total_tokens\":"));
+            frame_len = frame_len + append_i64(&frame, 2048, frame_len, (if has_prompt { prompt_tokens } else { 0 }) + (if has_completion { completion_tokens } else { 0 }));
+            if has_cache {
+                frame_len = frame_len + append_bytes(&frame, 2048, frame_len, STR_PTR(",\"prompt_tokens_details\":{\"cached_tokens\":"), STR_LEN(",\"prompt_tokens_details\":{\"cached_tokens\":"));
+                frame_len = frame_len + append_i64(&frame, 2048, frame_len, cache_tokens);
+                frame_len = frame_len + append_bytes(&frame, 2048, frame_len, STR_PTR("}"), 1);
+            };
+            frame_len = frame_len + append_bytes(&frame, 2048, frame_len, STR_PTR("}}}"), 3);
+            emit_message(self, &frame, frame_len);
+        };
+    };
+    if str_is(status_ptr, status_len, STR_PTR("failed"), STR_LEN("failed")) {
+        let frame = [0u8; 8192];
+        let frame_len: u64 = 0;
+        frame_len = frame_len + append_bytes(&frame, 8192, frame_len, STR_PTR("{\"method\":\"turn/failed\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"turn/failed\",\"params\":{\"threadId\":\""));
+        frame_len = frame_len + append_bytes(&frame, 8192, frame_len, thread_ptr, thread_len);
+        frame_len = frame_len + append_bytes(&frame, 8192, frame_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        frame_len = frame_len + append_bytes(&frame, 8192, frame_len, &turn_id, turn_len);
+        frame_len = frame_len + append_bytes(&frame, 8192, frame_len, STR_PTR("\",\"turn\":{\"id\":\""), STR_LEN("\",\"turn\":{\"id\":\""));
+        frame_len = frame_len + append_bytes(&frame, 8192, frame_len, &turn_id, turn_len);
+        frame_len = frame_len + append_bytes(&frame, 8192, frame_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        frame_len = frame_len + append_bytes(&frame, 8192, frame_len, thread_ptr, thread_len);
+        frame_len = frame_len + append_bytes(&frame, 8192, frame_len, STR_PTR("\",\"status\":\"failed\"},\"error\":\""), STR_LEN("\",\"status\":\"failed\"},\"error\":\""));
+        if has_err {
+            frame_len = frame_len + append_bytes(&frame, 8192, frame_len, err_ptr, err_len);
+        } else {
+            frame_len = frame_len + append_bytes(&frame, 8192, frame_len, STR_PTR("Cline run failed"), STR_LEN("Cline run failed"));
+        };
+        frame_len = frame_len + append_bytes(&frame, 8192, frame_len, STR_PTR("\"}}"), 3);
+        emit_message(self, &frame, frame_len);
+    } else {
+        let frame = [0u8; 4096];
+        let frame_len: u64 = 0;
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, STR_PTR("{\"method\":\"turn/completed\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"turn/completed\",\"params\":{\"threadId\":\""));
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, thread_ptr, thread_len);
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, &turn_id, turn_len);
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, STR_PTR("\",\"turn\":{\"id\":\""), STR_LEN("\",\"turn\":{\"id\":\""));
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, &turn_id, turn_len);
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, thread_ptr, thread_len);
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, STR_PTR("\",\"status\":\""), STR_LEN("\",\"status\":\""));
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, status_ptr, status_len);
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, STR_PTR("\",\"completedAt\":"), STR_LEN("\",\"completedAt\":"));
+        frame_len = frame_len + append_u64(&frame, 4096, frame_len, now_ms() / 1000);
+        frame_len = frame_len + append_bytes(&frame, 4096, frame_len, STR_PTR("}}}"), 3);
+        emit_message(self, &frame, frame_len);
+    };
+}
+
+// ---- free functions ----
+
+// parseJsonLoose(value): strings that look like JSON are
+// parsed; anything else passes through. Node form: string
+// nodes unwrap to their parsed doc when possible.
+fn parse_json_loose_node(node: u64, out: &u64) -> void {
+    out = node;
+    if node == 0 { return; };
+    let is_str = false;
+    json_node_is_string(node, &is_str);
+    if !is_str { return; };
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    json_node_string(node, &v_ptr, &v_len);
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    ts_trim_span(v_ptr, v_len, &tp, &tl);
+    if tl == 0 { return; };
+    let first = byte_at(tp, 0);
+    if first != 123 && first != 91 { return; };
+    let parsed = sa_json_parse(tp, tl);
+    if parsed != 0 { out = parsed; };
+}
+
+// numberOf(value): typeof number && Number.isFinite.
+fn number_of(doc: u64, key_ptr: ptr, key_len: u64, out: &i64) -> bool {
+    return sa_json_object_get_i64(doc, key_ptr, key_len, out) == 0;
+}
+
+// extractTurnText(p): prompt || text || input (string or
+// text-part array joined "\n", trimmed).
+fn extract_turn_text(params: u64, out: ptr, out_cap: u64) -> u64 {
+    if params == 0 { return 0; };
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    if sa_json_object_get_string(params, STR_PTR("prompt"), STR_LEN("prompt"), &v_ptr, &v_len) == 0 {
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        ts_trim_span(v_ptr, v_len, &tp, &tl);
+        if tl > 0 { return buf_copy(out, out_cap, v_ptr, v_len); };
+    };
+    if sa_json_object_get_string(params, STR_PTR("text"), STR_LEN("text"), &v_ptr, &v_len) == 0 {
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        ts_trim_span(v_ptr, v_len, &tp, &tl);
+        if tl > 0 { return buf_copy(out, out_cap, v_ptr, v_len); };
+    };
+    let input: u64 = 0;
+    if sa_json_object_get(params, STR_PTR("input"), STR_LEN("input"), &input) != 0 || input == 0 { return 0; };
+    let is_str = false;
+    json_node_is_string(input, &is_str);
+    if is_str {
+        json_node_string(input, &v_ptr, &v_len);
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        ts_trim_span(v_ptr, v_len, &tp, &tl);
+        if tl > 0 { return buf_copy(out, out_cap, v_ptr, v_len); };
+        return 0;
+    };
+    let n: u64 = 0;
+    let count: u64 = 0;
+    let parts: u64 = 0;
+    if sa_json_array_len(input, &count) == 0 {
+        for i in 0..count {
+            let entry: u64 = 0;
+            sa_json_array_get(input, i, &entry);
+            if entry == 0 { continue; };
+            let part_ptr: ptr = PTR_NULL();
+            let part_len: u64 = 0;
+            let is_entry_str = false;
+            json_node_is_string(entry, &is_entry_str);
+            if is_entry_str {
+                json_node_string(entry, &part_ptr, &part_len);
+            } else {
+                let t_ptr: ptr = PTR_NULL();
+                let t_len: u64 = 0;
+                if sa_json_object_get_string(entry, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len) != 0 || !str_is(t_ptr, t_len, STR_PTR("text"), 4) { continue; };
+                if sa_json_object_get_string(entry, STR_PTR("text"), STR_LEN("text"), &part_ptr, &part_len) != 0 { continue; };
+            };
+            if n > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR("\n"), 1); };
+            n = n + append_bytes(out, out_cap, n, part_ptr, part_len);
+            parts = parts + 1;
+        }
+    };
+    // parts.join("\n").trim()
+    let tp2: ptr = PTR_NULL();
+    let tl2: u64 = 0;
+    ts_trim_span(out, n, &tp2, &tl2);
+    if tp2 != out && tl2 > 0 {
+        // move the trimmed span to the front
+        let tmp = [0u8; 262144];
+        let tmp_len = buf_copy(&tmp, 262144, tp2, tl2);
+        return buf_copy(out, out_cap, &tmp, tmp_len);
+    };
+    return tl2;
+}
+
+// mapHubMessage(state, entry, threadId): one persisted hub
+// message -> 0..n stored items (tool cards + text row).
+fn map_hub_message(self: &ClineAgentBridge, s: &ClineSessionState, entry: u64, thread_ptr: ptr, thread_len: u64) -> void {
+    if entry == 0 { return; };
+    let content: u64 = 0;
+    sa_json_object_get(entry, STR_PTR("content"), STR_LEN("content"), &content);
+    // tools first (projectHubResultToolItems over content)
+    let items = [0u8; 524288];
+    let items_count: u64 = 0;
+    let items_len = project_hub_result_tool_items(content, thread_ptr, thread_len, PTR_NULL(), 0, false, &items, 524288, &items_count);
+    let arr = sa_json_parse(&items, items_len);
+    let ac: u64 = 0;
+    if arr != 0 && sa_json_array_len(arr, &ac) == 0 {
+        for i in 0..ac {
+            let item: u64 = 0;
+            sa_json_array_get(arr, i, &item);
+            let item_text = [0u8; 65536];
+            let item_text_len = stringify_into(item, &item_text, 65536);
+            cline_push_message(s, &item_text, item_text_len);
+        }
+    };
+    // text = text parts joined ""
+    let text = [0u8; 262144];
+    let text_len: u64 = 0;
+    let cc: u64 = 0;
+    if content != 0 && sa_json_array_len(content, &cc) == 0 {
+        for i in 0..cc {
+            let part: u64 = 0;
+            sa_json_array_get(content, i, &part);
+            if part == 0 { continue; };
+            let t_ptr: ptr = PTR_NULL();
+            let t_len: u64 = 0;
+            if sa_json_object_get_string(part, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len) != 0 || !str_is(t_ptr, t_len, STR_PTR("text"), 4) { continue; };
+            let v_ptr: ptr = PTR_NULL();
+            let v_len: u64 = 0;
+            if sa_json_object_get_string(part, STR_PTR("text"), STR_LEN("text"), &v_ptr, &v_len) == 0 {
+                text_len = text_len + append_bytes(&text, 262144, text_len, v_ptr, v_len);
+            };
+        }
+    };
+    if text_len == 0 { return; };
+    let role_ptr: ptr = PTR_NULL();
+    let role_len: u64 = 0;
+    sa_json_object_get_string(entry, STR_PTR("role"), STR_LEN("role"), &role_ptr, &role_len);
+    let id_ptr: ptr = PTR_NULL();
+    let id_len: u64 = 0;
+    let has_id = sa_json_object_get_string(entry, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len) == 0 && id_len > 0;
+    let uid = [0u8; 64];
+    let uid_len: u64 = 0;
+    if !has_id {
+        uid_len = uuid_new(&uid, 64);
+        id_ptr = &uid;
+        id_len = uid_len;
+    };
+    if str_is(role_ptr, role_len, STR_PTR("user"), 4) {
+        // unwrap <user_input ...>...</user_input> framing
+        let inner_ptr: ptr = &text;
+        let inner_len = text_len;
+        if starts_with(&text, text_len, STR_PTR("<user_input"), STR_LEN("<user_input")) {
+            let gt = find_byte(&text, text_len, 0, 62);
+            if gt != 4294967295 {
+                inner_ptr = byte_off(&text, gt + 1);
+                inner_len = text_len - gt - 1;
+                if ends_with(inner_ptr, inner_len, STR_PTR("</user_input>"), STR_LEN("</user_input>")) {
+                    inner_len = inner_len - STR_LEN("</user_input>");
+                };
+            };
+        };
+        let item = [0u8; 262144];
+        let item_len: u64 = 0;
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("{\"type\":\"userMessage\",\"id\":\""), STR_LEN("{\"type\":\"userMessage\",\"id\":\""));
+        item_len = item_len + append_bytes(&item, 262144, item_len, id_ptr, id_len);
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        item_len = item_len + append_bytes(&item, 262144, item_len, thread_ptr, thread_len);
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"content\":[{\"type\":\"text\",\"text\":\""), STR_LEN("\",\"content\":[{\"type\":\"text\",\"text\":\""));
+        item_len = item_len + append_bytes(&item, 262144, item_len, inner_ptr, inner_len);
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\"}],\"status\":\"completed\"}"), STR_LEN("\"}],\"status\":\"completed\"}"));
+        cline_push_message(s, &item, item_len);
+        return;
+    };
+    if str_is(role_ptr, role_len, STR_PTR("assistant"), STR_LEN("assistant")) {
+        let item = [0u8; 262144];
+        let item_len: u64 = 0;
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("{\"type\":\"agentMessage\",\"id\":\""), STR_LEN("{\"type\":\"agentMessage\",\"id\":\""));
+        item_len = item_len + append_bytes(&item, 262144, item_len, id_ptr, id_len);
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        item_len = item_len + append_bytes(&item, 262144, item_len, thread_ptr, thread_len);
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"content\":\""), STR_LEN("\",\"content\":\""));
+        item_len = item_len + append_bytes(&item, 262144, item_len, &text, text_len);
+        item_len = item_len + append_bytes(&item, 262144, item_len, STR_PTR("\",\"role\":\"assistant\",\"status\":\"completed\"}"), STR_LEN("\",\"role\":\"assistant\",\"status\":\"completed\"}"));
+        cline_push_message(s, &item, item_len);
+    };
+}
+
+fn ends_with(p: ptr, n: u64, suf_ptr: ptr, suf_len: u64) -> bool {
+    if n < suf_len { return false; };
+    return bytes_eq(byte_off(p, n - suf_len), suf_ptr, suf_len);
+}
+
+fn starts_with(p: ptr, n: u64, pre_ptr: ptr, pre_len: u64) -> bool {
+    if n < pre_len { return false; };
+    return bytes_eq(p, pre_ptr, pre_len);
+}
+
+// isClineTaskTool(name): task/subagent discriminator.
+// Full-name match first (team_run_task / team_spawn_
+// teammate true; team_task / team_mission_log false;
+// spawn_agent true), else the bare last segment compacted
+// in {task, newtask, spawnsubagent}.
+fn isClineTaskTool(name_ptr: ptr, name_len: u64) -> bool {
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    ts_trim_span(name_ptr, name_len, &tp, &tl);
+    let lowered = [0u8; 512];
+    let lowered_len = to_lower(&lowered, 512, tp, tl);
+    if lowered_len == 0 { return false; };
+    let compact_full = [0u8; 512];
+    let compact_full_len: u64 = 0;
+    for i in 0..lowered_len {
+        let b = lowered[i];
+        if b == 95 || b == 45 { continue; };
+        compact_full[compact_full_len] = b;
+        compact_full_len = compact_full_len + 1;
+    }
+    if str_is(&compact_full, compact_full_len, STR_PTR("teamruntask"), STR_LEN("teamruntask")) || str_is(&compact_full, compact_full_len, STR_PTR("teamspawnteammate"), STR_LEN("teamspawnteammate")) { return true; };
+    if str_is(&compact_full, compact_full_len, STR_PTR("teamtask"), STR_LEN("teamtask")) || str_is(&compact_full, compact_full_len, STR_PTR("teammissionlog"), STR_LEN("teammissionlog")) { return false; };
+    if str_is(&compact_full, compact_full_len, STR_PTR("spawnagent"), STR_LEN("spawnagent")) { return true; };
+    // bare = split(/[/:._-]{1,2}/).pop() — last segment
+    // after a separator run (1-2 chars)
+    let bare_start: u64 = 0;
+    let i: u64 = 0;
+    while i < lowered_len {
+        let b = lowered[i];
+        if b == 47 || b == 58 || b == 46 || b == 95 || b == 45 {
+            let j = i;
+            while j < lowered_len && j - i < 2 {
+                let bj = lowered[j];
+                if bj == 47 || bj == 58 || bj == 46 || bj == 95 || bj == 45 { j = j + 1; } else { break; };
+            }
+            if j < lowered_len { bare_start = j; };
+            i = j;
+        } else {
+            i = i + 1;
+        };
+    }
+    let bare_len = lowered_len - bare_start;
+    let compact = [0u8; 512];
+    let compact_len: u64 = 0;
+    let k: u64 = 0;
+    while k < bare_len {
+        let b = lowered[bare_start + k];
+        if b == 95 || b == 45 { k = k + 1; continue; };
+        compact[compact_len] = b;
+        compact_len = compact_len + 1;
+        k = k + 1;
+    }
+    return str_is(&compact, compact_len, STR_PTR("task"), 4) || str_is(&compact, compact_len, STR_PTR("newtask"), STR_LEN("newtask")) || str_is(&compact, compact_len, STR_PTR("spawnsubagent"), STR_LEN("spawnsubagent"));
+}
+
+// clineTaskPrompt(input, existing?)
+fn cline_task_prompt(input: u64, existing: u64, out: ptr, out_cap: u64) -> u64 {
+    let keys = [STR_PTR("description"), STR_PTR("task"), STR_PTR("rolePrompt"), STR_PTR("systemPrompt"), STR_PTR("message"), STR_PTR("prompt"), STR_PTR("instruction"), STR_PTR("goal")];
+    let key_lens = [STR_LEN("description"), STR_LEN("task"), STR_LEN("rolePrompt"), STR_LEN("systemPrompt"), STR_LEN("message"), STR_LEN("prompt"), STR_LEN("instruction"), STR_LEN("goal")];
+    for ki in 0..8 {
+        let v_ptr: ptr = PTR_NULL();
+        let v_len: u64 = 0;
+        if input != 0 && sa_json_object_get_string(input, keys[ki], key_lens[ki], &v_ptr, &v_len) == 0 {
+            let tp: ptr = PTR_NULL();
+            let tl: u64 = 0;
+            ts_trim_span(v_ptr, v_len, &tp, &tl);
+            if tl > 0 {
+                if v_len > 4000 { v_len = 4000; };
+                let start = v_ptr;
+                return buf_copy(out, out_cap, start, v_len);
+            };
+        };
+    }
+    let ekeys = [STR_PTR("prompt"), STR_PTR("message")];
+    let ekey_lens = [STR_LEN("prompt"), STR_LEN("message")];
+    for ki in 0..2 {
+        let v_ptr: ptr = PTR_NULL();
+        let v_len: u64 = 0;
+        if existing != 0 && sa_json_object_get_string(existing, ekeys[ki], ekey_lens[ki], &v_ptr, &v_len) == 0 {
+            let tp: ptr = PTR_NULL();
+            let tl: u64 = 0;
+            ts_trim_span(v_ptr, v_len, &tp, &tl);
+            if tl > 0 {
+                if v_len > 4000 { v_len = 4000; };
+                return buf_copy(out, out_cap, v_ptr, v_len);
+            };
+        };
+    }
+    return 0;
+}
+
+// clineRoleFromSystemPrompt(value): the source's regex
+// /你是\s*(.{2,40}?)(专家|专员|工程师|助手|顾问|研究员)/
+// as a hand scan over UTF-8 bytes (the CJK literals are
+// matched bytewise; .{2,40} counts code points in the
+// source — approximated by bytes here).
+fn cline_role_from_system_prompt(v_ptr: ptr, v_len: u64, out: ptr, out_cap: u64) -> u64 {
+    let anchor = STR_PTR("你是");
+    let anchor_len = STR_LEN("你是");
+    let pos = find_substr(v_ptr, v_len, anchor, anchor_len);
+    if pos == 4294967295 { return 0; };
+    let start = pos + anchor_len;
+    // \s* skip
+    while start < v_len && (byte_at(v_ptr, start) == 32 || byte_at(v_ptr, start) == 9 || byte_at(v_ptr, start) == 10) { start = start + 1; };
+    let suffixes = [STR_PTR("专家"), STR_PTR("专员"), STR_PTR("工程师"), STR_PTR("助手"), STR_PTR("顾问"), STR_PTR("研究员")];
+    let suffix_lens = [STR_LEN("专家"), STR_LEN("专员"), STR_LEN("工程师"), STR_LEN("助手"), STR_LEN("顾问"), STR_LEN("研究员")];
+    // lazy .{2,40}: try the shortest capture first
+    let cap: u64 = 2;
+    while cap <= 40 {
+        let end = start + cap * 3;
+        if end > v_len { break; };
+        for si in 0..6 {
+            if end + suffix_lens[si] <= v_len && bytes_eq(byte_off(v_ptr, end), suffixes[si], suffix_lens[si]) {
+                let total = (end - start) + suffix_lens[si];
+                if total > 120 { total = 120; };
+                return buf_copy(out, out_cap, byte_off(v_ptr, start), total);
+            };
+        }
+        cap = cap + 1;
+    }
+    return 0;
+}
+
+fn find_substr(p: ptr, n: u64, needle_ptr: ptr, needle_len: u64) -> u64 {
+    if needle_len == 0 { return 0; };
+    if n < needle_len { return 4294967295; };
+    let i: u64 = 0;
+    while i + needle_len <= n {
+        if bytes_eq(byte_off(p, i), needle_ptr, needle_len) { return i; };
+        i = i + 1;
+    }
+    return 4294967295;
+}
+
+// clineTaskRole(input, fallbackName)
+fn cline_task_role(input: u64, fallback_ptr: ptr, fallback_len: u64, out: ptr, out_cap: u64) -> u64 {
+    let keys = [STR_PTR("agentId"), STR_PTR("subagent_type"), STR_PTR("agent"), STR_PTR("agentName"), STR_PTR("mode")];
+    let key_lens = [STR_LEN("agentId"), STR_LEN("subagent_type"), STR_LEN("agent"), STR_LEN("agentName"), STR_LEN("mode")];
+    for ki in 0..5 {
+        let v_ptr: ptr = PTR_NULL();
+        let v_len: u64 = 0;
+        if input != 0 && sa_json_object_get_string(input, keys[ki], key_lens[ki], &v_ptr, &v_len) == 0 {
+            let tp: ptr = PTR_NULL();
+            let tl: u64 = 0;
+            ts_trim_span(v_ptr, v_len, &tp, &tl);
+            if tl > 0 {
+                if tl > 120 { tl = 120; };
+                return buf_copy(out, out_cap, tp, tl);
+            };
+        };
+    }
+    let sp_ptr: ptr = PTR_NULL();
+    let sp_len: u64 = 0;
+    if input != 0 && sa_json_object_get_string(input, STR_PTR("systemPrompt"), STR_LEN("systemPrompt"), &sp_ptr, &sp_len) != 0 {
+        if input != 0 { sa_json_object_get_string(input, STR_PTR("rolePrompt"), STR_LEN("rolePrompt"), &sp_ptr, &sp_len); };
+    };
+    if sp_len > 0 {
+        let role_len = cline_role_from_system_prompt(sp_ptr, sp_len, out, out_cap);
+        if role_len > 0 { return role_len; };
+    };
+    if fallback_len > 0 && !str_is(fallback_ptr, fallback_len, STR_PTR("Tool"), 4) {
+        return buf_copy(out, out_cap, fallback_ptr, fallback_len);
+    };
+    return buf_copy(out, out_cap, STR_PTR("subagent"), STR_LEN("subagent"));
+}
+
+// collabReceiptLine(output): message-ish field, else
+// "<agentId> · <status>", else none.
+fn collab_receipt_line(output: u64, out: ptr, out_cap: u64, out_len: &u64) -> bool {
+    out_len = 0;
+    if output == 0 { return false; };
+    let keys = [STR_PTR("message"), STR_PTR("result"), STR_PTR("output"), STR_PTR("report"), STR_PTR("text")];
+    let key_lens = [STR_LEN("message"), STR_LEN("result"), STR_LEN("output"), STR_LEN("report"), STR_LEN("text")];
+    for ki in 0..5 {
+        let v_ptr: ptr = PTR_NULL();
+        let v_len: u64 = 0;
+        if sa_json_object_get_string(output, keys[ki], key_lens[ki], &v_ptr, &v_len) == 0 {
+            let tp: ptr = PTR_NULL();
+            let tl: u64 = 0;
+            ts_trim_span(v_ptr, v_len, &tp, &tl);
+            if tl > 0 {
+                if ki == 0 {
+                    out_len = buf_copy(out, out_cap, tp, tl);
+                } else {
+                    out_len = summarize_collab_output(tp, tl, out, out_cap);
+                };
+                return true;
+            };
+        };
+    }
+    let agent_ptr: ptr = PTR_NULL();
+    let agent_len: u64 = 0;
+    let status_ptr: ptr = PTR_NULL();
+    let status_len: u64 = 0;
+    if sa_json_object_get_string(output, STR_PTR("agentId"), STR_LEN("agentId"), &agent_ptr, &agent_len) == 0 && sa_json_object_get_string(output, STR_PTR("status"), STR_LEN("status"), &status_ptr, &status_len) == 0 {
+        let atp: ptr = PTR_NULL();
+        let atl: u64 = 0;
+        ts_trim_span(agent_ptr, agent_len, &atp, &atl);
+        let stp: ptr = PTR_NULL();
+        let stl: u64 = 0;
+        ts_trim_span(status_ptr, status_len, &stp, &stl);
+        if atl > 0 && stl > 0 {
+            out_len = out_len + append_bytes(out, out_cap, out_len, atp, atl);
+            out_len = out_len + append_bytes(out, out_cap, out_len, STR_PTR(" · "), STR_LEN(" · "));
+            out_len = out_len + append_bytes(out, out_cap, out_len, stp, stl);
+            return true;
+        };
+    };
+    return false;
+}
+
+// summarizeCollabOutput(text)
+fn summarize_collab_output(text_ptr: ptr, text_len: u64, out: ptr, out_cap: u64) -> u64 {
+    if text_len <= 2000 { return buf_copy(out, out_cap, text_ptr, text_len); };
+    let n = buf_copy(out, out_cap, text_ptr, 2000);
+    let suffix = STR_PTR("\n\n…(完整报告见子任务卡片)");
+    let suffix_len = STR_LEN("\n\n…(完整报告见子任务卡片)");
+    return n + append_bytes(out, out_cap, n, suffix, suffix_len);
+}
+
+// projectHubResultToolItems(messages, threadId, turnId?):
+// JSON array text of projected tool items. Pending tool
+// uses are patched in place when their result arrives.
+fn project_hub_result_tool_items(messages: u64, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, has_turn: bool, out: ptr, out_cap: u64, out_count: &u64) -> u64 {
+    out_count = 0;
+    let items = [0u8; 524288];
+    let offs: [u64; 256] = [0u64; 256];
+    let lens: [u64; 256] = [0u64; 256];
+    let ids = [0u8; 16384];
+    let id_offs: [u64; 256] = [0u64; 256];
+    let id_lens: [u64; 256] = [0u64; 256];
+    let used: u64 = 0;
+    let id_used: u64 = 0;
+    let count: u64 = 0;
+    if messages == 0 { return write_items_array(out, out_cap, &items, &offs, &lens, 0); };
+    let is_arr = false;
+    json_node_is_array(messages, &is_arr);
+    if !is_arr { return write_items_array(out, out_cap, &items, &offs, &lens, 0); };
+    let mc: u64 = 0;
+    sa_json_array_len(messages, &mc);
+    for ei in 0..mc {
+        let entry: u64 = 0;
+        sa_json_array_get(messages, ei, &entry);
+        if entry == 0 { continue; };
+        // blocks = entry.content (array) or [entry]
+        let blocks: u64 = 0;
+        let bc: u64 = 0;
+        let single = false;
+        if sa_json_object_get(entry, STR_PTR("content"), STR_LEN("content"), &blocks) == 0 && blocks != 0 {
+            let arr_check = false;
+            json_node_is_array(blocks, &arr_check);
+            if arr_check {
+                sa_json_array_len(blocks, &bc);
+            } else {
+                single = true;
+            };
+        } else {
+            single = true;
+        };
+        let block_total = if single { 1 } else { bc };
+        for bi in 0..block_total {
+            let b: u64 = 0;
+            if single { b = entry; } else { sa_json_array_get(blocks, bi, &b); };
+            if b == 0 { continue; };
+            project_one_block(b, thread_ptr, thread_len, turn_ptr, turn_len, has_turn, &items, &used, &offs, &lens, &count, &ids, &id_used, &id_offs, &id_lens);
+        }
+    }
+    out_count = count;
+    return write_items_array(out, out_cap, &items, &offs, &lens, count);
+}
+
+fn write_items_array(out: ptr, out_cap: u64, items: ptr, offs: ptr, lens: ptr, count: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("["), 1);
+    for i in 0..count {
+        if i > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+        n = n + append_bytes(out, out_cap, n, byte_off(items, u64_at(offs, i)), u64_at(lens, i));
+    }
+    n = n + append_bytes(out, out_cap, n, STR_PTR("]"), 1);
+    return n;
+}
+
+// project_one_block: classify + emit/patch one block.
+fn project_one_block(b: u64, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, has_turn: bool, items: ptr, used: &u64, offs: ptr, lens: ptr, count: &u64, ids: ptr, id_used: &u64, id_offs: ptr, id_lens: ptr) -> void {
+    let type_ptr: ptr = PTR_NULL();
+    let type_len: u64 = 0;
+    sa_json_object_get_string(b, STR_PTR("type"), STR_LEN("type"), &type_ptr, &type_len);
+    let name_ptr: ptr = PTR_NULL();
+    let name_len: u64 = 0;
+    let has_name = false;
+    if sa_json_object_get_string(b, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len) == 0 && name_len > 0 {
+        has_name = true;
+    } else if sa_json_object_get_string(b, STR_PTR("tool"), STR_LEN("tool"), &name_ptr, &name_len) == 0 && name_len > 0 {
+        has_name = true;
+    };
+    let params: u64 = 0;
+    let has_params = false;
+    if sa_json_object_get(b, STR_PTR("input"), STR_LEN("input"), &params) == 0 && params != 0 {
+        has_params = true;
+    } else if sa_json_object_get(b, STR_PTR("arguments"), STR_LEN("arguments"), &params) == 0 && params != 0 {
+        has_params = true;
+    } else if sa_json_object_get(b, STR_PTR("args"), STR_LEN("args"), &params) == 0 && params != 0 {
+        has_params = true;
+    };
+    let looks_use = str_is(type_ptr, type_len, STR_PTR("tool_use"), STR_LEN("tool_use")) || str_is(type_ptr, type_len, STR_PTR("toolCall"), STR_LEN("toolCall")) || str_is(type_ptr, type_len, STR_PTR("tool_call"), STR_LEN("tool_call")) || str_is(type_ptr, type_len, STR_PTR("tool"), 4) || (type_len == 0 && has_name && has_params);
+    let looks_result = str_is(type_ptr, type_len, STR_PTR("tool_result"), STR_LEN("tool_result")) || str_is(type_ptr, type_len, STR_PTR("toolResult"), STR_LEN("toolResult")) || str_is(type_ptr, type_len, STR_PTR("tool_completed"), STR_LEN("tool_completed"));
+    if looks_use {
+        if count >= 256 { return; };
+        let id = [0u8; 128];
+        let id_len: u64 = 0;
+        let v_ptr: ptr = PTR_NULL();
+        let v_len: u64 = 0;
+        if sa_json_object_get_string(b, STR_PTR("id"), STR_LEN("id"), &v_ptr, &v_len) == 0 && v_len > 0 {
+            id_len = buf_copy(&id, 128, v_ptr, v_len);
+        } else {
+            id_len = id_len + append_bytes(&id, 128, id_len, STR_PTR("cline-"), STR_LEN("cline-"));
+            if has_turn {
+                id_len = id_len + append_bytes(&id, 128, id_len, turn_ptr, turn_len);
+            } else {
+                id_len = id_len + append_bytes(&id, 128, id_len, thread_ptr, thread_len);
+            };
+            id_len = id_len + append_bytes(&id, 128, id_len, STR_PTR("-tool-"), STR_LEN("-tool-"));
+            let uid = [0u8; 64];
+            let uid_len = uuid_new(&uid, 64);
+            id_len = id_len + append_bytes(&id, 128, id_len, &uid, uid_len);
+        };
+        let task_call = isClineTaskTool(name_ptr, name_len);
+        let prompt = [0u8; 8192];
+        let prompt_len: u64 = 0;
+        let role = [0u8; 256];
+        let role_len: u64 = 0;
+        if task_call {
+            prompt_len = cline_task_prompt(params, 0, &prompt, 8192);
+            role_len = cline_task_role(params, name_ptr, name_len, &role, 256);
+        };
+        let params_text = [0u8; 65536];
+        let params_text_len: u64 = 0;
+        if params != 0 { params_text_len = stringify_into(params, &params_text, 65536); };
+        if params_text_len == 0 { params_text_len = buf_copy(&params_text, 65536, STR_PTR("{}"), 2); };
+        let item = [0u8; 131072];
+        let item_len: u64 = 0;
+        if task_call {
+            item_len = build_history_collab(&item, 131072, &id, id_len, thread_ptr, thread_len, turn_ptr, turn_len, has_turn, name_ptr, name_len, &role, role_len, &prompt, prompt_len, &params_text, params_text_len);
+        } else {
+            item_len = build_history_tool(&item, 131072, &id, id_len, thread_ptr, thread_len, turn_ptr, turn_len, has_turn, name_ptr, name_len, has_name, &params_text, params_text_len);
+        };
+        let idx = count;
+        count = count + 1;
+        set_u64_at(offs, idx, used);
+        set_u64_at(lens, idx, item_len);
+        used = used + append_bytes(items, 524288, used, &item, item_len);
+        set_u64_at(id_offs, idx, id_used);
+        set_u64_at(id_lens, idx, id_len);
+        id_used = id_used + append_bytes(ids, 16384, id_used, &id, id_len);
+        return;
+    };
+    if looks_result {
+        let ref_ptr: ptr = PTR_NULL();
+        let ref_len: u64 = 0;
+        if sa_json_object_get_string(b, STR_PTR("tool_use_id"), STR_LEN("tool_use_id"), &ref_ptr, &ref_len) != 0 || ref_len == 0 {
+            sa_json_object_get_string(b, STR_PTR("id"), STR_LEN("id"), &ref_ptr, &ref_len);
+        };
+        // raw output text
+        let raw: u64 = 0;
+        let has_raw = sa_json_object_get(b, STR_PTR("output"), STR_LEN("output"), &raw) == 0 || sa_json_object_get(b, STR_PTR("result"), STR_LEN("result"), &raw) == 0 || sa_json_object_get(b, STR_PTR("text"), STR_LEN("text"), &raw) == 0 || sa_json_object_get(b, STR_PTR("content"), STR_LEN("content"), &raw) == 0;
+        let output_text = [0u8; 262144];
+        let output_text_len: u64 = 0;
+        if has_raw && raw != 0 {
+            let is_str = false;
+            json_node_is_string(raw, &is_str);
+            if is_str {
+                let rp: ptr = PTR_NULL();
+                let rl: u64 = 0;
+                json_node_string(raw, &rp, &rl);
+                output_text_len = buf_copy(&output_text, 262144, rp, rl);
+            } else {
+                output_text_len = stringify_into(raw, &output_text, 262144);
+            };
+        };
+        let is_error_flag = false;
+        sa_json_object_get_bool(b, STR_PTR("is_error"), STR_LEN("is_error"), &is_error_flag);
+        // pending target?
+        let target: u64 = 4294967295;
+        if ref_len > 0 {
+            for i in 0..count {
+                if u64_at(id_lens, i) == ref_len && bytes_eq(byte_off(ids, u64_at(id_offs, i)), ref_ptr, ref_len) { target = i; break; };
+            }
+        };
+        if target != 4294967295 {
+            if output_text_len > 0 {
+                let doc = sa_json_parse(byte_off(items, u64_at(offs, target)), u64_at(lens, target));
+                if doc != 0 {
+                    let t_ptr: ptr = PTR_NULL();
+                    let t_len: u64 = 0;
+                    sa_json_object_get_string(doc, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len);
+                    let shown = [0u8; 262144];
+                    let shown_len = output_text_len;
+                    if str_is(t_ptr, t_len, STR_PTR("collabAgentToolCall"), STR_LEN("collabAgentToolCall")) {
+                        shown_len = summarize_collab_output(&output_text, output_text_len, &shown, 262144);
+                    } else {
+                        shown_len = buf_copy(&shown, 262144, &output_text, output_text_len);
+                    };
+                    let take = shown_len;
+                    if take > 4000 { take = 4000; };
+                    sa_json_object_set_string(doc, STR_PTR("output"), STR_LEN("output"), &shown, take);
+                    let result_doc = json_object_new();
+                    sa_json_object_set_string(result_doc, STR_PTR("content"), STR_LEN("content"), &shown, take);
+                    sa_json_object_set(doc, STR_PTR("result"), STR_LEN("result"), result_doc);
+                    if is_error_flag {
+                        sa_json_object_set_string(doc, STR_PTR("status"), STR_LEN("status"), STR_PTR("failed"), STR_LEN("failed"));
+                    };
+                    // rewrite the slot: append the new text
+                    // and re-point (old bytes leak)
+                    let new_text = [0u8; 131072];
+                    let new_len = stringify_into(doc, &new_text, 131072);
+                    set_u64_at(offs, target, used);
+                    set_u64_at(lens, target, new_len);
+                    used = used + append_bytes(items, 524288, used, &new_text, new_len);
+                };
+            } else if is_error_flag {
+                let doc = sa_json_parse(byte_off(items, u64_at(offs, target)), u64_at(lens, target));
+                if doc != 0 {
+                    sa_json_object_set_string(doc, STR_PTR("status"), STR_LEN("status"), STR_PTR("failed"), STR_LEN("failed"));
+                    let new_text = [0u8; 131072];
+                    let new_len = stringify_into(doc, &new_text, 131072);
+                    set_u64_at(offs, target, used);
+                    set_u64_at(lens, target, new_len);
+                    used = used + append_bytes(items, 524288, used, &new_text, new_len);
+                };
+            };
+            return;
+        };
+        if output_text_len > 0 && ref_len > 0 && count < 256 {
+            // orphan result: fabricate the card
+            let task_call = isClineTaskTool(name_ptr, name_len);
+            let prompt = [0u8; 8192];
+            let prompt_len: u64 = 0;
+            let role = [0u8; 256];
+            let role_len: u64 = 0;
+            if task_call {
+                prompt_len = cline_task_prompt(params, 0, &prompt, 8192);
+                role_len = cline_task_role(params, name_ptr, name_len, &role, 256);
+            };
+            let params_text = [0u8; 65536];
+            let params_text_len: u64 = 0;
+            if params != 0 { params_text_len = stringify_into(params, &params_text, 65536); };
+            if params_text_len == 0 { params_text_len = buf_copy(&params_text, 65536, STR_PTR("{}"), 2); };
+            let shown = [0u8; 262144];
+            let shown_len = output_text_len;
+            if task_call {
+                shown_len = summarize_collab_output(&output_text, output_text_len, &shown, 262144);
+            } else {
+                shown_len = buf_copy(&shown, 262144, &output_text, output_text_len);
+            };
+            let item = [0u8; 131072];
+            let item_len: u64 = 0;
+            if task_call {
+                item_len = build_history_collab_full(&item, 131072, ref_ptr, ref_len, thread_ptr, thread_len, turn_ptr, turn_len, has_turn, name_ptr, name_len, &role, role_len, &prompt, prompt_len, &params_text, params_text_len, &shown, shown_len, is_error_flag);
+            } else {
+                item_len = build_history_tool_full(&item, 131072, ref_ptr, ref_len, thread_ptr, thread_len, turn_ptr, turn_len, has_turn, name_ptr, name_len, has_name, &params_text, params_text_len, &output_text, output_text_len, is_error_flag);
+            };
+            let idx = count;
+            count = count + 1;
+            set_u64_at(offs, idx, used);
+            set_u64_at(lens, idx, item_len);
+            used = used + append_bytes(items, 524288, used, &item, item_len);
+            set_u64_at(id_offs, idx, id_used);
+            set_u64_at(id_lens, idx, ref_len);
+            id_used = id_used + append_bytes(ids, 16384, id_used, ref_ptr, ref_len);
+        };
+    };
+}
+
+fn set_u64_at(base: ptr, i: u64, v: u64) -> void {
+    let arr = base as [u64];
+    arr[i] = v;
+}
+
+// history item builders (projectHubResultToolItems forms)
+fn build_history_collab(out: ptr, out_cap: u64, id_ptr: ptr, id_len: u64, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, has_turn: bool, name_ptr: ptr, name_len: u64, role_ptr: ptr, role_len: u64, prompt_ptr: ptr, prompt_len: u64, params_ptr: ptr, params_len: u64) -> u64 {
+    let name_use_ptr = name_ptr;
+    let name_use_len = name_len;
+    if name_use_len == 0 { name_use_ptr = role_ptr; name_use_len = role_len; };
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"type\":\"collabAgentToolCall\",\"id\":\""), STR_LEN("{\"type\":\"collabAgentToolCall\",\"id\":\""));
+    n = n + append_bytes(out, out_cap, n, id_ptr, id_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    if has_turn {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"turnId\":\""), STR_LEN(",\"turnId\":\""));
+        n = n + append_bytes(out, out_cap, n, turn_ptr, turn_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"name\":\""), STR_LEN(",\"name\":\""));
+    n = n + append_bytes(out, out_cap, n, name_use_ptr, name_use_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"tool\":\"task\",\"toolName\":\""), STR_LEN("\",\"tool\":\"task\",\"toolName\":\""));
+    n = n + append_bytes(out, out_cap, n, name_use_ptr, name_use_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"agentId\":\""), STR_LEN("\",\"agentId\":\""));
+    n = n + append_bytes(out, out_cap, n, id_ptr, id_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"agentName\":\""), STR_LEN("\",\"agentName\":\""));
+    n = n + append_bytes(out, out_cap, n, role_ptr, role_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"agentRole\":\""), STR_LEN("\",\"agentRole\":\""));
+    n = n + append_bytes(out, out_cap, n, role_ptr, role_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"taskName\":\""), STR_LEN("\",\"taskName\":\""));
+    n = n + append_bytes(out, out_cap, n, role_ptr, role_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    if prompt_len > 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"prompt\":\""), STR_LEN(",\"prompt\":\""));
+        n = n + append_bytes(out, out_cap, n, prompt_ptr, prompt_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"message\":\""), STR_LEN("\",\"message\":\""));
+        n = n + append_bytes(out, out_cap, n, prompt_ptr, prompt_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"senderThreadId\":\""), STR_LEN(",\"senderThreadId\":\""));
+    n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"receiverThreadIds\":[\""), STR_LEN("\",\"receiverThreadIds\":[\""));
+    n = n + append_bytes(out, out_cap, n, id_ptr, id_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\"],\"agentStatus\":\"completed\",\"input\":"), STR_LEN("\"],\"agentStatus\":\"completed\",\"input\":"));
+    n = n + append_bytes(out, out_cap, n, params_ptr, params_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"arguments\":"), STR_LEN(",\"arguments\":"));
+    n = n + append_bytes(out, out_cap, n, params_ptr, params_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"status\":\"completed\"}"), STR_LEN(",\"status\":\"completed\"}"));
+    return n;
+}
+
+fn build_history_collab_full(out: ptr, out_cap: u64, id_ptr: ptr, id_len: u64, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, has_turn: bool, name_ptr: ptr, name_len: u64, role_ptr: ptr, role_len: u64, prompt_ptr: ptr, prompt_len: u64, params_ptr: ptr, params_len: u64, shown_ptr: ptr, shown_len: u64, is_error: bool) -> u64 {
+    let n = build_history_collab(out, out_cap, id_ptr, id_len, thread_ptr, thread_len, turn_ptr, turn_len, has_turn, name_ptr, name_len, role_ptr, role_len, prompt_ptr, prompt_len, params_ptr, params_len);
+    // rebuild with output + status: parse + patch + restring
+    let doc = sa_json_parse(out, n);
+    if doc == 0 { return n; };
+    let take = shown_len;
+    if take > 4000 { take = 4000; };
+    sa_json_object_set_string(doc, STR_PTR("output"), STR_LEN("output"), shown_ptr, take);
+    let result_doc = json_object_new();
+    sa_json_object_set_string(result_doc, STR_PTR("content"), STR_LEN("content"), shown_ptr, take);
+    sa_json_object_set(doc, STR_PTR("result"), STR_LEN("result"), result_doc);
+    if is_error {
+        sa_json_object_set_string(doc, STR_PTR("status"), STR_LEN("status"), STR_PTR("failed"), STR_LEN("failed"));
+        sa_json_object_set_string(doc, STR_PTR("agentStatus"), STR_LEN("agentStatus"), STR_PTR("failed"), STR_LEN("failed"));
+    };
+    return stringify_into(doc, out, out_cap);
+}
+
+fn build_history_tool(out: ptr, out_cap: u64, id_ptr: ptr, id_len: u64, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, has_turn: bool, name_ptr: ptr, name_len: u64, has_name: bool, params_ptr: ptr, params_len: u64) -> u64 {
+    let name_use_ptr = name_ptr;
+    let name_use_len = name_len;
+    if !has_name { name_use_ptr = STR_PTR("Tool"); name_use_len = 4; };
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"type\":\"toolCall\",\"id\":\""), STR_LEN("{\"type\":\"toolCall\",\"id\":\""));
+    n = n + append_bytes(out, out_cap, n, id_ptr, id_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    if has_turn {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"turnId\":\""), STR_LEN(",\"turnId\":\""));
+        n = n + append_bytes(out, out_cap, n, turn_ptr, turn_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"name\":\""), STR_LEN(",\"name\":\""));
+    n = n + append_bytes(out, out_cap, n, name_use_ptr, name_use_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"tool\":\""), STR_LEN("\",\"tool\":\""));
+    n = n + append_bytes(out, out_cap, n, name_use_ptr, name_use_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"toolName\":\""), STR_LEN("\",\"toolName\":\""));
+    n = n + append_bytes(out, out_cap, n, name_use_ptr, name_use_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"input\":"), STR_LEN("\",\"input\":"));
+    n = n + append_bytes(out, out_cap, n, params_ptr, params_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"arguments\":"), STR_LEN(",\"arguments\":"));
+    n = n + append_bytes(out, out_cap, n, params_ptr, params_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"status\":\"completed\"}"), STR_LEN(",\"status\":\"completed\"}"));
+    return n;
+}
+
+fn build_history_tool_full(out: ptr, out_cap: u64, id_ptr: ptr, id_len: u64, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, has_turn: bool, name_ptr: ptr, name_len: u64, has_name: bool, params_ptr: ptr, params_len: u64, output_ptr: ptr, output_len: u64, is_error: bool) -> u64 {
+    let n = build_history_tool(out, out_cap, id_ptr, id_len, thread_ptr, thread_len, turn_ptr, turn_len, has_turn, name_ptr, name_len, has_name, params_ptr, params_len);
+    let doc = sa_json_parse(out, n);
+    if doc == 0 { return n; };
+    let take = output_len;
+    if take > 4000 { take = 4000; };
+    sa_json_object_set_string(doc, STR_PTR("output"), STR_LEN("output"), output_ptr, take);
+    let result_doc = json_object_new();
+    sa_json_object_set_string(result_doc, STR_PTR("content"), STR_LEN("content"), output_ptr, take);
+    sa_json_object_set(doc, STR_PTR("result"), STR_LEN("result"), result_doc);
+    if is_error {
+        sa_json_object_set_string(doc, STR_PTR("status"), STR_LEN("status"), STR_PTR("failed"), STR_LEN("failed"));
+    };
+    return stringify_into(doc, out, out_cap);
+}
+
+// ---- shims + local helpers ----
+
+// Hub-client pump/poll + pending take + child-state init +
+// event-log shims: declared by use in this pass (canonical
+// homes: clineHubClient.sla / clineChildSession.sla /
+// sdk-backend bridge event logger).
+fn ClineHubClient_pump(hub: &ClineHubClient) -> void;
+fn ClineHubClient_pollEvent(hub: &ClineHubClient, out: &ClineHubEvent) -> bool;
+fn hub_pending_take(hub: &ClineHubClient, rid_ptr: ptr, rid_len: u64, out_status: &u64, out_doc: &u64, out_err: ptr, out_err_cap: u64, out_err_len: &u64) -> void;
+fn cline_child_state_init(state: &ClineChildSessionState) -> void;
+fn host_event_log_init(kind_ptr: ptr, kind_len: u64, dir_ptr: ptr, dir_len: u64) -> void;
+fn host_event_log_hub(event_ptr: ptr, event_len: u64, session_ptr: ptr, session_len: u64, has_session: bool, text_len: u64, delta_form: bool) -> void;
+fn host_event_log_hub_full(event_ptr: ptr, event_len: u64, session_ptr: ptr, session_len: u64, has_session: bool, eventid_ptr: ptr, eventid_len: u64, has_eventid: bool, payload: u64) -> void;
+fn host_event_log_unknown(kind_ptr: ptr, kind_len: u64) -> void;
+fn json_object_new() -> u64;
+fn json_object_keys_len(doc: u64) -> u64;
+fn json_node_is_string(node: u64, out: &bool) -> void;
+fn json_node_is_array(node: u64, out: &bool) -> void;
+fn json_node_string(node: u64, out_ptr: &ptr, out_len: &u64) -> void;
+fn sa_json_object_set(doc: u64, key_ptr: ptr, key_len: u64, value: u64) -> i32;
+fn sa_json_object_set_string(doc: u64, key_ptr: ptr, key_len: u64, val_ptr: ptr, val_len: u64) -> i32;
+fn sa_json_object_delete(doc: u64, key_ptr: ptr, key_len: u64) -> i32;
+
+fn stringify_into(node: u64, out: ptr, out_cap: u64) -> u64 {
+    if node == 0 { return append_bytes(out, out_cap, 0, STR_PTR("null"), 4); };
+    let n: u64 = 0;
+    if sa_json_stringify_pretty(node, out, out_cap, &n) != 0 { return 0; };
+    return n;
+}
+
+fn sa_json_stringify_pretty(node: u64, out: ptr, out_cap: u64, out_len: &u64) -> i32;
+
+fn uuid_new(out: ptr, out_cap: u64) -> u64 {
+    // DEFECT: random UUID unavailable in this pass; emits
+    // a zero UUID (matches the other bridges in this unit).
+    return append_bytes(out, out_cap, 0, STR_PTR("00000000-0000-4000-8000-000000000000"), STR_LEN("00000000-0000-4000-8000-000000000000"));
+}
+
+fn now_ms() -> u64 { return 0; }
+
+fn process_cwd(out: ptr, out_cap: u64) -> u64 {
+    let n: u64 = 0;
+    env_get(STR_PTR("PWD"), STR_LEN("PWD"), out, out_cap, &n);
+    return n;
+}
+
+fn env_get(key_ptr: ptr, key_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> bool {
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    if sa_env_get(key_ptr, key_len, &v_ptr, &v_len) != 0 { out_len = 0; return false; };
+    out_len = buf_copy(out, out_cap, v_ptr, v_len);
+    return true;
+}
+
+// ts_trim_span: String.prototype.trim span — 已绑 sa_std
+// ts 面 (@ts_str_trim in sa_std/ts_string.sa; {ptr,len}
+// handle model — the repair phase aligns the exact macro
+// signature).
+fn ts_trim_span(p: ptr, n: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    @ts_str_trim(out_ptr, out_len, p, n);
+}
+
+fn sa_env_get(key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64) -> i32;
+
+fn slot(base: ptr, off: u64) -> ptr { return byte_off(base, off); }
+
+fn byte_off(base: ptr, off: u64) -> ptr {
+    let arr = base as [u8];
+    return &arr[off];
+}
+
+fn byte_at(base: ptr, idx: u64) -> u8 {
+    if base == PTR_NULL() { return 0; };
+    let arr = base as [u8];
+    return arr[idx];
+}
+
+fn bytes_eq(a: ptr, b: ptr, n: u64) -> bool {
+    if n == 0 { return true; };
+    if a == PTR_NULL() || b == PTR_NULL() { return false; };
+    let i: u64 = 0;
+    while i < n {
+        if byte_at(a, i) != byte_at(b, i) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn str_is(p: ptr, n: u64, lit_ptr: ptr, lit_len: u64) -> bool {
+    return n == lit_len && bytes_eq(p, lit_ptr, lit_len);
+}
+
+fn append_bytes(dst: ptr, dst_cap: u64, used: u64, src: ptr, src_len: u64) -> u64 {
+    let i: u64 = 0;
+    while i < src_len {
+        if used + i >= dst_cap { break; };
+        let a = dst as [u8];
+        a[used + i] = byte_at(src, i);
+        i = i + 1;
+    }
+    return i;
+}
+
+fn buf_copy(dst: ptr, dst_cap: u64, src: ptr, src_len: u64) -> u64 {
+    return append_bytes(dst, dst_cap, 0, src, src_len);
+}
+
+fn append_u64(dst: ptr, dst_cap: u64, used: u64, v: u64) -> u64 {
+    let digits = [0u8; 24];
+    let dn: u64 = 0;
+    let x = v;
+    if x == 0 { digits[0] = 48; dn = 1; } else {
+        let tmp = [0u8; 24];
+        let tn: u64 = 0;
+        while x > 0 {
+            tmp[tn] = (48 + (x % 10)) as u8;
+            tn = tn + 1;
+            x = x / 10;
+        }
+        while tn > 0 { tn = tn - 1; digits[dn] = tmp[tn]; dn = dn + 1; };
+    };
+    return used + append_bytes(dst, dst_cap, used, &digits, dn);
+}
+
+fn append_i64(dst: ptr, dst_cap: u64, used: u64, v: i64) -> u64 {
+    if v < 0 {
+        let n = used + append_bytes(dst, dst_cap, used, STR_PTR("-"), 1);
+        return append_u64(dst, dst_cap, n, (0 - v) as u64);
+    };
+    return append_u64(dst, dst_cap, used, v as u64);
+}
+
+fn find_byte(buf: ptr, len: u64, from: u64, b: u8) -> u64 {
+    let i: u64 = from;
+    while i < len {
+        if byte_at(buf, i) == b { return i; };
+        i = i + 1;
+    }
+    return 4294967295;
+}
+
+fn to_lower(out: ptr, out_cap: u64, src: ptr, src_len: u64) -> u64 {
+    let n = buf_copy(out, out_cap, src, src_len);
+    let i: u64 = 0;
+    while i < n {
+        let b = byte_at(out, i);
+        if b >= 65 && b <= 90 {
+            let a = out as [u8];
+            a[i] = b + 32;
+        };
+        i = i + 1;
+    }
+    return n;
+}

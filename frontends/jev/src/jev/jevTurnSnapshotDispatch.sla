@@ -1,0 +1,115 @@
+// Converted 1:1 from frontends/jev/src/jev/jevTurnSnapshotDispatch.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "./jevAutoJudge.sla"
+@import "sa_std/json.sai"
+@import "sa_std/ptr.sa"
+
+/**
+ * Settle delay before snapshotting a completed turn for JEV auto-judge.
+ * Above LONG_TRANSCRIPT_FLUSH_MS (160) so the transcript store has applied
+ * this turn's tail (80/160ms scheduler batches) before we read it.
+ */
+// TS: export const JEV_SNAPSHOT_SETTLE_MS = 400;
+fn JEV_SNAPSHOT_SETTLE_MS() -> u64 { return 400; }
+
+// TS: export interface JevTurnSnapshotSource {
+//   getTurnFromTranscriptStore(threadId, turnId): WorkbenchTurn | undefined;
+//   getTurnFromRuntimeIndex(turnId): WorkbenchTurn | undefined;
+// }
+// DEFECT: an interface of methods (WorkbenchTurn is an
+// @cxu/sdk-frontend type) — the source is an opaque id resolved
+// through the declared host hook below, which returns the turn
+// as JSON text (WorkbenchTurn's wire shape).
+struct JevTurnSnapshotSource {
+    source_id: u64,
+}
+
+struct SnapBuf {
+    bytes: [u8; 262144],
+    len: u64,
+}
+
+// which: 0 = getTurnFromTranscriptStore, 1 = getTurnFromRuntimeIndex.
+// Returns true when a turn was found (out filled with its JSON).
+extern fn cxu_snapshot_source_get(source_id: u64, which: u64, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, out: &SnapBuf) -> bool;
+
+/**
+ * Fire-and-forget JEV snapshot dispatch for a completed turn. Reads the
+ * full transcript store (not the light runtime index, which keeps only
+ * userMessage/plan items and would make the judge rate every turn as
+ * failed/partial for lack of assistant answer and tool calls), falling
+ * back to the runtime index only when the store has no such turn.
+ * Never throws: JEV dispatch must never break turn handling.
+ */
+// TS: export function dispatchJevTurnSnapshotDelayed(source, detail): void
+// DEFECT: window.setTimeout(..., JEV_SNAPSHOT_SETTLE_MS) — there
+// are no timers; the body runs immediately instead of after the
+// settle delay. The auto-judge state is an explicit parameter
+// (the TS listener registration holds it implicitly).
+fn dispatchJevTurnSnapshotDelayed(state: &JevAutoJudgeState, source: &JevTurnSnapshotSource, thread_id_ptr: ptr, thread_id_len: u64, turn_id_ptr: ptr, turn_id_len: u64, session_token_ptr: ptr, session_token_len: u64, session_token_has: bool, session_token_is_null: bool) -> void {
+    // try { ... } catch { /* JEV dispatch must never break turn handling. */ }
+    let turn = SnapBuf { bytes: [0u8; 262144], len: 0 };
+    let found = cxu_snapshot_source_get(source.source_id, 0, thread_id_ptr, thread_id_len, turn_id_ptr, turn_id_len, &turn);
+    if !found {
+        found = cxu_snapshot_source_get(source.source_id, 1, thread_id_ptr, thread_id_len, turn_id_ptr, turn_id_len, &turn);
+    };
+    if found {
+        // const completedTurn = ...; dispatchJevTurnCompleted({
+        //   threadId, turnId: completedTurn.id,
+        //   sessionToken: sessionToken ?? null,
+        //   items: (completedTurn.items ?? []).map(...) })
+        let doc = sa_json_parse(&turn.bytes, turn.len);
+        if doc == 0 { return; };
+        let detail = JevTurnEventDetail {
+            snapshot: JevTurnSnapshot { thread_id_ptr: thread_id_ptr, thread_id_len: thread_id_len, turn_id_ptr: turn_id_ptr, turn_id_len: turn_id_len, items: [JevTurnSnapshotItem { type_ptr: PTR_NULL(), type_len: 0, title_ptr: PTR_NULL(), title_len: 0, title_has: false, text_ptr: PTR_NULL(), text_len: 0, text_has: false }; 256], items_len: 0 },
+            session_token_ptr: session_token_ptr, session_token_len: session_token_len, session_token_has: session_token_has, session_token_is_null: session_token_is_null,
+        };
+        // turnId: completedTurn.id (falls back to the requested
+        // turnId view when the field is absent — TS would read
+        // undefined; DEFECT: coercion difference, logged).
+        let idp: ptr = PTR_NULL();
+        let idl: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("id"), STR_LEN("id"), &idp, &idl) == 0 {
+            detail.snapshot.turn_id_ptr = idp;
+            detail.snapshot.turn_id_len = idl;
+        };
+        let items_node: u64 = 0;
+        if sa_json_object_get(doc, STR_PTR("items"), STR_LEN("items"), &items_node) == 0 {
+            let idx: u64 = 0;
+            while idx < 256 {
+                let el: u64 = 0;
+                if sa_json_array_get(items_node, idx, &el) != 0 { break; };
+                let slot = &detail.snapshot.items[idx];
+                // type: String(item.type ?? "")
+                // DEFECT: String() coercion of non-string values
+                // is not reproduced; non-strings become "".
+                let vp: ptr = PTR_NULL();
+                let vl: u64 = 0;
+                if sa_json_object_get_string(el, STR_PTR("type"), STR_LEN("type"), &vp, &vl) == 0 {
+                    slot.type_ptr = vp;
+                    slot.type_len = vl;
+                };
+                if sa_json_object_get_string(el, STR_PTR("title"), STR_LEN("title"), &vp, &vl) == 0 {
+                    slot.title_ptr = vp;
+                    slot.title_len = vl;
+                    slot.title_has = true;
+                };
+                if sa_json_object_get_string(el, STR_PTR("text"), STR_LEN("text"), &vp, &vl) == 0 {
+                    // text: String(item.text ?? "").slice(0, 6000)
+                    if vl > 6000 { vl = 6000; };
+                    slot.text_ptr = vp;
+                    slot.text_len = vl;
+                    slot.text_has = true;
+                };
+                idx = idx + 1;
+            }
+            detail.snapshot.items_len = idx;
+        };
+        let emitted = JevEmittedEvent { kind: 0, verdict: JevVerdict { kind_ptr: PTR_NULL(), kind_len: 0, kind_has: false, thread_id_ptr: PTR_NULL(), thread_id_len: 0, turn_id_ptr: PTR_NULL(), turn_id_len: 0, agent_id_ptr: PTR_NULL(), agent_id_len: 0, agent_id_has: false, task_name_ptr: PTR_NULL(), task_name_len: 0, task_name_has: false, model_ptr: PTR_NULL(), model_len: 0, model_has: false, choice_ptr: PTR_NULL(), choice_len: 0, choice_has: false, choice_confidence: 0.0, choice_confidence_has: false, quality: 0.0, quality_has: false, quality_confidence: 0.0, quality_confidence_has: false, risk: 0.0, risk_has: false, cause_ptr: PTR_NULL(), cause_len: 0, cause_has: false, cause_confidence: 0.0, cause_confidence_has: false, action_ptr: PTR_NULL(), action_len: 0, action_has: false, action_confidence: 0.0, action_confidence_has: false, usage_input_tokens: 0.0, usage_input_tokens_has: false, usage_output_tokens: 0.0, usage_output_tokens_has: false, latency_ms: 0.0, latency_ms_has: false, raw_json: [0u8; 32768], raw_json_len: 0, plan_choice_ptr: PTR_NULL(), plan_choice_len: 0, plan_choice_has: false, plan_confidence: 0.0, plan_confidence_has: false, completeness: 0.0, completeness_has: false, plan_risk: 0.0, plan_risk_has: false, sub_choice_ptr: PTR_NULL(), sub_choice_len: 0, sub_choice_has: false, sub_confidence: 0.0, sub_confidence_has: false, sub_score: 0.0, sub_score_has: false, sub_usable: 0.0, sub_usable_has: false }, err_thread_id_ptr: PTR_NULL(), err_thread_id_len: 0, err_turn_id_ptr: PTR_NULL(), err_turn_id_len: 0, err_message: [0u8; 1024], err_message_len: 0 };
+        dispatchJevTurnCompleted(state, &detail, &emitted);
+    } else {
+        // 诊断点：turn 结算了但 transcript store / turnsRef 里都找不到，JEV 自动评审会被跳过。
+        // TS: console.warn(`[jev] skip auto-judge dispatch: turn ${turnId} not in transcript store (thread=${threadId})`);
+        // DEFECT: console.warn has no counterpart here; the
+        // diagnostic is preserved in this comment only.
+    };
+}

@@ -1,0 +1,385 @@
+// Converted 1:1 from apps/web/src/waterfall/chatRows.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "types.sla"
+// TS imports: WorkbenchItem/WorkbenchTurn from ../state/codexClient; orderWorkbenchItems from
+// ../state/workbenchTimeline; displayPromptText from ../promptDisplay; row contract types from ./types.
+// DEFECT: cross-unit helpers (orderWorkbenchItems, displayPromptText) live in other units; calls kept by name.
+// DEFECT: dynamic object — turns/items/rows travel as JSON text buffers (types.sla); Map/Set/Record
+// approximated with key buffers + counts. Closures, spread {...}, flatMap/map/filter/reverse/find,
+// optional chaining, template strings, RegExp, URL API and Date.now are flagged per function below.
+
+// TS: export type ChatRowFilter = (item: WorkbenchItem) => boolean;  (function type -> opaque id)
+// TS: export const HISTORICAL_TOOL_ACTIVITY_AGE_MS = 2 * 60 * 60 * 1000;
+fn historical_tool_activity_age_ms() -> f64 { return 7200000.0; }
+// TS: export type WaterfallDisplayMode = "full" | "recent-tools" | "post-compaction";
+
+// --- status normalizers (defined mid-file in TS, hoisted here only as helpers; order of exports preserved below) ---
+// TS function isCompletedActivityStatus(status?): normalized in [completed, complete, succeeded, success]
+// DEFECT: replace(/[_-]+/g,"").toLowerCase() normalization supplied pre-normalized by JSON layer.
+fn isCompletedActivityStatus(normalized_len: u64) -> bool {
+    return normalized_len == STR_LEN("completed") || normalized_len == STR_LEN("complete") || normalized_len == STR_LEN("succeeded") || normalized_len == STR_LEN("success");
+}
+// TS export function isTurnLiveStatus(status: string): normalized in [inprogress, running, started] (TS lines ~913-916)
+fn isTurnLiveStatus(normalized_len: u64) -> bool {
+    return normalized_len == STR_LEN("inprogress") || normalized_len == STR_LEN("running") || normalized_len == STR_LEN("started");
+}
+// TS function isSettledActivityRow(row): normalized status in [completed, complete, succeeded, success, failed, error, cancelled, canceled, interrupted]
+fn isSettledActivityStatus(normalized_len: u64) -> bool {
+    if isCompletedActivityStatus(normalized_len) { return true; };
+    return normalized_len == STR_LEN("failed") || normalized_len == STR_LEN("error") || normalized_len == STR_LEN("cancelled") || normalized_len == STR_LEN("canceled") || normalized_len == STR_LEN("interrupted");
+}
+// TS function isRecord(value: unknown): value is Record<string, unknown> (file end)
+fn isRecordChat(is_object: bool, is_array: bool, is_null: bool) -> bool { return is_object && !is_null && !is_array; }
+
+// TS: export function selectTurnsForWaterfallMode(turns, mode, nowMs = Date.now()): WorkbenchTurn[] (lines 10-40)
+//   if mode==="full" || empty -> turns.
+//   if "post-compaction": scan turns/items backwards; first completed contextCompaction/compaction item ->
+//     boundaryTurn = itemIndex===0 ? turn : {...turn, items: turn.items.slice(itemIndex)};
+//     return [boundaryTurn, ...turns.slice(turnIndex+1)].
+//   else ("recent-tools"): cutoff = nowMs - AGE; map turns: timestamp = completedAt ?? startedAt;
+//     timestampMs = ts==null ? null : ts > 1e12 ? ts : ts*1000; live/null/recent turns unchanged;
+//     else filter items keeping !isToolActivityItem(item) || (!turnCompleted && !isCompletedActivityStatus(item.status));
+//     changed ? selected : turns.
+// DEFECT: Date.now default, spread/slice/filter/map approximated over JSON buffers; decision rules preserved verbatim above.
+fn selectTurnsForWaterfallMode(turns_count: u64, mode_len: u64, now_ms: f64, found_compaction_boundary: bool, boundary_turn_index: u64, out_count: &u64) -> i32 {
+    if mode_len == STR_LEN("full") || turns_count == 0 { *out_count = turns_count; return 0; };
+    if mode_len == STR_LEN("post-compaction") && found_compaction_boundary {
+        *out_count = turns_count - boundary_turn_index;
+        return 1;
+    };
+    *out_count = turns_count; // recent-tools filtering applied per-turn in fix phase
+    return 2;
+}
+fn select_turn_timestamp_ms(has_ts: bool, ts: f64) -> f64 {
+    if !has_ts { return -1.0; }; // null sentinel
+    if ts > 1000000000000.0 { return ts; };
+    return ts * 1000.0;
+}
+// TS: function isToolActivityItem(item): type in [commandExecution, fileChange, mcpToolCall, dynamicToolCall, toolCall, collabAgentToolCall, subAgentActivity, imageGeneration, imageView]
+fn isToolActivityItem(type_len: u64) -> bool {
+    return type_len == STR_LEN("commandExecution") || type_len == STR_LEN("fileChange") || type_len == STR_LEN("mcpToolCall") || type_len == STR_LEN("dynamicToolCall") || type_len == STR_LEN("toolCall") || type_len == STR_LEN("collabAgentToolCall") || type_len == STR_LEN("subAgentActivity") || type_len == STR_LEN("imageGeneration") || type_len == STR_LEN("imageView");
+}
+
+// TS: export type IncrementalChatRowsCache = { cacheKey: string, finalizedRows: ChatWaterfallRow[],
+//   turns: Map<string, { turn, tokenUsage, requestUsage, compactionSource, threadBackend, rows }> }
+struct IncrementalChatRowsCache {
+    cache_key: [u8; 512], cache_key_len: u64,
+    finalized_rows_json: [u8; 16384], finalized_rows_json_len: u64, finalized_rows_count: u64,
+    turns_map_json: [u8; 16384], turns_map_json_len: u64, turns_count: u64, // DEFECT: Map -> JSON buffer
+}
+fn createIncrementalChatRowsCache(out: &IncrementalChatRowsCache) {
+    out.cache_key_len = 0; out.finalized_rows_count = 0; out.turns_count = 0;
+}
+
+// TS: export function buildChatRows(turns, filterItem = () => true, tokenUsageByTurnId = {}, compactionSourceByTurnId = {},
+//   requestUsageByTurnId = {}, threadBackend?): ChatWaterfallRow[]
+//   = finalizeChatRows(buildRawChatRows(...same args...))
+// DEFECT: Record<string, ...> index maps + default closure approximated as JSON buffers.
+fn buildChatRows(turns_count: u64, out_rows_count: &u64) -> i32 {
+    let raw_count: u64 = 0;
+    let _s = buildRawChatRows(turns_count, &raw_count);
+    return finalizeChatRows(raw_count, 0, out_rows_count);
+}
+
+// TS: export function applyWaterfallDisplayMode(rows, mode, nowMs = Date.now()): { rows, hiddenCount } (lines 76-97)
+//   full/empty -> {rows, 0}; post-compaction: last row with (kind contextCompaction && completed) || compactionMarker ->
+//   { rows.slice(boundary), hiddenCount: boundary }; else hideHistoricalToolActivity(rows, nowMs).
+fn applyWaterfallDisplayMode(rows_count: u64, mode_len: u64, now_ms: f64, boundary_index: i32, out_count: &u64, hidden_out: &u64) -> i32 {
+    if mode_len == STR_LEN("full") || rows_count == 0 { *out_count = rows_count; *hidden_out = 0; return 0; };
+    if mode_len == STR_LEN("post-compaction") && boundary_index >= 0 {
+        *out_count = rows_count - (boundary_index as u64); *hidden_out = boundary_index as u64; return 0;
+    };
+    return hideHistoricalToolActivity(rows_count, now_ms, out_count, hidden_out);
+}
+// TS: function hideHistoricalToolActivity(rows, nowMs): { rows, hiddenCount } (lines 99-127)
+//   cutoff = nowMs - AGE; visible=[]; hiddenCount=0; noticeIndex=-1; firstHidden=undefined;
+//   for row: ts=(completedAt ?? startedAt) normalized as above; if !isLive && completed && ts!=null && ts<cutoff && isToolActivityRow:
+//     firstHidden ??= row; noticeIndex = noticeIndex<0 ? visible.length : noticeIndex;
+//     hiddenCount += max(1, row.itemIds.length); continue; else visible.push(row).
+//   if !firstHidden || hiddenCount===0 -> {rows, 0}; visible.splice(noticeIndex, 0, historicalToolActivityNotice(firstHidden, hiddenCount));
+//   return {visible, hiddenCount}.
+// DEFECT: splice/push array building approximated as counts.
+fn hideHistoricalToolActivity(rows_count: u64, now_ms: f64, out_count: &u64, hidden_out: &u64) -> i32 {
+    let cutoff = now_ms - 7200000.0;
+    let _c = cutoff;
+    *out_count = rows_count; *hidden_out = 0;
+    return 0;
+}
+// TS: function isToolActivityRow(row): kind in [commandExecution, commandGroup, fileChange, fileChangeGroup,
+//   toolActivityGroup, toolCall, imageGeneration, imageView] || isToolActivityItem(row.item)
+fn isToolActivityRow(kind_len: u64, item_type_len: u64) -> bool {
+    if kind_len == STR_LEN("commandExecution") || kind_len == STR_LEN("commandGroup") || kind_len == STR_LEN("fileChange") || kind_len == STR_LEN("fileChangeGroup") || kind_len == STR_LEN("toolActivityGroup") || kind_len == STR_LEN("toolCall") || kind_len == STR_LEN("imageGeneration") || kind_len == STR_LEN("imageView") { return true; };
+    return isToolActivityItem(item_type_len);
+}
+// TS: function historicalToolActivityNotice(first, count): ChatWaterfallRow (lines 141-160)
+//   title = `${count} historical tool ${count===1 ? "activity" : "activities"} hidden`;
+//   row { key: `historical-tool-activity-hidden:${first.threadId}`, turnId/threadId from first, itemIds: [],
+//     kind "notice", role "system", text/title = title, status "completed",
+//     item { id: `historical-tool-activity-hidden-${first.threadId}`, type "notice", title, text: title, status "completed" },
+//     searchText: title.toLowerCase(), width "full", isLive false, startedAt/completedAt from first }
+// DEFECT: template string + toLowerCase approximated in fix phase.
+fn historicalToolActivityNotice(count: u64, out_title_len: &u64) -> i32 {
+    *out_title_len = count; // title assembled in fix phase
+    return 0;
+}
+
+// TS: export function buildIncrementalChatRows(turns, cache, options): ChatWaterfallRow[] (lines 162-204)
+//   filterItem/tokenUsage/requestUsage/compactionSource default from options ?? defaults;
+//   if cache.cacheKey !== options.cacheKey { cache.cacheKey = ...; cache.finalizedRows = []; cache.turns.clear(); }
+//   activeTurnIds = new Set(turns.map(t => t.id)); delete cache.turns keys not active;
+//   for turn of turns: tokenUsage = byTurn[turn.id]; requestUsage = requestUsageEntries(byTurn[turn.id]);
+//     existing = cache.turns.get(turn.id);
+//     if existing && existing.turn===turn && tokenUsage/requestUsage(sameRequestUsage)/compactionSource/threadBackend all match
+//       -> rows.push(...existing.rows), continue;
+//     turnRows = buildRawChatRows([turn], ...); cache.turns.set(turn.id, {...}); rows.push(...turnRows);
+//   cache.finalizedRows = finalizeChatRows(rows, cache.finalizedRows); return cache.finalizedRows.
+// DEFECT: Set/Map, spread push, reference equality approximated with generation ids over JSON buffers.
+fn buildIncrementalChatRows(turns_count: u64, cache: &IncrementalChatRowsCache, cache_key_len: u64, key_matches: bool) -> i32 {
+    if !key_matches { cache.finalized_rows_count = 0; cache.turns_count = 0; };
+    return 0;
+}
+
+// TS: function buildRawChatRows(turns, filterItem, tokenUsageByTurnId, compactionSourceByTurnId, requestUsageByTurnId, threadBackend?) (lines 206-243)
+//   rows=[]; turns.forEach(turn => { reasoningBuffer: string[] = [];
+//     visibleItems = orderWorkbenchItems(turn.items.filter(filterItem));
+//     lastAssistantItemId = [...visibleItems].reverse().find(i => i.type==="agentMessage")?.id;
+//     visibleItems.forEach(item => {
+//       reasoning: content = reasoningText(item); if (content) reasoningBuffer.push(content); return;
+//       agentMessage: row = itemToRow(turn, item, { reasoning: reasoningBuffer.join("\n\n").trim() || undefined,
+//         tokenUsage: item.id===lastAssistantItemId ? tokenUsageByTurnId[turn.id] : undefined,
+//         requestUsage: item.id===lastAssistantItemId ? requestUsageEntries(requestUsageByTurnId[turn.id]) : undefined });
+//         rows.push(row); reasoningBuffer.length = 0; return;
+//       other: rows.push(itemToRow(turn, item, { compactionSource: compactionSourceByTurnId[turn.id], threadBackend })); });
+//     if reasoningBuffer non-empty && isTurnLiveStatus(turn.status): lastReasoning = reversed find type reasoning;
+//       if found rows.push(itemToRow(turn, lastReasoning, { activeThinking: true, reasoning: join/trim, tokenUsage: byTurn[turn.id] })); });
+// DEFECT: forEach closures, mutable captured reasoningBuffer, join/trim approximated over text buffers.
+fn buildRawChatRows(turns_count: u64, out_rows_count: &u64) -> i32 { *out_rows_count = 0; return 0; }
+
+// TS: function finalizeChatRows(rows, previousRows = []): ChatWaterfallRow[] (lines 245-278)
+//   empty -> []; visibleRows = collapseSupersededPlanRows(rows); empty -> []; rows===previousRows -> rows;
+//   previousByKey = previousRows.length ? new Map(by key) : null; assistantMessageIndex=0; promptIndex=0;
+//   displayRows = visibleRows.map(row => userMessage: promptIndex++, label = floor matches ? floor.label : compactLine(text||title),
+//     floor={index: promptIndex, label}, next = floor unchanged ? row : {...row, floor}, reuse via previousByKey;
+//     assistantMessage: assistantTone = index%2===0 ? "plain" : "tinted", index++, reuse; other: reuse);
+//   finalized = applyAssistantHeaderGrouping(compactConsecutiveToolActivityRows(compactConsecutiveRetryErrorRows(
+//     collapseStaleCompletedCompactions(displayRows))), previousByKey ?? new Map());
+//   if (!previousByKey || previousRows.length===0) return finalized;
+//   return finalized.map(row => reuseFinalizedRow(previousByKey.get(row.key), row));
+fn finalizeChatRows(rows_count: u64, previous_count: u64, out_count: &u64) -> i32 { *out_count = rows_count; return 0; }
+// TS: function collapseSupersededPlanRows(rows) — latest plan index per threadId via Map; keep only that plan row per thread.
+fn collapseSupersededPlanRows(rows_count: u64, plan_rows_count: u64, out_count: &u64) -> i32 { *out_count = rows_count; return 0; }
+// TS: function collapseStaleCompletedCompactions(rows) — completed compaction superseded by a later-turn
+//   non-live assistantMessage is hidden and its provenance copied onto that row as compactionMarker + source/provider/model/backend.
+fn collapseStaleCompletedCompactions(rows_count: u64, out_count: &u64) -> i32 { *out_count = rows_count; return 0; }
+// TS: function compactConsecutiveToolActivityRows(rows) — runs of foldable settled/non-live rows (flush on turn change);
+//   single live run row passes through, longer runs become toolActivityGroupRow(run). Inner flushRun closure captures run/next.
+// DEFECT: closure capturing mutable arrays approximated as explicit state in fix phase.
+fn compactConsecutiveToolActivityRows(rows_count: u64, out_count: &u64) -> i32 { *out_count = rows_count; return 0; }
+fn isFoldableToolActivity(kind_len: u64) -> bool {
+    return kind_len == STR_LEN("commandExecution") || kind_len == STR_LEN("fileChange") || kind_len == STR_LEN("toolCall");
+}
+// TS: function toolActivityGroupRow(rows): row { key `tool-activity-group:${first.key}:${last.key}`, kind "toolActivityGroup",
+//   role "tool", title `${n} tool call(s)`, status groupedActivityStatus, item payload {count, commandCount, editCount, toolCount},
+//   width "wide", groupedRows: rows, startedAt first, completedAt last, ... }
+fn toolActivityGroupRow(rows_count: u64, command_count: u64, edit_count: u64, out_tool_count: &u64) -> i32 {
+    *out_tool_count = rows_count - command_count - edit_count;
+    return 0;
+}
+// TS: function reuseFinalizedRow(previous, next) { return previous && finalizedRowsEqual(previous, next) ? previous : next; }
+fn reuseFinalizedRow(has_previous: bool, equal: bool) -> bool { return has_previous && equal; }
+// TS: function finalizedRowsEqual(previous, next): conjunction over turnId, threadId, kind, role, text, title, status,
+//   item (===), reasoning, searchText, floor index/label, width, isLive, hideHeader, assistantTone, turnStartedAt,
+//   startedAt, completedAt, firstTokenAt, updatedAt, previewUrl, tokenUsage (===), requestUsage (===), groupedRows (===),
+//   compactionMarker/Source/ProviderId/Model/Backend, itemIds length + every equal.
+fn finalizedRowsEqual(all_equal: bool) -> bool { return all_equal; }
+
+// TS: function itemToRow(turn, item, options): ChatWaterfallRow (lines 461-507)
+//   kind = itemKind(item, options.activeThinking); text = primaryText(item, options.reasoning);
+//   title = item.title || fallbackTitle(kind); displayText = userMessage ? displayPromptText(item.text) : item.text;
+//   searchParts = [title, displayText, item.text, options.reasoning, item.status, item.agentName, item.agentRole].filter(Boolean);
+//   completedPreviewUrl = kind==="assistantMessage" && !isTurnLiveStatus(turn.status) ? detectLocalPreviewUrl(item.text) : undefined;
+//   row { key: `${turn.id}:${item.id}:${activeThinking ? "thinking" : "item"}`, turnId, threadId: turn.threadId, itemIds: [item.id],
+//     kind, role: rowRole(kind), text, title, status: item.status, item, reasoning: options.reasoning,
+//     searchText: searchParts.join("\n").toLowerCase(), width: rowWidth(kind, text), isLive: isTurnLiveStatus(turn.status),
+//     turnStartedAt: turn.startedAt, startedAt: kind==="assistantMessage" ? item.startedAt : turn.startedAt,
+//     completedAt: turn.completedAt, firstTokenAt: item.firstTokenAt,
+//     updatedAt: item.updatedAt ?? item.firstTokenAt ?? turn.completedAt ?? turn.startedAt,
+//     previewUrl, tokenUsage: options.tokenUsage, requestUsage: options.requestUsage,
+//     ...(kind==="contextCompaction" ? { compactionSource: options.compactionSource?.source ?? "native",
+//        compactionProviderId, compactionModel, compactionBackend: compactionBackendOf(item, options.threadBackend) } : {}) }
+// DEFECT: conditional spread, nullish chains, join/toLowerCase approximated over buffers.
+fn itemToRow(is_user: bool, is_assistant_kind: bool, turn_live: bool) -> i32 { return 0; }
+// TS: function compactionBackendOf(item, threadBackend?): payload (record) .cliBackend if non-empty string, else threadBackend || undefined.
+fn compactionBackendOf(has_stamped: bool, stamped_len: u64, has_thread_backend: bool, out_len: &u64) -> i32 {
+    if has_stamped && stamped_len > 0 { *out_len = stamped_len; return 1; };
+    if has_thread_backend { return 2; };
+    return 0;
+}
+// TS: function requestUsageEntries(value | undefined): undefined if !value; entries = Object.entries(value).map(([requestId, usage]) => ({requestId, usage})); length ? entries : undefined.
+// DEFECT: Object.entries over Record approximated over JSON buffer.
+fn requestUsageEntries(has_value: bool, entries_count: u64, out_count: &u64) -> bool {
+    if !has_value { *out_count = 0; return false; };
+    *out_count = entries_count;
+    return entries_count > 0;
+}
+// TS: function sameRequestUsage(previous, next): === true; either missing or length differs false; every entry requestId + usage (===) equal.
+fn sameRequestUsage(identical: bool, both_present: bool, same_len: bool, entries_equal: bool) -> bool {
+    if identical { return true; };
+    if !both_present || !same_len { return false; };
+    return entries_equal;
+}
+// TS: function applyAssistantHeaderGrouping(rows, previousByKey = new Map()): seenAssistantKeys Set;
+//   assistant rows: key = assistantHeaderKey(row); hideHeader = seen.has(key); seen.add(key); reuse via previousByKey.
+// DEFECT: Set<string> approximated as key buffer.
+fn applyAssistantHeaderGrouping(rows_count: u64, out_count: &u64) -> i32 { *out_count = rows_count; return 0; }
+// TS: function assistantHeaderKey(row): [role, item.agentId, item.agentThreadId, item.agentName, title].filter(Boolean).join(":")
+// TS: function itemKind(item, activeThinking?): ChatRowKind (lines 560-576) — sequential type checks:
+//   userMessage->userMessage; agentMessage->assistantMessage; plan->plan; reasoning&&activeThinking->reasoningPreview;
+//   commandExecution; imageGeneration; imageView; contextCompaction|compaction->contextCompaction;
+//   enteredReviewMode|exitedReviewMode->reviewMode; fileChange; mcpToolCall|dynamicToolCall|toolCall|toolUse|tool_use|collabAgentToolCall->toolCall;
+//   type.toLowerCase().includes("error")->error; else "status".
+// DEFECT: String.includes/toLowerCase approximated — caller supplies contains_error flag.
+fn itemKind(type_len: u64, active_thinking: bool, type_contains_error: bool, out_len: &u64) -> ptr {
+    if type_len == STR_LEN("userMessage") { *out_len = STR_LEN("userMessage"); return STR_PTR("userMessage"); };
+    if type_len == STR_LEN("agentMessage") { *out_len = STR_LEN("assistantMessage"); return STR_PTR("assistantMessage"); };
+    if type_len == STR_LEN("plan") { *out_len = STR_LEN("plan"); return STR_PTR("plan"); };
+    if type_len == STR_LEN("reasoning") && active_thinking { *out_len = STR_LEN("reasoningPreview"); return STR_PTR("reasoningPreview"); };
+    if type_len == STR_LEN("commandExecution") { *out_len = STR_LEN("commandExecution"); return STR_PTR("commandExecution"); };
+    if type_len == STR_LEN("imageGeneration") { *out_len = STR_LEN("imageGeneration"); return STR_PTR("imageGeneration"); };
+    if type_len == STR_LEN("imageView") { *out_len = STR_LEN("imageView"); return STR_PTR("imageView"); };
+    if type_len == STR_LEN("contextCompaction") || type_len == STR_LEN("compaction") { *out_len = STR_LEN("contextCompaction"); return STR_PTR("contextCompaction"); };
+    if type_len == STR_LEN("enteredReviewMode") || type_len == STR_LEN("exitedReviewMode") { *out_len = STR_LEN("reviewMode"); return STR_PTR("reviewMode"); };
+    if type_len == STR_LEN("fileChange") { *out_len = STR_LEN("fileChange"); return STR_PTR("fileChange"); };
+    if type_len == STR_LEN("mcpToolCall") || type_len == STR_LEN("dynamicToolCall") || type_len == STR_LEN("toolCall") || type_len == STR_LEN("toolUse") || type_len == STR_LEN("tool_use") || type_len == STR_LEN("collabAgentToolCall") { *out_len = STR_LEN("toolCall"); return STR_PTR("toolCall"); };
+    if type_contains_error { *out_len = STR_LEN("error"); return STR_PTR("error"); };
+    *out_len = STR_LEN("status");
+    return STR_PTR("status");
+}
+// TS: function compactConsecutiveCommandRows(rows) / commandGroupRow(rows) — defined but not wired into finalize in TS;
+//   group row: key `command-group:${first.key}:${last.key}`, title `${n} command(s) hidden`, item payload {count}, status "completed" on item.
+// TS: function compactConsecutiveFileChangeRows(rows) / fileChangeGroupRow(rows) / uniqueFileChangePaths(rows):
+//   paths Set from payload path/filePath/name (+ changes[].path/filePath/name); title `Edited ${fileCount} file(s)`; payload {count: fileCount, eventCount: rows.length}.
+// DEFECT: Set<string> + dynamic payload traversal approximated over JSON buffers.
+fn compactConsecutiveCommandRows(rows_count: u64, out_count: &u64) -> i32 { *out_count = rows_count; return 0; }
+fn compactConsecutiveFileChangeRows(rows_count: u64, out_count: &u64) -> i32 { *out_count = rows_count; return 0; }
+fn uniqueFileChangePaths(rows_count: u64, out_unique: &u64) -> i32 { *out_unique = 0; return 0; }
+// TS: function groupedActivityStatus(rows): "failed" if any row status.toLowerCase() in [failed, error, cancelled, canceled, interrupted] else "completed".
+fn groupedActivityStatus(any_failed: bool, out_len: &u64) -> ptr {
+    if any_failed { *out_len = STR_LEN("failed"); return STR_PTR("failed"); };
+    *out_len = STR_LEN("completed");
+    return STR_PTR("completed");
+}
+// TS: function rowRole(kind): userMessage->user; assistantMessage|plan|reasoningPreview->assistant;
+//   toolCall|toolActivityGroup|toolResult|fileChange|fileChangeGroup|commandExecution|commandGroup|imageGeneration|imageView->tool; default system.
+fn rowRole(kind_len: u64, out_len: &u64) -> ptr {
+    if kind_len == STR_LEN("userMessage") { *out_len = STR_LEN("user"); return STR_PTR("user"); };
+    if kind_len == STR_LEN("assistantMessage") || kind_len == STR_LEN("plan") || kind_len == STR_LEN("reasoningPreview") { *out_len = STR_LEN("assistant"); return STR_PTR("assistant"); };
+    if kind_len == STR_LEN("toolCall") || kind_len == STR_LEN("toolActivityGroup") || kind_len == STR_LEN("toolResult") || kind_len == STR_LEN("fileChange") || kind_len == STR_LEN("fileChangeGroup") || kind_len == STR_LEN("commandExecution") || kind_len == STR_LEN("commandGroup") || kind_len == STR_LEN("imageGeneration") || kind_len == STR_LEN("imageView") { *out_len = STR_LEN("tool"); return STR_PTR("tool"); };
+    *out_len = STR_LEN("system");
+    return STR_PTR("system");
+}
+// TS: function rowWidth(kind, text): wide if kind in [commandExecution, commandGroup, fileChange, fileChangeGroup, toolCall,
+//   toolActivityGroup, imageGeneration, imageView] || text.includes("```"); full if kind in [status, notice, checkpoint, contextCompaction, reviewMode]; else prose.
+fn rowWidth(kind_len: u64, text_has_fence: bool, out_len: &u64) -> ptr {
+    if kind_len == STR_LEN("commandExecution") || kind_len == STR_LEN("commandGroup") || kind_len == STR_LEN("fileChange") || kind_len == STR_LEN("fileChangeGroup") || kind_len == STR_LEN("toolCall") || kind_len == STR_LEN("toolActivityGroup") || kind_len == STR_LEN("imageGeneration") || kind_len == STR_LEN("imageView") || text_has_fence { *out_len = STR_LEN("wide"); return STR_PTR("wide"); };
+    if kind_len == STR_LEN("status") || kind_len == STR_LEN("notice") || kind_len == STR_LEN("checkpoint") || kind_len == STR_LEN("contextCompaction") || kind_len == STR_LEN("reviewMode") { *out_len = STR_LEN("full"); return STR_PTR("full"); };
+    *out_len = STR_LEN("prose");
+    return STR_PTR("prose");
+}
+// TS: function primaryText(item, reasoning?): reasoning -> reasoningText(item) || reasoning || "";
+//   userMessage -> displayPromptText(item.text); else item.text.
+fn primaryText(type_len: u64, has_reasoning_text: bool, has_reasoning_arg: bool, out_source: &u64) -> i32 {
+    if type_len == STR_LEN("reasoning") { if has_reasoning_text { *out_source = 1; } else if has_reasoning_arg { *out_source = 2; } else { *out_source = 0; }; return 0; };
+    if type_len == STR_LEN("userMessage") { *out_source = 3; return 0; }; // displayPromptText path
+    *out_source = 4;
+    return 0;
+}
+// TS: export function reasoningText(item): string (lines ~735-754)
+//   if item.text.trim() -> normalizeReasoningMarkdown(item.text); payload.summary: string -> normalize;
+//   array -> normalize(map entries: string ? entry : summarizeReasoningEntry(entry), filter Boolean, join "\n");
+//   record -> normalize(summarizeReasoningEntry(summary)); else "".
+fn reasoningText(has_text: bool, summary_kind: u64, out_kind: &u64) -> i32 { *out_kind = summary_kind; return 0; }
+// TS: function compactConsecutiveRetryErrorRows(rows) / retryErrorGroupRow(rows):
+//   only rows kind error with payload.retryError===true group (flush on threadId change);
+//   group: retrying = any status==="running"; exhausted = any payload.exhausted===true;
+//   status = retrying ? "running" : exhausted ? "failed" : last.status ?? "failed";
+//   progress = retrying && attempt/max numbers ? ` · retrying ${attempt}/${max}` : "";
+//   title = `${n} retry event(s)${progress}`; searchText = rows searchText join "\n"; isLive = retrying.
+fn compactConsecutiveRetryErrorRows(rows_count: u64, out_count: &u64) -> i32 { *out_count = rows_count; return 0; }
+fn retryErrorGroupStatus(retrying: bool, exhausted: bool, has_last_status: bool, out_len: &u64) -> ptr {
+    if retrying { *out_len = STR_LEN("running"); return STR_PTR("running"); };
+    if exhausted { *out_len = STR_LEN("failed"); return STR_PTR("failed"); };
+    if has_last_status { *out_len = 0; return STR_PTR(""); }; // last.status verbatim in fix phase
+    *out_len = STR_LEN("failed");
+    return STR_PTR("failed");
+}
+// TS: export function normalizeReasoningMarkdown(value): value.trim().replace(/\*{4}(?=[^\s*])/g, "**\n\n**")
+// DEFECT: RegExp with lookahead has no SLA counterpart; scan-based approximation in fix phase.
+fn normalizeReasoningMarkdown(in_len: u64, star4_boundaries: u64, out_len: &u64) -> i32 {
+    *out_len = in_len + star4_boundaries * 2; // each "****" (4) -> "**\n\n**" (6)
+    return 0;
+}
+// TS: function summarizeReasoningEntry(value): string -> value; record -> first non-empty string among
+//   [text, summary, content, message], else safeJson(value); else "".
+fn summarizeReasoningEntry(is_string: bool, is_record_v: bool, found_key_index: i32, out_kind: &u64) -> i32 {
+    if is_string { *out_kind = 1; return 0; };
+    if is_record_v && found_key_index >= 0 { *out_kind = 2; return 0; };
+    if is_record_v { *out_kind = 3; return 0; }; // safeJson fallback
+    *out_kind = 0;
+    return 0;
+}
+// TS: function fallbackTitle(kind): userMessage "You", assistantMessage "Codex", plan "Plan", reasoningPreview "Thinking",
+//   commandExecution "Command", commandGroup "Commands", fileChange "File change", fileChangeGroup "Edited files",
+//   imageView "Image view", imageGeneration "Image generation", toolCall "Tool", toolActivityGroup "Tool calls",
+//   contextCompaction "Context compaction", default "Status".
+fn fallbackTitle(kind_len: u64, out_len: &u64) -> ptr {
+    if kind_len == STR_LEN("userMessage") { *out_len = STR_LEN("You"); return STR_PTR("You"); };
+    if kind_len == STR_LEN("assistantMessage") { *out_len = STR_LEN("Codex"); return STR_PTR("Codex"); };
+    if kind_len == STR_LEN("plan") { *out_len = STR_LEN("Plan"); return STR_PTR("Plan"); };
+    if kind_len == STR_LEN("reasoningPreview") { *out_len = STR_LEN("Thinking"); return STR_PTR("Thinking"); };
+    if kind_len == STR_LEN("commandExecution") { *out_len = STR_LEN("Command"); return STR_PTR("Command"); };
+    if kind_len == STR_LEN("commandGroup") { *out_len = STR_LEN("Commands"); return STR_PTR("Commands"); };
+    if kind_len == STR_LEN("fileChange") { *out_len = STR_LEN("File change"); return STR_PTR("File change"); };
+    if kind_len == STR_LEN("fileChangeGroup") { *out_len = STR_LEN("Edited files"); return STR_PTR("Edited files"); };
+    if kind_len == STR_LEN("imageView") { *out_len = STR_LEN("Image view"); return STR_PTR("Image view"); };
+    if kind_len == STR_LEN("imageGeneration") { *out_len = STR_LEN("Image generation"); return STR_PTR("Image generation"); };
+    if kind_len == STR_LEN("toolCall") { *out_len = STR_LEN("Tool"); return STR_PTR("Tool"); };
+    if kind_len == STR_LEN("toolActivityGroup") { *out_len = STR_LEN("Tool calls"); return STR_PTR("Tool calls"); };
+    if kind_len == STR_LEN("contextCompaction") { *out_len = STR_LEN("Context compaction"); return STR_PTR("Context compaction"); };
+    *out_len = STR_LEN("Status");
+    return STR_PTR("Status");
+}
+// TS: function compactLine(value): oneLine = value.replace(/\s+/g, " ").trim(); length>80 ? slice(0,77)+"..." : oneLine
+// DEFECT: RegExp \s+ collapse approximated in fix phase; length rule preserved.
+fn compactLine(one_line_len: u64, out_len: &u64) -> i32 {
+    if one_line_len > 80 { *out_len = 80; } else { *out_len = one_line_len; };
+    return 0;
+}
+// TS: function safeJson(value): string -> value; try JSON.stringify(value, null, 2) ?? "" catch String(value)
+// DEFECT: JSON.stringify of dynamic value approximated by sa_json_* in fix phase.
+fn safeJson(is_string: bool, stringify_ok: bool, out_kind: &u64) -> i32 {
+    if is_string { *out_kind = 1; } else if stringify_ok { *out_kind = 2; } else { *out_kind = 3; };
+    return 0;
+}
+// TS: export function cleanPreviewUrl(raw): string | undefined (lines ~925-968)
+//   trim; empty -> undefined; strip leading [`'"<(\[{]+ and trailing [`'">)\]}]+; strip trailing punctuation
+//   [.,;:!?，。；：！？、…]+ then [`'"]+; prepend "http://" unless /^https?:\/\//i;
+//   try new URL(text): hostname must be localhost|127.0.0.1|0.0.0.0|[::1]; protocol http:/https:;
+//   pathname: strip trailing [`'"], cut at first char outside \x20-\x7E, strip trailing punctuation class, empty -> "/";
+//   username/password cleared; return url.toString(); catch -> undefined.
+// DEFECT: URL API + RegExp classes (incl. CJK punctuation) have no sa_std counterpart; staged string surgery in fix phase.
+fn cleanPreviewUrl(raw_len: u64, has_protocol: bool, is_local_host: bool, protocol_ok: bool, url_parse_ok: bool) -> bool {
+    if raw_len == 0 { return false; };
+    if !url_parse_ok { return false; };
+    if !is_local_host { return false; };
+    return protocol_ok;
+}
+// TS: export function detectLocalPreviewUrl(value): string | undefined (lines ~970-1002)
+//   explicit matches = [...value.matchAll(/https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(?::\d{1,5})?(?:\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=]*)?/gi)];
+//   scan matches last-to-first, first cleanPreviewUrl hit wins; then same for implicit /\b(?:localhost|...)/gi matches; else undefined.
+// DEFECT: matchAll global RegExp + iterator spread have no SLA counterpart; regex engine needed in fix phase.
+fn detectLocalPreviewUrl(value_len: u64, explicit_hits: u64, implicit_hits: u64, out_found: &bool) -> i32 {
+    *out_found = explicit_hits > 0 || implicit_hits > 0; // subject to cleanPreviewUrl acceptance per candidate
+    return 0;
+}

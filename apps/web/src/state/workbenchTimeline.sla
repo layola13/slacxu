@@ -1,0 +1,1091 @@
+// Converted 1:1 from apps/web/src/state/workbenchTimeline.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/ts_string.sa"
+@import "sa_std/ts_array.sa"
+@import "sa_std/ts_math.sa"
+@import "codexClient.sla"
+// Per SA_TS_INVENTORY.md: JS String/Array/Math semantics in this module bind
+// to the sa_std ts_* surface (@ts_str_trim in normalizeMessageText below;
+// sort in orderFullyTimedTurnsInPlace is a stable bubble sort pending the
+// @ts_arr_sort binding in the fix phase — see _defects/web-ts-state.md).
+
+// TS: import type { WorkbenchItem, WorkbenchTurn } from "./codexClient";
+// The structs live in codexClient.sla; the aliases below name the list shapes
+// used by this module (TS WorkbenchItem[] / WorkbenchTurn[]).
+// DEFECT: TS arrays are heap references with identity; SLA lists are
+// fixed-capacity value arrays (128 entries). sameReferences() therefore
+// degrades to id-sequence equality — see its DEFECT note.
+// DEFECT: string fields are fixed byte slots on the structs in
+// codexClient.sla; text is capped at 4096 bytes there.
+// DEFECT: the "notification" | "snapshot" string union is an enum code:
+// MODE_NOTIFICATION = 0, MODE_SNAPSHOT = 1.
+fn MODE_NOTIFICATION() -> u64 { return 0; }
+fn MODE_SNAPSHOT() -> u64 { return 1; }
+
+struct WorkbenchItemList {
+    items: [WorkbenchItem; 128],
+    len: u64,
+}
+
+struct WorkbenchTurnList {
+    turns: [WorkbenchTurn; 128],
+    len: u64,
+}
+
+// Id list used by mergeCanonicalIds/unique (TS string[]).
+struct IdList {
+    items: [[u8; 128]; 128],
+    lens: [u64; 128],
+    len: u64,
+}
+
+fn idListContains(list: &IdList, id_ptr: ptr, id_len: u64) -> bool {
+    for i in 0..list.len {
+        if list.lens[i] == id_len {
+            let same = true;
+            for j in 0..id_len {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, id_ptr, j);
+                if b != list.items[i][j] { same = false; };
+            }
+            if same { return true; };
+        };
+    }
+    return false;
+}
+
+fn idListPush(list: &IdList, id_ptr: ptr, id_len: u64) -> void {
+    if list.len >= 128 { return; };
+    let n = id_len;
+    if n > 128 { n = 128; };
+    for j in 0..n {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, id_ptr, j);
+        list.items[list.len][j] = b;
+    }
+    list.lens[list.len] = n;
+    list.len = list.len + 1;
+}
+
+fn idListInsertAt(list: &IdList, index: u64, id_ptr: ptr, id_len: u64) -> void {
+    if list.len >= 128 { return; };
+    let i = list.len;
+    while i > index {
+        let n = list.lens[i - 1];
+        for j in 0..n {
+            list.items[i][j] = list.items[i - 1][j];
+        }
+        list.lens[i] = n;
+        i = i - 1;
+    }
+    let n = id_len;
+    if n > 128 { n = 128; };
+    for j in 0..n {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, id_ptr, j);
+        list.items[index][j] = b;
+    }
+    list.lens[index] = n;
+    list.len = list.len + 1;
+}
+
+fn strEq(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    for j in 0..a_len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a_ptr, j);
+        PTR_BYTE_AT(y, b_ptr, j);
+        if x != y { return false; };
+    }
+    return true;
+}
+
+// TS: const TERMINAL_STATUSES = new Set([ "cancelled", "canceled", "complete",
+// "completed", "declined", "denied", "error", "failed", "interrupted",
+// "rejected", "stopped" ]);
+// Stored normalized (lowercase, "_" and "-" stripped), as isTerminalStatus
+// normalizes before lookup.
+fn terminalStatusAt(index: u64, out_len: &u64) -> ptr {
+    if index == 0 { *out_len = STR_LEN("cancelled"); return STR_PTR("cancelled"); };
+    if index == 1 { *out_len = STR_LEN("canceled"); return STR_PTR("canceled"); };
+    if index == 2 { *out_len = STR_LEN("complete"); return STR_PTR("complete"); };
+    if index == 3 { *out_len = STR_LEN("completed"); return STR_PTR("completed"); };
+    if index == 4 { *out_len = STR_LEN("declined"); return STR_PTR("declined"); };
+    if index == 5 { *out_len = STR_LEN("denied"); return STR_PTR("denied"); };
+    if index == 6 { *out_len = STR_LEN("error"); return STR_PTR("error"); };
+    if index == 7 { *out_len = STR_LEN("failed"); return STR_PTR("failed"); };
+    if index == 8 { *out_len = STR_LEN("interrupted"); return STR_PTR("interrupted"); };
+    if index == 9 { *out_len = STR_LEN("rejected"); return STR_PTR("rejected"); };
+    *out_len = STR_LEN("stopped");
+    return STR_PTR("stopped");
+}
+
+// TS: export function normalizeWorkbenchTimestamp(value?: number): number | null
+// Optional/null returns are (has, out) pairs in this pass.
+fn normalizeWorkbenchTimestamp(hasValue: bool, value: f64, valueIsFinite: bool, out: &f64) -> bool {
+    if !hasValue || !valueIsFinite || value <= 0.0 { return false; };
+    if value >= 1000000000000.0 { *out = value; } else { *out = value * 1000.0; };
+    return true;
+}
+
+// TS: export function workbenchItemTimestamp(item: WorkbenchItem): number | null
+fn workbenchItemTimestamp(item: &WorkbenchItem, out: &f64) -> bool {
+    if normalizeWorkbenchTimestamp(item.has_firstTokenAt, item.firstTokenAt, true, out) { return true; };
+    // const payload = asRecord(item.payload);
+    // return normalize(payload?.startedAt ?? payload?.started_at)
+    //     ?? normalize(payload?.completedAt ?? payload?.completed_at);
+    // DEFECT: dynamic object — payload is a JSON text buffer; field reads go
+    // through sa_json_object_get_number (fix phase to wire the exact sa_std
+    // JSON surface). Missing/non-numeric fields read as has=false.
+    let v: f64 = 0.0;
+    let has = false;
+    if item.has_payload {
+        let pp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(pp, &item.payload_bytes, 0);
+        has = sa_json_object_get_number(pp, item.payload_len, STR_PTR("startedAt"), STR_LEN("startedAt"), &v) == 0;
+        if !has { has = sa_json_object_get_number(pp, item.payload_len, STR_PTR("started_at"), STR_LEN("started_at"), &v) == 0; };
+        if has && normalizeWorkbenchTimestamp(true, v, true, out) { return true; };
+        has = sa_json_object_get_number(pp, item.payload_len, STR_PTR("completedAt"), STR_LEN("completedAt"), &v) == 0;
+        if !has { has = sa_json_object_get_number(pp, item.payload_len, STR_PTR("completed_at"), STR_LEN("completed_at"), &v) == 0; };
+        if has && normalizeWorkbenchTimestamp(true, v, true, out) { return true; };
+    };
+    return false;
+}
+
+// TS: export function workbenchTurnTimestamp(turn: WorkbenchTurn): number | null
+fn workbenchTurnTimestamp(turn: &WorkbenchTurn, out: &f64) -> bool {
+    if normalizeWorkbenchTimestamp(turn.has_startedAt, turn.startedAt, true, out) { return true; };
+    return normalizeWorkbenchTimestamp(turn.has_completedAt, turn.completedAt, true, out);
+}
+
+// TS: export function orderWorkbenchItems(items: WorkbenchItem[]): WorkbenchItem[]
+// (returns items.slice() — canonical causal order is kept, no sorting)
+fn orderWorkbenchItems(items: &WorkbenchItemList, out: &WorkbenchItemList) -> void {
+    out.len = 0;
+    for i in 0..items.len {
+        out.items[out.len] = items.items[i];
+        out.len = out.len + 1;
+    }
+}
+
+// TS: export function orderWorkbenchTurns(turns: WorkbenchTurn[]): WorkbenchTurn[]
+fn orderWorkbenchTurns(turns: &WorkbenchTurnList, out: &WorkbenchTurnList) -> void {
+    out.len = 0;
+    for i in 0..turns.len { out.turns[out.len] = turns.turns[i]; out.len = out.len + 1; }
+    orderFullyTimedTurnsInPlace(out);
+}
+
+// TS: export function upsertWorkbenchItem(items, incoming): WorkbenchItem[]
+fn upsertWorkbenchItem(items: &WorkbenchItemList, incoming: &WorkbenchItem, out: &WorkbenchItemList) -> void {
+    let index: u64 = 0;
+    let found = false;
+    for i in 0..items.len {
+        let a: ptr = PTR_NULL();
+        PTR_BYTE_ADD(a, &items.items[i].id_bytes, 0);
+        let b: ptr = PTR_NULL();
+        PTR_BYTE_ADD(b, &incoming.id_bytes, 0);
+        if strEq(a, items.items[i].id_len, b, incoming.id_len) { index = i; found = true; break; };
+    }
+    out.len = 0;
+    for i in 0..items.len {
+        out.items[out.len] = items.items[i];
+        out.len = out.len + 1;
+    }
+    if !found {
+        if out.len < 128 { out.items[out.len] = *incoming; out.len = out.len + 1; };
+        return;
+    };
+    let merged = items.items[index];
+    mergeWorkbenchItem(&items.items[index], incoming, MODE_NOTIFICATION(), &merged);
+    out.items[index] = merged;
+}
+
+// TS: export function upsertWorkbenchTurn(turns, incoming): WorkbenchTurn[]
+fn upsertWorkbenchTurn(turns: &WorkbenchTurnList, incoming: &WorkbenchTurn, out: &WorkbenchTurnList) -> void {
+    let index: u64 = 0;
+    let found = false;
+    for i in 0..turns.len {
+        let a: ptr = PTR_NULL();
+        PTR_BYTE_ADD(a, &turns.turns[i].id_bytes, 0);
+        let b: ptr = PTR_NULL();
+        PTR_BYTE_ADD(b, &incoming.id_bytes, 0);
+        if strEq(a, turns.turns[i].id_len, b, incoming.id_len) { index = i; found = true; break; };
+    }
+    out.len = 0;
+    for i in 0..turns.len {
+        out.turns[out.len] = turns.turns[i];
+        out.len = out.len + 1;
+    }
+    if !found {
+        if out.len < 128 { out.turns[out.len] = *incoming; out.len = out.len + 1; };
+        return;
+    };
+    let merged = turns.turns[index];
+    mergeWorkbenchTurn(&turns.turns[index], incoming, MODE_NOTIFICATION(), &merged);
+    out.turns[index] = merged;
+}
+
+// TS: export function mergeWorkbenchTurns(current, loaded): WorkbenchTurn[]
+fn mergeWorkbenchTurns(current: &WorkbenchTurnList, loaded: &WorkbenchTurnList, out: &WorkbenchTurnList) -> void {
+    if current.len == 0 { orderWorkbenchTurns(loaded, out); return; };
+    if loaded.len == 0 {
+        out.len = 0;
+        for i in 0..current.len { out.turns[out.len] = current.turns[i]; out.len = out.len + 1; }
+        return;
+    };
+    // const ids = mergeCanonicalIds(loaded.ids, current.ids)
+    let loadedIds = IdList { items: [[0u8; 128]; 128], lens: [0u64; 128], len: 0 };
+    let currentIds = IdList { items: [[0u8; 128]; 128], lens: [0u64; 128], len: 0 };
+    for i in 0..loaded.len {
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, &loaded.turns[i].id_bytes, 0);
+        idListPush(&loadedIds, p, loaded.turns[i].id_len);
+    }
+    for i in 0..current.len {
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, &current.turns[i].id_bytes, 0);
+        idListPush(&currentIds, p, current.turns[i].id_len);
+    }
+    let ids = IdList { items: [[0u8; 128]; 128], lens: [0u64; 128], len: 0 };
+    mergeCanonicalIds(&loadedIds, &currentIds, &ids);
+    // DEFECT: TS Map<id, turn> lookups (currentById/loadedById) approximated
+    // by linear scans over the lists below.
+    // The merged list is built directly into out, then ordered in place
+    // (TS: const merged = ids.map(...); const ordered = orderWorkbenchTurns(merged);)
+    out.len = 0;
+    for k in 0..ids.len {
+        let existingIdx: u64 = 0;
+        let hasExisting = false;
+        for i in 0..current.len {
+            let a: ptr = PTR_NULL();
+            PTR_BYTE_ADD(a, &current.turns[i].id_bytes, 0);
+            if current.turns[i].id_len == ids.lens[k] {
+                let same = true;
+                for j in 0..ids.lens[k] { if current.turns[i].id_bytes[j] != ids.items[k][j] { same = false; }; }
+                if same { existingIdx = i; hasExisting = true; };
+            };
+        }
+        let snapshotIdx: u64 = 0;
+        let hasSnapshot = false;
+        for i in 0..loaded.len {
+            if loaded.turns[i].id_len == ids.lens[k] {
+                let same = true;
+                for j in 0..ids.lens[k] { if loaded.turns[i].id_bytes[j] != ids.items[k][j] { same = false; }; }
+                if same { snapshotIdx = i; hasSnapshot = true; };
+            };
+        }
+        if hasExisting && hasSnapshot {
+            let m = current.turns[existingIdx];
+            mergeWorkbenchTurn(&current.turns[existingIdx], &loaded.turns[snapshotIdx], MODE_SNAPSHOT(), &m);
+            out.turns[out.len] = m;
+            out.len = out.len + 1;
+        } else {
+            if hasSnapshot { out.turns[out.len] = loaded.turns[snapshotIdx]; } else { out.turns[out.len] = current.turns[existingIdx]; };
+            out.len = out.len + 1;
+        };
+    }
+    orderFullyTimedTurnsInPlace(out);
+    // return sameReferences(current, ordered) ? current : ordered;
+    // DEFECT: reference identity — approximated by sameTurnReferences (id order).
+    if sameTurnReferences(current, out) {
+        out.len = 0;
+        for i in 0..current.len { out.turns[out.len] = current.turns[i]; out.len = out.len + 1; }
+        return;
+    };
+}
+
+// ---- small option/result shapes (constructible literals) ----
+struct OptStr64 {
+    has: bool,
+    bytes: [u8; 64],
+    len: u64,
+}
+
+struct OptF64 {
+    has: bool,
+    value: f64,
+}
+
+struct TextBuf {
+    bytes: [u8; 8192],
+    len: u64,
+}
+
+struct IdSlot {
+    bytes: [u8; 128],
+    len: u64,
+}
+
+fn copyFieldToTextBuf(dst: &TextBuf, src_ptr: ptr, src_len: u64) -> void {
+    dst.len = 0;
+    let n = src_len;
+    if n > 8192 { n = 8192; };
+    for j in 0..n {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src_ptr, j);
+        dst.bytes[dst.len] = b;
+        dst.len = dst.len + 1;
+    }
+}
+
+// TS: function mergeWorkbenchTurn(current, incoming, mode): WorkbenchTurn
+// DEFECT: TS builds item Maps and a reconciled item array; SLA version merges
+// by linear scans and computes reconciled snapshot ids lazily via
+// reconciledItemId (equivalent mapping, no materialized reconciled array).
+fn mergeWorkbenchTurn(current: &WorkbenchTurn, incoming: &WorkbenchTurn, mode: u64, out: &WorkbenchTurn) -> void {
+    // ids = mode === "snapshot"
+    //   ? mergeCanonicalIds(incomingItems.ids, current.items.ids)
+    //   : mergeCanonicalIds(current.items.ids, incomingItems.ids)
+    let currentIds = IdList { items: [[0u8; 128]; 128], lens: [0u64; 128], len: 0 };
+    let incomingIds = IdList { items: [[0u8; 128]; 128], lens: [0u64; 128], len: 0 };
+    for i in 0..current.items_len {
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, &current.items_items[i].id_bytes, 0);
+        idListPush(&currentIds, p, current.items_items[i].id_len);
+    }
+    for i in 0..incoming.items_len {
+        // effective id: reconciled id in snapshot mode, raw id otherwise
+        let slot = IdSlot { bytes: [0u8; 128], len: 0 };
+        if mode == MODE_SNAPSHOT() {
+            reconciledItemId(current, &incoming.items_items[i], &slot);
+        } else {
+            slot.len = incoming.items_items[i].id_len;
+            for j in 0..slot.len { slot.bytes[j] = incoming.items_items[i].id_bytes[j]; }
+        };
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, &slot.bytes, 0);
+        idListPush(&incomingIds, sp, slot.len);
+    }
+    let ids = IdList { items: [[0u8; 128]; 128], lens: [0u64; 128], len: 0 };
+    if mode == MODE_SNAPSHOT() {
+        mergeCanonicalIds(&incomingIds, &currentIds, &ids);
+    } else {
+        mergeCanonicalIds(&currentIds, &incomingIds, &ids);
+    };
+    // *out starts as { ...current, ...incoming } (spread approximated by
+    // starting from incoming, then overriding the fields TS overrides).
+    *out = *incoming;
+    out.items_len = 0;
+    for k in 0..ids.len {
+        let existingIdx: u64 = 0;
+        let hasExisting = false;
+        for i in 0..current.items_len {
+            if current.items_items[i].id_len == ids.lens[k] {
+                let same = true;
+                for j in 0..ids.lens[k] { if current.items_items[i].id_bytes[j] != ids.items[k][j] { same = false; }; }
+                if same { existingIdx = i; hasExisting = true; };
+            };
+        }
+        let nextIdx: u64 = 0;
+        let hasNext = false;
+        for i in 0..incoming.items_len {
+            let slot = IdSlot { bytes: [0u8; 128], len: 0 };
+            if mode == MODE_SNAPSHOT() {
+                reconciledItemId(current, &incoming.items_items[i], &slot);
+            } else {
+                slot.len = incoming.items_items[i].id_len;
+                for j in 0..slot.len { slot.bytes[j] = incoming.items_items[i].id_bytes[j]; }
+            };
+            if slot.len == ids.lens[k] {
+                let same = true;
+                for j in 0..ids.lens[k] { if slot.bytes[j] != ids.items[k][j] { same = false; }; }
+                if same { nextIdx = i; hasNext = true; };
+            };
+        }
+        if out.items_len < 128 {
+            if hasExisting && hasNext {
+                let m = current.items_items[existingIdx];
+                mergeWorkbenchItem(&current.items_items[existingIdx], &incoming.items_items[nextIdx], mode, &m);
+                if mode == MODE_SNAPSHOT() {
+                    // reconciled item carries the current (equivalent) id
+                    let slot = IdSlot { bytes: [0u8; 128], len: 0 };
+                    reconciledItemId(current, &incoming.items_items[nextIdx], &slot);
+                    m.id_len = slot.len;
+                    for j in 0..slot.len { m.id_bytes[j] = slot.bytes[j]; }
+                };
+                out.items_items[out.items_len] = m;
+            } else {
+                if hasNext { out.items_items[out.items_len] = incoming.items_items[nextIdx]; } else { out.items_items[out.items_len] = current.items_items[existingIdx]; };
+            };
+            out.items_len = out.items_len + 1;
+        };
+    }
+    // const orderedItems = orderWorkbenchItems(items); — identity copy, above
+    // order is already the canonical merged order.
+    let status = OptStr64 { has: false, bytes: [0u8; 64], len: 0 };
+    progressiveStatus(current, incoming, mode, &status);
+    // threadId: incoming.threadId || current.threadId
+    if incoming.threadId_len == 0 {
+        out.threadId_len = current.threadId_len;
+        for j in 0..current.threadId_len { out.threadId_bytes[j] = current.threadId_bytes[j]; }
+    };
+    // status: status ?? current.status
+    if status.has {
+        out.has_status = true;
+        out.status_len = status.len;
+        for j in 0..status.len { out.status_bytes[j] = status.bytes[j]; }
+    } else {
+        out.has_status = current.has_status;
+        out.status_len = current.status_len;
+        for j in 0..current.status_len { out.status_bytes[j] = current.status_bytes[j]; }
+    };
+    // startedAt: earlierTimestamp(current.startedAt, incoming.startedAt)
+    let started = OptF64 { has: false, value: 0.0 };
+    earlierTimestamp(current.has_startedAt, current.startedAt, incoming.has_startedAt, incoming.startedAt, &started);
+    out.has_startedAt = started.has;
+    out.startedAt = started.value;
+    // completedAt: (status && !terminal(status) && notification)
+    //   ? incoming.completedAt : laterTimestamp(current, incoming)
+    let useIncomingCompleted = false;
+    if status.has && mode == MODE_NOTIFICATION() {
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, &status.bytes, 0);
+        if !isTerminalStatus(true, sp, status.len) { useIncomingCompleted = true; };
+    };
+    if useIncomingCompleted {
+        out.has_completedAt = incoming.has_completedAt;
+        out.completedAt = incoming.completedAt;
+    } else {
+        let completed = OptF64 { has: false, value: 0.0 };
+        laterTimestamp(current.has_completedAt, current.completedAt, incoming.has_completedAt, incoming.completedAt, &completed);
+        out.has_completedAt = completed.has;
+        out.completedAt = completed.value;
+    };
+    // return sameWorkbenchTurn(current, merged) ? current : merged;
+    // DEFECT: reference identity — out already holds merged; the identity
+    // shortcut (returning the current object) is unobservable in value terms.
+}
+
+// Effective id of a snapshot item after reconcileSnapshotMessageIds:
+// the equivalent current item's id, or the item's own id.
+// Also records the claim in claimed (IdList) exactly as the TS does.
+fn reconciledItemIdWithClaims(current: &WorkbenchTurn, item: &WorkbenchItem, claimed: &IdList, out: &IdSlot) -> void {
+    out.len = item.id_len;
+    for j in 0..item.id_len { out.bytes[j] = item.id_bytes[j]; }
+    let tp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tp, &item.type_bytes, 0);
+    if !isReconciledMessageType(tp, item.type_len) { return; };
+    // if currentById.has(item.id) -> unchanged (and pre-claimed by caller)
+    for i in 0..current.items_len {
+        if current.items_items[i].id_len == item.id_len {
+            let same = true;
+            for j in 0..item.id_len { if current.items_items[i].id_bytes[j] != item.id_bytes[j] { same = false; }; }
+            if same { return; };
+        };
+    }
+    // find first equivalent unclaimed current item
+    let itemText = TextBuf { bytes: [0u8; 8192], len: 0 };
+    normalizeMessageText(&item.text_bytes, item.text_len, &itemText);
+    for i in 0..current.items_len {
+        let cand = &current.items_items[i];
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, &cand.id_bytes, 0);
+        if idListContains(claimed, cp, cand.id_len) { continue; };
+        if cand.type_len != item.type_len { continue; };
+        let typesSame = true;
+        for j in 0..item.type_len { if cand.type_bytes[j] != item.type_bytes[j] { typesSame = false; }; }
+        if !typesSame { continue; };
+        let candText = TextBuf { bytes: [0u8; 8192], len: 0 };
+        normalizeMessageText(&cand.text_bytes, cand.text_len, &candText);
+        if candText.len != itemText.len { continue; };
+        let textsSame = true;
+        for j in 0..itemText.len { if candText.bytes[j] != itemText.bytes[j] { textsSame = false; }; }
+        if !textsSame { continue; };
+        if !compatibleOptionalIdentity(cand.has_agentId, &cand.agentId_bytes, cand.agentId_len, item.has_agentId, &item.agentId_bytes, item.agentId_len) { continue; };
+        if !compatibleOptionalIdentity(cand.has_agentThreadId, &cand.agentThreadId_bytes, cand.agentThreadId_len, item.has_agentThreadId, &item.agentThreadId_bytes, item.agentThreadId_len) { continue; };
+        // claimedCurrentIds.add(equivalent.id); return { ...item, id: equivalent.id }
+        idListPush(claimed, cp, cand.id_len);
+        out.len = cand.id_len;
+        for j in 0..cand.id_len { out.bytes[j] = cand.id_bytes[j]; }
+        return;
+    }
+}
+
+fn reconciledItemId(current: &WorkbenchTurn, item: &WorkbenchItem, out: &IdSlot) -> void {
+    // Pre-claim ids present in both, as TS does before mapping.
+    let claimed = IdList { items: [[0u8; 128]; 128], lens: [0u64; 128], len: 0 };
+    for i in 0..current.items_len {
+        for k in 0..current.items_len {
+            if current.items_items[k].id_len == current.items_items[i].id_len {
+                let same = true;
+                for j in 0..current.items_items[i].id_len { if current.items_items[k].id_bytes[j] != current.items_items[i].id_bytes[j] { same = false; }; }
+                if same {
+                    let p: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(p, &current.items_items[i].id_bytes, 0);
+                    if !idListContains(&claimed, p, current.items_items[i].id_len) { idListPush(&claimed, p, current.items_items[i].id_len); };
+                };
+            };
+        }
+    }
+    // DEFECT: TS claims are built from the snapshot's ids intersected with
+    // current ids and accumulate in snapshot order; this helper rebuilds the
+    // base claim set per call and does not thread cross-item accumulation
+    // through mergeWorkbenchTurn — claim-order edge cases may differ.
+    reconciledItemIdWithClaims(current, item, &claimed, out);
+}
+
+// TS: function reconcileSnapshotMessageIds(current, snapshot): WorkbenchItem[]
+// Writes a copy of the snapshot turn with item ids replaced, into out.
+fn reconcileSnapshotMessageIds(current: &WorkbenchTurn, snapshot: &WorkbenchTurn, out: &WorkbenchTurn) -> void {
+    *out = *snapshot;
+    let claimed = IdList { items: [[0u8; 128]; 128], lens: [0u64; 128], len: 0 };
+    // claimedCurrentIds = new Set(snapshot.filter(id in current).map(id))
+    for i in 0..snapshot.items_len {
+        for k in 0..current.items_len {
+            if current.items_items[k].id_len == snapshot.items_items[i].id_len {
+                let same = true;
+                for j in 0..snapshot.items_items[i].id_len { if current.items_items[k].id_bytes[j] != snapshot.items_items[i].id_bytes[j] { same = false; }; }
+                if same {
+                    let p: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(p, &snapshot.items_items[i].id_bytes, 0);
+                    idListPush(&claimed, p, snapshot.items_items[i].id_len);
+                };
+            };
+        }
+    }
+    for i in 0..out.items_len {
+        let slot = IdSlot { bytes: [0u8; 128], len: 0 };
+        reconciledItemIdWithClaims(current, &snapshot.items_items[i], &claimed, &slot);
+        out.items_items[i].id_len = slot.len;
+        for j in 0..slot.len { out.items_items[i].id_bytes[j] = slot.bytes[j]; }
+    }
+}
+
+// TS: function compatibleOptionalIdentity(current?, snapshot?): boolean
+//   return !current || !snapshot || current === snapshot;
+fn compatibleOptionalIdentity(hasCurrent: bool, currentBytes: &[u8; 128], current_len: u64, hasSnapshot: bool, snapshotBytes: &[u8; 128], snapshot_len: u64) -> bool {
+    if !hasCurrent || current_len == 0 { return true; };
+    if !hasSnapshot || snapshot_len == 0 { return true; };
+    if current_len != snapshot_len { return false; };
+    for j in 0..current_len { if currentBytes[j] != snapshotBytes[j] { return false; }; }
+    return true;
+}
+
+// TS: function isReconciledMessageType(type: string): boolean
+fn isReconciledMessageType(type_ptr: ptr, type_len: u64) -> bool {
+    if strEq(type_ptr, type_len, STR_PTR("userMessage"), STR_LEN("userMessage")) { return true; };
+    return strEq(type_ptr, type_len, STR_PTR("agentMessage"), STR_LEN("agentMessage"));
+}
+
+// TS: function normalizeMessageText(value: string): string
+//   return value.trim().replace(/\r\n?/g, "\n");
+// The trim binds @ts_str_trim from sa_std/ts_string.sa (已绑 sa_std ts 面).
+// The \r\n? -> \n replacement is exact for CR/LF input.
+fn normalizeMessageText(srcBytes: &[u8; 8192], src_len: u64, out: &TextBuf) -> void {
+    let srcPtr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(srcPtr, srcBytes, 0);
+    let trimmedPtr: ptr = PTR_NULL();
+    let trimmedLen: u64 = 0;
+    @ts_str_trim(srcPtr, src_len, &trimmedPtr, &trimmedLen);
+    out.len = 0;
+    let i: u64 = 0;
+    while i < trimmedLen {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, trimmedPtr, i);
+        if b == 13 {
+            out.bytes[out.len] = 10;
+            out.len = out.len + 1;
+            if i + 1 < trimmedLen { let nb: u8 = 0; PTR_BYTE_AT(nb, trimmedPtr, i + 1); if nb == 10 { i = i + 1; }; };
+        } else {
+            out.bytes[out.len] = b;
+            out.len = out.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+// TS: function mergeWorkbenchItem(current, incoming, mode): WorkbenchItem
+fn mergeWorkbenchItem(current: &WorkbenchItem, incoming: &WorkbenchItem, mode: u64, out: &WorkbenchItem) -> void {
+    let cs: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cs, &current.status_bytes, 0);
+    let is_: ptr = PTR_NULL();
+    PTR_BYTE_ADD(is_, &incoming.status_bytes, 0);
+    let currentTerminal = isTerminalStatus(current.has_status, cs, current.status_len);
+    let incomingTerminal = isTerminalStatus(incoming.has_status, is_, incoming.status_len);
+    let preferIncoming = mode == MODE_NOTIFICATION() || incomingTerminal || (!currentTerminal && incoming.text_len > current.text_len);
+    // const preferred = preferIncoming ? incoming : current;
+    // const fallback = preferIncoming ? current : incoming;
+    // merged = { ...fallback, ...preferred, ...overrides }
+    if preferIncoming { *out = *current; *out = *incoming; } else { *out = *incoming; *out = *current; };
+    // status: progressiveItemStatus(current.status, incoming.status)
+    let st = OptStr64 { has: false, bytes: [0u8; 64], len: 0 };
+    progressiveItemStatus(current.has_status, cs, current.status_len, incoming.has_status, is_, incoming.status_len, &st);
+    out.has_status = st.has;
+    out.status_len = st.len;
+    for j in 0..st.len { out.status_bytes[j] = st.bytes[j]; }
+    // text: mergeItemText(current.text, incoming.text, mode, preferIncoming)
+    let ct: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ct, &current.text_bytes, 0);
+    let it: ptr = PTR_NULL();
+    PTR_BYTE_ADD(it, &incoming.text_bytes, 0);
+    let mergedText = TextBuf { bytes: [0u8; 8192], len: 0 };
+    mergeItemText(ct, current.text_len, it, incoming.text_len, mode, preferIncoming, &mergedText);
+    out.text_len = mergedText.len;
+    for j in 0..mergedText.len { out.text_bytes[j] = mergedText.bytes[j]; }
+    // startedAt / firstTokenAt: earlierTimestamp(...)
+    let started = OptF64 { has: false, value: 0.0 };
+    earlierTimestamp(current.has_startedAt, current.startedAt, incoming.has_startedAt, incoming.startedAt, &started);
+    out.has_startedAt = started.has;
+    out.startedAt = started.value;
+    let first = OptF64 { has: false, value: 0.0 };
+    earlierTimestamp(current.has_firstTokenAt, current.firstTokenAt, incoming.has_firstTokenAt, incoming.firstTokenAt, &first);
+    out.has_firstTokenAt = first.has;
+    out.firstTokenAt = first.value;
+    // images / files: longerArray(current, incoming, preferIncoming)
+    let pickImages = longerArrayPick(current.has_images, current.images_count, incoming.has_images, incoming.images_count, preferIncoming);
+    if pickImages == 1 {
+        out.has_images = current.has_images;
+        out.images_count = current.images_count;
+        out.images_json_len = current.images_json_len;
+        for j in 0..current.images_json_len { out.images_json_bytes[j] = current.images_json_bytes[j]; }
+    } else {
+        if pickImages == 2 {
+            out.has_images = incoming.has_images;
+            out.images_count = incoming.images_count;
+            out.images_json_len = incoming.images_json_len;
+            for j in 0..incoming.images_json_len { out.images_json_bytes[j] = incoming.images_json_bytes[j]; }
+        } else { out.has_images = false; out.images_count = 0; out.images_json_len = 0; };
+    };
+    let pickFiles = longerArrayPick(current.has_files, current.files_count, incoming.has_files, incoming.files_count, preferIncoming);
+    if pickFiles == 1 {
+        out.has_files = current.has_files;
+        out.files_count = current.files_count;
+        out.files_json_len = current.files_json_len;
+        for j in 0..current.files_json_len { out.files_json_bytes[j] = current.files_json_bytes[j]; }
+    } else {
+        if pickFiles == 2 {
+            out.has_files = incoming.has_files;
+            out.files_count = incoming.files_count;
+            out.files_json_len = incoming.files_json_len;
+            for j in 0..incoming.files_json_len { out.files_json_bytes[j] = incoming.files_json_bytes[j]; }
+        } else { out.has_files = false; out.files_count = 0; out.files_json_len = 0; };
+    };
+    // payload: mergePayload(fallback.payload, preferred.payload)
+    if preferIncoming { mergePayloadInto(current, incoming, out); } else { mergePayloadInto(incoming, current, out); };
+    // return sameWorkbenchItem(current, merged) ? current : merged;
+    // DEFECT: reference identity shortcut unobservable in value terms (see
+    // mergeWorkbenchTurn note).
+}
+
+// TS: function mergePayload(fallback, preferred): payload
+// DEFECT: dynamic object — payloads are JSON text buffers; the TS shallow
+// spread { ...fallbackRecord, ...preferredRecord } needs a JSON object merge,
+// approximated here by taking the preferred record whole when both are
+// records. Non-record case (preferred ?? fallback) is exact.
+fn mergePayloadInto(fallback: &WorkbenchItem, preferred: &WorkbenchItem, out: &WorkbenchItem) -> void {
+    let fallbackIsRecord = fallback.has_payload && fallback.payload_len > 0 && fallback.payload_bytes[0] == 123;
+    let preferredIsRecord = preferred.has_payload && preferred.payload_len > 0 && preferred.payload_bytes[0] == 123;
+    if fallbackIsRecord && preferredIsRecord {
+        out.has_payload = preferred.has_payload;
+        out.payload_len = preferred.payload_len;
+        for j in 0..preferred.payload_len { out.payload_bytes[j] = preferred.payload_bytes[j]; }
+        return;
+    };
+    if preferred.has_payload {
+        out.has_payload = true;
+        out.payload_len = preferred.payload_len;
+        for j in 0..preferred.payload_len { out.payload_bytes[j] = preferred.payload_bytes[j]; }
+        return;
+    };
+    out.has_payload = fallback.has_payload;
+    out.payload_len = fallback.payload_len;
+    for j in 0..fallback.payload_len { out.payload_bytes[j] = fallback.payload_bytes[j]; }
+}
+
+// TS: function progressiveStatus(current, incoming, mode): string | undefined
+fn progressiveStatus(current: &WorkbenchTurn, incoming: &WorkbenchTurn, mode: u64, out: &OptStr64) -> void {
+    let cs: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cs, &current.status_bytes, 0);
+    let is_: ptr = PTR_NULL();
+    PTR_BYTE_ADD(is_, &incoming.status_bytes, 0);
+    if mode == MODE_SNAPSHOT() && !isTerminalStatus(current.has_status, cs, current.status_len) && isTerminalStatus(incoming.has_status, is_, incoming.status_len) {
+        // A history/reconcile snapshot can be older than the live notification
+        // stream. Never let that snapshot make an active turn look finished
+        // unless it carries a trustworthy completion timestamp after the live
+        // turn began. (TS note: use < not <= — server timestamps are
+        // second-granularity; completedAt == startedAt is a legal terminal.)
+        let curStarted: f64 = 0.0;
+        let hasCurStarted = normalizeWorkbenchTimestamp(current.has_startedAt, current.startedAt, true, &curStarted);
+        let incStarted: f64 = 0.0;
+        let hasIncStarted = normalizeWorkbenchTimestamp(incoming.has_startedAt, incoming.startedAt, true, &incStarted);
+        let incCompleted: f64 = 0.0;
+        let hasIncCompleted = normalizeWorkbenchTimestamp(incoming.has_completedAt, incoming.completedAt, true, &incCompleted);
+        if !hasIncCompleted || (hasCurStarted && incCompleted < curStarted) || (hasCurStarted && hasIncStarted && incStarted < curStarted) {
+            out.has = current.has_status;
+            out.len = current.status_len;
+            for j in 0..current.status_len { out.bytes[j] = current.status_bytes[j]; }
+            return;
+        };
+    };
+    if isTerminalStatus(current.has_status, cs, current.status_len) && !isTerminalStatus(incoming.has_status, is_, incoming.status_len) {
+        if mode == MODE_SNAPSHOT() {
+            out.has = current.has_status;
+            out.len = current.status_len;
+            for j in 0..current.status_len { out.bytes[j] = current.status_bytes[j]; }
+            return;
+        };
+        let completedAt: f64 = 0.0;
+        let hasCompletedAt = normalizeWorkbenchTimestamp(current.has_completedAt, current.completedAt, true, &completedAt);
+        let startedAt: f64 = 0.0;
+        let hasStartedAt = normalizeWorkbenchTimestamp(incoming.has_startedAt, incoming.startedAt, true, &startedAt);
+        if !hasCompletedAt || !hasStartedAt || startedAt <= completedAt {
+            out.has = current.has_status;
+            out.len = current.status_len;
+            for j in 0..current.status_len { out.bytes[j] = current.status_bytes[j]; }
+            return;
+        };
+    };
+    // return incomingStatus ?? currentStatus;
+    if incoming.has_status {
+        out.has = true;
+        out.len = incoming.status_len;
+        for j in 0..incoming.status_len { out.bytes[j] = incoming.status_bytes[j]; }
+        return;
+    };
+    out.has = current.has_status;
+    out.len = current.status_len;
+    for j in 0..current.status_len { out.bytes[j] = current.status_bytes[j]; }
+}
+
+// TS: function progressiveItemStatus(current?, incoming?): string | undefined
+fn progressiveItemStatus(hasCurrent: bool, current_ptr: ptr, current_len: u64, hasIncoming: bool, incoming_ptr: ptr, incoming_len: u64, out: &OptStr64) -> void {
+    if isTerminalStatus(hasCurrent, current_ptr, current_len) && !isTerminalStatus(hasIncoming, incoming_ptr, incoming_len) {
+        out.has = hasCurrent;
+        out.len = current_len;
+        for j in 0..current_len {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, current_ptr, j);
+            out.bytes[j] = b;
+        }
+        return;
+    };
+    if hasIncoming {
+        out.has = true;
+        out.len = incoming_len;
+        for j in 0..incoming_len {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, incoming_ptr, j);
+            out.bytes[j] = b;
+        }
+        return;
+    };
+    out.has = hasCurrent;
+    out.len = current_len;
+    for j in 0..current_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, current_ptr, j);
+        out.bytes[j] = b;
+    }
+}
+
+// TS: function isTerminalStatus(value?: string): boolean
+//   return TERMINAL_STATUSES.has((value ?? "").replace(/[_-]+/g, "").toLowerCase());
+fn isTerminalStatus(hasValue: bool, value_ptr: ptr, value_len: u64) -> bool {
+    let norm: [u8; 64] = [0u8; 64];
+    let norm_len: u64 = 0;
+    if hasValue {
+        for j in 0..value_len {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, value_ptr, j);
+            if b == 95 || b == 45 { continue; };
+            if b >= 65 && b <= 90 { b = b + 32; };
+            if norm_len < 64 { norm[norm_len] = b; norm_len = norm_len + 1; };
+        }
+    };
+    let np: ptr = PTR_NULL();
+    PTR_BYTE_ADD(np, &norm, 0);
+    for i in 0..11 {
+        let tl: u64 = 0;
+        let tp = terminalStatusAt(i, &tl);
+        if strEq(np, norm_len, tp, tl) { return true; };
+    }
+    return false;
+}
+
+// TS: function mergeItemText(current, incoming, mode, preferIncoming): string
+fn mergeItemText(current_ptr: ptr, current_len: u64, incoming_ptr: ptr, incoming_len: u64, mode: u64, preferIncoming: bool, out: &TextBuf) -> void {
+    if strEq(current_ptr, current_len, incoming_ptr, incoming_len) { copyFieldToTextBuf(out, current_ptr, current_len); return; };
+    if mode == MODE_NOTIFICATION() {
+        if incoming_len > 0 { copyFieldToTextBuf(out, incoming_ptr, incoming_len); } else { copyFieldToTextBuf(out, current_ptr, current_len); };
+        return;
+    };
+    // if (current.startsWith(incoming)) return current;
+    if current_len >= incoming_len {
+        let prefix = true;
+        for j in 0..incoming_len {
+            let x: u8 = 0;
+            let y: u8 = 0;
+            PTR_BYTE_AT(x, current_ptr, j);
+            PTR_BYTE_AT(y, incoming_ptr, j);
+            if x != y { prefix = false; };
+        }
+        if prefix { copyFieldToTextBuf(out, current_ptr, current_len); return; };
+    };
+    // if (incoming.startsWith(current)) return incoming;
+    if incoming_len >= current_len {
+        let prefix = true;
+        for j in 0..current_len {
+            let x: u8 = 0;
+            let y: u8 = 0;
+            PTR_BYTE_AT(x, current_ptr, j);
+            PTR_BYTE_AT(y, incoming_ptr, j);
+            if x != y { prefix = false; };
+        }
+        if prefix { copyFieldToTextBuf(out, incoming_ptr, incoming_len); return; };
+    };
+    if current_len != incoming_len {
+        if current_len > incoming_len { copyFieldToTextBuf(out, current_ptr, current_len); } else { copyFieldToTextBuf(out, incoming_ptr, incoming_len); };
+        return;
+    };
+    if preferIncoming { copyFieldToTextBuf(out, incoming_ptr, incoming_len); } else { copyFieldToTextBuf(out, current_ptr, current_len); };
+}
+
+// TS: function longerArray<T>(current, incoming, preferIncoming): T[] | undefined
+// DEFECT: generic over element type; images/files are (count + JSON text)
+// pairs here, so the choice is returned as a code: 0 = neither (undefined),
+// 1 = current, 2 = incoming. Element contents are copied by the caller.
+fn longerArrayPick(hasCurrent: bool, current_len: u64, hasIncoming: bool, incoming_len: u64, preferIncoming: bool) -> u64 {
+    if !hasCurrent { return 2; };
+    if !hasIncoming { return 1; };
+    if current_len != incoming_len {
+        if current_len > incoming_len { return 1; };
+        return 2;
+    };
+    if preferIncoming { return 2; };
+    return 1;
+}
+
+// TS: function earlierTimestamp(current?, incoming?): number | undefined
+// (compares normalized values, returns the raw chosen value)
+fn earlierTimestamp(hasCurrent: bool, current: f64, hasIncoming: bool, incoming: f64, out: &OptF64) -> void {
+    let ct: f64 = 0.0;
+    let hasCt = normalizeWorkbenchTimestamp(hasCurrent, current, true, &ct);
+    let it: f64 = 0.0;
+    let hasIt = normalizeWorkbenchTimestamp(hasIncoming, incoming, true, &it);
+    if !hasCt { out.has = hasIncoming; out.value = incoming; return; };
+    if !hasIt { out.has = hasCurrent; out.value = current; return; };
+    if ct <= it { out.has = true; out.value = current; } else { out.has = true; out.value = incoming; };
+}
+
+// TS: function laterTimestamp(current?, incoming?): number | undefined
+fn laterTimestamp(hasCurrent: bool, current: f64, hasIncoming: bool, incoming: f64, out: &OptF64) -> void {
+    let ct: f64 = 0.0;
+    let hasCt = normalizeWorkbenchTimestamp(hasCurrent, current, true, &ct);
+    let it: f64 = 0.0;
+    let hasIt = normalizeWorkbenchTimestamp(hasIncoming, incoming, true, &it);
+    if !hasCt { out.has = hasIncoming; out.value = incoming; return; };
+    if !hasIt { out.has = hasCurrent; out.value = current; return; };
+    if ct >= it { out.has = true; out.value = current; } else { out.has = true; out.value = incoming; };
+}
+
+// TS: function orderFullyTimed<T>(items, timestamp): T[]
+// DEFECT: generic T + callback parameter; specialized here to turns, in
+// place (callers copy first, as orderWorkbenchTurns does). Stable bubble
+// sort: TS sort is stable and the comparator falls back to original index,
+// which stability reproduces.
+fn orderFullyTimedTurnsInPlace(list: &WorkbenchTurnList) -> void {
+    let stamps: [f64; 128] = [0.0; 128];
+    let hasStamps: [bool; 128] = [false; 128];
+    for i in 0..list.len {
+        let v: f64 = 0.0;
+        hasStamps[i] = workbenchTurnTimestamp(&list.turns[i], &v);
+        stamps[i] = v;
+    }
+    for i in 0..list.len {
+        if !hasStamps[i] { return; };
+    }
+    // decorated.sort((l, r) => l.timestamp - r.timestamp || l.index - r.index)
+    let n = list.len;
+    for i in 0..n {
+        for j in 0..n {
+            if j + 1 < n - i {
+                if stamps[j] > stamps[j + 1] {
+                    let tmpTurn = list.turns[j];
+                    list.turns[j] = list.turns[j + 1];
+                    list.turns[j + 1] = tmpTurn;
+                    let tmpStamp = stamps[j];
+                    stamps[j] = stamps[j + 1];
+                    stamps[j + 1] = tmpStamp;
+                };
+            };
+        }
+    }
+}
+
+// TS: function sameReferences<T>(current: T[], next: T[]): boolean
+// DEFECT: reference identity of elements cannot survive value copies;
+// approximated by id-sequence equality (sameItemReferences/sameTurnReferences).
+fn sameItemReferences(current: &WorkbenchItemList, next: &WorkbenchItemList) -> bool {
+    if current.len != next.len { return false; };
+    for i in 0..current.len {
+        if current.items[i].id_len != next.items[i].id_len { return false; };
+        for j in 0..current.items[i].id_len { if current.items[i].id_bytes[j] != next.items[i].id_bytes[j] { return false; }; }
+    }
+    return true;
+}
+
+fn sameTurnReferences(current: &WorkbenchTurnList, next: &WorkbenchTurnList) -> bool {
+    if current.len != next.len { return false; };
+    for i in 0..current.len {
+        if current.turns[i].id_len != next.turns[i].id_len { return false; };
+        for j in 0..current.turns[i].id_len { if current.turns[i].id_bytes[j] != next.turns[i].id_bytes[j] { return false; }; }
+    }
+    return true;
+}
+
+fn turnItemsSameReferences(current: &WorkbenchTurn, next: &WorkbenchTurn) -> bool {
+    if current.items_len != next.items_len { return false; };
+    for i in 0..current.items_len {
+        if current.items_items[i].id_len != next.items_items[i].id_len { return false; };
+        for j in 0..current.items_items[i].id_len { if current.items_items[i].id_bytes[j] != next.items_items[i].id_bytes[j] { return false; }; }
+    }
+    return true;
+}
+
+// TS: function sameWorkbenchTurn(current, next): boolean
+fn sameWorkbenchTurn(current: &WorkbenchTurn, next: &WorkbenchTurn) -> bool {
+    if current.id_len != next.id_len { return false; };
+    for j in 0..current.id_len { if current.id_bytes[j] != next.id_bytes[j] { return false; }; }
+    if current.threadId_len != next.threadId_len { return false; };
+    for j in 0..current.threadId_len { if current.threadId_bytes[j] != next.threadId_bytes[j] { return false; }; }
+    if current.has_status != next.has_status || current.status_len != next.status_len { return false; };
+    for j in 0..current.status_len { if current.status_bytes[j] != next.status_bytes[j] { return false; }; }
+    if current.has_startedAt != next.has_startedAt || current.startedAt != next.startedAt { return false; };
+    if current.has_completedAt != next.has_completedAt || current.completedAt != next.completedAt { return false; };
+    return turnItemsSameReferences(current, next);
+}
+
+// TS: function sameWorkbenchItem(current, next): boolean
+fn sameWorkbenchItem(current: &WorkbenchItem, next: &WorkbenchItem) -> bool {
+    if current.id_len != next.id_len { return false; };
+    for j in 0..current.id_len { if current.id_bytes[j] != next.id_bytes[j] { return false; }; }
+    if current.type_len != next.type_len { return false; };
+    for j in 0..current.type_len { if current.type_bytes[j] != next.type_bytes[j] { return false; }; }
+    if current.title_len != next.title_len { return false; };
+    for j in 0..current.title_len { if current.title_bytes[j] != next.title_bytes[j] { return false; }; }
+    if current.text_len != next.text_len { return false; };
+    for j in 0..current.text_len { if current.text_bytes[j] != next.text_bytes[j] { return false; }; }
+    if current.has_status != next.has_status || current.status_len != next.status_len { return false; };
+    for j in 0..current.status_len { if current.status_bytes[j] != next.status_bytes[j] { return false; }; }
+    if current.has_firstTokenAt != next.has_firstTokenAt || current.firstTokenAt != next.firstTokenAt { return false; };
+    if current.has_updatedAt != next.has_updatedAt || current.updatedAt != next.updatedAt { return false; };
+    if current.has_agentId != next.has_agentId || current.agentId_len != next.agentId_len { return false; };
+    for j in 0..current.agentId_len { if current.agentId_bytes[j] != next.agentId_bytes[j] { return false; }; }
+    if current.has_agentThreadId != next.has_agentThreadId || current.agentThreadId_len != next.agentThreadId_len { return false; };
+    for j in 0..current.agentThreadId_len { if current.agentThreadId_bytes[j] != next.agentThreadId_bytes[j] { return false; }; }
+    if current.has_agentName != next.has_agentName || current.agentName_len != next.agentName_len { return false; };
+    for j in 0..current.agentName_len { if current.agentName_bytes[j] != next.agentName_bytes[j] { return false; }; }
+    if current.has_agentRole != next.has_agentRole || current.agentRole_len != next.agentRole_len { return false; };
+    for j in 0..current.agentRole_len { if current.agentRole_bytes[j] != next.agentRole_bytes[j] { return false; }; }
+    if current.has_agentStatus != next.has_agentStatus || current.agentStatus_len != next.agentStatus_len { return false; };
+    for j in 0..current.agentStatus_len { if current.agentStatus_bytes[j] != next.agentStatus_bytes[j] { return false; }; }
+    // sameSerializable(images/files/payload) — JSON text equality, see DEFECT
+    // on sameSerializable below.
+    if !sameSerializableJson(current.has_images, &current.images_json_bytes, current.images_json_len, next.has_images, &next.images_json_bytes, next.images_json_len) { return false; };
+    if !sameSerializableJson(current.has_files, &current.files_json_bytes, current.files_json_len, next.has_files, &next.files_json_bytes, next.files_json_len) { return false; };
+    return sameSerializableJson(current.has_payload, &current.payload_bytes, current.payload_len, next.has_payload, &next.payload_bytes, next.payload_len);
+}
+
+// TS: function sameSerializable(current: unknown, next: unknown): boolean
+// DEFECT: dynamic JSON structural comparison (arrays/objects recursively,
+// key-order insensitive for objects) approximated by raw JSON text equality
+// of the stored buffers — object key order differences read as unequal.
+fn sameSerializableJson(hasCurrent: bool, currentBytes: &[u8; 4096], current_len: u64, hasNext: bool, nextBytes: &[u8; 4096], next_len: u64) -> bool {
+    if !hasCurrent && !hasNext { return true; };
+    if hasCurrent != hasNext { return false; };
+    if current_len != next_len { return false; };
+    for j in 0..current_len { if currentBytes[j] != nextBytes[j] { return false; }; }
+    return true;
+}
+
+// TS: function mergeCanonicalIds(primary: string[], secondary: string[]): string[]
+fn mergeCanonicalIds(primary: &IdList, secondary: &IdList, out: &IdList) -> void {
+    unique(primary, out);
+    let present = IdList { items: [[0u8; 128]; 128], lens: [0u64; 128], len: 0 };
+    for i in 0..out.len {
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, &out.items[i], 0);
+        idListPush(&present, p, out.lens[i]);
+    }
+    for index in 0..secondary.len {
+        let id_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(id_ptr, &secondary.items[index], 0);
+        let id_len = secondary.lens[index];
+        if idListContains(&present, id_ptr, id_len) { continue; };
+        let previous = IdSlot { bytes: [0u8; 128], len: 0 };
+        let hasPrevious = findPresentNeighbor(secondary, index, -1, &present, &previous);
+        let next = IdSlot { bytes: [0u8; 128], len: 0 };
+        let hasNext = findPresentNeighbor(secondary, index, 1, &present, &next);
+        if hasNext {
+            // result.splice(result.indexOf(next), 0, id)
+            let pos: u64 = 0;
+            for i in 0..out.len {
+                if out.lens[i] == next.len {
+                    let same = true;
+                    for j in 0..next.len { if out.items[i][j] != next.bytes[j] { same = false; }; }
+                    if same { pos = i; };
+                };
+            }
+            idListInsertAt(out, pos, id_ptr, id_len);
+        } else {
+            if hasPrevious {
+                // result.splice(result.lastIndexOf(previous) + 1, 0, id)
+                let pos: u64 = 0;
+                for i in 0..out.len {
+                    if out.lens[i] == previous.len {
+                        let same = true;
+                        for j in 0..previous.len { if out.items[i][j] != previous.bytes[j] { same = false; }; }
+                        if same { pos = i + 1; };
+                    };
+                }
+                idListInsertAt(out, pos, id_ptr, id_len);
+            } else {
+                idListPush(out, id_ptr, id_len);
+            };
+        };
+        idListPush(&present, id_ptr, id_len);
+    }
+}
+
+// TS: function findPresentNeighbor(ids, start, direction, present): string | null
+fn findPresentNeighbor(ids: &IdList, start: u64, direction: i32, present: &IdList, out: &IdSlot) -> bool {
+    let index: i64 = start as i64 + direction as i64;
+    while index >= 0 && index < ids.len as i64 {
+        let i = index as u64;
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, &ids.items[i], 0);
+        if idListContains(present, p, ids.lens[i]) {
+            out.len = ids.lens[i];
+            for j in 0..ids.lens[i] { out.bytes[j] = ids.items[i][j]; }
+            return true;
+        };
+        index = index + direction as i64;
+    }
+    return false;
+}
+
+// TS: function unique(ids: string[]): string[]  ([...new Set(ids)])
+fn unique(ids: &IdList, out: &IdList) -> void {
+    out.len = 0;
+    for i in 0..ids.len {
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, &ids.items[i], 0);
+        if !idListContains(out, p, ids.lens[i]) { idListPush(out, p, ids.lens[i]); };
+    }
+}
+
+// TS: function asRecord(value: unknown): Record<string, unknown> | null
+// DEFECT: dynamic object — only used here on item.payload (JSON text buffer);
+// a payload counts as a record when it holds a JSON object.
+fn payloadAsRecord(item: &WorkbenchItem) -> bool {
+    return item.has_payload && item.payload_len > 0 && item.payload_bytes[0] == 123;
+}
+
+// TS: function numberValue(value: unknown): number | undefined
+fn numberValue(hasValue: bool, value: f64, valueIsFinite: bool, out: &f64) -> bool {
+    if !hasValue || !valueIsFinite { return false; };
+    *out = value;
+    return true;
+}

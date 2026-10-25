@@ -1,0 +1,188 @@
+// Converted 1:1 from apps/server/src/legalPolicyStore.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+
+@import "sa_std/io/print.sai"
+@import "sa_std/string.sa"
+// @import "./localDatabase.sla"    // LocalDatabase (this unit)
+// @import "./runtime/database.sla" // RuntimeDatabase (runtime unit)
+// DEFECT: node:crypto createHash (streaming update/digest), node:fs sync, node:path, node:url fileURLToPath, import.meta.url -> sa_std sha256 / fs / path extern approximations; module URL base -> host-provided base dir.
+// DEFECT: @codex-ui/shared LegalConsentStatus / LegalPolicyBundle / LegalPolicyDocument / LegalPolicyLanguage -> local structs; language codes: 0=cn 1=en.
+
+// Source header comment preserved: acceptance is explicit through the UI checkbox; the old mandatory 30-second timer was removed.
+const MIN_READ_SECONDS: u64 = 0;
+const POLICY_CACHE_TTL_MS: u64 = 5000;
+
+// L18-36: function resolveLegalDir(): string
+fn resolveLegalDir(out_ptr: ptr, err_ptr: ptr) -> u64 {
+    // envDir = process.env.CODEX_UI_LEGAL_DIR?.trim(); if (envDir && existsSync(envDir)) return resolve(envDir)
+    // base = dirname(fileURLToPath(import.meta.url)) (DEFECT: -> host base dir extern)
+    // candidates = [join(base, "legal"), join(base, "..", "legal"), join(base, ".."), join(base, "..", "..", ".."), process.cwd(), join(process.cwd(), "legal")]
+    // DEFECT: array literal of computed paths -> sequential candidate probes (same order).
+    // for (candidate of candidates) if (existsSync(join(candidate, "PRIVACY.md"))) return resolve(candidate)
+    // return envDir ? resolve(envDir) : resolve(base, "../../..")
+    return 0;
+}
+
+// L38-50: const DOCUMENTS: Array<{id, titleCn, titleEn, cn, en, versioned?}>
+// id codes: 0=privacy 1=terms 2=license 3=thirdParty 4=legal
+// Rows (1:1; Chinese titles preserved as literals at fix stage):
+//   0 privacy:   titleCn "隐私政策",               titleEn "Privacy Policy",            cn "PRIVACY.md",             en "PRIVACY_EN.md"
+//   1 terms:     titleCn "服务条款与免责声明",       titleEn "Terms of Service & Disclaimer", cn "TERMS.md",             en "TERMS_EN.md"
+//   2 license:   titleCn "开源与商业许可协议",       titleEn "License & Commercial Policy",   cn "LICENSE",              en "LICENSE"
+//   3 thirdParty:titleCn "第三方开源库清单",         titleEn "Third-Party Components",        cn "THIRD_PARTY_LICENSES.md", en "THIRD_PARTY_LICENSES_EN.md"
+//   4 legal:     titleCn "综合法律协议",           titleEn "Merged Agreement",            cn "LEGAL.md",               en "LEGAL_EN.md"
+// DEFECT: array of objects -> parallel constant tables indexed by document index (0..4); versioned absent (= undefined, only `=== false` skips) for all rows.
+const DOCUMENTS_LEN: u64 = 5;
+
+// L52-55: type AcceptanceRow { accepted_at: number; language: LegalPolicyLanguage }
+struct AcceptanceRow {
+    accepted_at: f64,
+    language: u64,
+}
+
+// L57-59: type ReviewRow { started_at: number }
+struct ReviewRow {
+    started_at: f64,
+}
+
+// LegalPolicyDocument mirror: {id, title, file, content}
+struct LegalPolicyDocument {
+    id: u64,
+    title: [u8; 256], title_len: u64,
+    file: [u8; 256], file_len: u64,
+    content: [u8; 1048576], content_len: u64,
+}
+
+// L61: type CurrentPolicy = Omit<LegalPolicyBundle, "minReadSeconds" | "reviewStartedAt" | "serverNow">
+// DEFECT: Omit<> -> struct without those three fields.
+struct CurrentPolicy {
+    version: [u8; 32], version_len: u64, // 20 hex chars
+    language: u64,
+    updated_at: f64,
+    // DEFECT: documents: LegalPolicyDocument[] -> fixed array of 5 serialized documents
+    documents: [u8; 5242880], document_lens: [u64; 5], documents_len: u64,
+}
+
+// LegalConsentStatus mirror: {required, version, minReadSeconds, acceptedAt?, language?}
+struct LegalConsentStatus {
+    required: bool,
+    version: [u8; 32], version_len: u64,
+    min_read_seconds: f64,
+    has_accepted_at: bool, accepted_at: f64,
+    has_language: bool, language: u64,
+}
+
+// LegalPolicyBundle mirror (= CurrentPolicy + minReadSeconds + reviewStartedAt + serverNow)
+struct LegalPolicyBundle {
+    version: [u8; 32], version_len: u64,
+    language: u64,
+    updated_at: f64,
+    documents: [u8; 5242880], document_lens: [u64; 5], documents_len: u64,
+    min_read_seconds: f64,
+    review_started_at: f64,
+    server_now: f64,
+}
+
+// L63: let policyCache: {expiresAt, cn: CurrentPolicy, en: CurrentPolicy} | null = null
+// DEFECT: module-level mutable cache -> module state struct held by host (single instance passed to readCurrentPolicy).
+struct PolicyCacheState {
+    has_cache: bool,
+    expires_at: f64,
+    cn: [u8; 5242880], cn_len: u64, // DEFECT: CurrentPolicy serialized scratch
+    en: [u8; 5242880], en_len: u64,
+    out_policy: [u8; 5242880], out_policy_len: u64,
+    err: [u8; 1024], err_len: u64,
+}
+
+// L65-71: export class LegalPolicyStore
+struct LegalPolicyStore {
+    db: u64, // RuntimeDatabase handle (opaque)
+    err: [u8; 1024], err_len: u64,
+}
+
+// L67-69: constructor(database: Pick<LocalDatabase, "connection"> = new LocalDatabase())
+// DEFECT: Pick<> + default dependency -> db handle param (0 = construct LocalDatabase first).
+fn legalPolicyStore_new(store: &LegalPolicyStore, db_handle: u64) -> i32 {
+    store.db = db_handle;
+    return 0;
+}
+
+// L71-91: public initialize(): void
+fn legalPolicyStore_initialize(store: &LegalPolicyStore, cache: &PolicyCacheState) -> i32 {
+    // db.exec(CREATE TABLE IF NOT EXISTS legal_policy_reviews (user_id TEXT NOT NULL, policy_version TEXT NOT NULL,
+    //   started_at INTEGER NOT NULL, last_opened_at INTEGER NOT NULL, PRIMARY KEY (user_id, policy_version));
+    //   CREATE TABLE IF NOT EXISTS legal_policy_acceptances (user_id TEXT NOT NULL, policy_version TEXT NOT NULL,
+    //   language TEXT NOT NULL CHECK (language IN ('cn', 'en')), accepted_at INTEGER NOT NULL, read_seconds INTEGER NOT NULL,
+    //   PRIMARY KEY (user_id, policy_version));
+    //   CREATE INDEX IF NOT EXISTS legal_policy_acceptances_user_idx ON legal_policy_acceptances (user_id, accepted_at DESC))
+    // DEFECT: template literal DDL -> extern string constant (text preserved above).
+    return 0;
+}
+
+// L93-105: public status(userId): LegalConsentStatus
+fn legalPolicyStore_status(store: &LegalPolicyStore, cache: &PolicyCacheState, user_ptr: ptr, user_len: u64, out: &LegalConsentStatus) -> i32 {
+    // policy = readCurrentPolicy("cn")
+    // accepted = db.prepare("SELECT accepted_at, language FROM legal_policy_acceptances WHERE user_id = ? ORDER BY accepted_at DESC LIMIT 1").get(userId) as AcceptanceRow | undefined
+    // return { required: !accepted, version: policy.version, minReadSeconds: MIN_READ_SECONDS, acceptedAt: accepted?.accepted_at, language: accepted?.language }
+    // DEFECT: optional chaining on possibly-undefined row -> has_accepted_at / has_language flags.
+    return 0;
+}
+
+// L107-125: public open(userId, language): LegalPolicyBundle
+fn legalPolicyStore_open(store: &LegalPolicyStore, cache: &PolicyCacheState, user_ptr: ptr, user_len: u64, language: u64, out: &LegalPolicyBundle) -> i32 {
+    // policy = readCurrentPolicy(language); now = Date.now() (DEFECT: -> extern clock)
+    // db.prepare("INSERT INTO legal_policy_reviews (user_id, policy_version, started_at, last_opened_at) VALUES (?, ?, ?, ?)
+    //   ON CONFLICT(user_id, policy_version) DO UPDATE SET last_opened_at = excluded.last_opened_at").run(userId, policy.version, now, now)
+    // review = db.prepare("SELECT started_at FROM legal_policy_reviews WHERE user_id = ? AND policy_version = ? LIMIT 1").get(userId, policy.version) as ReviewRow | undefined
+    // return { ...policy, minReadSeconds: MIN_READ_SECONDS, reviewStartedAt: review?.started_at ?? now, serverNow: now }
+    // DEFECT: object spread -> field copies from CurrentPolicy scratch.
+    return 0;
+}
+
+// L127-155: public accept(userId, version, language): LegalConsentStatus — throws on stale version / no review / too-fast read
+// DEFECT: throw -> status codes (-1 version changed, -2 not opened, -3 read too fast) with source messages in store.err.
+fn legalPolicyStore_accept(store: &LegalPolicyStore, cache: &PolicyCacheState, user_ptr: ptr, user_len: u64, ver_ptr: ptr, ver_len: u64, language: u64, out: &LegalConsentStatus) -> i32 {
+    // policy = readCurrentPolicy(language)
+    // if (version !== policy.version) throw Error("The legal policy changed. Reopen it and review the latest version.")
+    // review = db.prepare("SELECT started_at ... ").get(userId, version); if (!review) throw Error("Open the legal policy before accepting it.")
+    // now = Date.now(); readSeconds = floor((now - review.started_at) / 1000)
+    // if (readSeconds < MIN_READ_SECONDS) throw Error(`Please continue reading for ${MIN_READ_SECONDS - readSeconds} seconds.`) (DEFECT: template literal -> formatted err)
+    // db.prepare("INSERT INTO legal_policy_acceptances (user_id, policy_version, language, accepted_at, read_seconds) VALUES (?, ?, ?, ?, ?)
+    //   ON CONFLICT(user_id, policy_version) DO UPDATE SET language = excluded.language, accepted_at = excluded.accepted_at,
+    //   read_seconds = excluded.read_seconds").run(userId, version, language, now, readSeconds)
+    // return this.status(userId)
+    return 0;
+}
+
+// L158-164: function readCurrentPolicy(language): CurrentPolicy
+fn readCurrentPolicy(cache: &PolicyCacheState, language: u64) -> i32 {
+    // now = Date.now(); if (!policyCache || policyCache.expiresAt <= now) policyCache = { ...buildPolicySnapshot(), expiresAt: now + POLICY_CACHE_TTL_MS }
+    // DEFECT: object spread of snapshot pair -> both cn/en scratches refreshed together.
+    // return policyCache[language] (DEFECT: computed key access -> language branch selecting cn/en scratch into out_policy)
+    return 0;
+}
+
+// L166-221: function buildPolicySnapshot(): {cn: CurrentPolicy, en: CurrentPolicy}
+fn buildPolicySnapshot(cache: &PolicyCacheState) -> i32 {
+    // sources = new Map<string, {content, modifiedAt}>() (DEFECT: Map -> fixed table of unique files, capacity 10)
+    // for (document of DOCUMENTS) { for (file of new Set([document.cn, document.en])) {
+    //   DEFECT: Set dedup of the (cn, en) pair -> skip when cn === en (license row).
+    //   if (sources.has(file)) continue; path = resolve(resolveLegalDir(), file)
+    //   if (existsSync(path)) { try { sources.set(file, {content: readFileSync(path, "utf8"), modifiedAt: statSync(path).mtimeMs}) } catch {} }
+    //   DEFECT: dead `if (!existsSync(path)) { // fallback handled below }` branch in source preserved as no-op note.
+    //   if (!sources.has(file)) sources.set(file, { content: `# ${file}\n\nCodex Ultra legal notice.\nBy using this workbench, you agree to comply with applicable terms, privacy policies, and local regulations.`, modifiedAt: 1 })
+    //   DEFECT: fallback template literal -> formatted buffer.
+    // } }
+    // hash = createHash("sha256"); versionedFiles = new Set<string>()
+    // for (document of DOCUMENTS) { if (document.versioned === false) continue;
+    //   for (file of new Set([document.cn, document.en])) { if (versionedFiles.has(file)) continue; versionedFiles.add(file);
+    //     hash.update(file); hash.update("\0"); hash.update(sources.get(file)?.content ?? "") } }
+    // DEFECT: streaming hash update sequence preserved via sa_std sha256 incremental extern; Set -> visited flags.
+    // version = hash.digest("hex").slice(0, 20)
+    // updatedAt = Math.max(...Array.from(sources.values(), s => s.modifiedAt)) (DEFECT: spread into Math.max + Array.from map -> max loop)
+    // createPolicy closure (L196-208): (language) => ({ version, language, updatedAt, documents: DOCUMENTS.map(document => {
+    //   file = language === "cn" ? document.cn : document.en;
+    //   return { id: document.id, title: language === "cn" ? document.titleCn : document.titleEn, file, content: sources.get(file)?.content ?? "" } satisfies LegalPolicyDocument }) })
+    // DEFECT: closure + Array.map + satisfies -> loop filling both language policies; satisfies dropped.
+    // return { cn: createPolicy("cn"), en: createPolicy("en") }
+    return 0;
+}

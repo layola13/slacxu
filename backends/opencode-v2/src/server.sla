@@ -1,0 +1,552 @@
+// Converted 1:1 from backends/opencode-v2/src/server.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/ptr.sa"
+@import "sa_std/io/print.sai"
+@import "manifest.sla"
+
+// OpenCode v2 — server side (kind "backend"). Independent plugin,
+// separate from the v1 plugin in every way: own project, own discovery,
+// own engine. Discovery rule (moved here from the host's cliVersions):
+// the v2 launcher is `opencode2` (installed by the official v2
+// installer into ~/.opencode-v2/bin, alongside the v1 dirs); a plain
+// `opencode` counts only when its probed version is >= 2. Env overrides:
+// OPENCODE_V2_BIN / CODEX_UI_OPENCODE_V2_BIN.
+//
+// Known upstream v2 gaps reflected in the capabilities: no file parts
+// and no permission/question round-trips yet.
+//
+// TS imports:
+//   execFileSync from "node:child_process"  -> intent extern sa_std_process_exec_file_sync (MISSING check)
+//   existsSync from "node:fs"                -> intent extern sa_std_fs_exists
+//   homedir from "node:os"                   -> intent extern sa_std_os_homedir
+//   basename, join from "node:path"          -> helpers below
+//   EngineHandle/EngineStatus/PluginInstallation/ServerHost/ServerPlugin
+//     from "@cxu/sdk-backend/server"         -> structs below
+// DEFECT: Node.js APIs have no confirmed sa_std surface; extern names are
+// intent-level and must be verified in the fix phase.
+
+// ---- SDK type approximations (1:1 field correspondence) ----
+
+// TS: EngineStatus = { phase: string; transport: string } (SDK union type).
+// DEFECT: string union -> byte buffers.
+struct EngineStatus {
+    phase: [u8; 32],
+    phase_len: u64,
+    transport: [u8; 32],
+    transport_len: u64,
+}
+
+// TS: PluginInstallation = { path: string; version?: string; source: string }.
+struct PluginInstallation {
+    path: [u8; 1024],
+    path_len: u64,
+    version: [u8; 64],
+    version_len: u64,
+    has_version: bool,
+    source: [u8; 32],
+    source_len: u64,
+}
+
+// TS: PluginInstallation[] — fixed capacity 64 (PATH enumeration bound).
+struct PluginInstallationList {
+    items: [PluginInstallation; 64],
+    len: u64,
+}
+
+// TS: ServerHost — opaque host handle in this file (only passed through).
+struct ServerHost {
+    opaque: u64,
+}
+
+// ---- small string helpers (node:path basename/join approximations) ----
+
+fn field_set(dst: ptr, cap: u64, src: ptr, src_len: u64) -> u64 {
+    let n = src_len;
+    if n > cap { n = cap; };
+    let i: u64 = 0;
+    while i < n {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src, i);
+        PTR_BYTE_SET(dst, i, b);
+        i = i + 1;
+    }
+    return n;
+}
+
+// TS: basename(path) — bytes after the last '/' or '\'.
+fn path_basename(path_ptr: ptr, path_len: u64, out_len: &u64) -> ptr {
+    let start: u64 = 0;
+    let i: u64 = 0;
+    while i < path_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, path_ptr, i);
+        if b == 47 || b == 92 { start = i + 1; };
+        i = i + 1;
+    }
+    let out: ptr = PTR_NULL();
+    PTR_BYTE_ADD(out, path_ptr, start);
+    *out_len = path_len - start;
+    return out;
+}
+
+// TS: join(dir, name) into scratch.path of the given installation slot.
+fn path_join_into(slot: &PluginInstallation, a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> void {
+    let dst: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dst, &slot.path, 0);
+    let n = field_set(dst, 1024, a_ptr, a_len);
+    if n > 0 && n < 1024 {
+        PTR_BYTE_SET(dst, n, 47);
+        n = n + 1;
+    };
+    let rest: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rest, dst, n);
+    n = n + field_set(rest, 1024 - n, b_ptr, b_len);
+    slot.path_len = n;
+}
+
+fn bytes_equal(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    let i: u64 = 0;
+    while i < a_len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a_ptr, i);
+        PTR_BYTE_AT(y, b_ptr, i);
+        if x != y { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn is_digit(b: u8) -> bool { return b >= 48 && b <= 57; }
+
+// Scan text for the first /\d+\.\d+\.\d+/ occurrence.
+// DEFECT: RegExp has no SLA counterpart; hand-written scanner approximation.
+fn scan_semver(text_ptr: ptr, text_len: u64, major_out: &u64, has_major: &bool, span_ptr: &ptr, span_len: &u64) -> bool {
+    *has_major = false;
+    *span_len = 0;
+    let i: u64 = 0;
+    while i < text_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, text_ptr, i);
+        if is_digit(b) {
+            let j = i;
+            let major: u64 = 0;
+            while j < text_len {
+                let d: u8 = 0;
+                PTR_BYTE_AT(d, text_ptr, j);
+                if !is_digit(d) { break; };
+                major = major * 10 + (d - 48) as u64;
+                j = j + 1;
+            }
+            let ok = true;
+            if j >= text_len { ok = false; };
+            if ok {
+                let dot: u8 = 0;
+                PTR_BYTE_AT(dot, text_ptr, j);
+                if dot != 46 { ok = false; };
+            };
+            if ok {
+                let k = j + 1;
+                let minor_digits: u64 = 0;
+                while k < text_len {
+                    let d: u8 = 0;
+                    PTR_BYTE_AT(d, text_ptr, k);
+                    if !is_digit(d) { break; };
+                    minor_digits = minor_digits + 1;
+                    k = k + 1;
+                }
+                if minor_digits == 0 { ok = false; };
+                if ok {
+                    if k >= text_len { ok = false; } else {
+                        let dot2: u8 = 0;
+                        PTR_BYTE_AT(dot2, text_ptr, k);
+                        if dot2 != 46 { ok = false; };
+                    };
+                };
+                if ok {
+                    let m = k + 1;
+                    let patch_digits: u64 = 0;
+                    while m < text_len {
+                        let d: u8 = 0;
+                        PTR_BYTE_AT(d, text_ptr, m);
+                        if !is_digit(d) { break; };
+                        patch_digits = patch_digits + 1;
+                        m = m + 1;
+                    }
+                    if patch_digits == 0 { ok = false; };
+                    if ok {
+                        *major_out = major;
+                        *has_major = true;
+                        let sp: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(sp, text_ptr, i);
+                        *span_ptr = sp;
+                        *span_len = m - i;
+                        return true;
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// TS: function probe(bin: string): { version?: string; major?: number }
+// try { execFileSync(bin, ["--version"], { timeout: 3000, encoding: "utf8" });
+//       match /(\d+)\.(\d+)\.(\d+)/ -> { version: match[0], major: Number(match[1]) } }
+// catch -> {}
+// DEFECT: try/catch + RegExp + optional object fields -> status outs below;
+// the version span points into a caller-provided out buffer (out_buf).
+fn probe(bin_ptr: ptr, bin_len: u64, out_buf: ptr, out_major: &u64, has_major: &bool, ver_ptr: &ptr, ver_len: &u64, has_version: &bool) -> void {
+    *has_major = false;
+    *has_version = false;
+    *ver_len = 0;
+    let out_len: u64 = 0;
+    // DEFECT: exec writes into caller scratch (4096 cap) instead of a string.
+    let rc = sa_std_process_exec_file_sync_into(bin_ptr, bin_len, STR_PTR("--version"), STR_LEN("--version"), 3000, out_buf, 4096, &out_len);
+    if rc != 0 { return; };
+    if scan_semver(out_buf, out_len, out_major, has_major, ver_ptr, ver_len) {
+        *has_version = true;
+    };
+}
+
+// ---- TS: class OpencodeV2Engine implements EngineHandle ----
+// DEFECT: class + interface + `#status` private field -> struct + family.
+struct OpencodeV2Engine {
+    // readonly pluginId = "opencode-v2"
+    plugin_id: [u8; 16],
+    plugin_id_len: u64,
+    // #status: EngineStatus = { phase: "stopped", transport: "stdio" }
+    status: EngineStatus,
+}
+
+fn OpencodeV2Engine_new(out: &OpencodeV2Engine) -> void {
+    let dst: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dst, &out.plugin_id, 0);
+    out.plugin_id_len = field_set(dst, 16, STR_PTR("opencode-v2"), STR_LEN("opencode-v2"));
+    let ph: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ph, &out.status.phase, 0);
+    out.status.phase_len = field_set(ph, 32, STR_PTR("stopped"), STR_LEN("stopped"));
+    let tr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tr, &out.status.transport, 0);
+    out.status.transport_len = field_set(tr, 32, STR_PTR("stdio"), STR_LEN("stdio"));
+}
+
+fn OpencodeV2Engine_set_status(self_e: &OpencodeV2Engine, phase_ptr: ptr, phase_len: u64) -> void {
+    let ph: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ph, &self_e.status.phase, 0);
+    self_e.status.phase_len = field_set(ph, 32, phase_ptr, phase_len);
+    let tr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tr, &self_e.status.transport, 0);
+    self_e.status.transport_len = field_set(tr, 32, STR_PTR("stdio"), STR_LEN("stdio"));
+}
+
+// TS: async start(): Promise<EngineStatus>
+// DEFECT: async -> synchronous status code.
+fn OpencodeV2Engine_start(self_e: &OpencodeV2Engine) -> i32 {
+    OpencodeV2Engine_set_status(self_e, STR_PTR("ready"), STR_LEN("ready"));
+    return 0;
+}
+
+// TS: async stop(): Promise<void>
+// DEFECT: async -> synchronous status code.
+fn OpencodeV2Engine_stop(self_e: &OpencodeV2Engine) -> i32 {
+    OpencodeV2Engine_set_status(self_e, STR_PTR("stopped"), STR_LEN("stopped"));
+    return 0;
+}
+
+// TS: status(): EngineStatus
+fn OpencodeV2Engine_status(self_e: &OpencodeV2Engine, out: &EngineStatus) -> void {
+    let ph: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ph, &out.phase, 0);
+    let sph: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sph, &self_e.status.phase, 0);
+    out.phase_len = field_set(ph, 32, sph, self_e.status.phase_len);
+    let tr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tr, &out.transport, 0);
+    let strp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(strp, &self_e.status.transport, 0);
+    out.transport_len = field_set(tr, 32, strp, self_e.status.transport_len);
+}
+
+// TS: async handleRpc(): Promise<unknown> { throw new Error("opencode-v2
+// plugin engine is not wired to the host yet (phase 1 declaration)"); }
+// DEFECT: async + throw -> status code 1. DEFECT: `unknown` -> no value.
+fn OpencodeV2Engine_handleRpc(self_e: &OpencodeV2Engine) -> i32 {
+    return 1;
+}
+
+// The v2 runtime shares the v1 bridge implementation, instantiated by
+// the host with apiVersion 2. This plugin deliberately does not import
+// or re-export the opencode plugin's bridge class: plugins never reach
+// into a sibling project (the host composes both). The identity
+// separation (discovery, manifest, engine id) lives in this module.
+
+// ---- TS: export const opencodeV2ServerPlugin: ServerPlugin = { ... } ----
+// DEFECT: object literal with nested objects/closures -> structs + family.
+struct OpencodeV2CliSettings {
+    // slug: "opencode-v2-cli"
+    slug: [u8; 32],
+    slug_len: u64,
+    // enabledEnvVar: "CODEX_UI_OPENCODE_V2_COMPATIBLE_CLI_ENABLED"
+    enabled_env_var: [u8; 64],
+    enabled_env_var_len: u64,
+    // (v2 has no linkKey — 1:1 with source)
+}
+
+struct OpencodeV2Discovery {
+    // preferredPathPrefKey: "cliPreferredOpencodePath" (declared sharing:
+    // v2 paths are chosen through the v1 preference key)
+    preferred_path_pref_key: [u8; 48],
+    preferred_path_pref_key_len: u64,
+    // binaryNames: ["opencode2", "opencode"] — capacity 4, NUL-separated
+    binary_names: [u8; 128],
+    binary_names_len: u64,
+    binary_names_count: u64,
+    // envBinVars: ["OPENCODE_V2_BIN", "CODEX_UI_OPENCODE_V2_BIN"] — cap 4
+    env_bin_vars: [u8; 192],
+    env_bin_vars_len: u64,
+    env_bin_vars_count: u64,
+}
+
+struct OpencodeV2ServerPlugin {
+    // manifest: OPENCODE_V2_MANIFEST
+    manifest: OpencodeV2Manifest,
+    cli_settings: OpencodeV2CliSettings,
+    discovery: OpencodeV2Discovery,
+}
+
+// TS: discovery.matchesKind(entry: { path: string; version?: string }): boolean
+//   const base = basename(entry.path).toLowerCase().replace(/\.(exe|cmd|bat|com)$/, "");
+//   const major = entry.version ? Number.parseInt(entry.version.split(".")[0] ?? "", 10) : Number.NaN;
+//   return base === "opencode2" || (Number.isFinite(major) && major >= 2);
+// DEFECT: regex replace + parseInt/NaN -> manual strip + (major, has) pair.
+fn opencode_v2_matchesKind(path_ptr: ptr, path_len: u64, version_ptr: ptr, version_len: u64, has_version: bool) -> bool {
+    let base_len: u64 = 0;
+    let base = path_basename(path_ptr, path_len, &base_len);
+    let stripped = base_len;
+    if stripped > 4 {
+        let dot: u8 = 0;
+        PTR_BYTE_AT(dot, base, stripped - 4);
+        if dot == 46 { stripped = stripped - 4; };
+    };
+    if bytes_equal(base, stripped, STR_PTR("opencode2"), STR_LEN("opencode2")) { return true; };
+    if has_version {
+        let major: u64 = 0;
+        let digits: u64 = 0;
+        let i: u64 = 0;
+        while i < version_len {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, version_ptr, i);
+            if b == 46 { break; };
+            if !is_digit(b) { break; };
+            major = major * 10 + (b - 48) as u64;
+            digits = digits + 1;
+            i = i + 1;
+        }
+        if digits > 0 && major >= 2 { return true; };
+    };
+    return false;
+}
+
+// TS: createEngine(_host: ServerHost): EngineHandle { return new OpencodeV2Engine(); }
+fn opencode_v2_createEngine(host: &ServerHost, out: &OpencodeV2Engine) -> void {
+    OpencodeV2Engine_new(out);
+}
+
+// ---- findInstallations ----
+// TS closure: const consider = (path, source) => { ... }
+// DEFECT: closure capturing seen/found -> explicit state struct + function.
+struct OpencodeV2FindState {
+    found: PluginInstallationList,
+    seen_paths: [PluginInstallation; 64],
+    seen_len: u64,
+    // scratch for probe() exec output
+    probe_buf: [u8; 4096],
+}
+
+fn opencode_v2_find_seen(state: &OpencodeV2FindState, path_ptr: ptr, path_len: u64) -> bool {
+    let i: u64 = 0;
+    while i < state.seen_len {
+        let p: ptr = PTR_NULL();
+        let slot_len = state.seen_paths[i].path_len;
+        PTR_BYTE_ADD(p, &state.seen_paths[i].path, 0);
+        if bytes_equal(p, slot_len, path_ptr, path_len) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn opencode_v2_consider(state: &OpencodeV2FindState, path_ptr: ptr, path_len: u64, source_ptr: ptr, source_len: u64) -> void {
+    if opencode_v2_find_seen(state, path_ptr, path_len) { return; };
+    if sa_std_fs_exists(path_ptr, path_len) == 0 { return; };
+    // const { version, major } = probe(path);
+    let buf_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(buf_ptr, &state.probe_buf, 0);
+    let major: u64 = 0;
+    let has_major = false;
+    let ver_ptr: ptr = PTR_NULL();
+    let ver_len: u64 = 0;
+    let has_version = false;
+    probe(path_ptr, path_len, buf_ptr, &major, &has_major, &ver_ptr, &ver_len, &has_version);
+    // if (basename(path) === "opencode" && (major === undefined || major < 2)) return;
+    let base_len: u64 = 0;
+    let base = path_basename(path_ptr, path_len, &base_len);
+    if bytes_equal(base, base_len, STR_PTR("opencode"), STR_LEN("opencode")) {
+        if !has_major { return; };
+        if major < 2 { return; };
+    };
+    // seen.add(path)
+    if state.seen_len < 64 {
+        let dst: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dst, &state.seen_paths[state.seen_len].path, 0);
+        state.seen_paths[state.seen_len].path_len = field_set(dst, 1024, path_ptr, path_len);
+        state.seen_len = state.seen_len + 1;
+    };
+    // found.push({ path, version, source })
+    if state.found.len < 64 {
+        let item = &state.found.items[state.found.len];
+        let dst: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dst, &item.path, 0);
+        item.path_len = field_set(dst, 1024, path_ptr, path_len);
+        item.has_version = has_version;
+        item.version_len = 0;
+        if has_version {
+            let vd: ptr = PTR_NULL();
+            PTR_BYTE_ADD(vd, &item.version, 0);
+            item.version_len = field_set(vd, 64, ver_ptr, ver_len);
+        };
+        let sd: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sd, &item.source, 0);
+        item.source_len = field_set(sd, 32, source_ptr, source_len);
+        state.found.len = state.found.len + 1;
+    };
+}
+
+// TS: async findInstallations(env: NodeJS.ProcessEnv): Promise<PluginInstallation[]>
+// DEFECT: async -> synchronous status code; result in out list.
+// DEFECT: NodeJS.ProcessEnv dynamic record -> sa_std_env_get intent extern.
+// DEFECT: PATH split on ":" kept as in source (Windows ";" not handled there either beyond this literal).
+fn opencode_v2_findInstallations(state: &OpencodeV2FindState, out: &PluginInstallationList) -> i32 {
+    state.found.len = 0;
+    state.seen_len = 0;
+    // const override = env.OPENCODE_V2_BIN ?? env.CODEX_UI_OPENCODE_V2_BIN;
+    let ov_ptr: ptr = PTR_NULL();
+    let ov_len: u64 = 0;
+    let has_ov = false;
+    sa_std_env_get(STR_PTR("OPENCODE_V2_BIN"), STR_LEN("OPENCODE_V2_BIN"), &ov_ptr, &ov_len, &has_ov);
+    if !has_ov {
+        sa_std_env_get(STR_PTR("CODEX_UI_OPENCODE_V2_BIN"), STR_LEN("CODEX_UI_OPENCODE_V2_BIN"), &ov_ptr, &ov_len, &has_ov);
+    };
+    if has_ov {
+        opencode_v2_consider(state, ov_ptr, ov_len, STR_PTR("env"), STR_LEN("env"));
+    };
+    // well-known dirs under homedir()
+    let home_ptr: ptr = PTR_NULL();
+    let home_len: u64 = 0;
+    sa_std_os_homedir(&home_ptr, &home_len);
+    let cand = PluginInstallation { path: [0u8; 1024], path_len: 0, version: [0u8; 64], version_len: 0, has_version: false, source: [0u8; 32], source_len: 0 };
+    // consider(join(homedir(), ".opencode-v2", "bin", "opencode2"), "well-known-dir")
+    path_join_into(&cand, home_ptr, home_len, STR_PTR(".opencode-v2/bin/opencode2"), STR_LEN(".opencode-v2/bin/opencode2"));
+    let cp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cp, &cand.path, 0);
+    opencode_v2_consider(state, cp, cand.path_len, STR_PTR("well-known-dir"), STR_LEN("well-known-dir"));
+    // consider(join(homedir(), ".opencode", "bin", "opencode2"), "well-known-dir")
+    path_join_into(&cand, home_ptr, home_len, STR_PTR(".opencode/bin/opencode2"), STR_LEN(".opencode/bin/opencode2"));
+    PTR_BYTE_ADD(cp, &cand.path, 0);
+    opencode_v2_consider(state, cp, cand.path_len, STR_PTR("well-known-dir"), STR_LEN("well-known-dir"));
+    // consider(join(homedir(), ".opencode", "bin", "opencode"), "well-known-dir")
+    path_join_into(&cand, home_ptr, home_len, STR_PTR(".opencode/bin/opencode"), STR_LEN(".opencode/bin/opencode"));
+    PTR_BYTE_ADD(cp, &cand.path, 0);
+    opencode_v2_consider(state, cp, cand.path_len, STR_PTR("well-known-dir"), STR_LEN("well-known-dir"));
+    // for (const dir of (env.PATH ?? "").split(":")) {
+    //   if (!dir) continue;
+    //   consider(join(dir, "opencode2"), "path");
+    //   consider(join(dir, "opencode"), "path");
+    // }
+    let path_env_ptr: ptr = PTR_NULL();
+    let path_env_len: u64 = 0;
+    let has_path = false;
+    sa_std_env_get(STR_PTR("PATH"), STR_LEN("PATH"), &path_env_ptr, &path_env_len, &has_path);
+    if has_path {
+        let seg_start: u64 = 0;
+        let i: u64 = 0;
+        while i <= path_env_len {
+            let at_end = i == path_env_len;
+            let b: u8 = 58;
+            if !at_end {
+                PTR_BYTE_AT(b, path_env_ptr, i);
+            };
+            if at_end || b == 58 {
+                let seg_len = i - seg_start;
+                if seg_len > 0 {
+                    let seg: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(seg, path_env_ptr, seg_start);
+                    path_join_into(&cand, seg, seg_len, STR_PTR("opencode2"), STR_LEN("opencode2"));
+                    let p2: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(p2, &cand.path, 0);
+                    opencode_v2_consider(state, p2, cand.path_len, STR_PTR("path"), STR_LEN("path"));
+                    path_join_into(&cand, seg, seg_len, STR_PTR("opencode"), STR_LEN("opencode"));
+                    PTR_BYTE_ADD(p2, &cand.path, 0);
+                    opencode_v2_consider(state, p2, cand.path_len, STR_PTR("path"), STR_LEN("path"));
+                };
+                seg_start = i + 1;
+            };
+            i = i + 1;
+        }
+    };
+    // return found;
+    out.len = state.found.len;
+    let k: u64 = 0;
+    while k < state.found.len {
+        out.items[k] = state.found.items[k];
+        k = k + 1;
+    }
+    return 0;
+}
+
+// TS: skillRoots(): string[] { return [".opencode/skills"]; }
+struct OpencodeV2SkillRoots {
+    roots: [u8; 256],
+    roots_len: u64,
+    count: u64,
+}
+
+fn opencode_v2_skillRoots(out: &OpencodeV2SkillRoots) -> void {
+    let dst: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dst, &out.roots, 0);
+    out.roots_len = field_set(dst, 256, STR_PTR(".opencode/skills"), STR_LEN(".opencode/skills"));
+    out.count = 1;
+}
+
+// TS: export default opencodeV2ServerPlugin;
+// DEFECT: default export object -> init function filling literal fields.
+fn opencodeV2ServerPlugin_init(out: &OpencodeV2ServerPlugin) -> void {
+    let s1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(s1, &out.cli_settings.slug, 0);
+    out.cli_settings.slug_len = field_set(s1, 32, STR_PTR("opencode-v2-cli"), STR_LEN("opencode-v2-cli"));
+    let s2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(s2, &out.cli_settings.enabled_env_var, 0);
+    out.cli_settings.enabled_env_var_len = field_set(s2, 64, STR_PTR("CODEX_UI_OPENCODE_V2_COMPATIBLE_CLI_ENABLED"), STR_LEN("CODEX_UI_OPENCODE_V2_COMPATIBLE_CLI_ENABLED"));
+    let d1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d1, &out.discovery.preferred_path_pref_key, 0);
+    out.discovery.preferred_path_pref_key_len = field_set(d1, 48, STR_PTR("cliPreferredOpencodePath"), STR_LEN("cliPreferredOpencodePath"));
+    // binaryNames NUL-separated: "opencode2\0opencode"
+    let d2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d2, &out.discovery.binary_names, 0);
+    let first = field_set(d2, 128, STR_PTR("opencode2"), STR_LEN("opencode2"));
+    let rest: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rest, d2, first + 1);
+    let second = field_set(rest, 128 - first - 1, STR_PTR("opencode"), STR_LEN("opencode"));
+    out.discovery.binary_names_len = first + 1 + second;
+    out.discovery.binary_names_count = 2;
+    // envBinVars NUL-separated: "OPENCODE_V2_BIN\0CODEX_UI_OPENCODE_V2_BIN"
+    let d3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d3, &out.discovery.env_bin_vars, 0);
+    let f3 = field_set(d3, 192, STR_PTR("OPENCODE_V2_BIN"), STR_LEN("OPENCODE_V2_BIN"));
+    let r3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(r3, d3, f3 + 1);
+    let s3 = field_set(r3, 192 - f3 - 1, STR_PTR("CODEX_UI_OPENCODE_V2_BIN"), STR_LEN("CODEX_UI_OPENCODE_V2_BIN"));
+    out.discovery.env_bin_vars_len = f3 + 1 + s3;
+    out.discovery.env_bin_vars_count = 2;
+}

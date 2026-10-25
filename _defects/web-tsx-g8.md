@@ -1,0 +1,1168 @@
+
+## g8 (app/composer/history/mobile/onboarding/settings/setup-guide/dialogs/theme/root)
+
+- src/App.tsx:18 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/App.tsx:18 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/StartupErrorBoundary.tsx:15 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/StartupErrorBoundary.tsx:29 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/StartupErrorBoundary.tsx:40 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:48 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:62 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/StartupErrorBoundary.tsx:63 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/StartupErrorBoundary.tsx:64 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/StartupErrorBoundary.tsx:65 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/StartupErrorBoundary.tsx:66 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/StartupErrorBoundary.tsx:67 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/StartupErrorBoundary.tsx:68 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/StartupErrorBoundary.tsx:68 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:68 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/StartupErrorBoundary.tsx:69 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/StartupErrorBoundary.tsx:69 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/StartupErrorBoundary.tsx:71 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/StartupErrorBoundary.tsx:73 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/StartupErrorBoundary.tsx:84 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:88 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:120 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:122 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:127 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:130 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:133 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:136 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:139 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:143 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:147 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:151 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/StartupErrorBoundary.tsx:151 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/StartupErrorBoundary.tsx:153 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/StartupErrorBoundary.tsx:153 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:155 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/StartupErrorBoundary.tsx:全文 | class component / ErrorBoundary lifecycle | SAX: no behavior counterpart (class lifecycle) | struct 式 <state> + fn 骨架近似
+- src/main.tsx:14 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/main.tsx:45 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/main.tsx:46 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/main.tsx:54 | React hook useEffect | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/main.tsx:55 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/main.tsx:59 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/main.tsx:61 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/main.tsx:62 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/main.tsx:63 | JSX event handler onThemeModeChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/main.tsx:63 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/main.tsx:64 | JSX event handler onCustomThemePluginsChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/main.tsx:64 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/main.tsx:72 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/app/transcripts/TopicConversationBoundary.tsx:全文 | render-prop children callback | SAX: no behavior counterpart (render prop) | children 调用结构保留 + DEFECT
+- src/app/transcripts/TopicTranscriptBoundary.tsx:全文 | render-prop children callback | SAX: no behavior counterpart (render prop) | children 调用结构保留 + DEFECT
+- src/app/workbench/useWorkbenchRuntime.tsx:285 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:289 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:295 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:296 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:297 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:298 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:299 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:300 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:301 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:302 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:303 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:304 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:305 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:306 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:307 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:308 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:309 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:310 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:311 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:312 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:313 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:314 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:315 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:316 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:317 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:318 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:319 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:320 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:321 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:322 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:323 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:324 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:325 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:326 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:327 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:328 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:329 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:330 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:331 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:332 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:333 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:334 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:335 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:336 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:337 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:338 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:339 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:340 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:341 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:342 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:343 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:344 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:345 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:346 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:347 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:348 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:349 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:350 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:351 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:352 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:353 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:354 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:355 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:356 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:357 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:358 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:359 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:360 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:361 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:362 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:363 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:364 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:365 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:366 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:367 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:368 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:369 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:370 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:371 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:372 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:373 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:374 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:375 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:376 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:377 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:378 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:379 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:380 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:381 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:382 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:388 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:389 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:390 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:391 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:392 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:393 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:394 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:395 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:396 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:397 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:398 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:399 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:400 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:401 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:402 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:403 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:404 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:405 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:406 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:407 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:408 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:409 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:410 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:411 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:412 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:413 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:414 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:415 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:416 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:417 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:418 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:419 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:420 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:421 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:422 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:423 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:424 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:425 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:426 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:427 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:428 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:434 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:435 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:436 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:437 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:438 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:439 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:440 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:441 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:442 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:443 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:444 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:445 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:446 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:447 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:448 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:449 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:450 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:451 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:452 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:453 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:454 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:455 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:461 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:462 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:463 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:464 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:465 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:466 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:467 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:468 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:469 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:470 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:471 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:472 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:473 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:474 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:475 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:476 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:477 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:478 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:479 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:480 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:481 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:482 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:483 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:484 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:485 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:486 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:487 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:488 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:489 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:490 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:491 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:492 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:493 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:497 | React hook useCallback | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/app/workbench/useWorkbenchRuntime.tsx:498 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/app/workbench/useWorkbenchRuntime.tsx:499 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/app/workbench/useWorkbenchRuntime.tsx:502 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/app/workbench/useWorkbenchRuntime.tsx:505 | React hook useCallback | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/app/workbench/useWorkbenchRuntime.tsx:506 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/app/workbench/useWorkbenchRuntime.tsx:507 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/app/workbench/useWorkbenchRuntime.tsx:510 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/app/workbench/useWorkbenchRuntime.tsx:513 | React hook useCallback | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/app/workbench/useWorkbenchRuntime.tsx:514 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/app/workbench/useWorkbenchRuntime.tsx:520 | React hook useCallback | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/app/workbench/useWorkbenchRuntime.tsx:527 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/app/workbench/useWorkbenchRuntime.tsx:528 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/app/workbench/useWorkbenchRuntime.tsx:530 | React hook useCallback | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/app/workbench/useWorkbenchRuntime.tsx:541 | React hook useMemo | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/app/workbench/useWorkbenchRuntime.tsx:542 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/app/workbench/useWorkbenchRuntime.tsx:545 | React hook useMemo | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/app/workbench/useWorkbenchRuntime.tsx:548 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/app/workbench/useWorkbenchRuntime.tsx:550 | React hook useMemo | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/app/workbench/useWorkbenchRuntime.tsx:554 | React hook useMemo | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/app/workbench/useWorkbenchRuntime.tsx:558 | React hook useMemo | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/app/workbench/useWorkbenchRuntime.tsx:559 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/app/workbench/useWorkbenchRuntime.tsx:561 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/app/workbench/useWorkbenchRuntime.tsx:565 | React hook useEffect | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/app/workbench/useWorkbenchRuntime.tsx:625 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:626 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:627 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:628 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:629 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:630 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:631 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:632 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:633 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:634 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/app/workbench/useWorkbenchRuntime.tsx:635 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:40 | React hook useState | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/composer/ComposerModelSelect.tsx:42 | React hook useMemo | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/composer/ComposerModelSelect.tsx:53 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:55 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:57 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:59 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:65 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:69 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:79 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:85 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/composer/ComposerModelSelect.tsx:85 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:88 | JSX event handler onClose | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/composer/ComposerModelSelect.tsx:88 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:89 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:94 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:97 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:112 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:113 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:114 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/composer/ComposerModelSelect.tsx:114 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:115 | JSX event handler onKeyDown | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/composer/ComposerModelSelect.tsx:115 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:116 | JSX event handler onMouseDown | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/composer/ComposerModelSelect.tsx:116 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:117 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/composer/ComposerModelSelect.tsx:117 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:118 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:119 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:122 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:127 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/composer/ComposerModelSelect.tsx:133 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:134 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:135 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:144 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:155 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:161 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:167 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerModelSelect.tsx:176 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:31 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/composer/ComposerQuotaChip.tsx:32 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/composer/ComposerQuotaChip.tsx:33 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/composer/ComposerQuotaChip.tsx:51 | React hook useState | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/composer/ComposerQuotaChip.tsx:60 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:89 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:101 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:108 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:111 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:112 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:113 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:114 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:115 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/composer/ComposerQuotaChip.tsx:115 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:117 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:134 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:135 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:136 | JSX event handler onClose | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/composer/ComposerQuotaChip.tsx:136 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:137 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:138 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:139 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:154 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:156 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:158 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:164 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:165 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/composer/ComposerQuotaChip.tsx:165 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/composer/ComposerQuotaChip.tsx:165 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:168 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/composer/ComposerQuotaChip.tsx:182 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:183 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:187 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:188 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:189 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:192 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:204 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:209 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:218 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:238 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:245 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:246 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:248 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:260 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:263 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:264 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/composer/ComposerQuotaChip.tsx:264 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:267 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:268 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:273 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:284 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:285 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:286 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/composer/ComposerQuotaChip.tsx:286 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/composer/ComposerQuotaChip.tsx:286 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:289 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/composer/ComposerQuotaChip.tsx:295 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:304 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:306 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:308 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:314 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:315 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/composer/ComposerQuotaChip.tsx:315 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/composer/ComposerQuotaChip.tsx:315 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:318 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/composer/ComposerQuotaChip.tsx:331 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:337 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:347 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:356 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:367 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:368 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/composer/ComposerQuotaChip.tsx:372 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:97 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/history/HistorySidebar.tsx:98 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/history/HistorySidebar.tsx:99 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/history/HistorySidebar.tsx:100 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/history/HistorySidebar.tsx:135 | React hook useState | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/history/HistorySidebar.tsx:142 | React hook useState | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/history/HistorySidebar.tsx:143 | React hook useMemo | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/history/HistorySidebar.tsx:166 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:181 | React hook useMemo | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/history/HistorySidebar.tsx:185 | React hook useMemo | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/history/HistorySidebar.tsx:191 | React hook useMemo | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/history/HistorySidebar.tsx:199 | React hook useEffect | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/history/HistorySidebar.tsx:203 | React hook useEffect | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/history/HistorySidebar.tsx:218 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/history/HistorySidebar.tsx:225 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/history/HistorySidebar.tsx:235 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/history/HistorySidebar.tsx:238 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/history/HistorySidebar.tsx:246 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/history/HistorySidebar.tsx:250 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/history/HistorySidebar.tsx:258 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/history/HistorySidebar.tsx:259 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/history/HistorySidebar.tsx:264 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/history/HistorySidebar.tsx:275 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:295 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:296 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:299 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:302 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:303 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:304 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:304 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:309 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:310 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:310 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:311 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/history/HistorySidebar.tsx:311 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:314 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:314 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:321 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:322 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:322 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:325 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:326 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:357 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/history/HistorySidebar.tsx:361 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:362 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:363 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:369 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:374 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/history/HistorySidebar.tsx:376 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:378 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:379 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:380 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:381 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:381 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/history/HistorySidebar.tsx:381 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:382 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:386 | JSX event handler onClose | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:386 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:392 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/history/HistorySidebar.tsx:393 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:393 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:394 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:395 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:396 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/history/HistorySidebar.tsx:396 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:401 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:402 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:403 | JSX event handler onClose | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:403 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:404 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:405 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:406 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:408 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:409 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:415 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:416 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:417 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:417 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:421 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:427 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:428 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:429 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:429 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:433 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:436 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:440 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:441 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:441 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:448 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:448 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:455 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:456 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:460 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:461 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:461 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:462 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:463 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:464 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:465 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:469 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:474 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:475 | JSX event handler onDelete | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:475 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:479 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:481 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:489 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:490 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:492 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:493 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:494 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:503 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:505 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:506 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:509 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:512 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/history/HistorySidebar.tsx:520 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:521 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:522 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:522 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:527 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:528 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:541 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:543 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:544 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:545 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:546 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:550 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:553 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:555 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:562 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:564 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:565 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:565 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:566 | JSX event handler onKeyDown | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:566 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:580 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:581 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:581 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:582 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:586 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:588 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:588 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:593 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:596 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:597 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:598 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:598 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:610 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:611 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:612 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:613 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:618 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:619 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:619 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:620 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:622 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:623 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:623 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:627 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:628 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:628 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:633 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:634 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:634 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:639 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:640 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:640 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:654 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:662 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:665 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:666 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:667 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:667 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:671 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:674 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:675 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:676 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:676 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:685 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:688 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:690 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:698 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:699 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:700 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:703 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:708 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:709 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:709 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:715 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/history/HistorySidebar.tsx:715 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:725 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/history/HistorySidebar.tsx:737 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/history/HistorySidebar.tsx:784 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:785 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:794 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:795 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:796 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:797 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:798 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:800 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/history/HistorySidebar.tsx:800 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:801 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/history/HistorySidebar.tsx:801 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:802 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/history/HistorySidebar.tsx:802 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/history/HistorySidebar.tsx:872 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:59 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:74 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:89 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:93 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/mobile/MobileTopBar.tsx:93 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:94 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:98 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:104 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/mobile/MobileTopBar.tsx:104 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:105 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:106 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:123 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:124 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:141 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/mobile/MobileTopBar.tsx:141 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:142 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:143 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:161 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:177 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:189 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:195 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/mobile/MobileTopBar.tsx:195 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:196 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:197 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:206 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/mobile/MobileTopBar.tsx:206 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:208 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:213 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:215 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:217 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/mobile/MobileTopBar.tsx:217 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:218 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:229 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBar.tsx:232 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:97 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:102 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:107 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:108 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:110 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/mobile/MobileTopBarDropdown.tsx:110 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:115 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:117 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:121 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:124 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:126 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:128 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:129 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:131 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:132 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:133 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/mobile/MobileTopBarDropdown.tsx:133 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:134 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:136 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/mobile/MobileTopBarDropdown.tsx:137 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:144 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:145 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:146 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:147 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:148 | JSX event handler onThemeChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/mobile/MobileTopBarDropdown.tsx:148 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:149 | JSX event handler onOpenAppearance | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/mobile/MobileTopBarDropdown.tsx:149 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:151 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:154 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/mobile/MobileTopBarDropdown.tsx:154 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:155 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:157 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:162 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:165 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/mobile/MobileTopBarDropdown.tsx:165 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:166 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/mobile/MobileTopBarDropdown.tsx:167 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/onboarding/OnboardingTour.tsx:20 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/onboarding/OnboardingTour.tsx:25 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/onboarding/OnboardingTour.tsx:26 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/onboarding/OnboardingTour.tsx:全文 | render-prop children callback | SAX: no behavior counterpart (render prop) | children 调用结构保留 + DEFECT
+- src/onboarding/useOnboarding.tsx:11 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:12 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:27 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/onboarding/useOnboarding.tsx:35 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/onboarding/useOnboarding.tsx:43 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/onboarding/useOnboarding.tsx:62 | React hook useState | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:64 | React hook useRef | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:65 | React hook useRef | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:66 | React hook useRef | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:67 | React hook useRef | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:69 | React hook useEffect | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:75 | React hook useCallback | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:88 | React hook useCallback | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:89 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:128 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/onboarding/useOnboarding.tsx:151 | React hook useCallback | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:152 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:155 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:172 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/onboarding/useOnboarding.tsx:176 | React hook useContext | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:186 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:187 | React hook useRef | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:189 | React hook useEffect | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/onboarding/useOnboarding.tsx:全文 | render-prop children callback | SAX: no behavior counterpart (render prop) | children 调用结构保留 + DEFECT
+- src/onboarding/useOnboarding.tsx:全文 | React Context Provider/Consumer | SAX: no behavior counterpart (context) | Provider 元素树保留 + DEFECT
+- src/onboarding/useOnboarding.tsx:全文 | timer (setInterval/setTimeout) | SAX: no behavior counterpart (timer) | fn 骨架保留 + DEFECT
+- src/settings/PluginManagerPanel.tsx:24 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/settings/PluginManagerPanel.tsx:24 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:25 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/settings/PluginManagerPanel.tsx:26 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/settings/PluginManagerPanel.tsx:33 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/settings/PluginManagerPanel.tsx:33 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:34 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/settings/PluginManagerPanel.tsx:39 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/settings/PluginManagerPanel.tsx:51 | React hook useCallback | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/settings/PluginManagerPanel.tsx:51 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/settings/PluginManagerPanel.tsx:53 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/settings/PluginManagerPanel.tsx:60 | React hook useEffect | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/settings/PluginManagerPanel.tsx:64 | React hook useCallback | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/settings/PluginManagerPanel.tsx:65 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/settings/PluginManagerPanel.tsx:68 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/settings/PluginManagerPanel.tsx:80 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:84 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:85 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:86 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:91 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:92 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/settings/PluginManagerPanel.tsx:92 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:93 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/settings/PluginManagerPanel.tsx:95 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:96 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:107 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:116 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:120 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:121 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:126 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:127 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/settings/PluginManagerPanel.tsx:128 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/settings/PluginManagerPanel.tsx:128 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:43 | React hook useState | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/setup-guide/SetupGuideDialog.tsx:57 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:58 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:59 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:60 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:61 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:62 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:63 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:68 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:70 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:71 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:74 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:75 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/setup-guide/SetupGuideDialog.tsx:78 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/setup-guide/SetupGuideDialog.tsx:78 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:79 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:80 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/setup-guide/SetupGuideDialog.tsx:80 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:81 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:82 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:89 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/setup-guide/SetupGuideDialog.tsx:89 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/setup-guide/SetupGuideDialog.tsx:89 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:92 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:93 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/setup-guide/SetupGuideDialog.tsx:93 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/setup-guide/SetupGuideDialog.tsx:93 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:94 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:95 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/setup-guide/SetupGuideDialog.tsx:95 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/setup-guide/SetupGuideDialog.tsx:96 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/setup-guide/SetupGuideDialog.tsx:96 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/setup-guide/SetupGuideDialog.tsx:96 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/setup-guide/SetupGuideDialog.tsx:96 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CliSwitchDialog.tsx:28 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CliSwitchDialog.tsx:29 | JSX event handler onClose | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/CliSwitchDialog.tsx:29 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CliSwitchDialog.tsx:33 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CliSwitchDialog.tsx:35 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CliSwitchDialog.tsx:56 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CliSwitchDialog.tsx:57 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/components/dialogs/CliSwitchDialog.tsx:57 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CliSwitchDialog.tsx:61 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/CliSwitchDialog.tsx:61 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CliSwitchDialog.tsx:64 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/CliSwitchDialog.tsx:64 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CodexCliUpdateDialog.tsx:37 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CodexCliUpdateDialog.tsx:38 | JSX event handler onClose | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/CodexCliUpdateDialog.tsx:38 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CodexCliUpdateDialog.tsx:43 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CodexCliUpdateDialog.tsx:44 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CodexCliUpdateDialog.tsx:45 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CodexCliUpdateDialog.tsx:51 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CodexCliUpdateDialog.tsx:55 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CodexCliUpdateDialog.tsx:59 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CodexCliUpdateDialog.tsx:64 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/CodexCliUpdateDialog.tsx:64 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CodexCliUpdateDialog.tsx:69 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CodexCliUpdateDialog.tsx:70 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/CodexCliUpdateDialog.tsx:70 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/components/dialogs/CodexCliUpdateDialog.tsx:70 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/CodexCliUpdateDialog.tsx:74 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/components/dialogs/CodexCliUpdateDialog.tsx:79 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/components/dialogs/DangerNewChatDialog.tsx:73 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/components/dialogs/DangerNewChatDialog.tsx:130 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:131 | JSX event handler onClose | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:131 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:134 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:135 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:139 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:141 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:142 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:145 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:153 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:154 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:159 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:160 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:162 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:168 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:176 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:180 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:200 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:201 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:201 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:208 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:210 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:213 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:221 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:222 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:223 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:223 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:224 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:225 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:230 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:231 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:232 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:232 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:233 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:234 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:236 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:236 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:242 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:243 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:244 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:244 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:245 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:251 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:253 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:254 | JSX event handler onSelectWorkspace | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:254 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:255 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:259 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:263 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:263 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:264 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:266 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:272 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:274 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:278 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:281 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:284 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:287 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/components/dialogs/DangerNewChatDialog.tsx:288 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:291 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:292 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:293 | JSX event handler onDelete | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:293 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:298 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:299 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:300 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:317 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:324 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:325 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:325 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:331 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:354 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:357 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:360 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:363 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:366 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:369 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:372 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:375 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:378 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:381 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:384 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:386 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:391 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:397 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:419 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:421 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:422 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:423 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:424 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:425 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:425 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:430 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:441 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:445 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:450 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:451 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:457 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:458 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:464 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:468 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:471 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:478 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:480 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:481 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:481 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:482 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:485 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:489 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:490 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:490 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:491 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:491 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:494 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:494 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/DangerNewChatDialog.tsx:495 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/components/dialogs/DangerNewChatDialog.tsx:495 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:62 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/components/dialogs/NewChatSetupDialog.tsx:115 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:116 | JSX event handler onClose | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/NewChatSetupDialog.tsx:116 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:121 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:123 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:124 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:127 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:134 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:136 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:140 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:159 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:160 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/NewChatSetupDialog.tsx:160 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:167 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:169 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:172 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:180 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:181 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:182 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/NewChatSetupDialog.tsx:182 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:183 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:184 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:189 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:190 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:191 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/NewChatSetupDialog.tsx:191 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:192 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:193 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:195 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/NewChatSetupDialog.tsx:195 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:199 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/NewChatSetupDialog.tsx:199 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:204 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:206 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:207 | JSX event handler onSelectWorkspace | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/NewChatSetupDialog.tsx:207 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:208 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:217 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:221 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:222 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/NewChatSetupDialog.tsx:222 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:223 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:224 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:225 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:226 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:227 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:228 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:229 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:230 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:231 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:232 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:233 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:237 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:242 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:244 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:245 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:246 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:247 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:248 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/NewChatSetupDialog.tsx:248 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:253 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:261 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:262 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:263 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/NewChatSetupDialog.tsx:263 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:267 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/components/dialogs/NewChatSetupDialog.tsx:268 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:277 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:278 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:279 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/NewChatSetupDialog.tsx:279 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:280 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:281 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:288 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:301 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:305 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:322 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/NewChatSetupDialog.tsx:322 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:323 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/NewChatSetupDialog.tsx:323 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/NewChatSetupDialog.tsx:324 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/components/dialogs/NewChatSetupDialog.tsx:324 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:15 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/components/dialogs/RelayShareDialogs.tsx:16 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/components/dialogs/RelayShareDialogs.tsx:25 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/components/dialogs/RelayShareDialogs.tsx:53 | JSX event handler onClose | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:53 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:56 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:58 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:58 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:59 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:59 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:60 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:60 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:61 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:61 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:61 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:64 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:64 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:65 | JSX event handler onCopy | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:65 | JSX event handler onCut | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:65 | JSX event handler onContextMenu | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:65 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:66 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:66 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:70 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:70 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:72 | JSX event handler onClose | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:72 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:75 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:76 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:76 | JSX event handler onCopy | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:76 | JSX event handler onCut | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:76 | JSX event handler onContextMenu | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:76 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:77 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:77 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:78 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:78 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:82 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:82 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/RelayShareDialogs.tsx:83 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:83 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/components/dialogs/RelayShareDialogs.tsx:83 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:16 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/components/dialogs/SshCodexInstallDialog.tsx:17 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/components/dialogs/SshCodexInstallDialog.tsx:35 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:36 | JSX event handler onClose | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/SshCodexInstallDialog.tsx:36 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:40 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:42 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:43 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:46 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:47 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:48 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:50 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/components/dialogs/SshCodexInstallDialog.tsx:50 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:52 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:56 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:57 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:59 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:60 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:61 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:63 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:64 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/SshCodexInstallDialog.tsx:64 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/components/dialogs/SshCodexInstallDialog.tsx:64 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:65 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:71 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:78 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/components/dialogs/SshCodexInstallDialog.tsx:78 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:82 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/SshCodexInstallDialog.tsx:82 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:83 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/SshCodexInstallDialog.tsx:83 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/components/dialogs/SshCodexInstallDialog.tsx:83 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:87 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/SshCodexInstallDialog.tsx:87 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/SshCodexInstallDialog.tsx:90 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/SshCodexInstallDialog.tsx:90 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:32 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/components/dialogs/WorkspacePickerDialog.tsx:37 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/components/dialogs/WorkspacePickerDialog.tsx:42 | async/await/Promise | SAX: no behavior counterpart (async) | 同步 fn 骨架近似 + DEFECT 注释
+- src/components/dialogs/WorkspacePickerDialog.tsx:101 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:102 | JSX event handler onClose | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:102 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:107 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:109 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:110 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:113 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:120 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:123 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:124 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:125 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:125 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:126 | JSX event handler onKeyDown | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:126 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:132 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:135 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:140 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:141 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:142 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:142 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:143 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:145 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:150 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:151 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:151 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:154 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:154 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:157 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:157 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:160 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:160 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:165 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:166 | JSX event handler onSelectWorkspace | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:166 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:176 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:180 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:183 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:184 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/components/dialogs/WorkspacePickerDialog.tsx:186 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:188 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:189 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:189 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:190 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:198 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:201 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:202 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:203 | JSX event handler onChange | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:203 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:204 | JSX event handler onKeyDown | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:204 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:210 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:211 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:213 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:217 | JSX conditional rendering | SAX: no behavior counterpart (conditional rendering) | 条件与分支 JSX 结构原样保留 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:217 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:218 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:218 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:219 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:220 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:226 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:238 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:239 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:240 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:243 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:244 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/components/dialogs/WorkspacePickerDialog.tsx:246 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:247 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:250 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:251 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:251 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:252 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:254 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:259 | Array.map list rendering | SAX: no behavior counterpart (list rendering) | JSX 结构原样保留 + DEFECT 注释
+- src/components/dialogs/WorkspacePickerDialog.tsx:261 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:262 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:265 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:266 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:266 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:267 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:274 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:281 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:283 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:284 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:284 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:293 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:293 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/components/dialogs/WorkspacePickerDialog.tsx:296 | JSX event handler onClick | SAX: no behavior counterpart | 属性名 1:1 保留，处理器记为 fn 骨架 + DEFECT
+- src/components/dialogs/WorkspacePickerDialog.tsx:296 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/theme/theme-provider.tsx:18 | {expr} expression binding | SAX: no behavior counterpart (expression binding) | <!-- bind: expr --> 注释 + 属性/子节点原样保留
+- src/theme/theme-provider.tsx:26 | React hook useState | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/theme/theme-provider.tsx:27 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/theme/theme-provider.tsx:30 | React hook useEffect | SAX: no behavior counterpart | 结构保留为 <state>/fn 骨架 + DEFECT 注释
+- src/theme/theme-provider.tsx:34 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/theme/theme-provider.tsx:36 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/theme/theme-provider.tsx:38 | DOM/browser API | SAX: no behavior counterpart (browser API) | 调用以注释保留 + DEFECT
+- src/theme/theme-provider.tsx:全文 | render-prop children callback | SAX: no behavior counterpart (render prop) | children 调用结构保留 + DEFECT
+- src/App.tsx:7-15 | barrel re-export + spread props {...props} | SAX: no behavior counterpart (re-export/spread) | re-export 列表与 <AppRoot {...props} /> 原样保留为注释/元素

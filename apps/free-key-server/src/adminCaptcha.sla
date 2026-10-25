@@ -1,0 +1,292 @@
+// Converted 1:1 from apps/free-key-server/src/adminCaptcha.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+
+// TS: import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+// TS: import { PNG } from "pngjs";
+// DEFECT: pngjs PNG encoder has no sa_std counterpart — render_captcha_png
+// keeps the RGBA pixel buffer and names an intent extern sa_png_encode_rgba.
+// DEFECT: node:crypto (sha256 / randomBytes / randomUUID / timingSafeEqual)
+// — intent externs sa_crypto_* as in adminAuth.sla / adminTotp.sla.
+// DEFECT: class AdminCaptchaStore with a private Map<string, CaptchaRecord>
+// becomes a struct + function family; the Map is a fixed table of 2000
+// records (TS prunes to <=2000, then down to 1500 — same thresholds here).
+// DEFECT: the 210x58 RGBA buffer is 48720 bytes, above the known SLA
+// imported-file large-array comfort zone (40960); fix phase may need to
+// move this allocation to the caller.
+
+fn captcha_alphabet() -> ptr { return STR_PTR("ABCDEFGHJKLMNPQRSTUVWXYZ23456789"); }
+fn captcha_alphabet_len() -> u64 { return 32; }
+
+struct CaptchaRecord {
+    id: [u8; 64],
+    id_len: u64,
+    answer_hash: [u8; 32],
+    address: [u8; 256],
+    address_len: u64,
+    expires_at: u64,
+}
+
+struct AdminCaptchaStore {
+    records: [CaptchaRecord; 2000],
+    len: u64,
+}
+
+// TS: export type CaptchaChallenge = { captchaId: string; imageDataUrl: string; expiresAt: number }
+struct CaptchaChallenge {
+    captcha_id: [u8; 64],
+    captcha_id_len: u64,
+    expires_at: u64,
+    // image_data_url is written to a caller ByteBuf (too long for a field).
+}
+
+// TS: private prune(now) — drop expired; if size > 2000 delete oldest until 1500.
+fn admin_captcha_prune(store: &AdminCaptchaStore, now_ms: u64) -> void {
+    let i: u64 = 0;
+    while i < store.len {
+        if store.records[i].expires_at <= now_ms {
+            let j = i;
+            while j + 1 < store.len {
+                store.records[j] = store.records[j + 1];
+                j = j + 1;
+            }
+            store.len = store.len - 1;
+        } else {
+            i = i + 1;
+        };
+    }
+    if store.len <= 2000 { return; };
+    // Map keys iterate in insertion order: delete from the front.
+    while store.len > 1500 {
+        let j: u64 = 0;
+        while j + 1 < store.len {
+            store.records[j] = store.records[j + 1];
+            j = j + 1;
+        }
+        store.len = store.len - 1;
+    }
+}
+
+// TS: function hashAnswer(id: string, answer: string): Buffer
+// sha256(id) then update("\0") then update(answer) — a single chained hash.
+fn hash_answer(id_ptr: ptr, id_len: u64, ans_ptr: ptr, ans_len: u64, out32: ptr) -> void {
+    // DEFECT: chained createHash().update().update().update() — approximated
+    // by hashing the concatenation id || "\0" || answer (identical bytes).
+    let joined = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&joined, id_ptr, id_len);
+    buf_append_byte(&joined, 0);
+    buf_append_lit(&joined, ans_ptr, ans_len);
+    sa_crypto_sha256(&joined.bytes, joined.len, out32);
+}
+
+// TS: function randomAnswer(length: number): string  (rejection sampling)
+fn random_answer(out: &ByteBuf, length: u64) -> void {
+    buf_reset(out);
+    let alpha: ptr = captcha_alphabet();
+    let limit = 256 / 32 * 32; // Math.floor(256/32)*32 = 256; kept formula-shaped
+    while out.len < length {
+        let chunk = [0u8; 64];
+        sa_crypto_random_bytes(&chunk, length);
+        for i in 0..length {
+            let byte = chunk[i] as u64;
+            if byte >= limit { continue; };
+            let ch: u8 = 0;
+            PTR_BYTE_AT(ch, alpha, byte % 32);
+            buf_append_byte(out, ch);
+            if out.len == length { break; };
+        }
+    }
+}
+
+// TS: public create(address: string, now = Date.now()): CaptchaChallenge
+// image_data_url lands in img_out.
+fn admin_captcha_create(store: &AdminCaptchaStore, out: &CaptchaChallenge, img_out: &ByteBuf, addr_ptr: ptr, addr_len: u64, now_ms: u64) -> void {
+    admin_captcha_prune(store, now_ms);
+    let answer = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    random_answer(&answer, 5);
+    // DEFECT: randomUUID() — intent extern sa_crypto_random_uuid.
+    out.captcha_id_len = 0;
+    sa_crypto_random_uuid(&out.captcha_id, &out.captcha_id_len);
+    out.expires_at = now_ms + 5 * 60000;
+    if store.len < 2000 {
+        let rec = store.records[store.len];
+        rec.id_len = 0;
+        for i in 0..out.captcha_id_len {
+            rec.id[rec.id_len] = out.captcha_id[i];
+            rec.id_len = rec.id_len + 1;
+        }
+        hash_answer(&out.captcha_id, out.captcha_id_len, &answer.bytes, answer.len, &rec.answer_hash);
+        rec.address_len = 0;
+        for j in 0..addr_len {
+            if rec.address_len < 256 {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, addr_ptr, j);
+                rec.address[rec.address_len] = b;
+                rec.address_len = rec.address_len + 1;
+            };
+        }
+        rec.expires_at = out.expires_at;
+        store.records[store.len] = rec;
+        store.len = store.len + 1;
+    };
+    render_captcha_png(img_out, &answer.bytes, answer.len);
+}
+
+// TS: public consume(captchaId: string, answer: string, address: string, now = Date.now()): boolean
+fn admin_captcha_consume(store: &AdminCaptchaStore, id_ptr: ptr, id_len: u64, ans_ptr: ptr, ans_len: u64, addr_ptr: ptr, addr_len: u64, now_ms: u64) -> bool {
+    // Find + delete the record first (TS deletes unconditionally).
+    let found: u64 = 4294967295;
+    for i in 0..store.len {
+        if store.records[i].id_len == id_len && bytes_eq(store.records[i].id, id_ptr, id_len) { found = i; };
+    }
+    if found == 4294967295 { return false; };
+    let rec = store.records[found];
+    let j = found;
+    while j + 1 < store.len {
+        store.records[j] = store.records[j + 1];
+        j = j + 1;
+    }
+    store.len = store.len - 1;
+    if rec.expires_at <= now_ms { return false; };
+    if rec.address_len != addr_len || !bytes_eq(rec.address, addr_ptr, addr_len) { return false; };
+    // answer.trim().toUpperCase()
+    let norm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let start: u64 = 0;
+    let end = ans_len;
+    while start < end {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, ans_ptr, start);
+        if b == 32 || b == 9 || b == 13 || b == 10 { start = start + 1; } else { break; };
+    }
+    while end > start {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, ans_ptr, end - 1);
+        if b == 32 || b == 9 || b == 13 || b == 10 { end = end - 1; } else { break; };
+    }
+    for i in start..end {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, ans_ptr, i);
+        if b >= 97 && b <= 122 { b = b - 32; };
+        buf_append_byte(&norm, b);
+    }
+    let actual = [0u8; 32];
+    hash_answer(id_ptr, id_len, &norm.bytes, norm.len, &actual);
+    return sa_crypto_timing_safe_equal(&actual, &rec.answer_hash, 32) == 0;
+}
+
+// --- PNG rendering (pngjs replacement) ---
+
+struct PngImage {
+    width: u64,
+    height: u64,
+    data: [u8; 48720], // 210 * 58 * 4 RGBA
+}
+
+// TS: function setPixel(png, x, y, r, g, b) — alpha forced to 255.
+fn png_set_pixel(png: &PngImage, x: u64, y: u64, r: u8, g: u8, b: u8) -> void {
+    if x >= png.width || y >= png.height { return; };
+    let offset = (png.width * y + x) * 4;
+    png.data[offset] = r;
+    png.data[offset + 1] = g;
+    png.data[offset + 2] = b;
+    png.data[offset + 3] = 255;
+}
+
+// Glyph table (TS GLYPHS Record<string, string[]>): 7 rows x 5 cols per
+// char, packed here as one 35-char literal per alphabet char, rows in order.
+fn glyph_bits(ch: u8, out_len: &u64) -> ptr {
+    if ch == 65 { *out_len = 35; return STR_PTR("01110100011000111111100011000110001"); };
+    if ch == 66 { *out_len = 35; return STR_PTR("11110100011000111110100011000111110"); };
+    if ch == 67 { *out_len = 35; return STR_PTR("01111100001000010000100001000001111"); };
+    if ch == 68 { *out_len = 35; return STR_PTR("11110100011000110001100011000111110"); };
+    if ch == 69 { *out_len = 35; return STR_PTR("11111100001000011110100001000011111"); };
+    if ch == 70 { *out_len = 35; return STR_PTR("11111100001000011110100001000010000"); };
+    if ch == 71 { *out_len = 35; return STR_PTR("01111100001000010111100011000101111"); };
+    if ch == 72 { *out_len = 35; return STR_PTR("10001100011000111111100011000110001"); };
+    if ch == 74 { *out_len = 35; return STR_PTR("00111000100001000010100101001001100"); };
+    if ch == 75 { *out_len = 35; return STR_PTR("10001100101010011000101001001010001"); };
+    if ch == 76 { *out_len = 35; return STR_PTR("10000100001000010000100001000011111"); };
+    if ch == 77 { *out_len = 35; return STR_PTR("10001110111010110101100011000110001"); };
+    if ch == 78 { *out_len = 35; return STR_PTR("10001110011010110011100011000110001"); };
+    if ch == 80 { *out_len = 35; return STR_PTR("11110100011000111110100001000010000"); };
+    if ch == 81 { *out_len = 35; return STR_PTR("01110100011000110001101011001001101"); };
+    if ch == 82 { *out_len = 35; return STR_PTR("11110100011000111110101001001010001"); };
+    if ch == 83 { *out_len = 35; return STR_PTR("01111100001000001110000010000111110"); };
+    if ch == 84 { *out_len = 35; return STR_PTR("11111001000010000100001000010000100"); };
+    if ch == 85 { *out_len = 35; return STR_PTR("10001100011000110001100011000101110"); };
+    if ch == 86 { *out_len = 35; return STR_PTR("10001100011000110001100010101000100"); };
+    if ch == 87 { *out_len = 35; return STR_PTR("10001100011000110101101011010101010"); };
+    if ch == 88 { *out_len = 35; return STR_PTR("10001100010101000100010101000110001"); };
+    if ch == 89 { *out_len = 35; return STR_PTR("10001100010101000100001000010000100"); };
+    if ch == 90 { *out_len = 35; return STR_PTR("11111000010001000100010001000011111"); };
+    if ch == 50 { *out_len = 35; return STR_PTR("01110100010000100010001000100011111"); };
+    if ch == 51 { *out_len = 35; return STR_PTR("11110000010000101110000010000111110"); };
+    if ch == 52 { *out_len = 35; return STR_PTR("00010001100101010010111110001000010"); };
+    if ch == 53 { *out_len = 35; return STR_PTR("11111100001000011110000010000111110"); };
+    if ch == 54 { *out_len = 35; return STR_PTR("01110100001000011110100011000101110"); };
+    if ch == 55 { *out_len = 35; return STR_PTR("11111000010001000100010000100001000"); };
+    if ch == 56 { *out_len = 35; return STR_PTR("01110100011000111110100011000101110"); };
+    if ch == 57 { *out_len = 35; return STR_PTR("01110100011000110111000010000101110"); };
+    *out_len = 0;
+    return STR_PTR("");
+}
+
+// TS: function drawGlyph(png, rows, startX, startY) — scale 6, color (23,32,51).
+fn draw_glyph(png: &PngImage, ch: u8, start_x: u64, start_y: u64) -> void {
+    let bits_len: u64 = 0;
+    let bits: ptr = glyph_bits(ch, &bits_len);
+    if bits_len == 0 { return; };
+    let scale: u64 = 6;
+    for y in 0..7 {
+        for x in 0..5 {
+            let px: u8 = 0;
+            PTR_BYTE_AT(px, bits, y * 5 + x);
+            if px != 49 { continue; }; // pixel !== "1"
+            for dy in 0..scale {
+                for dx in 0..scale {
+                    png_set_pixel(png, start_x + x * scale + dx, start_y + y * scale + dy, 23, 32, 51);
+                }
+            }
+        }
+    }
+}
+
+// TS: function renderCaptchaPng(answer: string): string
+// Returns "data:image/png;base64,<...>" in out.
+fn render_captcha_png(out: &ByteBuf, ans_ptr: ptr, ans_len: u64) -> void {
+    buf_reset(out);
+    let width: u64 = 210;
+    let height: u64 = 58;
+    let png = PngImage { width: width, height: height, data: [0u8; 48720] };
+    for y in 0..height {
+        for x in 0..width {
+            png_set_pixel(&png, x, y, 238, 242, 247);
+        }
+    }
+    // Noise: 1600 random bytes consumed in groups of 4.
+    let noise = [0u8; 1600];
+    sa_crypto_random_bytes(&noise, 1600);
+    let index: u64 = 0;
+    while index < 1600 {
+        let nx = (noise[index] as u64) % width;
+        let ny = (noise[index + 1] as u64) % height;
+        let nr = 130 + (noise[index + 2] as u64) % 100;
+        let ng = 130 + (noise[index + 3] as u64) % 100;
+        png_set_pixel(&png, nx, ny, nr as u8, ng as u8, 170);
+        index = index + 4;
+    }
+    // One glyph per answer char with random jitter (randomBytes(1) each axis).
+    for ci in 0..ans_len {
+        let ch: u8 = 0;
+        PTR_BYTE_AT(ch, ans_ptr, ci);
+        let jx = [0u8; 1];
+        sa_crypto_random_bytes(&jx, 1);
+        let jy = [0u8; 1];
+        sa_crypto_random_bytes(&jy, 1);
+        draw_glyph(&png, ch, 18 + ci * 38 + (jx[0] as u64) % 5, 10 + (jy[0] as u64) % 5);
+    }
+    // DEFECT: PNG.sync.write(png).toString("base64") — PNG encoder missing;
+    // intent extern sa_png_encode_base64 writes base64 of the encoded PNG.
+    buf_append_lit(out, STR_PTR("data:image/png;base64,"), STR_LEN("data:image/png;base64,"));
+    sa_png_encode_base64(out, &png.data, width, height);
+}

@@ -1,0 +1,146 @@
+// Converted 1:1 from backends/cline/src/runtime/clineRuntime.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// Process-wide registry for the shared cline bridge.
+//
+// One bridge per server process: it owns a single WebSocket to the
+// cline hub daemon, and hub sessions are the per-thread state. The
+// hub daemon itself is detached and shared — stopping the bridge
+// only disconnects.
+//
+// DEFECT: module-level mutable singletons (let sharedBridge,
+// const boundThreads: Set<string>) — SLA has no module globals or
+// Set; state is gathered into ClineRuntimeRegistry, created once
+// by the host and passed by reference. boundThreads is a fixed
+// (ptr,len) array, capacity 1024 thread ids (source has no cap).
+// DEFECT: optional callback parameter onCreate — SLA has no
+// closures/fn values in this position; the callback invocation is
+// dropped (creation is observable via has_bridge after the call).
+@import "./clineAgentBridge.sla"
+
+struct ClineRuntimeRegistry {
+    bridge: ClineAgentBridge,
+    has_bridge: bool,
+    boundThreads_ptr: [ptr; 1024],
+    boundThreads_len: [u64; 1024],
+    boundThreads_count: u64,
+}
+
+fn ClineRuntimeRegistry_new(self: &ClineRuntimeRegistry) -> void {
+    self.has_bridge = false;
+    self.boundThreads_count = 0;
+}
+
+fn clineRuntime_boundHas(self: &ClineRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64) -> bool {
+    for i in 0..self.boundThreads_count {
+        if self.boundThreads_len[i] == threadId_len {
+            if bytes_eq(self.boundThreads_ptr[i], threadId_ptr, threadId_len) { return true; };
+        };
+    }
+    return false;
+}
+
+fn clineRuntime_boundAdd(self: &ClineRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64) -> void {
+    if clineRuntime_boundHas(self, threadId_ptr, threadId_len) { return; };
+    if self.boundThreads_count < 1024 {
+        self.boundThreads_ptr[self.boundThreads_count] = threadId_ptr;
+        self.boundThreads_len[self.boundThreads_count] = threadId_len;
+        self.boundThreads_count = self.boundThreads_count + 1;
+    };
+}
+
+fn clineRuntime_boundDelete(self: &ClineRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64) -> void {
+    for i in 0..self.boundThreads_count {
+        if self.boundThreads_len[i] == threadId_len {
+            if bytes_eq(self.boundThreads_ptr[i], threadId_ptr, threadId_len) {
+                let last = self.boundThreads_count - 1;
+                self.boundThreads_ptr[i] = self.boundThreads_ptr[last];
+                self.boundThreads_len[i] = self.boundThreads_len[last];
+                self.boundThreads_count = last;
+                return;
+            };
+        };
+    }
+}
+
+// defaultClineDataDir(dataDir): join(dataDir, "cline").
+// DEFECT: node:path join — approximated by byte concat with '/'
+// into the caller's buffer (no Windows separator handling).
+fn defaultClineDataDir(dataDir_ptr: ptr, dataDir_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let n: u64 = 0;
+    for i in 0..dataDir_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, dataDir_ptr, i);
+        if n < out_cap { PTR_BYTE_SET(out, n, b); n = n + 1; };
+    }
+    if n < out_cap { PTR_BYTE_SET(out, n, 47); n = n + 1; };
+    let suffix = "cline";
+    let sp: ptr = STR_PTR(suffix);
+    for j in 0..5 {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, sp, j);
+        if n < out_cap { PTR_BYTE_SET(out, n, b); n = n + 1; };
+    }
+    out_len = n;
+}
+
+// ensureClineBridge(dataDir, onCreate?): creates the shared bridge
+// on first use. DEFECT: onCreate callback dropped (see header).
+fn ensureClineBridge(self: &ClineRuntimeRegistry, dataDir_ptr: ptr, dataDir_len: u64) -> &ClineAgentBridge {
+    if !self.has_bridge {
+        // TS: sharedBridge = new ClineAgentBridge(defaultClineDataDir(dataDir))
+        // DEFECT: heap allocation/new — bridge is embedded by value.
+        let dirbuf = [0u8; 1024];
+        let dirlen: u64 = 0;
+        defaultClineDataDir(dataDir_ptr, dataDir_len, &dirbuf, 1024, &dirlen);
+        ClineAgentBridge_new(&self.bridge, &dirbuf, dirlen);
+        self.has_bridge = true;
+    };
+    return &self.bridge;
+}
+
+fn ensureClineBridgeForThread(self: &ClineRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64, has_threadId: bool, dataDir_ptr: ptr, dataDir_len: u64) -> &ClineAgentBridge {
+    let bridge = ensureClineBridge(self, dataDir_ptr, dataDir_len);
+    if has_threadId { clineRuntime_boundAdd(self, threadId_ptr, threadId_len); };
+    return bridge;
+}
+
+fn existingClineBridgeForThread(self: &ClineRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64, out_has: &bool) -> &ClineAgentBridge {
+    out_has = false;
+    if !self.has_bridge { return &self.bridge; };
+    if clineRuntime_boundHas(self, threadId_ptr, threadId_len) || ClineAgentBridge_hasSession(&self.bridge, threadId_ptr, threadId_len) {
+        out_has = true;
+    };
+    return &self.bridge;
+}
+
+fn bindClineThreadBridge(self: &ClineRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64, bridge: &ClineAgentBridge) -> void {
+    // DEFECT: TS assigns the passed bridge object by reference;
+    // SLA copies the struct by value.
+    self.bridge = bridge;
+    self.has_bridge = true;
+    clineRuntime_boundAdd(self, threadId_ptr, threadId_len);
+}
+
+fn releaseClineThreadBridge(self: &ClineRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64) -> void {
+    clineRuntime_boundDelete(self, threadId_ptr, threadId_len);
+}
+
+fn stopClineRuntime(self: &ClineRuntimeRegistry) -> void {
+    if self.has_bridge { ClineAgentBridge_stop(&self.bridge); };
+    self.has_bridge = false;
+    self.boundThreads_count = 0;
+}
+
+// bytes_eq helper (local; a shared one lives in helpers of the
+// server unit — duplicated here to keep the file self-contained
+// in this pass).
+fn bytes_eq(a: ptr, b: ptr, n: u64) -> bool {
+    for i in 0..n {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a, i);
+        PTR_BYTE_AT(y, b, i);
+        if x != y { return false; };
+    }
+    return true;
+}

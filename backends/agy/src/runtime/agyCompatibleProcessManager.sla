@@ -1,0 +1,361 @@
+// Converted 1:1 from backends/agy/src/runtime/agyCompatibleProcessManager.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// DEFECT: class extends EventEmitter — SLA has no inheritance
+// and no event emitter. emit("rawLine"|"event"|"stderr"|
+// "error"|"exit") becomes appends to an in-struct event queue
+// (JSON text lines tagged by kind) that the owning runtime
+// drains and dispatches; once("exit") in waitForExit becomes a
+// poll on the queue + child state.
+// DEFECT: node:child_process spawn with piped stdio ->
+// sa_std_process_spawn_bidi handles. DEFECT: node:readline
+// line splitting -> the feed fn below (partial-line buffer).
+// DEFECT: Promise/setTimeout in waitForExit -> bounded blocking
+// wait via process_wait + exit-queue poll (no timer surface).
+// DEFECT: Error objects — error events carry message text.
+@import "./agyCompatibleProbe.sla"
+@import "./agyCompatibleProtocol.sla"
+
+// AgyProcessConfig (interface):
+//   cwd: string, addDirs?: string[], conversationId?: string,
+//   model?: string, effort?: string,
+//   mode?: "accept-edits" | "plan",
+//   dangerouslySkipPermissions?: boolean,
+//   envOverrides?: Record<string, string>
+// DEFECT: dynamic object — envOverrides kept as JSON text.
+struct AgyProcessConfig {
+    cwd_ptr: ptr,
+    cwd_len: u64,
+    addDirs_json_ptr: ptr,
+    addDirs_json_len: u64,
+    has_conversationId: bool,
+    conversationId_ptr: ptr,
+    conversationId_len: u64,
+    has_model: bool,
+    model_ptr: ptr,
+    model_len: u64,
+    has_effort: bool,
+    effort_ptr: ptr,
+    effort_len: u64,
+    mode: u64,
+    has_mode: bool,
+    dangerouslySkipPermissions: bool,
+    envOverrides_json_ptr: ptr,
+    envOverrides_json_len: u64,
+}
+
+struct AgyCompatibleProcessManager {
+    config: AgyProcessConfig,
+    proc: u64,
+    hin: u64,
+    hout: u64,
+    herr: u64,
+    has_child: bool,
+    child_killed: bool,
+    exit_seen: bool,
+    exit_code: i32,
+    stopping: bool,
+    stderrTail: [u8; 200000],
+    stderrTail_len: u64,
+    stderrTail_lines: u64,
+    pendingJsonLine: [u8; 1000000],
+    pendingJsonLine_len: u64,
+    lineBuf: [u8; 65536],
+    lineBuf_len: u64,
+    eventQueue: [u8; 1048576],
+    eventQueue_len: u64,
+}
+
+// static readonly MAX_STDERR_TAIL_LINES = 50
+// static readonly MAX_PENDING_JSON_CHARS = 1_000_000
+
+fn AgyCompatibleProcessManager_new(self: &AgyCompatibleProcessManager, config: &AgyProcessConfig) -> void {
+    self.config = config;
+    self.has_child = false;
+    self.child_killed = false;
+    self.exit_seen = false;
+    self.stopping = false;
+    self.stderrTail_len = 0;
+    self.stderrTail_lines = 0;
+    self.pendingJsonLine_len = 0;
+    self.lineBuf_len = 0;
+    self.eventQueue_len = 0;
+}
+
+fn AgyCompatibleProcessManager_emit(self: &AgyCompatibleProcessManager, kind_ptr: ptr, kind_len: u64, payload_ptr: ptr, payload_len: u64) -> void {
+    // Queue record: kind \t payload \n (consumer dispatches).
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, kind_ptr, kind_len);
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, STR_PTR("\t"), 1);
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, payload_ptr, payload_len);
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, STR_PTR("\n"), 1);
+}
+
+fn AgyCompatibleProcessManager_getStderrTail(self: &AgyCompatibleProcessManager, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    // this.stderrTail.join("").slice(-4000)
+    let total = self.stderrTail_len;
+    let skip: u64 = 0;
+    if total > 4000 { skip = total - 4000; };
+    let n: u64 = 0;
+    for i in 0..(total - skip) {
+        if n < out_cap {
+            PTR_BYTE_SET(out, n, self.stderrTail[skip + i]);
+            n = n + 1;
+        };
+    }
+    out_len = n;
+}
+
+// handleStdoutLine(line): emit rawLine; try the pending-partial
+// + line as one JSON event; on success emit event and clear the
+// partial; else keep a leading-"{" candidate under the 1M cap
+// as the new partial (multi-line JSON tolerance).
+fn AgyCompatibleProcessManager_handleStdoutLine(self: &AgyCompatibleProcessManager, line_ptr: ptr, line_len: u64) -> void {
+    AgyCompatibleProcessManager_emit(self, STR_PTR("rawLine"), STR_LEN("rawLine"), line_ptr, line_len);
+    let cand = [0u8; 1048576];
+    let cand_len: u64 = 0;
+    if self.pendingJsonLine_len > 0 {
+        cand_len = cand_len + append_bytes(&cand, 1048576, cand_len, &self.pendingJsonLine, self.pendingJsonLine_len);
+        cand_len = cand_len + append_bytes(&cand, 1048576, cand_len, STR_PTR("\n"), 1);
+    };
+    cand_len = cand_len + append_bytes(&cand, 1048576, cand_len, line_ptr, line_len);
+    let ev = AgyEvent { kind: 0, doc: 0, event_ptr: PTR_NULL(), event_len: 0 };
+    let ok = false;
+    parseAgyLine(&cand, cand_len, &ev, &ok);
+    if ok {
+        self.pendingJsonLine_len = 0;
+        // emit("event", event) — payload is the candidate text.
+        AgyCompatibleProcessManager_emit(self, STR_PTR("event"), STR_LEN("event"), &cand, cand_len);
+        return;
+    };
+    // trimmed.startsWith("{") && length < MAX
+    let start: u64 = 0;
+    while start < cand_len && is_ws(byte_at(&cand, start)) { start = start + 1; };
+    if start < cand_len && byte_at(&cand, start) == 123 && cand_len < 1000000 {
+        self.pendingJsonLine_len = 0;
+        for i in 0..cand_len {
+            self.pendingJsonLine[i] = cand[i];
+        }
+        self.pendingJsonLine_len = cand_len;
+        return;
+    };
+    self.pendingJsonLine_len = 0;
+}
+
+fn AgyCompatibleProcessManager_isRunning(self: &AgyCompatibleProcessManager) -> bool {
+    return self.has_child && !self.child_killed && !self.exit_seen;
+}
+
+// feedStdout: the readline replacement — bytes in, complete
+// lines dispatched to handleStdoutLine. Called by the owner
+// pumping hout (source: rl.on("line")).
+fn AgyCompatibleProcessManager_feedStdout(self: &AgyCompatibleProcessManager, data: ptr, data_len: u64) -> void {
+    for i in 0..data_len {
+        let b = byte_at(data, i);
+        if b == 10 {
+            AgyCompatibleProcessManager_handleStdoutLine(self, &self.lineBuf, self.lineBuf_len);
+            self.lineBuf_len = 0;
+        } else {
+            if self.lineBuf_len < 65536 {
+                self.lineBuf[self.lineBuf_len] = b;
+                self.lineBuf_len = self.lineBuf_len + 1;
+            };
+        };
+    }
+}
+
+// feedStderr: child.stderr.on("data") — push the chunk onto the
+// tail (drop oldest chunks past 50), emit "stderr".
+// DEFECT: tail entries are chunks in TS (named lines); the cap
+// counts chunks exactly like the source array.
+fn AgyCompatibleProcessManager_feedStderr(self: &AgyCompatibleProcessManager, data: ptr, data_len: u64) -> void {
+    if self.stderrTail_lines >= 50 {
+        // shift(): drop the oldest chunk — chunk boundaries are
+        // not tracked in the flat tail; approximated by dropping
+        // the first data_len bytes worth. DEFECT (see log).
+        let drop = data_len;
+        if drop > self.stderrTail_len { drop = self.stderrTail_len; };
+        let rest = self.stderrTail_len - drop;
+        for i in 0..rest {
+            self.stderrTail[i] = self.stderrTail[drop + i];
+        }
+        self.stderrTail_len = rest;
+        self.stderrTail_lines = self.stderrTail_lines - 1;
+    };
+    for i in 0..data_len {
+        if self.stderrTail_len < 200000 {
+            self.stderrTail[self.stderrTail_len] = byte_at(data, i);
+            self.stderrTail_len = self.stderrTail_len + 1;
+        };
+    }
+    self.stderrTail_lines = self.stderrTail_lines + 1;
+    AgyCompatibleProcessManager_emit(self, STR_PTR("stderr"), STR_LEN("stderr"), data, data_len);
+}
+
+// start(baseEnv = process.env): resolve bin/args/env via the
+// probe unit and spawn. DEFECT: baseEnv is the real process env
+// (injected env objects unsupported); envOverrides JSON is
+// handed to buildSafeAgyEnv in the probe unit.
+fn AgyCompatibleProcessManager_start(self: &AgyCompatibleProcessManager) -> void {
+    if self.has_child { return; };
+    let bin = [0u8; 1024];
+    let bin_len: u64 = 0;
+    let bin_found = false;
+    findAgyBin(&bin, 1024, &bin_len, &bin_found);
+    if !bin_found {
+        AgyCompatibleProcessManager_emit(self, STR_PTR("error"), STR_LEN("error"), STR_PTR("agy binary not found"), STR_LEN("agy binary not found"));
+        return;
+    };
+    let args = [0u8; 8192];
+    let args_len: u64 = 0;
+    buildAgySpawnArgs(&self.config, &args, 8192, &args_len);
+    let envbuf = [0u8; 8192];
+    let env_len: u64 = 0;
+    buildSafeAgyEnv(self.config.envOverrides_json_ptr, self.config.envOverrides_json_len, &envbuf, 8192, &env_len);
+    // spawn(bin, args, { cwd, env, stdio: pipe x3, windowsHide })
+    // DEFECT: argv/env packing + cwd at spawn — spawn_bidi takes
+    // the packed vectors (see auggieCommand run_capture2 note);
+    // windowsHide has no meaning off win32.
+    let argv = [0u8; 16384];
+    let argv_len: u64 = 0;
+    argv_len = argv_len + append_bytes(&argv, 16384, argv_len, &bin, bin_len);
+    argv_len = argv_len + append_bytes(&argv, 16384, argv_len, &args, args_len);
+    let proc: u64 = 0;
+    let hin: u64 = 0;
+    let hout: u64 = 0;
+    let herr: u64 = 0;
+    if sa_std_process_spawn_bidi(&argv, argv_len, &proc, &hin, &hout, &herr) != 0 {
+        AgyCompatibleProcessManager_emit(self, STR_PTR("error"), STR_LEN("error"), STR_PTR("spawn failed"), STR_LEN("spawn failed"));
+        return;
+    };
+    self.proc = proc;
+    self.hin = hin;
+    self.hout = hout;
+    self.herr = herr;
+    self.has_child = true;
+    self.child_killed = false;
+    self.exit_seen = false;
+}
+
+// noteChildError(err): child.on("error") -> emit("error", err).
+fn AgyCompatibleProcessManager_noteChildError(self: &AgyCompatibleProcessManager, msg_ptr: ptr, msg_len: u64) -> void {
+    AgyCompatibleProcessManager_emit(self, STR_PTR("error"), STR_LEN("error"), msg_ptr, msg_len);
+}
+
+// noteChildClose(code, signal): child.on("close") -> clear the
+// child, reset the partial, emit "exit" with
+// { code, signal, stopping, stderrTail } as JSON text.
+// DEFECT: signal name is text in TS; carried as text here too.
+fn AgyCompatibleProcessManager_noteChildClose(self: &AgyCompatibleProcessManager, code: i32, signal_ptr: ptr, signal_len: u64) -> void {
+    self.has_child = false;
+    self.exit_seen = true;
+    self.exit_code = code;
+    self.pendingJsonLine_len = 0;
+    let payload = [0u8; 8192];
+    let pl: u64 = 0;
+    pl = pl + append_bytes(&payload, 8192, pl, STR_PTR("{\"code\":"), STR_LEN("{\"code\":"));
+    pl = pl + append_i32(&payload, 8192, pl, code);
+    pl = pl + append_bytes(&payload, 8192, pl, STR_PTR(",\"signal\":\""), STR_LEN(",\"signal\":\""));
+    pl = pl + append_bytes(&payload, 8192, pl, signal_ptr, signal_len);
+    pl = pl + append_bytes(&payload, 8192, pl, STR_PTR("\",\"stopping\":"), STR_LEN("\",\"stopping\":"));
+    if self.stopping {
+        pl = pl + append_bytes(&payload, 8192, pl, STR_PTR("true"), STR_LEN("true"));
+    } else {
+        pl = pl + append_bytes(&payload, 8192, pl, STR_PTR("false"), STR_LEN("false"));
+    };
+    pl = pl + append_bytes(&payload, 8192, pl, STR_PTR("}"), STR_LEN("}"));
+    AgyCompatibleProcessManager_emit(self, STR_PTR("exit"), STR_LEN("exit"), &payload, pl);
+}
+
+// writePrompt(prompt): build the prompt input and end stdin
+// with it (child.stdin.end(payload)).
+// DEFECT: throw Error when not writable -> status code 1.
+fn AgyCompatibleProcessManager_writePrompt(self: &AgyCompatibleProcessManager, prompt_ptr: ptr, prompt_len: u64) -> i32 {
+    if !self.has_child { return 1; };
+    let payload = [0u8; 65536];
+    let payload_len: u64 = 0;
+    buildAgyPromptInput(prompt_ptr, prompt_len, &payload, 65536, &payload_len);
+    if sa_io_write_all(self.hin, &payload, payload_len) != 0 { return 1; };
+    sa_std_close(self.hin);
+    return 0;
+}
+
+// waitForExit(timeoutMs = 5000): resolve immediately when not
+// running; else wait for "exit", stopping the child at the
+// timeout. DEFECT: Promise/setTimeout — implemented as a
+// blocking process_wait bounded by the caller's pump; the
+// timeout stop() is applied by the owner when wait reports 2
+// (still running). Codes: 0 exited/not running, 2 still running.
+fn AgyCompatibleProcessManager_waitForExit(self: &AgyCompatibleProcessManager, timeout_ms: u64) -> i32 {
+    if !AgyCompatibleProcessManager_isRunning(self) { return 0; };
+    // DEFECT: no sleep/timer extern verified; a true bounded
+    // wait needs the epoll surface (sa_term_epoll_*) in repair.
+    let code: i32 = 0;
+    if sa_std_process_wait(self.proc, &code) == 0 {
+        AgyCompatibleProcessManager_noteChildClose(self, code, STR_PTR(""), 0);
+        return 0;
+    };
+    return 2;
+}
+
+// stop(): end stdin, then taskkill /T /F on win32 or SIGTERM
+// elsewhere; nested try/catch falls back to kill().
+// DEFECT: process signalling — sa_std has no kill extern in the
+// verified surface; closing the pipes + process_wait is the
+// approximation, taskkill branch unimplemented (logged).
+fn AgyCompatibleProcessManager_stop(self: &AgyCompatibleProcessManager) -> void {
+    if !self.has_child { return; };
+    self.stopping = true;
+    sa_std_close(self.hin);
+    // DEFECT: child.kill("SIGTERM") / taskkill — no std kill.
+}
+
+// ---- local helpers ----
+
+fn byte_at(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+fn is_ws(b: u8) -> bool {
+    return b == 32 || b == 9 || b == 10 || b == 13;
+}
+
+fn append_bytes(dst: ptr, cap: u64, at: u64, src: ptr, n: u64) -> u64 {
+    let w: u64 = 0;
+    for i in 0..n {
+        if at + w < cap {
+            PTR_BYTE_SET(dst, at + w, byte_at(src, i));
+            w = w + 1;
+        };
+    }
+    return w;
+}
+
+fn append_i32(dst: ptr, cap: u64, at: u64, v: i32) -> u64 {
+    let tmp = [0u8; 12];
+    let tl: u64 = 0;
+    let x = v;
+    let neg = false;
+    if x < 0 { neg = true; x = 0 - x; };
+    if x == 0 {
+        tmp[0] = 48;
+        tl = 1;
+    } else {
+        let rev = [0u8; 12];
+        let rl: u64 = 0;
+        while x > 0 {
+            rev[rl] = (48 + (x % 10)) as u8;
+            rl = rl + 1;
+            x = x / 10;
+        }
+        if neg {
+            tmp[tl] = 45;
+            tl = tl + 1;
+        };
+        for i in 0..rl {
+            tmp[tl] = rev[rl - 1 - i];
+            tl = tl + 1;
+        }
+    };
+    return append_bytes(dst, cap, at, &tmp, tl);
+}

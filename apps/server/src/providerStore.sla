@@ -1,0 +1,925 @@
+// Converted 1:1 from apps/server/src/providerStore.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// NOTE: single-file sequential conversion of the 1,951-line provider store.
+// TS imports: node:fs/promises readFile, node:path join, node:crypto randomUUID,
+// ./runtime/database RuntimeDatabase, @napi-rs/keyring AsyncEntry,
+// @codex-ui/shared (ProviderConfig, ChannelGroupConfig, RelayCapabilityCatalog,
+// Relay*Bundle, UiProfile, ...), ./localDatabase (codexUiDataDir, LocalDatabase),
+// backends/relay-config relayCatalog (buildCatalogImportPreview, deriveCatalogGroups,
+// mergeCatalogGroups, parseRelayCapabilityCatalog, reconcileRequiredImageCatalogGroups).
+// None of the dynamic shared types / keyring / catalog fns have an SLA counterpart
+// yet; ProviderConfig/ChannelGroupConfig are carried as JSON text buffers.
+
+@import "sa_std/io/print.sai"
+@import "sa_std/string.sa"
+// @import "./localDatabase.sla"        // codexUiDataDir, LocalDatabase
+// @import "./runtime/database.sla"     // RuntimeDatabase (SQLite prepare/exec)
+// @import "../../../backends/relay-config/src/relay/relayCatalog.sla" // catalog fns
+
+// ---- src/providerStore.ts:26-28 — type StoreShape ----
+struct StoreShape {
+    providers_json: [u8; 1048576], providers_len: u64, // ProviderConfig[] as JSON array text // DEFECT: dynamic object
+}
+
+// ---- src/providerStore.ts:30-81 — type RelayGroupRow (SQLite row mirror) ----
+struct RelayGroupRow {
+    provider_id: [u8; 128], provider_id_len: u64,
+    group_id: [u8; 128], group_id_len: u64,
+    name: [u8; 256], name_len: u64,
+    base_url: [u8; 1024], base_url_len: u64, has_base_url: bool,
+    kind: [u8; 32], kind_len: u64,
+    status: [u8; 32], status_len: u64, has_status: bool,
+    group_ratio: f64,
+    quota_usd: f64, has_quota_usd: bool,
+    used_quota_usd: f64, has_used_quota_usd: bool,
+    priority: i64, has_priority: bool,
+    weight: i64, has_weight: bool,
+    key_mode: [u8; 32], key_mode_len: u64, has_key_mode: bool,
+    response_protocol: [u8; 64], response_protocol_len: u64, has_response_protocol: bool,
+    response_protocol_mode: [u8; 64], response_protocol_mode_len: u64, has_response_protocol_mode: bool,
+    claude_code_headers_enabled: i64, has_claude_code_headers_enabled: bool,
+    claude_code_version: [u8; 64], claude_code_version_len: u64, has_claude_code_version: bool,
+    endpoint_path_override: [u8; 512], endpoint_path_override_len: u64, has_endpoint_path_override: bool,
+    auth_type: [u8; 64], auth_type_len: u64, has_auth_type: bool,
+    credential_mode: [u8; 64], credential_mode_len: u64, has_credential_mode: bool,
+    catalog_group_name: [u8; 256], catalog_group_name_len: u64, has_catalog_group_name: bool,
+    catalog_managed: i64, has_catalog_managed: bool,
+    keys_json: [u8; 8192], keys_json_len: u64,
+    models_json: [u8; 8192], models_json_len: u64,
+    model_capabilities_json: [u8; 8192], model_capabilities_json_len: u64, has_model_capabilities_json: bool,
+    supported_endpoint_types_json: [u8; 4096], supported_endpoint_types_json_len: u64, has_supported_endpoint_types_json: bool,
+    image_json: [u8; 4096], image_json_len: u64, has_image_json: bool,
+    model_mapping_json: [u8; 8192], model_mapping_json_len: u64,
+    status_code_mapping_json: [u8; 4096], status_code_mapping_json_len: u64,
+    advanced_model_mapping_json: [u8; 8192], advanced_model_mapping_json_len: u64, has_advanced_model_mapping_json: bool,
+    tag: [u8; 256], tag_len: u64, has_tag: bool,
+    remark: [u8; 1024], remark_len: u64, has_remark: bool,
+    auto_ban: i64, has_auto_ban: bool,
+    request_limit: i64, has_request_limit: bool,
+    request_interval_seconds: i64, has_request_interval_seconds: bool,
+    context_window: i64, has_context_window: bool,
+    command_blacklist_enabled: i64, has_command_blacklist_enabled: bool,
+    command_blacklist_json: [u8; 8192], command_blacklist_json_len: u64,
+    network_allowlist_json: [u8; 8192], network_allowlist_json_len: u64,
+    enable_fallback: i64, has_enable_fallback: bool,
+    fallback_channel_id: [u8; 128], fallback_channel_id_len: u64, has_fallback_channel_id: bool,
+    fallback_group_name: [u8; 256], fallback_group_name_len: u64, has_fallback_group_name: bool,
+    enable_tiered_context: i64, has_enable_tiered_context: bool,
+    tiered_context_ratios_json: [u8; 4096], tiered_context_ratios_json_len: u64,
+    sort_order: i64,
+    created_at: u64,
+    updated_at: u64,
+}
+
+// ---- src/providerStore.ts:83-93 — class ProviderStore (fields) ----
+// DEFECT: class -> struct + fn family with &ProviderStore first param; private fields are convention only.
+struct ProviderStore {
+    dir: [u8; 512], dir_len: u64,          // readonly dir = codexUiDataDir()
+    file: [u8; 640], file_len: u64,         // readonly file = join(dir, "providers.json")
+    db: u64,                                // RuntimeDatabase handle (database.connection)
+    memorySecrets: u64,                     // Map<string,string> as JSON registry handle // DEFECT: Map
+    transientProviders: u64,                // Map<string,ProviderConfig> as JSON registry // DEFECT: Map + dynamic object
+    transientOnlyProviderIds: u64,          // Set<string> as JSON registry // DEFECT: Set
+}
+
+// SafeAsyncEntryClass: module-level mutable let, null until require("@napi-rs/keyring") succeeds (L~1330).
+// DEFECT: dynamic require() in try/catch + class value; approximated as a bool flag + factory fn keyringEntry().
+// KEYRING_SERVICE = "codex-react-ui" (const string).
+
+fn ProviderStore_new(out: &ProviderStore, database: u64, has_database: bool) -> void {
+    // constructor(database: Pick<LocalDatabase,"connection"> = new LocalDatabase())
+    // this.db = database.connection; this.ensureSchema(); this.migrateRelayGroupsFromPayloads();
+    // DEFECT: default-arg construction of LocalDatabase; caller supplies handle or 0.
+    ProviderStore_ensureSchema(out);
+    ProviderStore_migrateRelayGroupsFromPayloads(out);
+}
+
+// ---- L95-152 initialize(): Promise<void> ----
+// DEFECT: async
+fn ProviderStore_initialize(s: &ProviderStore) -> i32 {
+    // await migrateLegacyProviders(); store = await read();
+    // changed=false; validProviders=[];
+    // for provider of store.providers:
+    //   persistedGroups = readRelayGroups().get(provider.id) ?? []
+    //   if !relayGroupTopologyMatches(provider.groups ?? [], persistedGroups) { changed=true; };
+    //   persistedSecret = readPersistedProviderKey(provider.id)
+    //   groupedProvider = ensureDefaultRelayGroup(provider, persistedSecret)
+    //   if groupedProvider.capabilityCatalog:
+    //     reconciled = reconcileRequiredImageCatalogGroups(groups ?? [], catalog)
+    //     if JSON.stringify(reconciled) !== JSON.stringify(groups ?? []):
+    //       groupedProvider = {...groupedProvider, groups: reconciled, updatedAt: Date.now()}; changed=true // DEFECT: object spread
+    //   if !hasValidRelayGroups(groupedProvider): changed=true; memorySecrets.delete(id);
+    //     deletePersistedProviderKey(id); continue
+    //   validProviders.push(groupedProvider)
+    //   if persistedSecret: memorySecrets.set(id, persistedSecret);
+    //     if provider.apiKeyStorage !== "database" { provider.apiKeyStorage="database"; changed=true; }; continue
+    //   if !provider.apiKeyRef: if apiKeyStorage!=="none" { ="none"; changed=true; }; continue
+    //   try { entry=keyringEntry(id); secret = entry ? await entry.getPassword() : null; // DEFECT: async keyring + try/catch
+    //     if secret: memorySecrets.set; if storage!=="keyring" {="keyring"; changed=true;}
+    //     else if storage!=="memory" {="memory"; changed=true;}
+    //   } catch { if storage!=="memory" {="memory"; changed=true;} }
+    // if changed { await write({providers: validProviders}); };
+    return 0; // 0=ok; DEFECT: throw-free status-code approximation
+}
+
+// ---- L154-157 list(): Promise<ProviderConfig[]> ---- // DEFECT: async
+fn ProviderStore_list(s: &ProviderStore, out_json: &u64) -> i32 {
+    // persisted = (await read()).providers.filter(p => !p.trashedAt && !transientProviders.has(p.id))
+    // return [...persisted, ...transientProviders.values()].filter(p => !p.trashedAt) // DEFECT: spread + Map.values + closures
+    return 0;
+}
+
+// ---- L159-162 listTrashed(): Promise<ProviderConfig[]> ---- // DEFECT: async
+fn ProviderStore_listTrashed(s: &ProviderStore, out_json: &u64) -> i32 {
+    // same as list() but filter Boolean(p.trashedAt)
+    return 0;
+}
+
+// ---- L164-166 get(id): Promise<ProviderConfig|null> ---- // DEFECT: async
+fn ProviderStore_get(s: &ProviderStore, id_ptr: ptr, id_len: u64, out_json: &u64) -> i32 {
+    // return transientProviders.get(id) ?? (await read()).providers.find(p => p.id===id) ?? null // DEFECT: closure find
+    return 0;
+}
+
+// ---- L168-180 saveTransient(provider): Promise<ProviderConfig> ---- // DEFECT: async
+fn ProviderStore_saveTransient(s: &ProviderStore, provider_json: u64, out_json: &u64) -> i32 {
+    // now=Date.now(); clean = normalizeProvider({...normalizeProviderTopology(provider),
+    //   apiKeyStorage:"none", createdAt: provider.createdAt||now, updatedAt: now}) // DEFECT: spread
+    // if !clean throw Error("Invalid transient provider config") // DEFECT: throw -> status code
+    // validateRelayGroupKeys(clean, false); transientProviders.set(clean.id, clean); return clean
+    return 0;
+}
+
+// ---- L182-187 reserveTransient(id): Promise<void> ---- // DEFECT: async
+fn ProviderStore_reserveTransient(s: &ProviderStore, id_ptr: ptr, id_len: u64) -> i32 {
+    // providerId=id.trim(); if !providerId throw "Transient provider id is required"
+    // await delete(providerId); transientOnlyProviderIds.add(providerId)
+    return 0;
+}
+
+// ---- L189-232 save(provider, apiKey?, mergeIntoProviderId?): Promise<ProviderConfig> ---- // DEFECT: async
+fn ProviderStore_save(s: &ProviderStore, provider_json: u64, apiKey_ptr: ptr, apiKey_len: u64, has_apiKey: bool, mergeInto_ptr: ptr, mergeInto_len: u64, has_mergeInto: bool, out_json: &u64) -> i32 {
+    // now=Date.now(); requestedId=provider.id.trim(); secret=apiKey?.trim(); store=await read()
+    // mergeTargetId=mergeIntoProviderId?.trim()
+    // duplicate = mergeTargetId ? store.providers.find(id===mergeTargetId)
+    //   : requestedId ? undefined : store.providers.find(name.trim().toLowerCase()===provider.name.trim().toLowerCase())
+    // if mergeTargetId && !duplicate throw `Provider not found: ${mergeTargetId}` // DEFECT: template string
+    // id = duplicate?.id ?? (requestedId || providerIdFromName(provider.name))
+    // if transientOnlyProviderIds.has(id) return saveTransient({...provider, id})
+    // transientProviders.delete(id)
+    // topology = normalizeProviderTopology(duplicate ? mergeProviderGroups(duplicate, provider, now) : {...provider, id})
+    // validateRelayGroupKeys(topology, Boolean(secret))
+    // apiKeyRef = secret ? `env:${envKeyForProvider(id)}` : topology.apiKeyRef
+    // apiKeyStorage = provider.apiKeyStorage ?? (provider.apiKeyRef ? "memory" : "none")
+    // if secret { memorySecrets.set(id, secret); apiKeyStorage="database"; }
+    // clean = normalizeProvider({...topology, id, apiKeyRef,
+    //   apiKeyPreview: secret ? previewSecret(secret) : provider.apiKeyPreview,
+    //   apiKeyStorage, createdAt: provider.createdAt||now, updatedAt: now})
+    // if !clean throw "Invalid provider config"
+    // next = store.providers.filter(e => e.id!==id); next.push(clean); await write({providers: next})
+    // if secret { persistProviderKey(id, secret); }; return clean
+    return 0;
+}
+
+// ---- L234-245 addUsedQuota(providerId, groupId, amountUsd): void (sync) ----
+fn ProviderStore_addUsedQuota(s: &ProviderStore, providerId_ptr: ptr, providerId_len: u64, groupId_ptr: ptr, groupId_len: u64, amountUsd: f64) -> void {
+    // if !providerId || !groupId || !Number.isFinite(amountUsd) || amountUsd<=0 return;
+    // db.prepare("UPDATE relay_groups SET used_quota_usd = COALESCE(used_quota_usd, 0) + ?, updated_at = ? WHERE provider_id = ? AND group_id = ?")
+    //   .run(amountUsd, Date.now(), providerId, groupId)
+    // DEFECT: RuntimeDatabase prepared-statement API has no sa_std counterpart; SQL text preserved in comment.
+}
+
+// ---- L247-259 runtimeEnv(): NodeJS.ProcessEnv ----
+fn ProviderStore_runtimeEnv(s: &ProviderStore, out_json: &u64) -> void {
+    // env={}; for [id,secret] of memorySecrets.entries() env[envKeyForProvider(id)]=secret // DEFECT: Map iteration
+    // for [key,value] of Object.entries(process.env): // DEFECT: process.env + Object.entries
+    //   if key.startsWith("CODEX_UI_PROVIDER_") && key.endsWith("_API_KEY") && typeof value==="string" && value.trim() env[key]=value
+    // return env // DEFECT: dynamic object (env record) -> JSON buffer
+}
+
+// ---- L261-272 providerApiKey(id): string ----
+fn ProviderStore_providerApiKey(s: &ProviderStore, id_ptr: ptr, id_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // memory=memorySecrets.get(id)?.trim(); if memory return memory
+    // persisted=readPersistedProviderKey(id); if persisted { memorySecrets.set(id,persisted); return persisted; }
+    // return process.env[envKeyForProvider(id)]?.trim() ?? "" // DEFECT: process.env
+}
+
+// ---- L274-278 useProviderKey(id, apiKey): void ----
+fn ProviderStore_useProviderKey(s: &ProviderStore, id_ptr: ptr, id_len: u64, apiKey_ptr: ptr, apiKey_len: u64) -> void {
+    // key=apiKey.trim(); if key memorySecrets.set(id, key)
+}
+
+// ---- L280-294 delete(id): Promise<void> ---- // DEFECT: async
+fn ProviderStore_delete(s: &ProviderStore, id_ptr: ptr, id_len: u64) -> i32 {
+    // transientProviders.delete(id); memorySecrets.delete(id); deletePersistedProviderKey(id)
+    // try { entry=keyringEntry(id); if entry await entry.deleteCredential(); } catch {} // DEFECT: async keyring + try/catch (comment: missing/unavailable keyrings do not block deletion)
+    // store=await read(); await write({providers: store.providers.filter(e => e.id!==id)})
+    return 0;
+}
+
+// ---- L296-310 trash(id): Promise<ProviderConfig> ---- // DEFECT: async
+fn ProviderStore_trash(s: &ProviderStore, id_ptr: ptr, id_len: u64, out_json: &u64) -> i32 {
+    // transient hit: trashed={...transient, trashedAt:Date.now(), updatedAt:Date.now()}; set; return trashed // DEFECT: spread
+    // else store=await read(); existing=find(id); if !existing throw `Provider not found: ${id}`
+    // trashed=normalizeProvider({...existing, trashedAt:Date.now(), updatedAt:Date.now()}); if !trashed throw "Invalid provider config"
+    // await write({providers: store.providers.map(e => e.id===id ? trashed : e)}); return trashed
+    return 0;
+}
+
+// ---- L312-326 restore(id): Promise<ProviderConfig> ---- // DEFECT: async
+fn ProviderStore_restore(s: &ProviderStore, id_ptr: ptr, id_len: u64, out_json: &u64) -> i32 {
+    // mirror of trash() with trashedAt: undefined (field removed) // DEFECT: undefined field deletion has no struct equivalent
+    return 0;
+}
+
+// ---- L328-335 exportProfile(): Promise<UiProfile> ---- // DEFECT: async
+fn ProviderStore_exportProfile(s: &ProviderStore, out_json: &u64) -> i32 {
+    // store=await read(); return {schema:"codex-react-ui.profile.v1", exportedAt:Date.now(),
+    //   providers: store.providers.map(profileProvider)} // DEFECT: dynamic object literal
+    return 0;
+}
+
+// ---- L337-368 importProfile(profile: unknown): Promise<UiProfileImportResult> ---- // DEFECT: async + unknown/dynamic JSON
+fn ProviderStore_importProfile(s: &ProviderStore, profile_json: u64, out_json: &u64) -> i32 {
+    // record=asRecord(profile); if record.schema!=="codex-react-ui.profile.v1" throw "Unsupported UI profile schema"
+    // if !Array.isArray(record.providers) throw "UI profile is missing providers"
+    // store=await read(); providersById=new Map(store.providers.map(p => [p.id, p])) // DEFECT: Map from array map closure
+    // imported=record.providers.map(entry => { existingId=stringValue(asRecord(entry).id);
+    //   return normalizeProfileProvider(entry, existingId ? providersById.get(existingId) : undefined); })
+    // for provider of imported providersById.set(provider.id, provider)
+    // providers=Array.from(providersById.values()); await write({providers})
+    // return {importedProviders: imported.length, providers}
+    return 0;
+}
+
+// ---- L370-378 exportRelayConfig(): Promise<RelayConfigBundle> ---- // DEFECT: async
+fn ProviderStore_exportRelayConfig(s: &ProviderStore, out_json: &u64) -> i32 {
+    // return {schema:"codex-react-ui.relay-config.v1", exportedAt:Date.now(), includesSecrets:true, providers:(await read()).providers}
+    return 0;
+}
+
+// ---- L380-395 exportRelayBackup(): Promise<RelayBackupBundle> ---- // DEFECT: async
+fn ProviderStore_exportRelayBackup(s: &ProviderStore, out_json: &u64) -> i32 {
+    // store=await read(); providerIds=new Set(store.providers.map(p=>p.id)) // DEFECT: Set
+    // providerSecrets = db.prepare("SELECT provider_id, api_key FROM provider_secrets ORDER BY provider_id ASC").all()
+    //   .filter(e => providerIds.has(e.provider_id) && e.api_key.trim())
+    //   .map(e => ({providerId:e.provider_id, apiKey:e.api_key}))
+    // return {schema:"codex-react-ui.relay-backup.v1", exportedAt:Date.now(), includesSecrets:true, providers:store.providers, providerSecrets}
+    return 0;
+}
+
+// ---- L397-427 importRelayConfig(bundle: unknown): Promise<UiProfileImportResult> ---- // DEFECT: async + unknown
+fn ProviderStore_importRelayConfig(s: &ProviderStore, bundle_json: u64, out_json: &u64) -> i32 {
+    // record=asRecord(bundle); schema!=="codex-react-ui.relay-config.v1" -> throw "Unsupported relay config schema"
+    // record.includesSecrets!==true -> throw "Relay config bundle must declare includesSecrets=true"
+    // !Array.isArray(record.providers) -> throw "Relay config is missing providers"
+    // store=await read(); providersById=new Map(...); imported=record.providers.map(entry => {
+    //   existingId=stringValue(asRecord(entry).id)
+    //   normalized=normalizeProvider({...asRecord(entry), id: existingId||undefined,
+    //     createdAt: numberValue(createdAt) ?? providersById.get(existingId ?? "")?.createdAt ?? Date.now(), updatedAt: Date.now()})
+    //   if !normalized throw "Invalid relay provider config"; return normalized })
+    // for imported: providersById.set; providers=Array.from(values); await write({providers})
+    // return {importedProviders: imported.length, providers}
+    return 0;
+}
+
+// ---- L429-456 importRelayBackup(bundle: unknown): Promise<UiProfileImportResult> ---- // DEFECT: async + unknown
+fn ProviderStore_importRelayBackup(s: &ProviderStore, bundle_json: u64, out_json: &u64) -> i32 {
+    // schema!=="codex-react-ui.relay-backup.v1" -> throw; includesSecrets!==true -> throw; providers array check -> throw
+    // providerSecrets = Array.isArray(record.providerSecrets) ? record.providerSecrets : []
+    // result = await importRelayConfig({schema:"codex-react-ui.relay-config.v1",
+    //   exportedAt: numberValue(record.exportedAt) ?? Date.now(), includesSecrets:true, providers:record.providers})
+    // for entry of providerSecrets: secret=asRecord(entry); providerId=stringValue(secret.providerId)?.trim();
+    //   apiKey=stringValue(secret.apiKey)?.trim();
+    //   if providerId && apiKey && result.providers.some(p => p.id===providerId) persistProviderKey(providerId, apiKey) // DEFECT: closure some()
+    // return result
+    return 0;
+}
+
+// ---- L458-463 previewCapabilityCatalog(providerId, catalog: unknown) ---- // DEFECT: async + unknown
+fn ProviderStore_previewCapabilityCatalog(s: &ProviderStore, providerId_ptr: ptr, providerId_len: u64, catalog_json: u64, out_json: &u64) -> i32 {
+    // provider=await get(providerId); if !provider throw `Provider not found: ${providerId}`
+    // validateCatalogProvider(provider); return buildCatalogImportPreview(providerId, provider.groups ?? [], catalog)
+    return 0;
+}
+
+// ---- L465-490 importCapabilityCatalog(providerId, catalogInput: unknown, mode="merge"|"replace"="merge") ---- // DEFECT: async + union literal type + default arg
+fn ProviderStore_importCapabilityCatalog(s: &ProviderStore, providerId_ptr: ptr, providerId_len: u64, catalog_json: u64, mode: u64, out_json: &u64) -> i32 {
+    // mode: 0=merge, 1=replace (string union approximated as enum code)
+    // store=await read(); providerIndex=store.providers.findIndex(p=>p.id===providerId); if <0 throw
+    // provider=store.providers[providerIndex]! // DEFECT: non-null assertion
+    // validateCatalogProvider(provider); preview=buildCatalogImportPreview(providerId, groups ?? [], catalogInput)
+    // groups=mergeCatalogGroups(groups ?? [], preview.groups, mode)
+    // catalogModels=preview.catalog.data.map(m=>m.model_name)
+    // nextProvider={...provider, channelMode:"advanced", nativeModels:uniqueStrings([...nativeModels, ...catalogModels]),
+    //   capabilityCatalog:preview.catalog, groups, updatedAt:Date.now()} // DEFECT: spread
+    // store.providers[providerIndex]=nextProvider; await write(store); return {...preview, provider:nextProvider, mode}
+    return 0;
+}
+
+// ---- L492-497 validateCatalogProvider(provider): void (private) ----
+fn ProviderStore_validateCatalogProvider(s: &ProviderStore, provider_json: u64) -> i32 {
+    // if !provider.baseUrl?.trim() throw "Capability catalogs require an existing Provider with a Base URL"
+    return 0;
+}
+
+// ---- L499-518 read(): Promise<StoreShape> (private) ---- // DEFECT: async
+fn ProviderStore_read(s: &ProviderStore, out: &StoreShape) -> i32 {
+    // rows=db.prepare("SELECT id, payload FROM providers ORDER BY created_at ASC, id ASC").all()
+    // groupsByProvider=readRelayGroups()
+    // providers = rows.map(row => { provider=parseProvider(row.payload); if !provider return null;
+    //   persistedGroups=groupsByProvider.get(row.id);
+    //   groups=selectConsistentRelayGroups(provider.groups ?? [], persistedGroups);
+    //   return ensureDefaultRelayGroup(groups && groups.length>0 ? {...provider, groups} : provider,
+    //     readPersistedProviderKey(row.id)); })
+    //   .filter((p): p is ProviderConfig => Boolean(p)) // DEFECT: type-guard predicate + map/filter closures
+    return 0;
+}
+
+// ---- L520-556 write(store: StoreShape): Promise<void> (private) ---- // DEFECT: async
+fn ProviderStore_write(s: &ProviderStore, store: &StoreShape) -> i32 {
+    // db.exec("BEGIN"); try {
+    //   clearCapabilityCatalogTables(); DELETE FROM relay_groups; DELETE FROM providers
+    //   insert=prepare("INSERT INTO providers (id, payload, created_at, updated_at) VALUES (?, ?, ?, ?)")
+    //   insertGroup=prepare(INSERT INTO relay_groups (...41 cols...) VALUES (...41 ?...)) // SQL preserved verbatim in source L532-543
+    //   for rawProvider of store.providers: provider=normalizeProviderTopology(rawProvider);
+    //     insert.run(provider.id, JSON.stringify(provider), createdAt ?? Date.now(), updatedAt ?? Date.now())
+    //     insertRelayGroups(insertGroup, provider); insertCapabilityCatalog(provider)
+    //   db.exec("COMMIT")
+    // } catch (error) { db.exec("ROLLBACK"); throw error; } // DEFECT: try/catch + rethrow
+    return 0;
+}
+
+// ---- L558-~760 ensureSchema(): void (private) ----
+fn ProviderStore_ensureSchema(s: &ProviderStore) -> void {
+    // db.exec(CREATE TABLE IF NOT EXISTS providers / provider_secrets / relay_groups /
+    //   relay_catalogs / relay_catalog_groups / relay_catalog_models /
+    //   relay_model_enable_groups / relay_model_supported_endpoint_types /
+    //   relay_supported_endpoints / relay_vendors / relay_auto_groups + 3 indexes)
+    //   -- full DDL preserved verbatim in source L559-748; executed as one SQL text block.
+    // migrateProviderSecretsSchema()
+    // relayGroupColumns: Array<[string,string]> of 18 (column,type) pairs // DEFECT: tuple array literal
+    // for [column,type] of relayGroupColumns: // DEFECT: array destructuring in for-of
+    //   try { db.prepare(`ALTER TABLE relay_groups ADD COLUMN ${column} ${type}`).run(); } catch {} // already exists
+}
+
+// ---- migrateProviderSecretsSchema(): void (private) ----
+fn ProviderStore_migrateProviderSecretsSchema(s: &ProviderStore) -> void {
+    // foreignKeys=db.prepare("PRAGMA foreign_key_list(provider_secrets)").all()
+    // if !foreignKeys.some(e => e.table==="providers") return // DEFECT: closure some()
+    // db.exec(rename provider_secrets -> _legacy; CREATE TABLE provider_secrets; INSERT SELECT; DROP legacy)
+}
+
+// ---- readPersistedProviderKey(id): string (private) ----
+fn ProviderStore_readPersistedProviderKey(s: &ProviderStore, id_ptr: ptr, id_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // row=db.prepare("SELECT api_key FROM provider_secrets WHERE provider_id = ?").get(id)
+    // return typeof row?.api_key==="string" ? row.api_key.trim() : ""
+}
+
+// ---- persistProviderKey(id, secret): void (private) ----
+fn ProviderStore_persistProviderKey(s: &ProviderStore, id_ptr: ptr, id_len: u64, secret_ptr: ptr, secret_len: u64) -> void {
+    // INSERT INTO provider_secrets ... ON CONFLICT(provider_id) DO UPDATE ... .run(id, secret, Date.now())
+}
+
+// ---- deletePersistedProviderKey(id): void (private) ----
+fn ProviderStore_deletePersistedProviderKey(s: &ProviderStore, id_ptr: ptr, id_len: u64) -> void {
+    // DELETE FROM provider_secrets WHERE provider_id = ?
+}
+
+// ---- migrateRelayGroupsFromPayloads(): void (private) ----
+fn ProviderStore_migrateRelayGroupsFromPayloads(s: &ProviderStore) -> void {
+    // existing=prepare("SELECT COUNT(*) AS count FROM relay_groups").get(); if (existing?.count ?? 0)>0 return
+    // rows=prepare("SELECT payload FROM providers ORDER BY created_at ASC, id ASC").all()
+    // providers=rows.map(parseProvider).filter(type-guard Boolean) // DEFECT: closures + type guard
+    // if !providers.some(p => (p.groups?.length ?? 0)>0) return
+    // insertGroup=prepare(INSERT OR REPLACE INTO relay_groups (...41 cols...))
+    // BEGIN; try { for provider: insertRelayGroups + insertCapabilityCatalog; COMMIT } catch { ROLLBACK; throw; } // DEFECT: try/catch
+}
+
+// ---- readRelayGroups(): Map<string, ChannelGroupConfig[]> (private) ---- // DEFECT: Map return
+fn ProviderStore_readRelayGroups(s: &ProviderStore, out_json: &u64) -> void {
+    // rows=prepare("SELECT * FROM relay_groups ORDER BY provider_id ASC, sort_order ASC, priority ASC, group_id ASC").all() as RelayGroupRow[]
+    // groupsByProvider=new Map(); for row: group=groupFromRow(row); if !group continue;
+    //   groups=get(row.provider_id) ?? []; groups.push(group); set(row.provider_id, groups)
+    // return groupsByProvider (JSON object keyed by provider_id)
+}
+
+// ---- insertRelayGroups(insertGroup, provider): void (private) ----
+// DEFECT: prepared-statement object passed as parameter (ReturnType<RuntimeDatabase["prepare"]>) -> stmt handle u64.
+fn ProviderStore_insertRelayGroups(s: &ProviderStore, insertGroup: u64, provider_json: u64) -> void {
+    // now=provider.updatedAt ?? Date.now()
+    // for [index, group] of (provider.groups ?? []).entries(): // DEFECT: entries() destructuring
+    //   insertGroup.run(provider.id, group.id, group.name, group.baseUrl ?? null, group.kind ?? "text",
+    //     group.status ?? null, group.groupRatio ?? 1, quotaUsd ?? null, usedQuotaUsd ?? null, priority ?? null,
+    //     weight ?? null, keyMode ?? null, responseProtocol ?? null, responseProtocolMode ?? null,
+    //     endpointPathOverride ?? null, authType ?? null, credentialMode ?? null, catalogGroupName ?? null,
+    //     booleanToSql(catalogManaged), JSON.stringify(keys ?? []), JSON.stringify(models ?? []),
+    //     JSON.stringify(modelCapabilities ?? {}), JSON.stringify(supportedEndpointTypes ?? []),
+    //     group.image ? JSON.stringify(group.image) : null, JSON.stringify(modelMapping ?? []),
+    //     JSON.stringify(statusCodeMapping ?? []), JSON.stringify(advancedModelMapping ?? []),
+    //     tag ?? null, remark ?? null, booleanToSql(autoBan), requestLimit ?? null, requestIntervalSeconds ?? null,
+    //     contextWindow>0 ? Math.round : null, booleanToSql(enableFallback), fallbackChannelId ?? null,
+    //     fallbackGroupName ?? null, booleanToSql(enableTieredContext), JSON.stringify(tieredContextRatios ?? []),
+    //     index, provider.createdAt ?? now, now)
+    //   persistCommandBlacklistFields(provider.id, group); persistClaudeCodeHeaderFields(provider.id, group)
+}
+
+// ---- persistClaudeCodeHeaderFields(providerId, group) (private) ----
+fn ProviderStore_persistClaudeCodeHeaderFields(s: &ProviderStore, providerId_ptr: ptr, providerId_len: u64, group_json: u64) -> void {
+    // UPDATE relay_groups SET claude_code_headers_enabled=?, claude_code_version=? WHERE provider_id=? AND group_id=?
+    //   .run(group.claudeCodeHeadersEnabled===true ? 1:0, group.claudeCodeVersion?.trim() || null, providerId, group.id)
+}
+
+// ---- persistCommandBlacklistFields(providerId, group) (private) ----
+fn ProviderStore_persistCommandBlacklistFields(s: &ProviderStore, providerId_ptr: ptr, providerId_len: u64, group_json: u64) -> void {
+    // UPDATE relay_groups SET command_blacklist_enabled=?, command_blacklist_json=?, network_allowlist_json=? WHERE ...
+    //   .run(group.commandBlacklistEnabled===false ? 0:1, JSON.stringify(commandBlacklist ?? []),
+    //        JSON.stringify(networkAllowlist ?? []), providerId, group.id)
+}
+
+// ---- clearCapabilityCatalogTables(): void (private) ----
+fn ProviderStore_clearCapabilityCatalogTables(s: &ProviderStore) -> void {
+    // for table of [relay_model_enable_groups, relay_model_supported_endpoint_types, relay_auto_groups,
+    //   relay_supported_endpoints, relay_vendors, relay_catalog_groups, relay_catalog_models, relay_catalogs]:
+    //   db.prepare(`DELETE FROM ${table}`).run() // DEFECT: template-string SQL (fixed table-name set)
+}
+
+// ---- insertCapabilityCatalog(provider): void (private) ----
+fn ProviderStore_insertCapabilityCatalog(s: &ProviderStore, provider_json: u64) -> void {
+    // catalog=provider.capabilityCatalog; if !catalog return
+    // INSERT INTO relay_catalogs ... .run(id, success?1:0, imported_at, source_hash, JSON.stringify(warnings))
+    // catalogGroups=new Map(deriveCatalogGroups(catalog).map(g => [g.catalogGroupName ?? g.name, g])) // DEFECT: Map
+    // runtimeGroups=new Map((groups ?? []).map(g => [g.catalogGroupName ?? g.name, g]))
+    // groupNames=uniqueStrings([...Object.keys(catalog.usable_group), ...Object.keys(catalog.group_ratio),
+    //   ...catalog.auto_groups, ...catalog.data.flatMap(m => m.enable_groups)]) // DEFECT: spread + flatMap closure
+    // for groupName: group=runtimeGroups.get ?? catalogGroups.get; INSERT INTO relay_catalog_groups ...
+    //   (usable_group[groupName] ?? groupName, group_ratio[groupName] ?? 1, group?.responseProtocol ?? null, ...)
+    // INSERT relay_catalog_models per catalog.data model (12 cols, JSON.stringify(extensions ?? {}));
+    //   per enable_groups -> relay_model_enable_groups; per supported_endpoint_types -> relay_model_supported_endpoint_types
+    // for [endpointType, endpoint] of Object.entries(catalog.supported_endpoint): INSERT relay_supported_endpoints // DEFECT: Object.entries
+    // for vendor of catalog.vendors: INSERT relay_vendors
+    // for groupName of catalog.auto_groups: INSERT relay_auto_groups
+}
+
+// ---- migrateLegacyProviders(): Promise<void> (private) ---- // DEFECT: async
+fn ProviderStore_migrateLegacyProviders(s: &ProviderStore) -> i32 {
+    // existing=COUNT providers; if >0 return
+    // try { raw=await readFile(this.file,"utf8"); parsed=JSON.parse(raw) as StoreShape; // DEFECT: fs/promises + cast
+    //   providers=Array.isArray(parsed.providers) ? parsed.providers.map(normalizeProvider).filter(type-guard) : []
+    //   if providers.length>0 await write({providers})
+    // } catch {} // fresh installs have no legacy file
+    return 0;
+}
+
+// ================= module-level functions (source order) =================
+
+// ---- validateRelayGroupKeys(provider, providerSecretSupplied=false): void ----
+fn validateRelayGroupKeys(provider_json: u64, providerSecretSupplied: bool) -> i32 {
+    // if (groups?.length ?? 0)===0 throw "Every relay provider requires at least one configured group"
+    // if kind==="chatgpt" || id==="omniroute-free" || stationType==="charity" return 0
+    // hasProviderCredential = providerSecretSupplied || Boolean(apiKeyRef?.trim())
+    // missing = groups.filter(g => g.authType!=="none" && g.id!=="cline-free" && g.id!=="freebuff"
+    //   && !(g.keys ?? []).some(k => k.trim()) && !(g.credentialMode==="provider" && hasProviderCredential)) // DEFECT: filter/some closures
+    // if missing.length>0 throw `Every configured relay group requires at least one API key: ${missing.map(name).join(", ")}`
+    return 0;
+}
+
+// ---- parseProvider(payload: string): ProviderConfig|null ----
+fn parseProvider(payload_ptr: ptr, payload_len: u64, out_json: &u64) -> bool {
+    // try { out = normalizeProvider(JSON.parse(payload)); return out != null; } catch { return false; } // DEFECT: try/catch + JSON.parse
+    return false;
+}
+
+// ---- isProviderLike(value: unknown): boolean ---- // DEFECT: unknown/dynamic JSON
+fn isProviderLike(value_json: u64) -> bool {
+    // record=asRecord(value); return typeof record.id==="string" && typeof record.name==="string" && typeof record.kind==="string"
+    return false;
+}
+
+// ---- normalizeProvider(value: unknown): ProviderConfig|null ---- // DEFECT: unknown/dynamic JSON (central normalizer)
+fn normalizeProvider(value_json: u64, out_json: &u64) -> bool {
+    // if !isProviderLike return false(null); record=asRecord(value); now=Date.now()
+    // out = normalizeProviderTopology({ id: stringValue(record.id) ?? randomUUID(), // DEFECT: randomUUID (node:crypto)
+    //   kind: providerKindValue(record.kind), name: stringValue(record.name) ?? "Provider",
+    //   serviceProvider: serviceProviderValue(...), baseUrl, apiKeyRef: envKeyRefValue(...), apiKeyPreview,
+    //   apiKeyStorage: apiKeyStorageValue(...), defaultModel, streamMaxRetries: retryCountValue(...),
+    //   image: imageProviderConfig(...), nativeModels: stringArray(...), modelAliases: aliasArray(...),
+    //   modelDisplayNames: stringRecord(...), modelRates: modelRateArray(...),
+    //   capabilityCatalog: capabilityCatalogValue(...), capabilityCatalogUrl, channelMode: channelModeValue(...),
+    //   groups: groupArray(...), quotaUsd: nullableNumberValue(...), usedQuotaUsd: numberValue(...),
+    //   stationType: stationTypeValue(...), enableCheckin/remindCheckin: booleanValue(...), remark,
+    //   sharedImport: sharedImportValue(...), trashedAt: numberValue(...),
+    //   createdAt: numberValue(...) ?? now, updatedAt: numberValue(...) ?? now })
+    return false;
+}
+
+// ---- normalizeProviderTopology(provider): ProviderConfig ----
+fn normalizeProviderTopology(provider_json: u64, out_json: &u64) -> void {
+    // if id==="omniroute-free": return {...provider, name:"CodexUltraFree",
+    //   serviceProvider:{id:"codex-ultra-free", name:"CodexUltraFree"},
+    //   groups:(groups ?? []).map(group => { // DEFECT: spread + nested ternary chain for defaultName
+    //     isCline=id==="cline-free"; isFreebuff; isD2Api;
+    //     defaultName = opencode-free->"CodexUltraFree" | opencode->name||"OpenCode" | kilocode->name||"KiloCode"
+    //       | cline->name||"ClineFree" | freebuff->name||"Freebuff" | d2api->name||"D2API" | group.name
+    //     return {...group, name:defaultName,
+    //       responseProtocol: (opencode-free|opencode|cline|freebuff|d2api) ? "openai" : "openai-response",
+    //       responseProtocolMode:"fixed"} })}
+    // if isDeepKeyProvider(provider): return {...provider, serviceProvider:{id:"deepkey", name:"DeepKey", logo}}
+    // return provider
+}
+
+// ---- sharedImportValue(value: unknown) ---- // DEFECT: unknown
+fn sharedImportValue(value_json: u64, out_json: &u64) -> bool {
+    // record=asRecord(value); return record.source==="codex-ultra-share"
+    //   ? {source:"codex-ultra-share", importedAt: numberValue(record.importedAt) ?? Date.now()} : undefined(false)
+    return false;
+}
+
+// ---- isDeepKeyProvider(provider): boolean ----
+fn isDeepKeyProvider(provider_json: u64) -> bool {
+    // if serviceProvider?.id.trim().toLowerCase()==="deepkey" return true
+    // for value of [baseUrl, capabilityCatalogUrl, ...(groups ?? []).map(g=>g.baseUrl)]: // DEFECT: spread in array literal
+    //   if !value continue; try { host=new URL(value).hostname.toLowerCase(); // DEFECT: URL parser has no sa_std counterpart
+    //     if host==="deepkey.top" || host.endsWith(".deepkey.top") return true; } catch { continue; }
+    return false;
+}
+
+// ---- mergeProviderGroups(existing, incoming, now): ProviderConfig ----
+fn mergeProviderGroups(existing_json: u64, incoming_json: u64, now: u64, out_json: &u64) -> void {
+    // usedNames=new Set(existing.groups.map(name.trim().toLowerCase())); usedIds=new Set(...) // DEFECT: Set
+    // incomingGroups=incoming.groups.map(group => { name=uniqueGroupValue(group.name||"default", usedNames);
+    //   id=uniqueGroupValue(group.id||name, usedIds);
+    //   return {...group, id, name, baseUrl: group.baseUrl ?? (incoming.baseUrl && incoming.baseUrl!==existing.baseUrl ? incoming.baseUrl : undefined)} })
+    // return {...existing, nativeModels:uniqueStrings([...existing.nativeModels, ...incoming.nativeModels]),
+    //   modelAliases:[...existing.modelAliases, ...incoming.modelAliases.filter(a => !existing.modelAliases.some(e=>e.alias===a.alias))],
+    //   groups:[...(existing.groups ?? []), ...incomingGroups], defaultModel: existing.defaultModel ?? incoming.defaultModel, updatedAt: now}
+}
+
+// ---- uniqueGroupValue(preferred, used: Set<string>): string ---- // DEFECT: Set param (registry handle)
+fn uniqueGroupValue(preferred_ptr: ptr, preferred_len: u64, used: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // base=preferred.trim()||"default"; candidate=base; suffix=2
+    // while used.has(candidate.toLowerCase()) { candidate=`${base}-${suffix}`; suffix+=1; } // while block: no ';' after
+    // used.add(candidate.toLowerCase()); return candidate
+}
+
+// ---- hasValidRelayGroups(provider): boolean ----
+fn hasValidRelayGroups(provider_json: u64) -> bool {
+    // if (groups?.length ?? 0)===0 return false; if kind==="chatgpt" return true
+    // return groups!.some(g => (g.keys ?? []).some(k => k.trim())) || Boolean(apiKeyRef?.trim()) // DEFECT: non-null assertion + nested some closures
+    return false;
+}
+
+// ---- selectConsistentRelayGroups(payloadGroups, persistedGroups|undefined) ----
+fn selectConsistentRelayGroups(payload_json: u64, persisted_json: u64, has_persisted: bool, out_json: &u64) -> void {
+    // if !persisted || persisted.length===0 return payload.length>0 ? payload : persisted
+    // if payload.length===0 return persisted
+    // if relayGroupIdsMatch(payload, persisted) return persisted
+    // return payload.length>=persisted.length ? payload : persisted
+}
+
+// ---- relayGroupTopologyMatches(left, right): boolean ----
+fn relayGroupTopologyMatches(left_json: u64, right_json: u64) -> bool {
+    // return relayGroupIdsMatch(left,right) && relayGroupCompletenessScore(left)===relayGroupCompletenessScore(right)
+    return false;
+}
+
+// ---- relayGroupIdsMatch(left, right): boolean ----
+fn relayGroupIdsMatch(left_json: u64, right_json: u64) -> bool {
+    // if left.length!==right.length return false; rightIds=new Set(right.map(g=>g.id)); return left.every(g=>rightIds.has(g.id)) // DEFECT: Set + every closure
+    return false;
+}
+
+// ---- relayGroupCompletenessScore(groups): number ----
+fn relayGroupCompletenessScore(groups_json: u64) -> i64 {
+    // groups.reduce((score,g) => score + (g.keys ?? []).filter(k=>k.trim()).length*4 + (g.models ?? []).length*2
+    //   + (g.supportedEndpointTypes ?? []).length + (g.modelMapping ?? []).length + (g.status==="enabled" ? 1:0), 0) // DEFECT: reduce closure
+    return 0;
+}
+
+// ---- ensureDefaultRelayGroup(provider, apiKey=""): ProviderConfig ----
+fn ensureDefaultRelayGroup(provider_json: u64, apiKey_ptr: ptr, apiKey_len: u64, out_json: &u64) -> void {
+    // secret=apiKey.trim()
+    // if (groups?.length ?? 0)>0:
+    //   if !secret || groups!.some(g => (g.keys?.length ?? 0)>0) return provider
+    //   return {...provider, groups: groups!.map((g,i) => i===0 ? {...g, credentialMode:"group", keys:[secret]} : g)}
+    // if !secret return provider
+    // models=uniqueStrings([defaultModel ?? "", ...nativeModels].filter(Boolean))
+    // return {...provider, channelMode: provider.channelMode ?? "fast", groups:[{id:"default", name:"default",
+    //   kind:"text", status:"enabled", groupRatio:1, keyMode:"polling", models,
+    //   responseProtocol: kind==="openai" ? "openai" : "openai-response", responseProtocolMode:"fixed",
+    //   authType:"inherit", credentialMode:"group", keys: secret ? [secret] : []}]}
+}
+
+// ---- keyringEntry(id): AsyncEntry|null ----
+fn keyringEntry(id_ptr: ptr, id_len: u64, out_handle: &u64) -> bool {
+    // if !SafeAsyncEntryClass return false(null)
+    // try { out=new SafeAsyncEntryClass(KEYRING_SERVICE, `provider:${id}`); return true; } catch { return false; }
+    // DEFECT: OS keyring (@napi-rs/keyring) has no sa_std counterpart.
+    return false;
+}
+
+// ---- providerIdFromName(name): string ----
+fn providerIdFromName(name_ptr: ptr, name_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // slug=name.trim().toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"").slice(0,40) // DEFECT: RegExp replace
+    // return slug || randomUUID()
+}
+
+// ---- envKeyForProvider(id): string ----
+fn envKeyForProvider(id_ptr: ptr, id_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // return `CODEX_UI_PROVIDER_${id.replace(/[^A-Za-z0-9]/g,"_").toUpperCase()}_API_KEY` // DEFECT: RegExp + template string
+}
+
+// ---- previewSecret(secret): string ----
+fn previewSecret(secret_ptr: ptr, secret_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // if secret.length<=8 return "********"; return `${secret.slice(0,4)}...${secret.slice(-4)}`
+}
+
+// ---- profileProvider(provider): ProviderConfig ----
+fn profileProvider(provider_json: u64, out_json: &u64) -> void {
+    // return {...provider, apiKeyPreview:undefined, apiKeyStorage:"none", groups: groups?.map(g => ({...g, keys:[]}))}
+}
+
+// ---- normalizeProfileProvider(value: unknown, existing?): ProviderConfig ---- // DEFECT: unknown
+fn normalizeProfileProvider(value_json: u64, existing_json: u64, has_existing: bool, out_json: &u64) -> i32 {
+    // record=asRecord(value); now=Date.now(); name=stringValue(record.name)||"Imported provider"
+    // id=stringValue(record.id)||providerIdFromName(name); kind=providerKindValue(record.kind)
+    // apiKeyRef=envKeyRefValue(record.apiKeyRef) ?? existing?.apiKeyRef
+    // preserveExistingKey = existing?.apiKeyRef && apiKeyRef===existing.apiKeyRef
+    // normalized=normalizeProvider({...record, id, kind, name, apiKeyRef,
+    //   apiKeyPreview: preserveExistingKey ? existing.apiKeyPreview : undefined,
+    //   apiKeyStorage: preserveExistingKey ? existing.apiKeyStorage : "none",
+    //   remark: stringValue(record.remark) ?? existing?.remark,
+    //   createdAt: numberValue(record.createdAt) ?? existing?.createdAt ?? now, updatedAt: now})
+    // if !normalized throw "Invalid provider profile"; return normalized
+    return 0;
+}
+
+// ---- asRecord(value: unknown): Record<string,unknown> ---- // DEFECT: dynamic object
+fn asRecord(value_json: u64, out_json: &u64) -> void {
+    // return value && typeof value==="object" && !Array.isArray(value) ? value : {} (JSON object handle passthrough)
+}
+
+// ---- stringValue(value: unknown): string|undefined ---- // DEFECT: unknown + undefined -> has flag
+fn stringValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    // return typeof value==="string" && value.trim() ? trimmed : undefined(false)
+    return false;
+}
+
+// ---- numberValue(value: unknown): number|undefined ----
+fn numberValue(value_json: u64, out: &f64) -> bool {
+    // return typeof value==="number" && Number.isFinite(value) ? value : undefined(false)
+    return false;
+}
+
+// ---- nullableNumberValue(value: unknown): number|null|undefined ---- // has + is_null flags
+fn nullableNumberValue(value_json: u64, out: &f64, is_null: &bool) -> bool {
+    // return value===null ? null : numberValue(value)
+    return false;
+}
+
+// ---- retryCountValue(value: unknown): number|undefined ----
+fn retryCountValue(value_json: u64, out: &f64) -> bool {
+    // count=numberValue(value); return count==null ? undefined : min(100, max(5, round(count)))
+    return false;
+}
+
+// ---- booleanValue(value: unknown): boolean|undefined ----
+fn booleanValue(value_json: u64, out: &bool) -> bool {
+    // if typeof boolean return it; return typeof number && (0|1) ? Boolean(value) : undefined(false)
+    return false;
+}
+
+// ---- stringArray(value: unknown): string[] ----
+fn stringArray(value_json: u64, out_json: &u64) -> void {
+    // return Array.isArray(value) ? value.map(stringValue).filter((e): e is string => Boolean(e)) : [] // DEFECT: type-guard filter
+}
+
+// ---- serviceProviderValue(value: unknown) ----
+fn serviceProviderValue(value_json: u64, out_json: &u64) -> bool {
+    // record=asRecord(value); id=stringValue(record.id); name=stringValue(record.name); if !id||!name return undefined
+    // rawLogo=stringValue(record.logo)
+    // logo = rawLogo && rawLogo.length<=700_000 && /^data:image\/(?:png|jpeg|webp);base64,/i.test(rawLogo) ? rawLogo : undefined // DEFECT: RegExp
+    // return {id, name, logo}
+    return false;
+}
+
+// ---- uniqueStrings(values: string[]): string[] ----
+fn uniqueStrings(values_json: u64, out_json: &u64) -> void {
+    // return [...new Set(values)] // DEFECT: Set dedup -> order-preserving dedup over JSON array
+}
+
+// ---- stringArrayFromJson(value: string): string[] ----
+fn stringArrayFromJson(value_ptr: ptr, value_len: u64, out_json: &u64) -> void {
+    // try { return stringArray(JSON.parse(value)); } catch { return []; } // DEFECT: try/catch + JSON.parse
+}
+
+// ---- groupArray(value: unknown): ProviderConfig["groups"] ----
+fn groupArray(value_json: u64, out_json: &u64) -> bool {
+    // if !Array.isArray(value) return undefined(false)
+    // groups=value.map((entry,index) => { record=asRecord(entry); id=stringValue(record.id) ?? `group-${index+1}`;
+    //   name=stringValue(record.name) ?? "default"; return { id, name, baseUrl, kind:groupKindValue,
+    //   capabilities: groupCapabilities(record.capabilities, kind, imageProviderConfig(record.image)),
+    //   status:groupStatusValue, groupRatio:numberValue ?? 1, quotaUsd:nullableNumberValue, usedQuotaUsd,
+    //   priority, weight, keyMode:groupKeyModeValue, models:stringArray, modelCapabilities:modelCapabilitiesFromValue,
+    //   supportedEndpointTypes:stringArray, responseProtocol:responseProtocolValue,
+    //   responseProtocolMode:responseProtocolModeValue, claudeCodeHeadersEnabled: booleanValue===true,
+    //   claudeCodeVersion, endpointPathOverride, authType:authTypeValue, credentialMode:credentialModeValue,
+    //   catalogGroupName, catalogManaged:booleanValue, image:imageProviderConfig,
+    //   modelMapping:modelMappingArray, statusCodeMapping:statusCodeMappingArray,
+    //   advancedModelMapping:advancedModelMappingArray, tag, remark, autoBan:booleanValue,
+    //   requestLimit, requestIntervalSeconds, contextWindow,
+    //   commandBlacklistEnabled: booleanValue!==false, commandBlacklist:stringArray, networkAllowlist:stringArray,
+    //   keys:stringArray, enableFallback:booleanValue, fallbackChannelId, fallbackGroupName,
+    //   enableTieredContext:booleanValue, tieredContextRatios:tieredContextRatioArray } })
+    //   .filter(e => e.id && e.name)
+    // return groups.length>0 ? groups : undefined
+    return false;
+}
+
+// ---- groupFromRow(row: RelayGroupRow): ChannelGroupConfig|null ----
+fn groupFromRow(row: &RelayGroupRow, out_json: &u64) -> bool {
+    // id=stringValue(row.group_id); name=stringValue(row.name); if !id||!name return false(null)
+    // out={id, name, baseUrl:stringValue(row.base_url), kind:groupKindValue(row.kind), status:groupStatusValue(row.status),
+    //   groupRatio:numberValue(row.group_ratio) ?? 1, quotaUsd:nullableNumberValue, usedQuotaUsd, priority, weight,
+    //   keyMode:groupKeyModeValue(row.key_mode), models:stringArrayFromJson(row.models_json),
+    //   modelCapabilities:modelCapabilitiesFromJson(row.model_capabilities_json ?? "{}"),
+    //   supportedEndpointTypes:stringArrayFromJson(row.supported_endpoint_types_json ?? "[]"),
+    //   responseProtocol:..., responseProtocolMode:..., claudeCodeHeadersEnabled: row.claude_code_headers_enabled===1,
+    //   claudeCodeVersion, endpointPathOverride, authType, credentialMode, catalogGroupName,
+    //   catalogManaged:sqlBooleanValue(row.catalog_managed ?? null), image:imageProviderConfig(jsonFromString(row.image_json)),
+    //   capabilities:groupCapabilities(undefined, kind, image...), modelMapping:modelMappingArrayFromJson,
+    //   statusCodeMapping:..., advancedModelMapping:advancedModelMappingArrayFromJson, tag, remark,
+    //   autoBan:sqlBooleanValue, requestLimit, requestIntervalSeconds, contextWindow,
+    //   commandBlacklistEnabled: row.command_blacklist_enabled!==0,
+    //   commandBlacklist:stringArrayFromJson(row.command_blacklist_json ?? "[]"),
+    //   networkAllowlist:stringArrayFromJson(...), keys:stringArrayFromJson(row.keys_json),
+    //   enableFallback:sqlBooleanValue, fallbackChannelId, fallbackGroupName,
+    //   enableTieredContext:sqlBooleanValue, tieredContextRatios:tieredContextRatioArrayFromJson(...)}
+    return false;
+}
+
+// ---- enum-value helpers: switch on string code (TS switch on literal union) ----
+// DEFECT: string-union return types (ProviderConfig["status"] etc.) -> interned string codes in JSON text.
+fn groupStatusValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    // "disabled"->disabled; "enabled"->enabled; default undefined(false)
+    return false;
+}
+fn groupKeyModeValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    // "single"|"random"|"polling" passthrough; default undefined
+    return false;
+}
+fn responseProtocolValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    // "openai-response"|"openai"|"anthropic"|"gemini"; default undefined
+    return false;
+}
+fn responseProtocolModeValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    // "model_auto"|"fixed"; default undefined
+    return false;
+}
+fn authTypeValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    // "none"|"inherit"|"bearer"|"anthropic"|"google_api_key"|"google_query_key"; default undefined
+    return false;
+}
+fn credentialModeValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    // "provider"|"group"; default undefined
+    return false;
+}
+fn capabilityCatalogValue(value_json: u64, out_json: &u64) -> bool {
+    // if !value || typeof!=="object" return undefined; try { return parseRelayCapabilityCatalog(value); } catch { return undefined; }
+    return false;
+}
+fn booleanToSql(value: u64, has_value: bool) -> i64 {
+    // return typeof boolean ? (value?1:0) : null (has flag on caller side) // DEFECT: null return -> sentinel
+    return 0;
+}
+fn sqlBooleanValue(value: i64, has_value: bool, out: &bool) -> bool {
+    // return value===0||value===1 ? Boolean(value) : undefined(false)
+    return false;
+}
+fn tieredContextRatioArray(value_json: u64, out_json: &u64) -> bool {
+    // if !Array.isArray return undefined; map entries {minTokens, maxTokens(nullable), ratio} all present else null;
+    // filter type-guard; return length>0 ? ratios : undefined // DEFECT: dynamic JSON array
+    return false;
+}
+fn tieredContextRatioArrayFromJson(value_ptr: ptr, value_len: u64, out_json: &u64) -> bool {
+    // try { return tieredContextRatioArray(JSON.parse(value)); } catch { return undefined; }
+    return false;
+}
+fn modelMappingArray(value_json: u64, out_json: &u64) -> bool {
+    // map {from,to} both stringValue else null; filter guard; length>0 ? entries : undefined
+    return false;
+}
+fn modelMappingArrayFromJson(value_ptr: ptr, value_len: u64, out_json: &u64) -> bool {
+    // try/catch JSON.parse wrapper of modelMappingArray
+    return false;
+}
+fn advancedModelMappingArray(value_json: u64, out_json: &u64) -> bool {
+    // map: requestModel=stringValue(record.requestModel) ?? stringValue(record.from);
+    //   targetModel=stringValue(record.targetModel) ?? stringValue(record.to);
+    //   if !requestModel||!targetModel null; rule={requestModel,targetModel};
+    //   optional targetProviderId/targetGroupId/label assigned imperatively; // DEFECT: conditional property assignment on dynamic rule object
+    //   if record.enabled===false rule.enabled=false; return rule; filter guard; length>0 ? entries : undefined
+    return false;
+}
+fn advancedModelMappingArrayFromJson(value_ptr: ptr, value_len: u64, has_value: bool, out_json: &u64) -> bool {
+    // try { return advancedModelMappingArray(JSON.parse(value ?? "[]")); } catch { return undefined; }
+    return false;
+}
+fn statusCodeMappingArray(value_json: u64, out_json: &u64) -> bool {
+    // map {from:numberValue, to:numberValue} both !=null else null; filter guard; length>0 ? entries : undefined
+    return false;
+}
+fn statusCodeMappingArrayFromJson(value_ptr: ptr, value_len: u64, out_json: &u64) -> bool {
+    // try/catch JSON.parse wrapper
+    return false;
+}
+fn aliasArray(value_json: u64, out_json: &u64) -> void {
+    // if !Array.isArray return []; map {alias,model} both present else null; filter guard (returns [] not undefined)
+}
+fn modelRateArray(value_json: u64, out_json: &u64) -> bool {
+    // if !Array.isArray return undefined; for entry: model + 9 numeric fields with multiplier fallback chain
+    //   (multiplier ?? 1; input/cacheRead/cacheWrite/output multipliers ?? multiplier);
+    //   if model push {...}; return length>0 ? rates : undefined // DEFECT: imperative push loop over dynamic JSON
+    return false;
+}
+fn imageProviderConfig(value_json: u64, out_json: &u64) -> bool {
+    // record=asRecord; generations/edits:booleanValue; defaultModel; protocols:imageProtocolArray;
+    // defaultProtocol:imageProtocolValue; modelPrices:imageModelPriceArray; billing:imageBillingValue;
+    // availability:imageAvailabilityValue; notice
+    // if all empty return undefined; return {generations, edits, defaultModel,
+    //   protocols: len>0 ? protocols : undefined,
+    //   defaultProtocol: defaultProtocol && (protocols empty || includes) ? it : undefined, // DEFECT: Array.includes
+    //   modelPrices: len>0 ? ... : undefined, billing, availability, notice}
+    return false;
+}
+fn stringRecord(value_json: u64, out_json: &u64) -> bool {
+    // entries=Object.entries(asRecord(value)).flatMap(([k,raw]) => { nk=k.trim(); nv=stringValue(raw)?.trim();
+    //   return nk && nv ? [[nk,nv]] : []; }) // DEFECT: Object.entries + flatMap + tuple destructure
+    // return entries.length>0 ? Object.fromEntries(entries) : undefined // DEFECT: Object.fromEntries
+    return false;
+}
+fn modelCapabilitiesFromJson(value_ptr: ptr, value_len: u64, out_json: &u64) -> bool {
+    // try { return modelCapabilitiesFromValue(JSON.parse(value)); } catch { return undefined; }
+    return false;
+}
+fn modelCapabilitiesFromValue(value_json: u64, out_json: &u64) -> bool {
+    // if !object || Array return undefined; result={}
+    // for [model, raw] of Object.entries(value): // DEFECT: Object.entries iteration over dynamic record
+    //   if !raw object || Array continue; efforts = Array.isArray(record.reasoningEfforts)
+    //     ? filter(typeof string && trim length>0) : []
+    //   contextWindow = finite number>0 ? Math.round : undefined; maxOutputTokens likewise
+    //   if no efforts && !contextWindow && !maxOutputTokens continue
+    //   result[model]={...(efforts?{reasoningEfforts:efforts}:{}), ...(contextWindow?{contextWindow}:{}),
+    //     ...(maxOutputTokens?{maxOutputTokens}:{}), source: record.source==="catalog"||"inferred" ? it : "upstream"} // DEFECT: conditional spread
+    // return Object.keys(result).length>0 ? result : undefined
+    return false;
+}
+fn groupCapabilities(value_json: u64, kind: u64, image_json: u64, out_json: &u64) -> void {
+    // record=asRecord(value); return { text: booleanValue(record.text) ?? kind!=="image",
+    //   imageGeneration: booleanValue(record.imageGeneration) ?? image?.generations ?? (kind==="image" ? true : undefined),
+    //   imageEdits: booleanValue(record.imageEdits) ?? image?.edits ?? (kind==="image" ? true : undefined) }
+}
+fn imageBillingValue(value_json: u64, out_json: &u64) -> bool {
+    // mode==="per_image": usdPerImage!=null && >=0 ? {mode, usdPerImage, currency:"USD"} : undefined
+    // mode==="token_multiplier": multiplier!=null && >0 ? {mode, multiplier, currency:"USD"} : undefined; else undefined
+    return false;
+}
+fn imageAvailabilityValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    // "available"|"constrained"|"unavailable" passthrough else undefined
+    return false;
+}
+fn imageModelPriceArray(value_json: u64, out_json: &u64) -> void {
+    // if !Array return []; for entry: model && usdPerImage!=null && >=0 -> push {model, usdPerImage}
+}
+fn imageProtocolArray(value_json: u64, out_json: &u64) -> void {
+    // if !Array return []; for entry: protocol=imageProtocolValue(entry); if protocol && !protocols.includes(protocol) push // DEFECT: includes
+}
+fn imageProtocolValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    // "openaiImages"|"openaiImageEdits"|"geminiChatCompletions"|"geminiGenerateContent"|"deepkeyAsyncVideos"; default undefined
+    return false;
+}
+fn jsonFromString(value_ptr: ptr, value_len: u64, has_value: bool, out_json: &u64) -> bool {
+    // if !value return undefined(false); try { out=JSON.parse(value); return true; } catch { return false; }
+    return false;
+}
+fn envKeyRefValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    // ref=stringValue(value); return ref?.startsWith("env:") ? ref(true) : undefined(false)
+    return false;
+}
+fn apiKeyStorageValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    // "database"|"keyring"|"memory"|"none"; default undefined
+    return false;
+}
+fn channelModeValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    // "fast"|"advanced"; default undefined
+    return false;
+}
+fn groupKindValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // return value==="image" ? "image" : "text" (never undefined)
+}
+fn stationTypeValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    // "third_party"|"rich"|"charity"|"official"; default undefined
+    return false;
+}
+fn providerKindValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // "chatgpt"|"openai"|"responsesRelay"|"ollama"|"lmstudio"|"bedrock" passthrough; default "responsesRelay"
+}

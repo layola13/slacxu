@@ -1,0 +1,459 @@
+// Converted 1:1 from packages/cxu/src/serve.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/io/print.sai"
+@import "sa_std/ptr.sa"
+@import "cli-doctor.sla"
+@import "server-build.sla"
+
+// TS imports: spawn/ChildProcess (node:child_process),
+// chmodSync/existsSync/rmSync (node:fs), dirname/join (node:path),
+// fileURLToPath (node:url), doctor, ensureServerBinary.
+// DEFECT: child process events (on error/exit) + Promise await ->
+// blocking spawn + sa_std_process_wait; env object spread ->
+// fixed key/value table (EnvTable) with set-if-absent semantics.
+
+struct SBuf {
+    bytes: [u8; 4096],
+    len: u64,
+}
+
+fn sb_reset(b: &SBuf) -> void { b.len = 0; }
+
+fn sb_append(b: &SBuf, src_ptr: ptr, src_len: u64) -> void {
+    for i in 0..src_len {
+        if b.len < 4096 {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, src_ptr, i);
+            b.bytes[b.len] = c;
+            b.len = b.len + 1;
+        };
+    }
+}
+
+fn sb_append_buf(b: &SBuf, src: &SBuf) -> void {
+    for i in 0..src.len {
+        if b.len < 4096 {
+            b.bytes[b.len] = src.bytes[i];
+            b.len = b.len + 1;
+        };
+    }
+}
+
+fn sb_eq(b: &SBuf, s_ptr: ptr, s_len: u64) -> bool {
+    if b.len != s_len { return false; };
+    for i in 0..s_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, s_ptr, i);
+        if b.bytes[i] != c { return false; };
+    }
+    return true;
+}
+
+fn sb_starts_with(b: &SBuf, s_ptr: ptr, s_len: u64) -> bool {
+    if b.len < s_len { return false; };
+    for i in 0..s_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, s_ptr, i);
+        if b.bytes[i] != c { return false; };
+    }
+    return true;
+}
+
+fn sb_trimmed_len(b: &SBuf) -> u64 {
+    let lo: u64 = 0;
+    let hi = b.len;
+    while lo < hi {
+        let c = b.bytes[lo];
+        if c != 32 && c != 9 && c != 10 && c != 13 { break; };
+        lo = lo + 1;
+    }
+    while hi > lo {
+        let c = b.bytes[hi - 1];
+        if c != 32 && c != 9 && c != 10 && c != 13 { break; };
+        hi = hi - 1;
+    }
+    return hi - lo;
+}
+
+fn sb_all_digits(b: &SBuf) -> bool {
+    if b.len == 0 { return false; };
+    for i in 0..b.len {
+        if b.bytes[i] < 48 || b.bytes[i] > 57 { return false; };
+    }
+    return true;
+}
+
+// dirname: strip last path segment (approximation of node:path).
+fn sb_dirname(out: &SBuf, p: &SBuf) -> void {
+    sb_reset(out);
+    let cut: u64 = 0;
+    let i: u64 = 0;
+    while i < p.len {
+        if p.bytes[i] == 47 { cut = i; };
+        i = i + 1;
+    }
+    for j in 0..cut {
+        if out.len < 4096 {
+            out.bytes[out.len] = p.bytes[j];
+            out.len = out.len + 1;
+        };
+    }
+}
+
+fn sb_join2(out: &SBuf, a: &SBuf, b_ptr: ptr, b_len: u64) -> void {
+    sb_reset(out);
+    sb_append_buf(out, a);
+    if out.len > 0 && out.bytes[out.len - 1] != 47 { sb_append(out, STR_PTR("/"), STR_LEN("/")); };
+    sb_append(out, b_ptr, b_len);
+}
+
+fn fs_exists(p: &SBuf) -> bool {
+    let total: u64 = 0;
+    return sa_std_fs_len(&p.bytes, p.len, &total) == 0;
+}
+
+// --- env table ({ ...process.env } approximation) ---
+struct EnvEntry {
+    key: SBuf,
+    val: SBuf,
+}
+
+struct EnvTable {
+    entries: [EnvEntry; 64],
+    count: u64,
+}
+
+fn env_get(t: &EnvTable, key_ptr: ptr, key_len: u64, out: &SBuf) -> bool {
+    for i in 0..t.count {
+        if sb_eq(&t.entries[i].key, key_ptr, key_len) {
+            sb_reset(out);
+            sb_append_buf(out, &t.entries[i].val);
+            return true;
+        };
+    }
+    return false;
+}
+
+fn env_set(t: &EnvTable, key_ptr: ptr, key_len: u64, val: &SBuf) -> void {
+    for i in 0..t.count {
+        if sb_eq(&t.entries[i].key, key_ptr, key_len) {
+            t.entries[i].val = *val;
+            return;
+        };
+    }
+    if t.count < 64 {
+        sb_reset(&t.entries[t.count].key);
+        sb_append(&t.entries[t.count].key, key_ptr, key_len);
+        t.entries[t.count].val = *val;
+        t.count = t.count + 1;
+    };
+}
+
+fn env_set_if_absent(t: &EnvTable, key_ptr: ptr, key_len: u64, val: &SBuf) -> void {
+    let probe = SBuf { bytes: [0u8; 4096], len: 0 };
+    if !env_get(t, key_ptr, key_len, &probe) {
+        env_set(t, key_ptr, key_len, val);
+    };
+}
+
+// serveHelp(): void — the console.log lines, verbatim.
+fn serveHelp() -> void {
+    println("cxu: start the codex-ultra workbench (server + web UI).");
+    println("  cxu [PORT] [--no-prompt]  Start the server (e.g. `cxu 43110`)");
+    println("  cxu serve [--port N] [--data-dir DIR]   Start with options");
+    println("  cxu doctor [--yes|--all] [--no-prompt]  Check CLIs; prompt a/s/m when missing");
+    println("  cxu install [tool] [--yes] Print or run official installers");
+    println("  cxu --help, -h            Show this help");
+    println("  cxu --version, -v         Print installed version");
+    println("");
+    println("Doctor tools: bun + codex/claude/agy/grok/pi/opencode [optional] + MiniAgent [BUILTIN].");
+    println("Missing tools offer: [a]uto-install, [s]kip, [m]anual commands.");
+    println("The server is compiled locally with Bun on first run (one-time per version).");
+}
+
+// parseServeArgs(rawArgs: string[]) ->
+//   { port?: string; host?: string; dataDir?: string; passthrough: string[] }
+// DEFECT: dynamic string array -> fixed argv table of SBuf; optionals
+// carry has_* flags.
+struct ServeArgs {
+    has_port: bool,
+    port: SBuf,
+    has_host: bool,
+    host: SBuf,
+    has_data_dir: bool,
+    data_dir: SBuf,
+    passthrough: [SBuf; 32],
+    passthrough_count: u64,
+}
+
+fn parseServeArgs(argv: &[SBuf; 32], argc: u64, out: &ServeArgs) -> void {
+    out.has_port = false;
+    out.has_host = false;
+    out.has_data_dir = false;
+    out.passthrough_count = 0;
+    let index: u64 = 0;
+    while index < argc {
+        let arg = &argv[index];
+        if (sb_eq(arg, STR_PTR("--port"), STR_LEN("--port")) || sb_eq(arg, STR_PTR("-p"), STR_LEN("-p"))) && index + 1 < argc {
+            index = index + 1;
+            out.port = argv[index];
+            out.has_port = true;
+        } else if sb_starts_with(arg, STR_PTR("--port="), STR_LEN("--port=")) {
+            sb_slice_from(&out.port, arg, 7);
+            out.has_port = true;
+        } else if sb_eq(arg, STR_PTR("--host"), STR_LEN("--host")) && index + 1 < argc {
+            index = index + 1;
+            out.host = argv[index];
+            out.has_host = true;
+        } else if sb_starts_with(arg, STR_PTR("--host="), STR_LEN("--host=")) {
+            sb_slice_from(&out.host, arg, 7);
+            out.has_host = true;
+        } else if sb_eq(arg, STR_PTR("--data-dir"), STR_LEN("--data-dir")) && index + 1 < argc {
+            index = index + 1;
+            out.data_dir = argv[index];
+            out.has_data_dir = true;
+        } else if sb_starts_with(arg, STR_PTR("--data-dir="), STR_LEN("--data-dir=")) {
+            sb_slice_from(&out.data_dir, arg, 11);
+            out.has_data_dir = true;
+        } else if sb_eq(arg, STR_PTR("--no-prompt"), STR_LEN("--no-prompt")) {
+            // already handled in doctor check before runServe
+        } else if sb_all_digits(arg) && !out.has_port {
+            out.port = *arg;
+            out.has_port = true;
+        } else {
+            if out.passthrough_count < 32 {
+                out.passthrough[out.passthrough_count] = *arg;
+                out.passthrough_count = out.passthrough_count + 1;
+            };
+        };
+        index = index + 1;
+    }
+}
+
+fn sb_slice_from(out: &SBuf, src: &SBuf, from: u64) -> void {
+    sb_reset(out);
+    let i = from;
+    while i < src.len {
+        if out.len < 4096 {
+            out.bytes[out.len] = src.bytes[i];
+            out.len = out.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+// runServe(rawArgs: string[]) -> Promise<number>
+// DEFECT: async -> synchronous; spawn "error"/"exit" events -> spawn
+// status + sa_std_process_wait; the EFTYPE/ENOEXEC fallback respawn
+// is sequentialized in spawnServerWithFallback below.
+// pkgDir/module-url inputs (dirname(dirname(fileURLToPath(import.meta.url))))
+// and the inherited env are passed in by the caller.
+fn runServe(argv: &[SBuf; 32], argc: u64, pkg_dir: &SBuf, exec_path: &SBuf, env: &EnvTable) -> i32 {
+    let args = ServeArgs {
+        has_port: false, port: SBuf { bytes: [0u8; 4096], len: 0 },
+        has_host: false, host: SBuf { bytes: [0u8; 4096], len: 0 },
+        has_data_dir: false, data_dir: SBuf { bytes: [0u8; 4096], len: 0 },
+        passthrough: [SBuf { bytes: [0u8; 4096], len: 0 }; 32], passthrough_count: 0,
+    };
+    parseServeArgs(argv, argc, &args);
+    let server = EnsureServerBinaryResult { ok: false, hint_bytes: [0u8; 512], hint_len: 0, exe_path: SBuf { bytes: [0u8; 4096], len: 0 }, is_node_script: false, has_script_path: false, script_path: SBuf { bytes: [0u8; 4096], len: 0 }, has_bundle_path: false, bundle_path: SBuf { bytes: [0u8; 4096], len: 0 } };
+    ensureServerBinary(&server);
+    if !server.ok {
+        // console.error(server.hint)
+        sa_print_bytes(&server.hint_bytes, server.hint_len);
+        println("");
+        return 1;
+    };
+    let exePath = server.exe_path;
+    let isNode = server.is_node_script && server.has_script_path;
+    // const hostWebDist = join(pkgDir, "web-dist");
+    let hostWebDist = SBuf { bytes: [0u8; 4096], len: 0 };
+    sb_join2(&hostWebDist, pkg_dir, STR_PTR("web-dist"), STR_LEN("web-dist"));
+    // if (!env.CODEX_UI_WEB_DIST) { if (existsSync(join(hostWebDist,"index.html"))) env... = hostWebDist }
+    let probe = SBuf { bytes: [0u8; 4096], len: 0 };
+    if !env_get(env, STR_PTR("CODEX_UI_WEB_DIST"), STR_LEN("CODEX_UI_WEB_DIST"), &probe) || probe.len == 0 {
+        let idx = SBuf { bytes: [0u8; 4096], len: 0 };
+        sb_join2(&idx, &hostWebDist, STR_PTR("index.html"), STR_LEN("index.html"));
+        if fs_exists(&idx) {
+            env_set(env, STR_PTR("CODEX_UI_WEB_DIST"), STR_LEN("CODEX_UI_WEB_DIST"), &hostWebDist);
+        };
+    };
+    // if (!env.CODEX_UI_PI_RELAY_EXTENSION): candidates
+    //   join(pkgDir,"extensions","pi-relay"),
+    //   join(pkgDir,"server-bundle","extensions","pi-relay"),
+    //   join(dirname(exePath),"extensions","pi-relay")
+    // found = first with existsSync(join(c,"index.js"))
+    if !env_get(env, STR_PTR("CODEX_UI_PI_RELAY_EXTENSION"), STR_LEN("CODEX_UI_PI_RELAY_EXTENSION"), &probe) || probe.len == 0 {
+        let c1 = SBuf { bytes: [0u8; 4096], len: 0 };
+        sb_join2(&c1, pkg_dir, STR_PTR("extensions/pi-relay"), STR_LEN("extensions/pi-relay"));
+        let exe_dir = SBuf { bytes: [0u8; 4096], len: 0 };
+        sb_dirname(&exe_dir, &exePath);
+        let c3 = SBuf { bytes: [0u8; 4096], len: 0 };
+        sb_join2(&c3, &exe_dir, STR_PTR("extensions/pi-relay"), STR_LEN("extensions/pi-relay"));
+        let c2 = SBuf { bytes: [0u8; 4096], len: 0 };
+        sb_join2(&c2, pkg_dir, STR_PTR("server-bundle/extensions/pi-relay"), STR_LEN("server-bundle/extensions/pi-relay"));
+        let found = SBuf { bytes: [0u8; 4096], len: 0 };
+        let has_found = false;
+        if candidateHasFile(&c1, STR_PTR("index.js"), STR_LEN("index.js")) { found = c1; has_found = true; }
+        else if candidateHasFile(&c2, STR_PTR("index.js"), STR_LEN("index.js")) { found = c2; has_found = true; }
+        else if candidateHasFile(&c3, STR_PTR("index.js"), STR_LEN("index.js")) { found = c3; has_found = true; };
+        if has_found {
+            env_set(env, STR_PTR("CODEX_UI_PI_RELAY_EXTENSION"), STR_LEN("CODEX_UI_PI_RELAY_EXTENSION"), &found);
+        };
+    };
+    // if (!env.SA_VM_MCP_SOURCE_PATH): candidates sa-vm-mcp.mjs under
+    // server-bundle / scripts / dirname(exePath); existsSync(c) direct.
+    if !env_get(env, STR_PTR("SA_VM_MCP_SOURCE_PATH"), STR_LEN("SA_VM_MCP_SOURCE_PATH"), &probe) || probe.len == 0 {
+        let m1 = SBuf { bytes: [0u8; 4096], len: 0 };
+        sb_join2(&m1, pkg_dir, STR_PTR("server-bundle/sa-vm-mcp.mjs"), STR_LEN("server-bundle/sa-vm-mcp.mjs"));
+        let m2 = SBuf { bytes: [0u8; 4096], len: 0 };
+        sb_join2(&m2, pkg_dir, STR_PTR("scripts/sa-vm-mcp.mjs"), STR_LEN("scripts/sa-vm-mcp.mjs"));
+        let exe_dir2 = SBuf { bytes: [0u8; 4096], len: 0 };
+        sb_dirname(&exe_dir2, &exePath);
+        let m3 = SBuf { bytes: [0u8; 4096], len: 0 };
+        sb_join2(&m3, &exe_dir2, STR_PTR("sa-vm-mcp.mjs"), STR_LEN("sa-vm-mcp.mjs"));
+        let found = SBuf { bytes: [0u8; 4096], len: 0 };
+        let has_found = false;
+        if fs_exists(&m1) { found = m1; has_found = true; }
+        else if fs_exists(&m2) { found = m2; has_found = true; }
+        else if fs_exists(&m3) { found = m3; has_found = true; };
+        if has_found {
+            env_set(env, STR_PTR("SA_VM_MCP_SOURCE_PATH"), STR_LEN("SA_VM_MCP_SOURCE_PATH"), &found);
+        };
+    };
+    // if (!env.CODEX_UI_LEGAL_DIR): candidates join(pkgDir,"legal"),
+    // pkgDir, join(dirname(exePath),"legal"), dirname(exePath);
+    // found = first with existsSync(join(c,"PRIVACY.md"))
+    if !env_get(env, STR_PTR("CODEX_UI_LEGAL_DIR"), STR_LEN("CODEX_UI_LEGAL_DIR"), &probe) || probe.len == 0 {
+        let l1 = SBuf { bytes: [0u8; 4096], len: 0 };
+        sb_join2(&l1, pkg_dir, STR_PTR("legal"), STR_LEN("legal"));
+        let exe_dir3 = SBuf { bytes: [0u8; 4096], len: 0 };
+        sb_dirname(&exe_dir3, &exePath);
+        let l3 = SBuf { bytes: [0u8; 4096], len: 0 };
+        sb_join2(&l3, &exe_dir3, STR_PTR("legal"), STR_LEN("legal"));
+        let found = SBuf { bytes: [0u8; 4096], len: 0 };
+        let has_found = false;
+        if candidateHasFile(&l1, STR_PTR("PRIVACY.md"), STR_LEN("PRIVACY.md")) { found = l1; has_found = true; }
+        else if candidateHasFile(pkg_dir, STR_PTR("PRIVACY.md"), STR_LEN("PRIVACY.md")) { found = *pkg_dir; has_found = true; }
+        else if candidateHasFile(&l3, STR_PTR("PRIVACY.md"), STR_LEN("PRIVACY.md")) { found = l3; has_found = true; }
+        else if candidateHasFile(&exe_dir3, STR_PTR("PRIVACY.md"), STR_LEN("PRIVACY.md")) { found = exe_dir3; has_found = true; };
+        if has_found {
+            env_set(env, STR_PTR("CODEX_UI_LEGAL_DIR"), STR_LEN("CODEX_UI_LEGAL_DIR"), &found);
+        };
+    };
+    // if (port && !env.CODEX_UI_PORT) env.CODEX_UI_PORT = port; (host, dataDir likewise)
+    if args.has_port { env_set_if_absent(env, STR_PTR("CODEX_UI_PORT"), STR_LEN("CODEX_UI_PORT"), &args.port); };
+    if args.has_host { env_set_if_absent(env, STR_PTR("CODEX_UI_HOST"), STR_LEN("CODEX_UI_HOST"), &args.host); };
+    if args.has_data_dir { env_set_if_absent(env, STR_PTR("CODEX_UI_DATA_DIR"), STR_LEN("CODEX_UI_DATA_DIR"), &args.data_dir); };
+    // if (!env.CODEX_BIN || !env.CODEX_UI_CODEX_AVAILABLE) { doctor() ... }
+    let bin_probe = SBuf { bytes: [0u8; 4096], len: 0 };
+    let avail_probe = SBuf { bytes: [0u8; 4096], len: 0 };
+    let has_bin = env_get(env, STR_PTR("CODEX_BIN"), STR_LEN("CODEX_BIN"), &bin_probe) && bin_probe.len > 0;
+    let has_avail = env_get(env, STR_PTR("CODEX_UI_CODEX_AVAILABLE"), STR_LEN("CODEX_UI_CODEX_AVAILABLE"), &avail_probe) && avail_probe.len > 0;
+    if !has_bin || !has_avail {
+        // DEFECT: doctor() report shape comes from cli-doctor.sla;
+        // the codex status is extracted via the helper below whose
+        // field layout follows the TS DoctorStatus usage.
+        let cpath = SBuf { bytes: [0u8; 4096], len: 0 };
+        let cfound = false;
+        let cversion = false;
+        let has_status = doctorCodexStatus(&cpath, &cfound, &cversion);
+        if has_status {
+            if !has_bin && cfound {
+                env_set(env, STR_PTR("CODEX_BIN"), STR_LEN("CODEX_BIN"), &cpath);
+            };
+            if !has_avail {
+                let v = SBuf { bytes: [0u8; 4096], len: 0 };
+                if cfound && cversion { sb_append(&v, STR_PTR("1"), STR_LEN("1")); } else { sb_append(&v, STR_PTR("0"), STR_LEN("0")); };
+                env_set(env, STR_PTR("CODEX_UI_CODEX_AVAILABLE"), STR_LEN("CODEX_UI_CODEX_AVAILABLE"), &v);
+            };
+        };
+    };
+    // const listenPort = env.CODEX_UI_PORT?.trim() || "43110";
+    let listenPort = SBuf { bytes: [0u8; 4096], len: 0 };
+    if env_get(env, STR_PTR("CODEX_UI_PORT"), STR_LEN("CODEX_UI_PORT"), &listenPort) && sb_trimmed_len(&listenPort) > 0 {
+    } else {
+        sb_reset(&listenPort);
+        sb_append(&listenPort, STR_PTR("43110"), STR_LEN("43110"));
+    };
+    // const listenHost = env.CODEX_UI_HOST?.trim() || "127.0.0.1";
+    let listenHost = SBuf { bytes: [0u8; 4096], len: 0 };
+    if env_get(env, STR_PTR("CODEX_UI_HOST"), STR_LEN("CODEX_UI_HOST"), &listenHost) && sb_trimmed_len(&listenHost) > 0 {
+    } else {
+        sb_reset(&listenHost);
+        sb_append(&listenHost, STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"));
+    };
+    // console.log(`codex-ultra workbench starting: http://${listenHost}:${listenPort}/`)
+    print("codex-ultra workbench starting: http://");
+    sa_print_bytes(&listenHost.bytes, listenHost.len);
+    print(":");
+    sa_print_bytes(&listenPort.bytes, listenPort.len);
+    println("/");
+    // const targetBinary = isNode ? process.execPath : exePath;
+    // const targetArgs = isNode ? [server.scriptPath!, ...passthrough] : passthrough;
+    // if (!isNode && platform !== "win32") chmodSync(exePath, 0o755) in try/catch.
+    // DEFECT: chmodSync -> std fs chmod extern (stubbed note in log);
+    // process.platform branch kept via the is_windows flag param shape
+    // of spawnServerWithFallback (approximated false here).
+    let fallback = SBuf { bytes: [0u8; 4096], len: 0 };
+    let has_fallback = false;
+    if server.has_bundle_path { fallback = server.bundle_path; has_fallback = true; }
+    else if server.has_script_path { fallback = server.script_path; has_fallback = true; };
+    return spawnServerWithFallback(isNode, &exePath, &server.script_path, exec_path, &args, env, has_fallback, &fallback);
+}
+
+fn candidateHasFile(dir: &SBuf, name_ptr: ptr, name_len: u64) -> bool {
+    let p = SBuf { bytes: [0u8; 4096], len: 0 };
+    sb_join2(&p, dir, name_ptr, name_len);
+    return fs_exists(&p);
+}
+
+// DEFECT: doctor() bridge — returns the codex DoctorStatus fields
+// (path/found/version-present). Implemented in cli-doctor.sla in the
+// full build; declared here to keep serve.sla structurally complete.
+fn doctorCodexStatus(out_path: &SBuf, out_found: &bool, out_has_version: &bool) -> bool {
+    return false;
+}
+
+// spawn(targetBinary, targetArgs, { stdio: "inherit", env }) with the
+// EFTYPE/ENOEXEC fallback: on spawn error (or async "error" event)
+// with !isNode and a fallback bundle: warn, rmSync(exePath), respawn
+// process.execPath [fallbackBundle, ...passthrough]; the fallback
+// child's exit resolves (signal ? 1 : code ?? 1); plain child exit
+// resolves the same way; other errors -> console.error + resolve(1).
+// DEFECT: event-driven error path sequentialized into the spawn
+// status; stdio inherit + env table passed to the spawn extern.
+fn spawnServerWithFallback(is_node: bool, exe_path: &SBuf, script_path: &SBuf, exec_path: &SBuf, args: &ServeArgs, env: &EnvTable, has_fallback: bool, fallback: &SBuf) -> i32 {
+    // DEFECT: spawn + wait externs (sa_std_process_spawn_bidi shape);
+    // returns child exit code, or -1 with err class in out_err
+    // (1 = EFTYPE/ENOEXEC-class, 2 = other).
+    let err_class: u64 = 0;
+    let code = spawnAndWait(is_node, exe_path, script_path, exec_path, args, env, &err_class);
+    if code >= 0 { return code; };
+    if !is_node && err_class == 1 && has_fallback {
+        println("cxu: compiled server binary failed; removing binary and falling back to Node.js...");
+        // try { rmSync(exePath, { force: true }) } catch {}
+        fs_remove(exe_path);
+        let err2: u64 = 0;
+        let code2 = spawnFallback(exec_path, fallback, args, env, &err2);
+        if code2 >= 0 { return code2; };
+        println("Failed to start server");
+        return 1;
+    };
+    println("Failed to start server");
+    return 1;
+}
+
+// DEFECT: spawn stubs — wired to sa_std process externs in fix phase.
+fn spawnAndWait(is_node: bool, exe_path: &SBuf, script_path: &SBuf, exec_path: &SBuf, args: &ServeArgs, env: &EnvTable, out_err_class: &u64) -> i32 {
+    out_err_class = 2;
+    return -1;
+}
+
+fn spawnFallback(exec_path: &SBuf, fallback: &SBuf, args: &ServeArgs, env: &EnvTable, out_err_class: &u64) -> i32 {
+    out_err_class = 2;
+    return -1;
+}
+
+fn fs_remove(p: &SBuf) -> void {
+    sa_fs_remove_file(&p.bytes, p.len);
+}

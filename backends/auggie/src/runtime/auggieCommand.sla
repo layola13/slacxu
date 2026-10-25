@@ -1,0 +1,446 @@
+// Converted 1:1 from backends/auggie/src/runtime/auggieCommand.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// Find the external auggie (Augment Code) CLI binary. Auggie is NOT
+// embedded (user rule 2026-10-24: only Mini Agent is embedded) — the
+// bridge spawns the user's own `auggie` installation (npm
+// `@augmentcode/auggie`) with `--acp`, exactly like the other
+// external CLI backends.
+//
+// Resolution order:
+//  a) The user's preferred installation (Settings → CLI version
+//     switcher, persisted via the host CLI selection service) when
+//     it still exists.
+//  b) env.AUGGIE_BIN / env.CODEX_UI_AUGGIE_BIN / env.AUGGIE_LAUNCH_BIN.
+//  c) PATH lookup for an "auggie" executable (with win32 extensions).
+//
+// DEFECT: NodeJS.ProcessEnv is a dynamic string map; SLA reads
+// the real process env through sa_env_get (the TS default
+// `env = process.env` matches this exactly; explicitly injected
+// env objects used by tests have no counterpart — logged).
+// DEFECT: tryPluginHostServices() from @cxu/sdk-backend is a host
+// service locator; the call is kept as an extern-shaped shim
+// (host_cli_getPreferredCliBinary) owned by the sdk-backend unit.
+// DEFECT: node:path helpers (join/extname/delimiter) are
+// re-implemented as byte scans; Windows separator semantics are
+// approximated.
+// DEFECT: RegExp version match — hand scanner below.
+
+struct AuggieVersionCache {
+    keys_ptr: [ptr; 64],
+    keys_len: [u64; 64],
+    vals_ptr: [ptr; 64],
+    vals_len: [u64; 64],
+    vals_has: [bool; 64],
+    count: u64,
+}
+
+// findAuggieBin(env, platform) -> string | undefined.
+// platform_is_win32 stands in for NodeJS.Platform == "win32"
+// checks (the only platform distinction the source makes).
+// Result is written to out (capacity out_cap); out_found=false
+// is the TS `undefined`.
+fn findAuggieBin(platform_is_win32: bool, out: ptr, out_cap: u64, out_len: &u64, out_found: &bool) -> void {
+    out_found = false;
+    // a) preferred installation via host CLI selection service.
+    let pref_len: u64 = 0;
+    // DEFECT: host service locator — shim returns the preferred
+    // path for plugin id "auggie" or nothing.
+    if host_cli_getPreferredCliBinary(STR_PTR("auggie"), STR_LEN("auggie"), out, out_cap, &pref_len) {
+        if pref_len > 0 && fs_exists(out, pref_len) {
+            out_len = pref_len;
+            out_found = true;
+            return;
+        };
+    };
+    // b) env-configured binary.
+    let cfg_ptr: ptr = PTR_NULL();
+    let cfg_len: u64 = 0;
+    if env_first_of3(STR_PTR("AUGGIE_BIN"), STR_LEN("AUGGIE_BIN"), STR_PTR("CODEX_UI_AUGGIE_BIN"), STR_LEN("CODEX_UI_AUGGIE_BIN"), STR_PTR("AUGGIE_LAUNCH_BIN"), STR_LEN("AUGGIE_LAUNCH_BIN"), &cfg_ptr, &cfg_len) {
+        if resolveConfiguredAuggieBin(cfg_ptr, cfg_len, platform_is_win32, out, out_cap, out_len) {
+            out_found = true;
+            return;
+        };
+    };
+    // c) PATH lookup.
+    if resolveAuggieFromPath(STR_PTR("auggie"), STR_LEN("auggie"), platform_is_win32, out, out_cap, out_len) {
+        out_found = true;
+        return;
+    };
+}
+
+// probeAuggieVersion(binPath): probe the external binary's
+// version (`auggie --version`), cached per path. Used for the
+// bridge's initialize user-agent label; the installations
+// endpoint probes versions independently. Writes the version (or
+// nothing, TS null) to out; cache is the caller's struct (the TS
+// module-level Map).
+// DEFECT: spawnCliSync (sdk-backend) = child_process.spawnSync
+// with utf8 capture + 10s timeout; approximated with
+// sa_std_process_spawn_bidi + drain + sa_std_process_wait.
+// DEFECT: try/catch — spawn failure is folded into null.
+fn probeAuggieVersion(cache: &AuggieVersionCache, bin_ptr: ptr, bin_len: u64, out: ptr, out_cap: u64, out_len: &u64, out_has: &bool) -> void {
+    out_has = false;
+    out_len = 0;
+    for i in 0..cache.count {
+        if cache.keys_len[i] == bin_len && bytes_eq(cache.keys_ptr[i], bin_ptr, bin_len) {
+            if cache.vals_has[i] {
+                out_len = buf_copy(out, out_cap, cache.vals_ptr[i], cache.vals_len[i]);
+                out_has = true;
+            };
+            return;
+        };
+    }
+    // Run `binPath --version`, capture stdout+stderr combined.
+    let combined = [0u8; 4096];
+    let combined_len: u64 = 0;
+    let rc = run_capture2(bin_ptr, bin_len, STR_PTR("--version"), STR_LEN("--version"), &combined, 4096, &combined_len);
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    if rc == 0 {
+        if scan_version(&combined, combined_len, &v_ptr, &v_len) {
+            out_len = buf_copy(out, out_cap, v_ptr, v_len);
+            out_has = true;
+        };
+    };
+    if cache.count < 64 {
+        cache.keys_ptr[cache.count] = bin_ptr;
+        cache.keys_len[cache.count] = bin_len;
+        cache.vals_has[cache.count] = out_has;
+        if out_has {
+            // DEFECT: cache stores the caller's out buffer pointer;
+            // TS strings are immutable heap values. Buffer lifetime
+            // must be fixed in the repair phase (arena/duplication).
+            cache.vals_ptr[cache.count] = out;
+            cache.vals_len[cache.count] = out_len;
+        };
+        cache.count = cache.count + 1;
+    };
+}
+
+fn resolveConfiguredAuggieBin(configured_ptr: ptr, configured_len: u64, platform_is_win32: bool, out: ptr, out_cap: u64, out_len: &u64) -> bool {
+    let has_sep = contains_byte(configured_ptr, configured_len, 47) || contains_byte(configured_ptr, configured_len, 92);
+    if !has_sep {
+        return resolveAuggieFromPath(configured_ptr, configured_len, platform_is_win32, out, out_cap, out_len);
+    };
+    if fs_exists(configured_ptr, configured_len) {
+        out_len = buf_copy(out, out_cap, configured_ptr, configured_len);
+        return true;
+    };
+    if platform_is_win32 && extname_len(configured_ptr, configured_len) == 0 {
+        // Try each windows executable extension appended.
+        let exts = [0u8; 256];
+        let ext_count: u64 = 0;
+        let ext_off = [0u64; 8];
+        let ext_len = [0u64; 8];
+        auggieWindowsExecutableExtensions(&exts, 256, &ext_off, &ext_len, &ext_count);
+        for e in 0..ext_count {
+            let cand = [0u8; 1024];
+            let cand_len: u64 = 0;
+            cand_len = buf_copy(&cand, 1024, configured_ptr, configured_len);
+            cand_len = cand_len + buf_copy_at(&cand, 1024, cand_len, byte_ptr_at(&exts, ext_off[e]), ext_len[e]);
+            if fs_exists(&cand, cand_len) {
+                out_len = buf_copy(out, out_cap, &cand, cand_len);
+                return true;
+            };
+        }
+    };
+    return false;
+}
+
+fn resolveAuggieFromPath(command_ptr: ptr, command_len: u64, platform_is_win32: bool, out: ptr, out_cap: u64, out_len: &u64) -> bool {
+    // pathValue = env.PATH ?? env.Path ?? env.path ?? ""
+    let path_ptr: ptr = PTR_NULL();
+    let path_len: u64 = 0;
+    if !env_first_of3(STR_PTR("PATH"), STR_LEN("PATH"), STR_PTR("Path"), STR_LEN("Path"), STR_PTR("path"), STR_LEN("path"), &path_ptr, &path_len) {
+        path_len = 0;
+    };
+    let delim: u8 = 58;
+    if platform_is_win32 { delim = 59; };
+    let ext_empty = extname_len(command_ptr, command_len) == 0;
+    let use_exts = platform_is_win32 && ext_empty;
+    let exts = [0u8; 256];
+    let ext_count: u64 = 0;
+    let ext_off = [0u64; 8];
+    let ext_len = [0u64; 8];
+    if use_exts {
+        auggieWindowsExecutableExtensions(&exts, 256, &ext_off, &ext_len, &ext_count);
+    } else {
+        ext_count = 1;
+        ext_off[0] = 0;
+        ext_len[0] = 0;
+    };
+    // Iterate PATH segments (split on delimiter, skip empties).
+    let seg_start: u64 = 0;
+    let pos: u64 = 0;
+    while pos <= path_len {
+        let at_end = pos == path_len;
+        let b: u8 = 0;
+        if !at_end { PTR_BYTE_AT(b, path_ptr, pos); };
+        if at_end || b == delim {
+            let seg_len = pos - seg_start;
+            if seg_len > 0 {
+                for e in 0..ext_count {
+                    let cand = [0u8; 1024];
+                    let cand_len: u64 = 0;
+                    cand_len = buf_copy(&cand, 1024, byte_ptr_at(path_ptr, seg_start), seg_len);
+                    cand_len = cand_len + buf_copy_at(&cand, 1024, cand_len, STR_PTR("/"), 1);
+                    // DEFECT: TS uses path.join (platform separator);
+                    // '/' approximation (win32 accepts '/' too).
+                    cand_len = cand_len + buf_copy_at(&cand, 1024, cand_len, command_ptr, command_len);
+                    if ext_len[e] > 0 {
+                        cand_len = cand_len + buf_copy_at(&cand, 1024, cand_len, byte_ptr_at(&exts, ext_off[e]), ext_len[e]);
+                    };
+                    if fs_exists(&cand, cand_len) {
+                        out_len = buf_copy(out, out_cap, &cand, cand_len);
+                        return true;
+                    };
+                }
+            };
+            seg_start = pos + 1;
+        };
+        pos = pos + 1;
+    }
+    return false;
+}
+
+// auggieWindowsExecutableExtensions(env): PATHEXT (default
+// ".COM;.EXE;.CMD;.BAT"), split ';', trim, lowercase, keep
+// [.com .exe .cmd .bat .ps1], then Set-union with
+// [.exe .cmd .bat .com .ps1]. Written as a packed list into exts
+// with per-entry offset/len tables.
+// DEFECT: string map/filter/Set semantics hand-expanded.
+fn auggieWindowsExecutableExtensions(exts: ptr, exts_cap: u64, ext_off: &u64, ext_len: &u64, ext_count: &u64) -> void {
+    // Kept approximation: the union of the supported set and the
+    // defaults is exactly [.exe .cmd .bat .com .ps1] plus any
+    // PATHEXT entries within the supported list, deduplicated
+    // with supported-first order per the source filter; the
+    // repair phase must reproduce exact ordering against PATHEXT
+    // variations. Here: emit supported defaults in source order.
+    let packed = ".exe.cmd.bat.com.ps1";
+    let pp: ptr = STR_PTR(packed);
+    let used: u64 = 0;
+    let count: u64 = 0;
+    // entries: .exe(4) .cmd(4) .bat(4) .com(4) .ps1(4)
+    for e in 0..5 {
+        let off = e * 4;
+        ext_off[e] = used;
+        ext_len[e] = 4;
+        for j in 0..4 {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, pp, off + j);
+            if used < exts_cap { PTR_BYTE_SET(exts, used, b); used = used + 1; };
+        }
+        count = count + 1;
+    }
+    ext_count = count;
+}
+
+// ---- local helpers (TS relied on node:path / fs / env) ----
+
+// fs_exists: existsSync(path) via sa_std_fs_len probe.
+fn fs_exists(path_ptr: ptr, path_len: u64) -> bool {
+    let total: u64 = 0;
+    return sa_std_fs_len(path_ptr, path_len, &total) == 0;
+}
+
+// env_first_of3: first non-empty of three env keys (TS `a || b ||
+// c` / `a ?? b ?? c` chains); writes value ptr/len, returns found.
+fn env_first_of3(k1: ptr, k1_len: u64, k2: ptr, k2_len: u64, k3: ptr, k3_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    let h = sa_env_get(k1, k1_len);
+    if h != 0 {
+        out_ptr = sa_env_buffer_data(h);
+        out_len = sa_env_buffer_len(h);
+        if out_len > 0 { return true; };
+    };
+    h = sa_env_get(k2, k2_len);
+    if h != 0 {
+        out_ptr = sa_env_buffer_data(h);
+        out_len = sa_env_buffer_len(h);
+        if out_len > 0 { return true; };
+    };
+    h = sa_env_get(k3, k3_len);
+    if h != 0 {
+        out_ptr = sa_env_buffer_data(h);
+        out_len = sa_env_buffer_len(h);
+        if out_len > 0 { return true; };
+    };
+    return false;
+}
+
+// run_capture2: run [bin, arg] capturing stdout+stderr interleaved
+// into buf (the TS code concatenates stdout and stderr before the
+// regex, so interleave order does not matter). Returns 0 when the
+// process ran (any exit code — spawnSync does not throw on
+// nonzero), 1 when the spawn itself failed.
+// DEFECT: spawnCliSync (spawnSync, utf8, timeout 10_000) has no
+// single std equivalent; composed here from spawn_bidi + blocking
+// reads + process_wait. No timeout enforcement, no utf8 decode
+// validation, stderr/stdout merged instead of concatenated.
+fn run_capture2(bin_ptr: ptr, bin_len: u64, arg_ptr: ptr, arg_len: u64, buf: ptr, cap: u64, out_len: &u64) -> i32 {
+    out_len = 0;
+    let argv = [0u8; 2048];
+    let argv_len: u64 = 0;
+    // DEFECT: argv vector construction (NUL-separated packing) is
+    // the std PROCESS_ARGV_SET_PTR discipline in real code; kept
+    // schematic in this pass.
+    argv_len = buf_copy(&argv, 2048, bin_ptr, bin_len) + buf_copy_at(&argv, 2048, argv_len, arg_ptr, arg_len);
+    let proc: u64 = 0;
+    let hin: u64 = 0;
+    let hout: u64 = 0;
+    let herr: u64 = 0;
+    if sa_std_process_spawn_bidi(&argv, argv_len, &proc, &hin, &hout, &herr) != 0 { return 1; };
+    sa_std_close(hin);
+    let chunk = [0u8; 512];
+    while 1 == 1 {
+        let n: u64 = 0;
+        if sa_io_read(hout, &chunk, 512, &n) != 0 { break; };
+        if n == 0 { break; };
+        for i in 0..n {
+            if out_len < cap {
+                PTR_BYTE_SET(buf, out_len, chunk[i]);
+                out_len = out_len + 1;
+            };
+        }
+    }
+    while 1 == 1 {
+        let n: u64 = 0;
+        if sa_io_read(herr, &chunk, 512, &n) != 0 { break; };
+        if n == 0 { break; };
+        for i in 0..n {
+            if out_len < cap {
+                PTR_BYTE_SET(buf, out_len, chunk[i]);
+                out_len = out_len + 1;
+            };
+        }
+    }
+    sa_std_close(hout);
+    sa_std_close(herr);
+    let code: i32 = 0;
+    sa_std_process_wait(proc, &code);
+    return 0;
+}
+
+fn contains_byte(p: ptr, n: u64, want: u8) -> bool {
+    for i in 0..n {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, p, i);
+        if b == want { return true; };
+    }
+    return false;
+}
+
+// extname_len: length of the path.extname suffix (0 when none) —
+// simplified: scan the last path segment for '.'.
+fn extname_len(p: ptr, n: u64) -> u64 {
+    let i = n;
+    while i > 0 {
+        i = i - 1;
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, p, i);
+        if b == 47 || b == 92 { return 0; };
+        if b == 46 { return n - i; };
+    }
+    return 0;
+}
+
+fn bytes_eq(a: ptr, b: ptr, n: u64) -> bool {
+    for i in 0..n {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a, i);
+        PTR_BYTE_AT(y, b, i);
+        if x != y { return false; };
+    }
+    return true;
+}
+
+fn buf_copy(dst: ptr, cap: u64, src: ptr, n: u64) -> u64 {
+    let m = n;
+    if m > cap { m = cap; };
+    for i in 0..m {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src, i);
+        PTR_BYTE_SET(dst, i, b);
+    }
+    return m;
+}
+
+fn buf_copy_at(dst: ptr, cap: u64, at: u64, src: ptr, n: u64) -> u64 {
+    let written: u64 = 0;
+    for i in 0..n {
+        if at + written < cap {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, src, i);
+            PTR_BYTE_SET(dst, at + written, b);
+            written = written + 1;
+        };
+    }
+    return written;
+}
+
+fn byte_ptr_at(base: ptr, off: u64) -> ptr {
+    let r: ptr = PTR_NULL();
+    PTR_BYTE_ADD(r, base, off);
+    return r;
+}
+
+// scan_version: hand scanner for the source regex
+// /(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/ over combined output.
+// DEFECT: RegExp — scanner covers the same grammar greedily.
+fn scan_version(buf: ptr, n: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    let i: u64 = 0;
+    while i < n {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, buf, i);
+        if b >= 48 && b <= 57 {
+            let start = i;
+            let j = i;
+            let parts: u64 = 0;
+            let ok = true;
+            while parts < 3 {
+                let digits: u64 = 0;
+                while j < n {
+                    let d: u8 = 0;
+                    PTR_BYTE_AT(d, buf, j);
+                    if d < 48 || d > 57 { break; };
+                    j = j + 1;
+                    digits = digits + 1;
+                }
+                if digits == 0 { ok = false; break; };
+                parts = parts + 1;
+                if parts < 3 {
+                    if j >= n { ok = false; break; };
+                    let dot: u8 = 0;
+                    PTR_BYTE_AT(dot, buf, j);
+                    if dot != 46 { ok = false; break; };
+                    j = j + 1;
+                };
+            }
+            if ok {
+                // optional [-+][0-9A-Za-z.-]+
+                if j < n {
+                    let s: u8 = 0;
+                    PTR_BYTE_AT(s, buf, j);
+                    if s == 45 || s == 43 {
+                        let k = j + 1;
+                        let cnt: u64 = 0;
+                        while k < n {
+                            let c: u8 = 0;
+                            PTR_BYTE_AT(c, buf, k);
+                            let good = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 46 || c == 45;
+                            if !good { break; };
+                            k = k + 1;
+                            cnt = cnt + 1;
+                        }
+                        if cnt > 0 { j = k; };
+                    };
+                };
+                out_ptr = byte_ptr_at(buf, start);
+                out_len = j - start;
+                return true;
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}

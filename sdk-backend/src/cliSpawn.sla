@@ -1,0 +1,345 @@
+// Converted 1:1 from sdk-backend/src/cliSpawn.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Windows-safe CLI spawning for external agent CLIs.
+//
+// npm-installed CLIs land on Windows as `.cmd` / `.bat` / `.ps1` shim
+// scripts, and Node/Bun refuse to spawn those directly (EINVAL since the
+// BatBadBut hardening). `resolveCliSpawn` rewrites such invocations the
+// same way the Codex backend has always done it: batch shims run through
+// an absolute `cmd.exe` (`call "<cmd>" <args>` with cmd quoting),
+// PowerShell shims through `powershell.exe -File`. Everything else —
+// real executables, `.exe`, and every non-Windows platform — passes
+// through untouched.
+//
+// This resolver is a pure function of (command, args, platform, env) plus
+// an existence probe for the ComSpec candidates, so it lives in the SDK:
+// every backend plugin spawns its external CLI through here instead of
+// re-implementing (or forgetting) the Windows shim rules.
+
+@import "sa_std/ptr.sa"
+
+// DEFECT: NodeJS.ProcessEnv dynamic record + default parameters
+// (platform = process.platform, env = process.env) -> platform tag
+// (0 = other, 1 = win32) and explicit env lookups via sa_env_get.
+// DEFECT: string[] -> fixed ArgvBuf table. ChildProcess handles ->
+// u64 process handles; spawn options record -> individual fields
+// (only the ones this file itself sets are modeled).
+
+struct ArgBuf {
+    bytes: [u8; 4096],
+    len: u64,
+}
+
+struct ArgvBuf {
+    items: [ArgBuf; 64],
+    count: u64,
+}
+
+struct CliSpawnResolved {
+    command: ArgBuf,
+    args: ArgvBuf,
+    usesCommandShim: bool,
+}
+
+fn arg_set(a: &ArgBuf, src_ptr: ptr, src_len: u64) -> void {
+    a.len = 0;
+    for i in 0..src_len {
+        if a.len < 4096 {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, src_ptr, i);
+            a.bytes[a.len] = b;
+            a.len = a.len + 1;
+        };
+    }
+}
+
+fn arg_append(a: &ArgBuf, src_ptr: ptr, src_len: u64) -> void {
+    for i in 0..src_len {
+        if a.len < 4096 {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, src_ptr, i);
+            a.bytes[a.len] = b;
+            a.len = a.len + 1;
+        };
+    }
+}
+
+fn argv_push(v: &ArgvBuf, src_ptr: ptr, src_len: u64) -> void {
+    if v.count < 64 {
+        arg_set(&v.items[v.count], src_ptr, src_len);
+        v.count = v.count + 1;
+    };
+}
+
+fn ends_with_ci(p: ptr, l: u64, suf: ptr, suf_len: u64) -> bool {
+    if l < suf_len { return false; };
+    let off = l - suf_len;
+    for i in 0..suf_len {
+        let a: u8 = 0;
+        let b: u8 = 0;
+        PTR_BYTE_AT(a, p, off + i);
+        PTR_BYTE_AT(b, suf, i);
+        if a >= 65 && a <= 90 { a = a + 32; };
+        if b >= 65 && b <= 90 { b = b + 32; };
+        if a != b { return false; };
+    }
+    return true;
+}
+
+fn contains_byte(p: ptr, l: u64, want: u8) -> bool {
+    for i in 0..l {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, p, i);
+        if b == want { return true; };
+    }
+    return false;
+}
+
+fn env_or_empty(key_ptr: ptr, key_len: u64, out: &ArgBuf) -> bool {
+    out.len = 0;
+    let h = sa_env_get(key_ptr, key_len);
+    if h == 0 { return false; };
+    let vp: ptr = sa_env_buffer_data(h);
+    let vl = sa_env_buffer_len(h);
+    if vl == 0 { return false; };
+    arg_set(out, vp, vl);
+    return true;
+}
+
+fn fs_exists(p: ptr, l: u64) -> bool {
+    let total: u64 = 0;
+    return sa_std_fs_len(p, l, &total) == 0;
+}
+
+fn resolveCliSpawn(cmd_ptr: ptr, cmd_len: u64, args: &ArgvBuf, platform_win32: bool, out: &CliSpawnResolved) -> void {
+    out.args.count = 0;
+    if platform_win32 && ends_with_ci(cmd_ptr, cmd_len, STR_PTR(".ps1"), STR_LEN(".ps1")) {
+        resolveWindowsPowerShell(&out.command);
+        argv_push(&out.args, STR_PTR("-NoLogo"), STR_LEN("-NoLogo"));
+        argv_push(&out.args, STR_PTR("-NoProfile"), STR_LEN("-NoProfile"));
+        argv_push(&out.args, STR_PTR("-NonInteractive"), STR_LEN("-NonInteractive"));
+        argv_push(&out.args, STR_PTR("-ExecutionPolicy"), STR_LEN("-ExecutionPolicy"));
+        argv_push(&out.args, STR_PTR("Bypass"), STR_LEN("Bypass"));
+        argv_push(&out.args, STR_PTR("-File"), STR_LEN("-File"));
+        argv_push(&out.args, cmd_ptr, cmd_len);
+        for i in 0..args.count {
+            let ap: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ap, &args.items[i].bytes, 0);
+            argv_push(&out.args, ap, args.items[i].len);
+        }
+        out.usesCommandShim = true;
+        return;
+    };
+    let mut_shim = false;
+    if platform_win32 {
+        if ends_with_ci(cmd_ptr, cmd_len, STR_PTR(".cmd"), STR_LEN(".cmd")) || ends_with_ci(cmd_ptr, cmd_len, STR_PTR(".bat"), STR_LEN(".bat")) {
+            mut_shim = true;
+        } else if !contains_byte(cmd_ptr, cmd_len, 47) && !contains_byte(cmd_ptr, cmd_len, 92) {
+            mut_shim = true;
+        };
+    };
+    if !mut_shim {
+        arg_set(&out.command, cmd_ptr, cmd_len);
+        out.args.count = 0;
+        for i in 0..args.count {
+            let ap: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ap, &args.items[i].bytes, 0);
+            argv_push(&out.args, ap, args.items[i].len);
+        }
+        out.usesCommandShim = false;
+        return;
+    };
+    // Bun-compiled standalone servers resolve a bare "cmd.exe" less reliably
+    // than Node, and a bare name makes `uv_spawn cmd.exe ENOENT` ambiguous
+    // (missing cwd vs missing binary). Always prefer an absolute System32
+    // path so the error — if any — points at the real cause.
+    resolveWindowsComSpec(&out.command);
+    // invocation = [quoteCmdArgument(command), ...args.map(quoteCmdArgument)].join(" ")
+    let invocation = ArgBuf { bytes: [0u8; 4096], len: 0 };
+    let quoted = ArgBuf { bytes: [0u8; 4096], len: 0 };
+    quoteCmdArgument(cmd_ptr, cmd_len, &quoted);
+    let qp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(qp, &quoted.bytes, 0);
+    arg_append(&invocation, qp, quoted.len);
+    for i in 0..args.count {
+        let ap: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ap, &args.items[i].bytes, 0);
+        quoteCmdArgument(ap, args.items[i].len, &quoted);
+        arg_append(&invocation, STR_PTR(" "), STR_LEN(" "));
+        let qp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(qp2, &quoted.bytes, 0);
+        arg_append(&invocation, qp2, quoted.len);
+    }
+    argv_push(&out.args, STR_PTR("/d"), STR_LEN("/d"));
+    argv_push(&out.args, STR_PTR("/s"), STR_LEN("/s"));
+    argv_push(&out.args, STR_PTR("/c"), STR_LEN("/c"));
+    let callbuf = ArgBuf { bytes: [0u8; 4096], len: 0 };
+    arg_append(&callbuf, STR_PTR("call "), STR_LEN("call "));
+    let ip: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip, &invocation.bytes, 0);
+    arg_append(&callbuf, ip, invocation.len);
+    let cbp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cbp, &callbuf.bytes, 0);
+    argv_push(&out.args, cbp, callbuf.len);
+    out.usesCommandShim = true;
+}
+
+// Absolute cmd.exe path for the Windows command shim. Never a bare name.
+// DEFECT: the TS candidate list reads env.ComSpec/env.COMSPEC from
+// the passed env and again from process.env; both are sa_env_get
+// here (identical in practice).
+fn resolveWindowsComSpec(out: &ArgBuf) -> void {
+    let cand = ArgBuf { bytes: [0u8; 4096], len: 0 };
+    if env_or_empty(STR_PTR("ComSpec"), STR_LEN("ComSpec"), &cand) {
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, &cand.bytes, 0);
+        if fs_exists(cp, cand.len) { arg_set(out, cp, cand.len); return; };
+    };
+    if env_or_empty(STR_PTR("COMSPEC"), STR_LEN("COMSPEC"), &cand) {
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, &cand.bytes, 0);
+        if fs_exists(cp, cand.len) { arg_set(out, cp, cand.len); return; };
+    };
+    if env_or_empty(STR_PTR("SystemRoot"), STR_LEN("SystemRoot"), &cand) {
+        arg_append(&cand, STR_PTR("\\System32\\cmd.exe"), STR_LEN("\\System32\\cmd.exe"));
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, &cand.bytes, 0);
+        if fs_exists(cp, cand.len) { arg_set(out, cp, cand.len); return; };
+    };
+    if env_or_empty(STR_PTR("SYSTEMROOT"), STR_LEN("SYSTEMROOT"), &cand) {
+        arg_append(&cand, STR_PTR("\\System32\\cmd.exe"), STR_LEN("\\System32\\cmd.exe"));
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, &cand.bytes, 0);
+        if fs_exists(cp, cand.len) { arg_set(out, cp, cand.len); return; };
+    };
+    let fallback = ArgBuf { bytes: [0u8; 4096], len: 0 };
+    arg_set(&fallback, STR_PTR("C:\\Windows\\System32\\cmd.exe"), STR_LEN("C:\\Windows\\System32\\cmd.exe"));
+    let fp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp, &fallback.bytes, 0);
+    if fs_exists(fp, fallback.len) { arg_set(out, fp, fallback.len); return; };
+    // return env.ComSpec || env.COMSPEC || "C:\\Windows\\System32\\cmd.exe"
+    if env_or_empty(STR_PTR("ComSpec"), STR_LEN("ComSpec"), &cand) {
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, &cand.bytes, 0);
+        arg_set(out, cp, cand.len);
+        return;
+    };
+    if env_or_empty(STR_PTR("COMSPEC"), STR_LEN("COMSPEC"), &cand) {
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, &cand.bytes, 0);
+        arg_set(out, cp, cand.len);
+        return;
+    };
+    arg_set(out, fp, fallback.len);
+}
+
+// Absolute powershell.exe path; falls back to the bare name when absent.
+fn resolveWindowsPowerShell(out: &ArgBuf) -> void {
+    let cand = ArgBuf { bytes: [0u8; 4096], len: 0 };
+    if env_or_empty(STR_PTR("SystemRoot"), STR_LEN("SystemRoot"), &cand) {
+        arg_append(&cand, STR_PTR("\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"), STR_LEN("\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, &cand.bytes, 0);
+        if fs_exists(cp, cand.len) { arg_set(out, cp, cand.len); return; };
+    };
+    if env_or_empty(STR_PTR("SYSTEMROOT"), STR_LEN("SYSTEMROOT"), &cand) {
+        arg_append(&cand, STR_PTR("\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"), STR_LEN("\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, &cand.bytes, 0);
+        if fs_exists(cp, cand.len) { arg_set(out, cp, cand.len); return; };
+    };
+    let fb = ArgBuf { bytes: [0u8; 4096], len: 0 };
+    arg_set(&fb, STR_PTR("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"), STR_LEN("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
+    let fp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp, &fb.bytes, 0);
+    if fs_exists(fp, fb.len) { arg_set(out, fp, fb.len); return; };
+    arg_set(out, STR_PTR("powershell.exe"), STR_LEN("powershell.exe"));
+}
+
+fn quoteCmdArgument(value_ptr: ptr, value_len: u64, out: &ArgBuf) -> void {
+    out.len = 0;
+    if value_len == 0 {
+        arg_append(out, STR_PTR("\"\""), STR_LEN("\"\""));
+        return;
+    };
+    let needs = false;
+    for i in 0..value_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, value_ptr, i);
+        if b == 32 || b == 9 || b == 38 || b == 94 || b == 124 || b == 40 || b == 41 || b == 60 || b == 62 || b == 37 { needs = true; break; };
+    }
+    if !needs {
+        arg_append(out, value_ptr, value_len);
+        return;
+    };
+    // "%" -> "%%", '"' -> '""', wrapped in quotes
+    arg_append(out, STR_PTR("\""), STR_LEN("\""));
+    for i in 0..value_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, value_ptr, i);
+        if b == 37 {
+            arg_append(out, STR_PTR("%%"), STR_LEN("%%"));
+        } else if b == 34 {
+            arg_append(out, STR_PTR("\"\""), STR_LEN("\"\""));
+        } else {
+            if out.len < 4096 {
+                out.bytes[out.len] = b;
+                out.len = out.len + 1;
+            };
+        };
+    }
+    arg_append(out, STR_PTR("\""), STR_LEN("\""));
+}
+
+// Spawn an external CLI, applying `resolveCliSpawn` first. With a command
+// shim, the child runs under cmd.exe with verbatim arguments (without
+// that, Node/Bun turn the quotes inside the `/c` string into literal `\"`
+// characters and cmd.exe looks for a file whose name includes quotes —
+// the classic failure when npm lives under "Program Files"). PowerShell
+// launchers still need normal argv quoting, hence the `.ps1` exception.
+// DEFECT: SpawnOptions record (cwd/env/stdio/...) and the
+// ChildProcess stream surface are not modeled; returns the
+// sa_std bidirectional spawn handles. process.platform is read
+// from a host-provided tag in the fix phase; bulk pass takes it
+// as the platform_win32 parameter via resolveCliSpawn callers.
+fn spawnCli(cmd_ptr: ptr, cmd_len: u64, args: &ArgvBuf, platform_win32: bool, out_proc: &u64, out_stdin: &u64, out_stdout: &u64, out_stderr: &u64) -> i32 {
+    let resolved = CliSpawnResolved { command: ArgBuf { bytes: [0u8; 4096], len: 0 }, args: ArgvBuf { items: [ArgBuf { bytes: [0u8; 4096], len: 0 }; 64], count: 0 }, usesCommandShim: false };
+    resolveCliSpawn(cmd_ptr, cmd_len, args, platform_win32, &resolved);
+    // DEFECT: windowsHide / windowsVerbatimArguments options have
+    // no sa_std spawn counterpart.
+    return spawn_argv(&resolved, out_proc, out_stdin, out_stdout, out_stderr);
+}
+
+// Synchronous variant of `spawnCli`, for short version probes.
+// DEFECT: SpawnSyncReturns<string> (status/stdout/error fields)
+// reduced to exit code + captured stdout buffer in the fix phase;
+// bulk pass performs the same spawn and waits.
+fn spawnCliSync(cmd_ptr: ptr, cmd_len: u64, args: &ArgvBuf, platform_win32: bool, out_code: &u64) -> i32 {
+    let proc: u64 = 0;
+    let hin: u64 = 0;
+    let hout: u64 = 0;
+    let herr: u64 = 0;
+    let st = spawnCli(cmd_ptr, cmd_len, args, platform_win32, &proc, &hin, &hout, &herr);
+    if st != 0 { return st; };
+    return sa_std_process_wait(proc, out_code);
+}
+
+// DEFECT: helper not in TS source (Node spawn there); flattens the
+// resolved argv into the sa_std bidi spawn shape.
+fn spawn_argv(resolved: &CliSpawnResolved, out_proc: &u64, out_stdin: &u64, out_stdout: &u64, out_stderr: &u64) -> i32 {
+    let flat = ArgBuf { bytes: [0u8; 4096], len: 0 };
+    let cp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cp, &resolved.command.bytes, 0);
+    arg_append(&flat, cp, resolved.command.len);
+    arg_append(&flat, STR_PTR("\n"), STR_LEN("\n"));
+    // DEFECT: argv framing for sa_std_process_spawn_bidi is a
+    // newline-joined approximation in the bulk pass.
+    for i in 0..resolved.args.count {
+        let ap: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ap, &resolved.args.items[i].bytes, 0);
+        arg_append(&flat, ap, resolved.args.items[i].len);
+        arg_append(&flat, STR_PTR("\n"), STR_LEN("\n"));
+    }
+    let fp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp, &flat.bytes, 0);
+    return sa_std_process_spawn_bidi(fp, flat.len, out_proc, out_stdin, out_stdout, out_stderr);
+}

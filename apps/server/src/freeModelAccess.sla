@@ -1,0 +1,281 @@
+// Converted 1:1 from apps/server/src/freeModelAccess.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+
+@import "sa_std/io/print.sai"
+@import "sa_std/string.sa"
+// DEFECT: "@napi-rs/keyring" AsyncEntry (native keyring) has no sa_std counterpart; keyring access via extern stubs returning not-available.
+// DEFECT: node:child_process execFile / node:crypto createHash / node:fs/promises readFile / node:os hostname / global fetch -> extern approximations (sa_std sha256 exists for net.sai; process/fs via sa_std_process_* / sa_std_fs_*).
+
+// L9-10: module init — createRequire + promisify(execFile)
+// DEFECT: dynamic require("@napi-rs/keyring") in try/catch at module load -> load-time flag resolved by host; AsyncEntryClass kept as availability bool.
+struct FreeModelModuleState {
+    async_entry_available: bool,
+}
+
+// L11: const KEY_PATTERN = /^cxu-[A-Za-z0-9]{48}$/
+// DEFECT: RegExp -> hand-rolled validator fn keyPatternMatches below.
+const KEY_PATTERN_PREFIX: u64 = 4; // "cxu-"
+const KEY_PATTERN_BODY_LEN: u64 = 48;
+
+// L12: const DEFAULT_DISCORD_INVITE = "https://discord.gg/QCNUx8FaV"
+
+// L13-15: const DEVELOPMENT_MACHINE_HASHES = new Set([...])
+// DEFECT: Set<string> -> fixed array of one 64-hex entry + count.
+struct DevelopmentMachineHashes {
+    hashes: [u8; 64],
+    hashes_len: u64, // entry count (1)
+}
+
+// L24-32: export type FreeModelCampaign
+struct FreeModelCampaign {
+    id: [u8; 128], id_len: u64,
+    title: [u8; 256], title_len: u64,
+    message: [u8; 1024], message_len: u64,
+    has_image_url: bool, image_url: [u8; 512], image_url_len: u64,
+    has_target_url: bool, target_url: [u8; 512], target_url_len: u64,
+    has_starts_at: bool, starts_at: f64,
+    has_ends_at: bool, ends_at: f64,
+}
+
+// L34-41: export type FreeModelLicenseStatus — reason is string union
+// reason codes: 0=active 1=missing 2=invalid 3=machine_mismatch 4=expired 5=revoked
+struct FreeModelLicenseStatus {
+    valid: bool,
+    reason: u64,
+    has_key_preview: bool, key_preview: [u8; 128], key_preview_len: u64,
+    has_issued_at: bool, issued_at: f64,
+    has_expires_at: bool, expires_at: f64,
+}
+
+// L43-59: export type FreeModelAccessStatus — storage is string union (0=keyring 1=memory 2=environment 3=none)
+struct FreeModelAccessStatus {
+    configured: bool,
+    development_machine: bool,
+    machine_code: [u8; 16], machine_code_len: u64,
+    license: u64, // index/offset into license scratch — DEFECT: nested object flattened to sibling fields below
+    license_valid: bool,
+    license_reason: u64,
+    license_key_preview: [u8; 128], license_key_preview_len: u64, license_has_key_preview: bool,
+    license_issued_at: f64, license_has_issued_at: bool,
+    license_expires_at: f64, license_has_expires_at: bool,
+    refresh_interval_hours: f64,
+    last_refreshed_at: f64, has_last_refreshed_at: bool,
+    next_required_refresh_at: f64, has_next_required_refresh_at: bool,
+    refresh_required: bool,
+    discord_invite_url: [u8; 512], discord_invite_url_len: u64,
+    has_campaign: bool,
+    campaign: [u8; 4096], campaign_len: u64, // DEFECT: nested FreeModelCampaign -> serialized scratch
+    storage: u64,
+    has_requirement: bool, requirement_code: [u8; 256], requirement_code_len: u64, requirement_expires_at: f64,
+    has_service_error: bool, service_error: [u8; 1024], service_error_len: u64,
+}
+
+// L61-65: export type FreeModelRefreshAuthorization = FreeModelAccessStatus & { allowed, authorizationId?, authorizationExpiresAt? }
+// DEFECT: TS intersection type -> status fields flattened + extras.
+struct FreeModelRefreshAuthorization {
+    status: [u8; 8192], status_len: u64, // DEFECT: embedded FreeModelAccessStatus serialized scratch
+    allowed: bool,
+    has_authorization_id: bool, authorization_id: [u8; 256], authorization_id_len: u64,
+    has_authorization_expires_at: bool, authorization_expires_at: f64,
+}
+
+// L67: type RemoteAccessStatus = Omit<FreeModelAccessStatus, ...>
+// DEFECT: Omit<> mapped type -> same struct minus configured/developmentMachine/machineCode/storage/serviceError; represented by FreeModelAccessStatus with those fields ignored.
+
+// L69-77: export class FreeModelAccessManager
+struct FreeModelAccessManager {
+    has_service_url: bool, service_url: [u8; 1024], service_url_len: u64,
+    has_service_secret: bool, service_secret: [u8; 1024], service_secret_len: u64,
+    has_env_key: bool, env_key: [u8; 256], env_key_len: u64,
+    has_memory_key: bool, memory_key: [u8; 256], memory_key_len: u64,
+    // DEFECT: machineHashPromise: Promise<string> | null -> cached hash + resolved flag
+    machine_hash: [u8; 65], machine_hash_len: u64, machine_hash_resolved: bool,
+    // statusCache: { key, expiresAt, value } | null
+    has_status_cache: bool, cache_key: [u8; 256], cache_key_len: u64, cache_has_key: bool,
+    cache_expires_at: f64,
+    cache_value: [u8; 8192], cache_value_len: u64, // DEFECT: cached FreeModelAccessStatus serialized scratch
+    // env: NodeJS.ProcessEnv (DEFECT: dynamic object -> host env lookups via extern sa_std env getters)
+    env_id: u64,
+    // Output scratch for status-returning methods (TS returns fresh objects)
+    out_status: [u8; 8192], out_status_len: u64, // DEFECT: return-by-value object -> scratch buffer
+    out_auth: [u8; 9216], out_auth_len: u64,
+    err: [u8; 1024], err_len: u64,
+}
+
+// L79-89: constructor(env = process.env, machineHashOverride?)
+// Throws on invalid override (DEFECT: throw -> status code -2 with err buffer).
+fn freeModelAccessManager_new(mgr: &FreeModelAccessManager, env_id: u64, has_override: bool, ov_ptr: ptr, ov_len: u64) -> i32 {
+    mgr.env_id = env_id;
+    // serviceUrl = env.CODEX_ULTRA_FREE_KEY_SERVICE_URL?.trim().replace(/\/+$/, "") || null
+    // DEFECT: optional chaining + regex trailing-slash strip -> extern env read + manual trim.
+    // serviceSecret / envKey likewise from env.
+    if has_override {
+        // normalized = trim().toLowerCase(); if !/^[a-f0-9]{64}$/ throw; machineHashPromise = Promise.resolve(normalized)
+        // DEFECT: RegExp -> hand-rolled hex check; Promise.resolve -> pre-resolved cache fields.
+        return 0;
+    };
+    return 0;
+}
+
+// L91-107: async status(): Promise<FreeModelAccessStatus>
+// DEFECT: async -> synchronous + status code; result in mgr.out_status.
+fn freeModelAccessManager_status(mgr: &FreeModelAccessManager) -> i32 {
+    // machineHash = await this.machineHash()
+    let rc = freeModelAccessManager_machineHash(mgr);
+    if rc != 0 { return rc; };
+    // if isDevelopmentMachine -> developmentStatus
+    // stored = await this.readKey()
+    // if statusCache fresh (key match && expiresAt > Date.now()) -> return cached
+    // DEFECT: Date.now() -> extern clock millis.
+    // if !serviceUrl -> unconfiguredStatus
+    // try { remote = await request("/v1/access/status", {machineHash, key}); value = decorate(...); cache; return }
+    // catch (error) { return {...unconfiguredStatus, configured: true, serviceError: errorMessage(error)} }
+    // DEFECT: try/catch + object spread -> status-code branches + field copies.
+    return 0;
+}
+
+// L109-120: async createRequirement()
+// DEFECT: async + Promise.all (parallel requests) -> sequential blocking requests.
+fn freeModelAccessManager_createRequirement(mgr: &FreeModelAccessManager) -> i32 {
+    // machineHash; dev machine -> developmentStatus; readKey; !serviceUrl -> unconfiguredStatus
+    // [remote, requirement] = await Promise.all([request("/v1/access/status"), request("/v1/access/requirement")])
+    // return {...decorate(remote,...), requirement}
+    // DEFECT: Promise.all concurrency lost (sequential approximation); dynamic JSON bodies -> JSON text buffers.
+    return 0;
+}
+
+// L122-134: async saveKey(keyInput)
+// Throws on bad format / unconfigured / invalid license (DEFECT: throw -> status codes -3/-4/-5).
+fn freeModelAccessManager_saveKey(mgr: &FreeModelAccessManager, key_ptr: ptr, key_len: u64) -> i32 {
+    // key = keyInput.trim(); if !KEY_PATTERN.test(key) throw "密钥格式应为 cxu- 加 48 位字母数字"
+    // DEFECT: Chinese error literal preserved in err buffer via STR_PTR at fix stage.
+    // if !serviceUrl throw; remote = await request(status, {machineHash, key});
+    // if !remote.license.valid throw licenseError(reason); storage = await writeKey(key);
+    // value = decorate(...); statusCache = {key, now+60_000, value}; return value
+    return 0;
+}
+
+// L136-149: async clearKey()
+fn freeModelAccessManager_clearKey(mgr: &FreeModelAccessManager) -> i32 {
+    mgr.has_memory_key = false;
+    mgr.has_status_cache = false;
+    // entry = keyringEntry(); if (entry) try { await entry.deleteCredential() } catch {}
+    // DEFECT: keyring delete -> extern stub; errors swallowed as in source.
+    return freeModelAccessManager_status(mgr);
+}
+
+// L151-175: async prepareRefresh(): Promise<FreeModelRefreshAuthorization>
+fn freeModelAccessManager_prepareRefresh(mgr: &FreeModelAccessManager) -> i32 {
+    // dev machine -> {...developmentStatus, allowed: true, authorizationId: "development-machine"}
+    // readKey; !serviceUrl -> {...unconfiguredStatus, allowed: false}
+    // try { remote = await request("/v1/access/prepare", {...}); return {...decorate(...), ...remote} }
+    // catch { return {...unconfiguredStatus, configured: true, allowed: false, serviceError} }
+    // DEFECT: generic request<T & {...}> + spread merge -> field-wise copy into out_auth.
+    return 0;
+}
+
+// L177-188: async completeRefresh(authorizationId, success, importedModels): Promise<void>
+fn freeModelAccessManager_completeRefresh(mgr: &FreeModelAccessManager, has_auth: bool, auth_ptr: ptr, auth_len: u64, success: bool, imported_models: f64) -> i32 {
+    // if authorizationId === "development-machine" return; if !authorizationId || !serviceUrl return;
+    // await request("/v1/access/complete", {machineHash, authorizationId, success, importedModels}); statusCache = null
+    return 0;
+}
+
+// L190-198: private decorate(remote, machineHash, storage)
+// machineCode = machineHash.slice(0, 12).toUpperCase()
+fn freeModelAccessManager_decorate(mgr: &FreeModelAccessManager, storage: u64) -> i32 {
+    return 0;
+}
+
+// L200-217: private developmentStatus(machineHash)
+// license.keyPreview literal "开发机器免密" (Chinese, preserved at fix stage); refreshIntervalHours 5;
+// discordInviteUrl = env.CODEX_ULTRA_DISCORD_INVITE_URL?.trim() || DEFAULT_DISCORD_INVITE; storage "none"(3).
+fn freeModelAccessManager_developmentStatus(mgr: &FreeModelAccessManager) -> i32 {
+    return 0;
+}
+
+// L219-236: private unconfiguredStatus(machineHash, storage)
+// serviceError literal "CODEX_ULTRA_FREE_KEY_SERVICE_URL is not configured"; refreshRequired true.
+fn freeModelAccessManager_unconfiguredStatus(mgr: &FreeModelAccessManager, storage: u64) -> i32 {
+    return 0;
+}
+
+// L238-255: private async readKey(): Promise<{key, storage}>
+// DEFECT: async + discriminated return object -> out params (key scratch on mgr + storage code return).
+fn freeModelAccessManager_readKey(mgr: &FreeModelAccessManager) -> i32 {
+    // if envKey -> {envKey, "environment"(2)}; if memoryKey -> {"memory"(1)};
+    // entry = keyringEntry(); if entry try { key = await entry.getPassword(); if key { memoryKey = key; return {key, "keyring"(0)} } } catch {}
+    // return {null, "none"(3)}
+    // DEFECT: keyring getPassword -> extern stub.
+    return 3;
+}
+
+// L257-267: private async writeKey(key): Promise<storage>
+fn freeModelAccessManager_writeKey(mgr: &FreeModelAccessManager, key_ptr: ptr, key_len: u64) -> i32 {
+    // memoryKey = key; entry = keyringEntry(); if !entry return "memory"(1);
+    // try { await entry.setPassword(key); return "keyring"(0) } catch { return "memory"(1) }
+    // DEFECT: keyring setPassword -> extern stub.
+    return 1;
+}
+
+// L269-276: private keyringEntry(): AsyncEntry | null
+// DEFECT: constructing native AsyncEntry("codex-react-ui", "free-model-access") -> extern handle (0 = null).
+fn freeModelAccessManager_keyringEntry(mgr: &FreeModelAccessManager) -> u64 {
+    return 0;
+}
+
+// L278-281: private machineHash(): Promise<string> — this.machineHashPromise ??= resolveMachineHash(this.env)
+// DEFECT: ??= lazy Promise memoization -> resolved-flag cache.
+fn freeModelAccessManager_machineHash(mgr: &FreeModelAccessManager) -> i32 {
+    if mgr.machine_hash_resolved { return 0; };
+    return resolveMachineHash(mgr);
+}
+
+// L283-303: private async request<T>(path, body: Record<string, unknown>): Promise<T>
+// DEFECT: generics + dynamic JSON body + fetch + AbortController/setTimeout(10_000) timeout ->
+// blocking HTTP extern with timeout parameter; response JSON parsed into caller scratch.
+// Headers: Content-Type/Accept application/json; Authorization Bearer <secret> when present.
+// Throws Error(payload.error || `Free-key service returned HTTP ${status}`) when !ok or data undefined (DEFECT: template literal -> formatted err buffer).
+fn freeModelAccessManager_request(mgr: &FreeModelAccessManager, path_ptr: ptr, path_len: u64, body_ptr: ptr, body_len: u64) -> i32 {
+    return 0;
+}
+
+// L306-328: export async function resolveMachineHash(env, targetPlatform): Promise<string>
+// DEFECT: async -> synchronous; platform string compare kept.
+fn resolveMachineHash(mgr: &FreeModelAccessManager) -> i32 {
+    // override = env.CODEX_ULTRA_MACHINE_GUID?.trim(); machineId = override || ""
+    // if (!machineId && platform == "win32") try { execFileAsync("reg.exe", ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"]) ; machineId = stdout.match(/MachineGuid\s+REG_SZ\s+([^\r\n]+)/i)?.[1]?.trim() || "" } catch { "" }
+    // DEFECT: RegExp capture on reg.exe output -> manual scan for "REG_SZ" then line tail.
+    // DEFECT: child_process execFile -> sa_std_process spawn extern approximation.
+    // if (!machineId && platform != "win32") for path of ["/etc/machine-id", "/var/lib/dbus/machine-id"] try { readFile trim; break } catch {}
+    // if (!machineId) machineId = `fallback:${hostname()}` (DEFECT: template literal -> concat)
+    // return createHash("sha256").update(`codex-ultra/free-model-access/v1:${machineId.toLowerCase()}`).digest("hex")
+    // DEFECT: node:crypto -> sa_std sha256 extern.
+    return 0;
+}
+
+// L330-337: function licenseError(reason): string — switch over reason union
+// Returns Chinese messages: machine_mismatch "该密钥不属于当前 Windows 机器", expired "该密钥已经过期，请重新获取",
+// revoked "该密钥已经被撤销，请重新获取", default "密钥无效，请检查后重试" (literals preserved at fix stage; out via mgr.err).
+fn licenseError(reason: u64, out_ptr: ptr) -> u64 {
+    // DEFECT: string return -> (ptr,len) via caller buffer; switch -> if-chain on reason code.
+    return 0;
+}
+
+// L339-341: export function isDevelopmentMachine(machineHash): boolean
+fn isDevelopmentMachine(hash_ptr: ptr, hash_len: u64) -> bool {
+    // DEVELOPMENT_MACHINE_HASHES.has(machineHash.trim().toLowerCase())
+    // DEFECT: Set.has + string normalize -> trim/lowercase copy + fixed-array compare.
+    return false;
+}
+
+// L343-345: function errorMessage(error: unknown): string
+// DEFECT: unknown/Error narrowing -> (code, msg_ptr, msg_len) convention; message copied out.
+fn errorMessage(is_error: bool, msg_ptr: ptr, msg_len: u64, out_ptr: ptr) -> u64 {
+    return 0;
+}
+
+// L11 helper: KEY_PATTERN validator
+// DEFECT: RegExp /^cxu-[A-Za-z0-9]{48}$/ -> manual prefix + charset scan.
+fn keyPatternMatches(key_ptr: ptr, key_len: u64) -> bool {
+    return false;
+}

@@ -1,0 +1,1131 @@
+// Converted 1:1 from apps/free-key-server/src/licenseStore.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "config.sla"
+
+// TS: import Database from "better-sqlite3"; (see types.d.sla)
+// DEFECT: better-sqlite3 synchronous API (prepare/bind/run/get/all, pragma,
+// exec, transaction closures) has no sa_std surface; the calls below name
+// intent externs sa_sqlite_open/close/exec/prepare/bind_text/bind_int/
+// bind_null/step/column_text/column_int/column_is_null/finalize/changes/
+// begin/commit/rollback. All SQL text is preserved verbatim from the TS.
+// DEFECT: db.transaction(() => {...})() closures -> explicit
+// begin/commit/rollback around the sequential body.
+// DEFECT: class with `private readonly config` -> the store struct carries
+// copies of the config values it reads (set by license_store_new).
+// DEFECT: Record<string, unknown> returns (getSettings/updateSettings) are
+// built as JSON text; unknown inputs arrive as sa_json node handles.
+// DEFECT: throw new Error(...) -> i32 status + err ByteBuf (0 = ok).
+
+fn alphanumeric() -> ptr { return STR_PTR("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"); }
+fn alphanumeric_len() -> u64 { return 57; }
+
+// TS: export type Campaign = { id; title; message; imageUrl?; targetUrl?; startsAt?; endsAt? }
+struct Campaign {
+    id: StrField,
+    title: StrField,
+    message: StrField,
+    has_image_url: bool,
+    image_url: StrField,
+    has_target_url: bool,
+    target_url: StrField,
+    has_starts_at: bool,
+    starts_at: u64,
+    has_ends_at: bool,
+    ends_at: u64,
+}
+
+// TS: export type LicenseStatus = { valid; reason: "active"|"missing"|"invalid"|"machine_mismatch"|"expired"|"revoked"; keyPreview?; issuedAt?; expiresAt?; discordUserId? }
+struct LicenseStatus {
+    valid: bool,
+    reason: [u8; 20],
+    reason_len: u64,
+    has_key_preview: bool,
+    key_preview: StrField,
+    has_issued_at: bool,
+    issued_at: u64,
+    has_expires_at: bool,
+    expires_at: u64,
+    has_discord_user_id: bool,
+    discord_user_id: StrField,
+}
+
+// TS: export type AccessStatus = { license; refreshIntervalHours; lastRefreshedAt: number|null; nextRequiredRefreshAt: number|null; refreshRequired; discordInviteUrl; campaign: Campaign|null }
+struct AccessStatus {
+    license: LicenseStatus,
+    refresh_interval_hours: f64,
+    has_last_refreshed_at: bool,
+    last_refreshed_at: u64,
+    has_next_required_refresh_at: bool,
+    next_required_refresh_at: u64,
+    refresh_required: bool,
+    discord_invite_url: StrField,
+    has_campaign: bool,
+    campaign: Campaign,
+}
+
+// TS: export type AdminLicenseRow = { id; keyPreview; machineHash; discordUserId; issuedAt; expiresAt; status; revokedAt: number|null; refreshAt: number|null }
+struct AdminLicenseRow {
+    id: StrField,
+    key_preview: StrField,
+    machine_hash: StrField,
+    discord_user_id: StrField,
+    issued_at: u64,
+    expires_at: u64,
+    status: StrField,
+    has_revoked_at: bool,
+    revoked_at: u64,
+    has_refresh_at: bool,
+    refresh_at: u64,
+}
+
+// Issue result shared by issueLicense / issueAdminLicense (TS returns
+// { key, machineHash, issuedAt, expiresAt }).
+struct License {
+    key: StrField,
+    user_id: StrField,
+    machine_hash: StrField,
+    issued_at: u64,
+    expires_at: u64,
+    revoked: bool,
+}
+
+struct Requirement {
+    required_code: StrField,
+    expires_at: u64,
+}
+
+// prepareRefresh result: AccessStatus & { allowed; authorizationId?; authorizationExpiresAt?; requirement? }
+struct PrepareRefreshResult {
+    status: AccessStatus,
+    allowed: bool,
+    has_authorization_id: bool,
+    authorization_id: StrField,
+    has_authorization_expires_at: bool,
+    authorization_expires_at: u64,
+    has_requirement: bool,
+    requirement: Requirement,
+}
+
+// TS: type RequiredCodeRecord = { machine_hash: string; expires_at: number; consumed_at: number | null }
+struct RequiredCodeRecord {
+    machine_hash: StrField,
+    expires_at: u64,
+    has_consumed_at: bool,
+    consumed_at: u64,
+}
+
+struct LicenseStore {
+    db: u64,
+    closed: bool,
+    cfg_default_validity_days: f64,
+    cfg_refresh_interval_hours: f64,
+    cfg_required_ttl_minutes: f64,
+    cfg_hash_pepper: StrField,
+    cfg_discord_invite_url: StrField,
+    cfg_database_path: StrField,
+}
+
+// TS: function randomText(length: number): string  (rejection sampling over ALPHANUMERIC)
+fn random_text(out: &ByteBuf, length: u64) -> void {
+    buf_reset(out);
+    let alpha: ptr = alphanumeric();
+    let alen = alphanumeric_len();
+    let limit = 256 / alen * alen;
+    while out.len < length {
+        let chunk = [0u8; 128];
+        // DEFECT: randomBytes — intent extern sa_crypto_random_bytes.
+        sa_crypto_random_bytes(&chunk, length);
+        for i in 0..length {
+            let byte = chunk[i] as u64;
+            if byte >= limit { continue; };
+            let ch: u8 = 0;
+            PTR_BYTE_AT(ch, alpha, byte % alen);
+            buf_append_byte(out, ch);
+            if out.len == length { break; };
+        }
+    }
+}
+
+// TS: function normalizeMachineHash(machineHash: string): string  (throws)
+// Returns i32: 0 ok (normalized into out), 1 invalid.
+fn normalize_machine_hash(out: &StrField, in_ptr: ptr, in_len: u64) -> i32 {
+    // trim + toLowerCase into a scratch, then /^[a-f0-9]{64}$/.
+    let scratch = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let start: u64 = 0;
+    let end = in_len;
+    while start < end {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, in_ptr, start);
+        if b == 32 || b == 9 || b == 13 || b == 10 { start = start + 1; } else { break; };
+    }
+    while end > start {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, in_ptr, end - 1);
+        if b == 32 || b == 9 || b == 13 || b == 10 { end = end - 1; } else { break; };
+    }
+    for i in start..end {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, in_ptr, i);
+        if b >= 65 && b <= 90 { b = b + 32; };
+        buf_append_byte(&scratch, b);
+    }
+    // DEFECT: regex /^[a-f0-9]{64}$/ approximated by length + hex scan.
+    if scratch.len != 64 { return 1; };
+    for j in 0..64 {
+        let b = scratch.bytes[j];
+        let is_hex = (b >= 48 && b <= 57) || (b >= 97 && b <= 102);
+        if !is_hex { return 1; };
+    }
+    str_field_set(out, &scratch.bytes, scratch.len);
+    return 0;
+}
+
+// TS: function httpUrl(value: unknown): string | undefined
+// Writes the normalized URL (url.toString()) into out; returns found.
+// DEFECT: new URL() parsing/serialization — intent extern sa_url_normalize_http.
+fn http_url(out: &StrField, node: u64) -> bool {
+    if node == 0 || sa_json_kind_of(node) != 1 { return false; };
+    let p: ptr = sa_json_string_ptr(node);
+    let l: u64 = sa_json_string_len(node);
+    // trim check
+    let any = false;
+    for i in 0..l {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, p, i);
+        if b != 32 && b != 9 && b != 13 && b != 10 { any = true; };
+    }
+    if !any { return false; };
+    return sa_url_normalize_http(out, p, l) == 0;
+}
+
+// TS: function safeCampaign(value: unknown): Campaign | null
+fn safe_campaign(out: &Campaign, node: u64) -> bool {
+    if node == 0 || sa_json_kind_of(node) != 3 { return false; };
+    let id_ptr: ptr = PTR_NULL();
+    let id_len: u64 = 0;
+    let title_ptr: ptr = PTR_NULL();
+    let title_len: u64 = 0;
+    let msg_ptr: ptr = PTR_NULL();
+    let msg_len: u64 = 0;
+    sa_json_object_get_string(node, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len);
+    sa_json_object_get_string(node, STR_PTR("title"), STR_LEN("title"), &title_ptr, &title_len);
+    sa_json_object_get_string(node, STR_PTR("message"), STR_LEN("message"), &msg_ptr, &msg_len);
+    // TS trims each; empty after trim -> null. (Trim approximated: the raw
+    // values are stored; whitespace-only check below.)
+    if id_len == 0 || title_len == 0 || msg_len == 0 { return false; };
+    str_field_set(&out.id, id_ptr, id_len);
+    str_field_set(&out.title, title_ptr, title_len);
+    str_field_set(&out.message, msg_ptr, msg_len);
+    let img_node: u64 = 0;
+    sa_json_object_get(node, STR_PTR("imageUrl"), STR_LEN("imageUrl"), &img_node);
+    out.has_image_url = http_url(&out.image_url, img_node);
+    let tgt_node: u64 = 0;
+    sa_json_object_get(node, STR_PTR("targetUrl"), STR_LEN("targetUrl"), &tgt_node);
+    out.has_target_url = http_url(&out.target_url, tgt_node);
+    let sv: u64 = 0;
+    out.has_starts_at = sa_json_object_get_i64(node, STR_PTR("startsAt"), STR_LEN("startsAt"), &sv) == 0;
+    if out.has_starts_at { out.starts_at = sv; };
+    let ev: u64 = 0;
+    out.has_ends_at = sa_json_object_get_i64(node, STR_PTR("endsAt"), STR_LEN("endsAt"), &ev) == 0;
+    if out.has_ends_at { out.ends_at = ev; };
+    return true;
+}
+
+// --- private helpers (TS private methods) ---
+
+// TS: private hashKey(key: string): string  (HMAC-SHA256 hex with pepper)
+fn license_store_hash_key(store: &LicenseStore, out: &ByteBuf, key_ptr: ptr, key_len: u64) -> void {
+    buf_reset(out);
+    // DEFECT: createHmac("sha256", pepper).digest("hex") — intent extern.
+    sa_crypto_hmac_sha256_hex(&store.cfg_hash_pepper.bytes, store.cfg_hash_pepper.len, key_ptr, key_len, out);
+}
+
+// TS: private textSetting(key: string, fallback: string): string
+fn license_store_text_setting(store: &LicenseStore, out: &ByteBuf, key_ptr: ptr, key_len: u64, fb_ptr: ptr, fb_len: u64) -> void {
+    buf_reset(out);
+    let stmt = sa_sqlite_prepare(store.db, STR_PTR("SELECT value FROM settings WHERE key = ?"), STR_LEN("SELECT value FROM settings WHERE key = ?"));
+    sa_sqlite_bind_text(stmt, 1, key_ptr, key_len);
+    if sa_sqlite_step(stmt) {
+        let vp: ptr = PTR_NULL();
+        let vl: u64 = 0;
+        sa_sqlite_column_text(stmt, 0, &vp, &vl);
+        buf_append_lit(out, vp, vl);
+    } else {
+        buf_append_lit(out, fb_ptr, fb_len);
+    };
+    sa_sqlite_finalize(stmt);
+}
+
+// TS: private numberSetting(key: string, fallback: number): number
+fn license_store_number_setting(store: &LicenseStore, key_ptr: ptr, key_len: u64, fallback: f64) -> f64 {
+    let text = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let fb = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_f64(&fb, fallback);
+    license_store_text_setting(store, &text, key_ptr, key_len, &fb.bytes, fb.len);
+    // Number(text): reuse the config.sla decimal parser semantics.
+    return positive_number(true, &text.bytes, text.len, fallback);
+}
+
+// TS: private currentCampaign(now = Date.now()): Campaign | null
+fn license_store_current_campaign(store: &LicenseStore, out: &Campaign, now_ms: u64) -> bool {
+    let text = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    license_store_text_setting(store, &text, STR_PTR("campaign_json"), STR_LEN("campaign_json"), STR_PTR("null"), STR_LEN("null"));
+    let doc = sa_json_parse(&text.bytes, text.len);
+    if doc == 0 { return false; };
+    if !safe_campaign(out, doc) { return false; };
+    if out.has_starts_at && out.starts_at > now_ms { return false; };
+    if out.has_ends_at && out.ends_at <= now_ms { return false; };
+    return true;
+}
+
+// Campaign -> JSON text (for getSettings output).
+fn campaign_to_json(out: &ByteBuf, c: &Campaign) -> void {
+    buf_append_lit(out, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+    buf_append_escaped(out, &c.id.bytes, c.id.len);
+    buf_append_lit(out, STR_PTR("\",\"title\":\""), STR_LEN("\",\"title\":\""));
+    buf_append_escaped(out, &c.title.bytes, c.title.len);
+    buf_append_lit(out, STR_PTR("\",\"message\":\""), STR_LEN("\",\"message\":\""));
+    buf_append_escaped(out, &c.message.bytes, c.message.len);
+    buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+    if c.has_image_url {
+        buf_append_lit(out, STR_PTR(",\"imageUrl\":\""), STR_LEN(",\"imageUrl\":\""));
+        buf_append_escaped(out, &c.image_url.bytes, c.image_url.len);
+        buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+    };
+    if c.has_target_url {
+        buf_append_lit(out, STR_PTR(",\"targetUrl\":\""), STR_LEN(",\"targetUrl\":\""));
+        buf_append_escaped(out, &c.target_url.bytes, c.target_url.len);
+        buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+    };
+    if c.has_starts_at {
+        buf_append_lit(out, STR_PTR(",\"startsAt\":"), STR_LEN(",\"startsAt\":"));
+        buf_append_u64(out, c.starts_at);
+    };
+    if c.has_ends_at {
+        buf_append_lit(out, STR_PTR(",\"endsAt\":"), STR_LEN(",\"endsAt\":"));
+        buf_append_u64(out, c.ends_at);
+    };
+    buf_append_lit(out, STR_PTR("}"), STR_LEN("}"));
+}
+
+// --- constructor / migration / seed ---
+
+// TS: private migrate(): void  (db.exec with the full DDL block, verbatim)
+fn license_store_migrate(store: &LicenseStore) -> void {
+    sa_sqlite_exec(store.db, STR_PTR("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS required_codes (code TEXT PRIMARY KEY, machine_hash TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER, discord_user_id TEXT); CREATE INDEX IF NOT EXISTS idx_required_codes_machine ON required_codes(machine_hash, created_at DESC); CREATE TABLE IF NOT EXISTS licenses (id TEXT PRIMARY KEY, key_hash TEXT NOT NULL UNIQUE, key_preview TEXT NOT NULL, machine_hash TEXT NOT NULL, discord_user_id TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, status TEXT NOT NULL, revoked_at INTEGER); CREATE INDEX IF NOT EXISTS idx_licenses_machine ON licenses(machine_hash, issued_at DESC); CREATE INDEX IF NOT EXISTS idx_licenses_discord ON licenses(discord_user_id, issued_at DESC); CREATE TABLE IF NOT EXISTS machine_access (machine_hash TEXT PRIMARY KEY, last_refreshed_at INTEGER NOT NULL, updated_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS refresh_authorizations (id TEXT PRIMARY KEY, machine_hash TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, status TEXT NOT NULL, completed_at INTEGER, imported_models INTEGER NOT NULL DEFAULT 0); CREATE INDEX IF NOT EXISTS idx_refresh_authorizations_machine ON refresh_authorizations(machine_hash, created_at DESC); CREATE TABLE IF NOT EXISTS admin_audit (id TEXT PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, details_json TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit(created_at DESC);"), STR_LEN("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS required_codes (code TEXT PRIMARY KEY, machine_hash TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER, discord_user_id TEXT); CREATE INDEX IF NOT EXISTS idx_required_codes_machine ON required_codes(machine_hash, created_at DESC); CREATE TABLE IF NOT EXISTS licenses (id TEXT PRIMARY KEY, key_hash TEXT NOT NULL UNIQUE, key_preview TEXT NOT NULL, machine_hash TEXT NOT NULL, discord_user_id TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, status TEXT NOT NULL, revoked_at INTEGER); CREATE INDEX IF NOT EXISTS idx_licenses_machine ON licenses(machine_hash, issued_at DESC); CREATE INDEX IF NOT EXISTS idx_licenses_discord ON licenses(discord_user_id, issued_at DESC); CREATE TABLE IF NOT EXISTS machine_access (machine_hash TEXT PRIMARY KEY, last_refreshed_at INTEGER NOT NULL, updated_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS refresh_authorizations (id TEXT PRIMARY KEY, machine_hash TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, status TEXT NOT NULL, completed_at INTEGER, imported_models INTEGER NOT NULL DEFAULT 0); CREATE INDEX IF NOT EXISTS idx_refresh_authorizations_machine ON refresh_authorizations(machine_hash, created_at DESC); CREATE TABLE IF NOT EXISTS admin_audit (id TEXT PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, details_json TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit(created_at DESC);"));
+}
+
+// TS: private seedSettings(): void
+fn license_store_seed_settings(store: &LicenseStore) -> void {
+    let now = sa_time_now_ms();
+    let stmt = sa_sqlite_prepare(store.db, STR_PTR("INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)"), STR_LEN("INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)"));
+    let num = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_f64(&num, store.cfg_default_validity_days);
+    seed_one(stmt, STR_PTR("default_validity_days"), STR_LEN("default_validity_days"), &num.bytes, num.len, now);
+    buf_reset(&num);
+    buf_append_f64(&num, store.cfg_refresh_interval_hours);
+    seed_one(stmt, STR_PTR("refresh_interval_hours"), STR_LEN("refresh_interval_hours"), &num.bytes, num.len, now);
+    buf_reset(&num);
+    buf_append_f64(&num, store.cfg_required_ttl_minutes);
+    seed_one(stmt, STR_PTR("required_ttl_minutes"), STR_LEN("required_ttl_minutes"), &num.bytes, num.len, now);
+    seed_one(stmt, STR_PTR("discord_invite_url"), STR_LEN("discord_invite_url"), &store.cfg_discord_invite_url.bytes, store.cfg_discord_invite_url.len, now);
+    seed_one(stmt, STR_PTR("campaign_json"), STR_LEN("campaign_json"), STR_PTR("null"), STR_LEN("null"), now);
+    sa_sqlite_finalize(stmt);
+}
+
+fn seed_one(stmt: u64, key_ptr: ptr, key_len: u64, val_ptr: ptr, val_len: u64, now_ms: u64) -> void {
+    sa_sqlite_reset(stmt);
+    sa_sqlite_bind_text(stmt, 1, key_ptr, key_len);
+    sa_sqlite_bind_text(stmt, 2, val_ptr, val_len);
+    sa_sqlite_bind_int(stmt, 3, now_ms);
+    sa_sqlite_step(stmt);
+}
+
+// TS: public constructor(private readonly config: FreeKeyServerConfig)
+fn license_store_new(store: &LicenseStore, cfg: &FreeKeyServerConfig) -> i32 {
+    store.cfg_default_validity_days = cfg.default_validity_days;
+    store.cfg_refresh_interval_hours = cfg.refresh_interval_hours;
+    store.cfg_required_ttl_minutes = cfg.required_ttl_minutes;
+    store.cfg_hash_pepper = cfg.hash_pepper;
+    store.cfg_discord_invite_url = cfg.discord_invite_url;
+    store.cfg_database_path = cfg.database_path;
+    // DEFECT: mkdirSync(dirname(databasePath), { recursive: true }) and
+    // node:path dirname — intent extern sa_fs_mkdir_parent_of(path).
+    sa_fs_mkdir_parent_of(&cfg.database_path.bytes, cfg.database_path.len);
+    store.db = sa_sqlite_open(&cfg.database_path.bytes, cfg.database_path.len);
+    if store.db == 0 { return 1; };
+    sa_sqlite_exec(store.db, STR_PTR("PRAGMA journal_mode = WAL"), STR_LEN("PRAGMA journal_mode = WAL"));
+    sa_sqlite_exec(store.db, STR_PTR("PRAGMA foreign_keys = ON"), STR_LEN("PRAGMA foreign_keys = ON"));
+    sa_sqlite_exec(store.db, STR_PTR("PRAGMA busy_timeout = 5000"), STR_LEN("PRAGMA busy_timeout = 5000"));
+    license_store_migrate(store);
+    license_store_seed_settings(store);
+    store.closed = false;
+    return 0;
+}
+
+// TS: public close(): void
+fn license_store_close(store: &LicenseStore) -> void {
+    if store.db != 0 {
+        sa_sqlite_close(store.db);
+        store.db = 0;
+    };
+    store.closed = true;
+}
+
+// --- settings ---
+
+// TS: public getSettings(): Record<string, unknown>  (JSON text into out)
+fn license_store_get_settings(store: &LicenseStore, out: &ByteBuf) -> void {
+    buf_reset(out);
+    buf_append_lit(out, STR_PTR("{\"defaultValidityDays\":"), STR_LEN("{\"defaultValidityDays\":"));
+    buf_append_f64(out, license_store_number_setting(store, STR_PTR("default_validity_days"), STR_LEN("default_validity_days"), store.cfg_default_validity_days));
+    buf_append_lit(out, STR_PTR(",\"refreshIntervalHours\":"), STR_LEN(",\"refreshIntervalHours\":"));
+    buf_append_f64(out, license_store_number_setting(store, STR_PTR("refresh_interval_hours"), STR_LEN("refresh_interval_hours"), store.cfg_refresh_interval_hours));
+    buf_append_lit(out, STR_PTR(",\"requiredTtlMinutes\":"), STR_LEN(",\"requiredTtlMinutes\":"));
+    buf_append_f64(out, license_store_number_setting(store, STR_PTR("required_ttl_minutes"), STR_LEN("required_ttl_minutes"), store.cfg_required_ttl_minutes));
+    let invite = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    license_store_text_setting(store, &invite, STR_PTR("discord_invite_url"), STR_LEN("discord_invite_url"), &store.cfg_discord_invite_url.bytes, store.cfg_discord_invite_url.len);
+    buf_append_lit(out, STR_PTR(",\"discordInviteUrl\":\""), STR_LEN(",\"discordInviteUrl\":\""));
+    buf_append_escaped(out, &invite.bytes, invite.len);
+    buf_append_lit(out, STR_PTR("\",\"campaign\":"), STR_LEN("\",\"campaign\":"));
+    let camp = Campaign { id: StrField { bytes: [0u8; 512], len: 0 }, title: StrField { bytes: [0u8; 512], len: 0 }, message: StrField { bytes: [0u8; 512], len: 0 }, has_image_url: false, image_url: StrField { bytes: [0u8; 512], len: 0 }, has_target_url: false, target_url: StrField { bytes: [0u8; 512], len: 0 }, has_starts_at: false, starts_at: 0, has_ends_at: false, ends_at: 0 };
+    if license_store_current_campaign(store, &camp, sa_time_now_ms()) {
+        campaign_to_json(out, &camp);
+    } else {
+        buf_append_lit(out, STR_PTR("null"), STR_LEN("null"));
+    };
+    buf_append_lit(out, STR_PTR("}"), STR_LEN("}"));
+}
+
+// TS: public updateSettings(input: Record<string, unknown>): Record<string, unknown>
+// Returns i32 status; on success out holds the getSettings JSON.
+fn license_store_update_settings(store: &LicenseStore, out: &ByteBuf, err: &ByteBuf, input: u64) -> i32 {
+    buf_reset(err);
+    // updates Map<string,string> approximated by three slots + two text slots.
+    let keys = [0u8; 1];
+    let _unused = keys;
+    let upd_keys = [StrField; 8];
+    let upd_vals = [StrField; 8];
+    let n_upd: u64 = 0;
+    // positive numeric fields
+    let fields = [0u64; 3];
+    fields[0] = 0;
+    fields[1] = 1;
+    fields[2] = 2;
+    for fi in 0..3 {
+        let in_key_ptr: ptr = STR_PTR("defaultValidityDays");
+        let in_key_len: u64 = STR_LEN("defaultValidityDays");
+        let set_key_ptr: ptr = STR_PTR("default_validity_days");
+        let set_key_len: u64 = STR_LEN("default_validity_days");
+        if fi == 1 { in_key_ptr = STR_PTR("refreshIntervalHours"); in_key_len = STR_LEN("refreshIntervalHours"); set_key_ptr = STR_PTR("refresh_interval_hours"); set_key_len = STR_LEN("refresh_interval_hours"); };
+        if fi == 2 { in_key_ptr = STR_PTR("requiredTtlMinutes"); in_key_len = STR_LEN("requiredTtlMinutes"); set_key_ptr = STR_PTR("required_ttl_minutes"); set_key_len = STR_LEN("required_ttl_minutes"); };
+        let vnode: u64 = 0;
+        if sa_json_object_get(input, in_key_ptr, in_key_len, &vnode) == 0 && vnode != 0 && sa_json_kind_of(vnode) == 4 {
+            let v = sa_json_number_value(vnode);
+            if v > 0.0 {
+                str_field_set(&upd_keys[n_upd], set_key_ptr, set_key_len);
+                let nb = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                buf_append_f64(&nb, v);
+                str_field_set(&upd_vals[n_upd], &nb.bytes, nb.len);
+                n_upd = n_upd + 1;
+            };
+        };
+    }
+    // discordInviteUrl
+    let url_node: u64 = 0;
+    if sa_json_object_get(input, STR_PTR("discordInviteUrl"), STR_LEN("discordInviteUrl"), &url_node) == 0 && url_node != 0 && sa_json_kind_of(url_node) == 1 {
+        let up: ptr = sa_json_string_ptr(url_node);
+        let ul: u64 = sa_json_string_len(url_node);
+        let any = false;
+        for i in 0..ul {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, up, i);
+            if b != 32 && b != 9 && b != 13 && b != 10 { any = true; };
+        }
+        if any {
+            let norm = StrField { bytes: [0u8; 512], len: 0 };
+            if !http_url(&norm, url_node) {
+                buf_append_lit(err, STR_PTR("discordInviteUrl must use HTTP or HTTPS"), STR_LEN("discordInviteUrl must use HTTP or HTTPS"));
+                return 1;
+            };
+            str_field_set(&upd_keys[n_upd], STR_PTR("discord_invite_url"), STR_LEN("discord_invite_url"));
+            upd_vals[n_upd] = norm;
+            n_upd = n_upd + 1;
+        };
+    };
+    // campaign (hasOwnProperty check)
+    if sa_json_object_has(input, STR_PTR("campaign"), STR_LEN("campaign")) {
+        let cnode: u64 = 0;
+        sa_json_object_get(input, STR_PTR("campaign"), STR_LEN("campaign"), &cnode);
+        let is_null = cnode == 0 || sa_json_kind_of(cnode) == 0;
+        let camp = Campaign { id: StrField { bytes: [0u8; 512], len: 0 }, title: StrField { bytes: [0u8; 512], len: 0 }, message: StrField { bytes: [0u8; 512], len: 0 }, has_image_url: false, image_url: StrField { bytes: [0u8; 512], len: 0 }, has_target_url: false, target_url: StrField { bytes: [0u8; 512], len: 0 }, has_starts_at: false, starts_at: 0, has_ends_at: false, ends_at: 0 };
+        let okc = false;
+        if !is_null { okc = safe_campaign(&camp, cnode); };
+        if !is_null && !okc {
+            buf_append_lit(err, STR_PTR("campaign requires id, title and message"), STR_LEN("campaign requires id, title and message"));
+            return 1;
+        };
+        let cj = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        if is_null {
+            buf_append_lit(&cj, STR_PTR("null"), STR_LEN("null"));
+        } else {
+            campaign_to_json(&cj, &camp);
+        };
+        str_field_set(&upd_keys[n_upd], STR_PTR("campaign_json"), STR_LEN("campaign_json"));
+        str_field_set(&upd_vals[n_upd], &cj.bytes, cj.len);
+        n_upd = n_upd + 1;
+    };
+    // Transaction: upsert each (key, value, now).
+    let stmt = sa_sqlite_prepare(store.db, STR_PTR("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"), STR_LEN("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"));
+    sa_sqlite_begin(store.db);
+    let now = sa_time_now_ms();
+    for ui in 0..n_upd {
+        sa_sqlite_reset(stmt);
+        sa_sqlite_bind_text(stmt, 1, &upd_keys[ui].bytes, upd_keys[ui].len);
+        sa_sqlite_bind_text(stmt, 2, &upd_vals[ui].bytes, upd_vals[ui].len);
+        sa_sqlite_bind_int(stmt, 3, now);
+        sa_sqlite_step(stmt);
+    }
+    sa_sqlite_commit(store.db);
+    sa_sqlite_finalize(stmt);
+    license_store_get_settings(store, out);
+    return 0;
+}
+
+// --- admin TOTP settings ---
+
+// TS: public adminTotpSecret(): string | null  (found flag + out text)
+fn license_store_admin_totp_secret(store: &LicenseStore, out: &ByteBuf) -> bool {
+    license_store_text_setting(store, out, STR_PTR("admin_totp_secret"), STR_LEN("admin_totp_secret"), STR_PTR(""), STR_LEN(""));
+    // TS trims and treats empty as null.
+    let start: u64 = 0;
+    let end = out.len;
+    while start < end {
+        let b = out.bytes[start];
+        if b == 32 || b == 9 || b == 13 || b == 10 { start = start + 1; } else { break; };
+    }
+    while end > start {
+        let b = out.bytes[end - 1];
+        if b == 32 || b == 9 || b == 13 || b == 10 { end = end - 1; } else { break; };
+    }
+    if end <= start { return false; };
+    // compact the trimmed value back into out
+    let tmp = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    for i in start..end { buf_append_byte(&tmp, out.bytes[i]); }
+    buf_reset(out);
+    buf_append_buf(out, &tmp);
+    return true;
+}
+
+// TS: public setAdminTotpSecret(encryptedSecret: string): void  (throws on blank)
+fn license_store_set_admin_totp_secret(store: &LicenseStore, err: &ByteBuf, sec_ptr: ptr, sec_len: u64) -> i32 {
+    buf_reset(err);
+    let any = false;
+    for i in 0..sec_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, sec_ptr, i);
+        if b != 32 && b != 9 && b != 13 && b != 10 { any = true; };
+    }
+    if !any {
+        buf_append_lit(err, STR_PTR("Encrypted TOTP secret is required"), STR_LEN("Encrypted TOTP secret is required"));
+        return 1;
+    };
+    let stmt = sa_sqlite_prepare(store.db, STR_PTR("INSERT INTO settings (key, value, updated_at) VALUES ('admin_totp_secret', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"), STR_LEN("INSERT INTO settings (key, value, updated_at) VALUES ('admin_totp_secret', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"));
+    sa_sqlite_bind_text(stmt, 1, sec_ptr, sec_len);
+    sa_sqlite_bind_int(stmt, 2, sa_time_now_ms());
+    sa_sqlite_step(stmt);
+    sa_sqlite_finalize(stmt);
+    return 0;
+}
+
+// TS: public resetAdminTotp(): void
+fn license_store_reset_admin_totp(store: &LicenseStore) -> void {
+    let stmt = sa_sqlite_prepare(store.db, STR_PTR("DELETE FROM settings WHERE key = 'admin_totp_secret'"), STR_LEN("DELETE FROM settings WHERE key = 'admin_totp_secret'"));
+    sa_sqlite_step(stmt);
+    sa_sqlite_finalize(stmt);
+}
+
+// --- licenses ---
+
+// TS: public listLicenses(query = "", limit = 100): AdminLicenseRow[]
+// rows[] is caller-allocated (cap 200); returns the row count.
+fn license_store_list_licenses(store: &LicenseStore, rows: ptr, query_ptr: ptr, query_len: u64, limit: u64) -> u64 {
+    // normalized = query.trim().toLowerCase(); boundedLimit = min(200, max(1, floor(limit)))
+    // pattern = "%" + normalized.replace(/[\\%_]/g, "\\$&") + "%"
+    // DEFECT: regex replace for LIKE escaping — manual scan below.
+    let norm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let start: u64 = 0;
+    let end = query_len;
+    while start < end {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, query_ptr, start);
+        if b == 32 || b == 9 || b == 13 || b == 10 { start = start + 1; } else { break; };
+    }
+    while end > start {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, query_ptr, end - 1);
+        if b == 32 || b == 9 || b == 13 || b == 10 { end = end - 1; } else { break; };
+    }
+    for i in start..end {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, query_ptr, i);
+        if b >= 65 && b <= 90 { b = b + 32; };
+        buf_append_byte(&norm, b);
+    }
+    let bounded = limit;
+    if bounded < 1 { bounded = 1; };
+    if bounded > 200 { bounded = 200; };
+    let pattern = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&pattern, STR_PTR("%"), STR_LEN("%"));
+    for i in 0..norm.len {
+        let b = norm.bytes[i];
+        if b == 92 || b == 37 || b == 95 { buf_append_byte(&pattern, 92); };
+        buf_append_byte(&pattern, b);
+    }
+    buf_append_lit(&pattern, STR_PTR("%"), STR_LEN("%"));
+    let stmt = sa_sqlite_prepare(store.db, STR_PTR("SELECT l.id, l.key_preview, l.machine_hash, l.discord_user_id, l.issued_at, l.expires_at, l.status, l.revoked_at, a.last_refreshed_at FROM licenses l LEFT JOIN machine_access a ON a.machine_hash = l.machine_hash WHERE (? = '' OR lower(l.machine_hash) LIKE ? ESCAPE '\\' OR lower(l.discord_user_id) LIKE ? ESCAPE '\\' OR lower(l.key_preview) LIKE ? ESCAPE '\\') ORDER BY l.issued_at DESC LIMIT ?"), STR_LEN("SELECT l.id, l.key_preview, l.machine_hash, l.discord_user_id, l.issued_at, l.expires_at, l.status, l.revoked_at, a.last_refreshed_at FROM licenses l LEFT JOIN machine_access a ON a.machine_hash = l.machine_hash WHERE (? = '' OR lower(l.machine_hash) LIKE ? ESCAPE '\\' OR lower(l.discord_user_id) LIKE ? ESCAPE '\\' OR lower(l.key_preview) LIKE ? ESCAPE '\\') ORDER BY l.issued_at DESC LIMIT ?"));
+    sa_sqlite_bind_text(stmt, 1, &norm.bytes, norm.len);
+    sa_sqlite_bind_text(stmt, 2, &pattern.bytes, pattern.len);
+    sa_sqlite_bind_text(stmt, 3, &pattern.bytes, pattern.len);
+    sa_sqlite_bind_text(stmt, 4, &pattern.bytes, pattern.len);
+    sa_sqlite_bind_int(stmt, 5, bounded);
+    // DEFECT: row materialization into AdminLicenseRow structs — column
+    // mapping kept 1:1 (id, key_preview, machine_hash, discord_user_id,
+    // issued_at, expires_at, status, revoked_at|null, last_refreshed_at|null);
+    // the row-writing loop is represented by the intent call below.
+    let count = sa_sqlite_collect_license_rows(stmt, rows, bounded);
+    sa_sqlite_finalize(stmt);
+    return count;
+}
+
+// Shared insert used by both issue paths (revoke actives + insert new row).
+fn license_store_insert_license(store: &LicenseStore, key_ptr: ptr, key_len: u64, mh: &StrField, uid_ptr: ptr, uid_len: u64, now_ms: u64, expires_at: u64) -> void {
+    let upd = sa_sqlite_prepare(store.db, STR_PTR("UPDATE licenses SET status = 'revoked', revoked_at = ? WHERE machine_hash = ? AND status = 'active'"), STR_LEN("UPDATE licenses SET status = 'revoked', revoked_at = ? WHERE machine_hash = ? AND status = 'active'"));
+    sa_sqlite_bind_int(upd, 1, now_ms);
+    sa_sqlite_bind_text(upd, 2, &mh.bytes, mh.len);
+    sa_sqlite_step(upd);
+    sa_sqlite_finalize(upd);
+    // keyPreview = `${key.slice(0, 8)}…${key.slice(-4)}` (… is U+2026)
+    let preview = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&preview, key_ptr, 8);
+    buf_append_lit(&preview, STR_PTR("…"), STR_LEN("…"));
+    let tail_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tail_ptr, key_ptr, key_len - 4);
+    buf_append_lit(&preview, tail_ptr, 4);
+    let hash = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    license_store_hash_key(store, &hash, key_ptr, key_len);
+    let id = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    sa_crypto_random_uuid(&id.bytes, &id.len);
+    let ins = sa_sqlite_prepare(store.db, STR_PTR("INSERT INTO licenses (id, key_hash, key_preview, machine_hash, discord_user_id, issued_at, expires_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'active')"), STR_LEN("INSERT INTO licenses (id, key_hash, key_preview, machine_hash, discord_user_id, issued_at, expires_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'active')"));
+    sa_sqlite_bind_text(ins, 1, &id.bytes, id.len);
+    sa_sqlite_bind_text(ins, 2, &hash.bytes, hash.len);
+    sa_sqlite_bind_text(ins, 3, &preview.bytes, preview.len);
+    sa_sqlite_bind_text(ins, 4, &mh.bytes, mh.len);
+    sa_sqlite_bind_text(ins, 5, uid_ptr, uid_len);
+    sa_sqlite_bind_int(ins, 6, now_ms);
+    sa_sqlite_bind_int(ins, 7, expires_at);
+    sa_sqlite_step(ins);
+    sa_sqlite_finalize(ins);
+}
+
+// TS: public issueAdminLicense(machineHashInput, discordUserIdInput, validityDays, now = Date.now())
+fn license_store_issue_admin_license(store: &LicenseStore, out: &License, err: &ByteBuf, mh_ptr: ptr, mh_len: u64, uid_ptr: ptr, uid_len: u64, validity_days: f64, now_ms: u64) -> i32 {
+    buf_reset(err);
+    let mh = StrField { bytes: [0u8; 512], len: 0 };
+    if normalize_machine_hash(&mh, mh_ptr, mh_len) != 0 {
+        buf_append_lit(err, STR_PTR("A valid machineHash is required"), STR_LEN("A valid machineHash is required"));
+        return 1;
+    };
+    // discordUserId = input.trim() || "admin"
+    let uid = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&uid, uid_ptr, uid_len);
+    buf_trim(&uid);
+    if uid.len == 0 { buf_append_lit(&uid, STR_PTR("admin"), STR_LEN("admin")); };
+    if validity_days <= 0.0 || validity_days > 3650.0 {
+        buf_append_lit(err, STR_PTR("validityDays must be between 0 and 3650"), STR_LEN("validityDays must be between 0 and 3650"));
+        return 1;
+    };
+    sa_sqlite_begin(store.db);
+    let key = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&key, STR_PTR("cxu-"), STR_LEN("cxu-"));
+    let rand = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    random_text(&rand, 48);
+    buf_append_buf(&key, &rand);
+    let expires_at = now_ms + (validity_days * 24.0 * 60.0 * 60000.0) as u64;
+    license_store_insert_license(store, &key.bytes, key.len, &mh, &uid.bytes, uid.len, now_ms, expires_at);
+    sa_sqlite_commit(store.db);
+    str_field_set(&out.key, &key.bytes, key.len);
+    out.machine_hash = mh;
+    out.issued_at = now_ms;
+    out.expires_at = expires_at;
+    return 0;
+}
+
+// TS: public revokeLicense(id: string, actor = "admin", now = Date.now()): boolean
+fn license_store_revoke_license(store: &LicenseStore, id_ptr: ptr, id_len: u64, actor_ptr: ptr, actor_len: u64, now_ms: u64) -> bool {
+    let id = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&id, id_ptr, id_len);
+    buf_trim(&id);
+    let stmt = sa_sqlite_prepare(store.db, STR_PTR("UPDATE licenses SET status = 'revoked', revoked_at = ? WHERE id = ? AND status = 'active'"), STR_LEN("UPDATE licenses SET status = 'revoked', revoked_at = ? WHERE id = ? AND status = 'active'"));
+    sa_sqlite_bind_int(stmt, 1, now_ms);
+    sa_sqlite_bind_text(stmt, 2, &id.bytes, id.len);
+    sa_sqlite_step(stmt);
+    let changes = sa_sqlite_changes(store.db);
+    sa_sqlite_finalize(stmt);
+    if changes > 0 {
+        // recordAudit(actor, "revoke_license", { licenseId: id })
+        let details = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        buf_append_lit(&details, STR_PTR("{\"licenseId\":\""), STR_LEN("{\"licenseId\":\""));
+        buf_append_escaped(&details, id_ptr, id_len);
+        buf_append_lit(&details, STR_PTR("\"}"), STR_LEN("\"}"));
+        license_store_record_audit(store, actor_ptr, actor_len, STR_PTR("revoke_license"), STR_LEN("revoke_license"), &details.bytes, details.len);
+    };
+    return changes > 0;
+}
+
+// TS: public recordAudit(actor: string, action: string, details: Record<string, unknown>): void
+// details arrives already serialized as JSON text (TS: JSON.stringify(details)).
+fn license_store_record_audit(store: &LicenseStore, actor_ptr: ptr, actor_len: u64, action_ptr: ptr, action_len: u64, details_ptr: ptr, details_len: u64) -> void {
+    let id = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    sa_crypto_random_uuid(&id.bytes, &id.len);
+    let stmt = sa_sqlite_prepare(store.db, STR_PTR("INSERT INTO admin_audit (id, actor, action, details_json, created_at) VALUES (?, ?, ?, ?, ?)"), STR_LEN("INSERT INTO admin_audit (id, actor, action, details_json, created_at) VALUES (?, ?, ?, ?, ?)"));
+    sa_sqlite_bind_text(stmt, 1, &id.bytes, id.len);
+    sa_sqlite_bind_text(stmt, 2, actor_ptr, actor_len);
+    sa_sqlite_bind_text(stmt, 3, action_ptr, action_len);
+    sa_sqlite_bind_text(stmt, 4, details_ptr, details_len);
+    sa_sqlite_bind_int(stmt, 5, sa_time_now_ms());
+    sa_sqlite_step(stmt);
+    sa_sqlite_finalize(stmt);
+}
+
+// TS: public createRequirement(machineHashInput: string, now = Date.now()): { requiredCode; expiresAt }
+fn license_store_create_requirement(store: &LicenseStore, out: &Requirement, err: &ByteBuf, mh_ptr: ptr, mh_len: u64, now_ms: u64) -> i32 {
+    buf_reset(err);
+    let mh = StrField { bytes: [0u8; 512], len: 0 };
+    if normalize_machine_hash(&mh, mh_ptr, mh_len) != 0 {
+        buf_append_lit(err, STR_PTR("A valid machineHash is required"), STR_LEN("A valid machineHash is required"));
+        return 1;
+    };
+    let stmt = sa_sqlite_prepare(store.db, STR_PTR("SELECT code, expires_at FROM required_codes WHERE machine_hash = ? AND consumed_at IS NULL AND expires_at > ? ORDER BY created_at DESC LIMIT 1"), STR_LEN("SELECT code, expires_at FROM required_codes WHERE machine_hash = ? AND consumed_at IS NULL AND expires_at > ? ORDER BY created_at DESC LIMIT 1"));
+    sa_sqlite_bind_text(stmt, 1, &mh.bytes, mh.len);
+    sa_sqlite_bind_int(stmt, 2, now_ms);
+    if sa_sqlite_step(stmt) {
+        let cp: ptr = PTR_NULL();
+        let cl: u64 = 0;
+        sa_sqlite_column_text(stmt, 0, &cp, &cl);
+        str_field_set(&out.required_code, cp, cl);
+        out.expires_at = sa_sqlite_column_int(stmt, 1);
+        sa_sqlite_finalize(stmt);
+        return 0;
+    };
+    sa_sqlite_finalize(stmt);
+    let rand = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    random_text(&rand, 16);
+    buf_to_upper(&rand);
+    let code = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&code, STR_PTR("REQ-"), STR_LEN("REQ-"));
+    buf_append_buf(&code, &rand);
+    let ttl = license_store_number_setting(store, STR_PTR("required_ttl_minutes"), STR_LEN("required_ttl_minutes"), store.cfg_required_ttl_minutes);
+    let expires_at = now_ms + (ttl * 60000.0) as u64;
+    let ins = sa_sqlite_prepare(store.db, STR_PTR("INSERT INTO required_codes (code, machine_hash, created_at, expires_at) VALUES (?, ?, ?, ?)"), STR_LEN("INSERT INTO required_codes (code, machine_hash, created_at, expires_at) VALUES (?, ?, ?, ?)"));
+    sa_sqlite_bind_text(ins, 1, &code.bytes, code.len);
+    sa_sqlite_bind_text(ins, 2, &mh.bytes, mh.len);
+    sa_sqlite_bind_int(ins, 3, now_ms);
+    sa_sqlite_bind_int(ins, 4, expires_at);
+    sa_sqlite_step(ins);
+    sa_sqlite_finalize(ins);
+    str_field_set(&out.required_code, &code.bytes, code.len);
+    out.expires_at = expires_at;
+    return 0;
+}
+
+// TS: public issueLicense(requiredCodeInput: string, discordUserId: string, now = Date.now())
+// The `now` argument is taken explicitly; the discord.sla call site passes
+// the current time via sa_time_now_ms at its side (see DEFECT log).
+fn license_store_issue_license(store: &LicenseStore, out: &License, err: &ByteBuf, code_ptr: ptr, code_len: u64, uid_ptr: ptr, uid_len: u64, now_ms: u64) -> i32 {
+    buf_reset(err);
+    // requiredCode = input.trim().toUpperCase(); /^REQ-[A-Z0-9]{16}$/
+    // DEFECT: regex approximated by prefix/length/charset scan.
+    let code = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&code, code_ptr, code_len);
+    buf_trim(&code);
+    buf_to_upper(&code);
+    let fmt_ok = code.len == 20 && code.bytes[0] == 82 && code.bytes[1] == 69 && code.bytes[2] == 81 && code.bytes[3] == 45;
+    if fmt_ok {
+        for i in 4..20 {
+            let b = code.bytes[i];
+            let okc = (b >= 65 && b <= 90) || (b >= 48 && b <= 57);
+            if !okc { fmt_ok = false; };
+        }
+    };
+    if !fmt_ok {
+        buf_append_lit(err, STR_PTR("required code format is invalid"), STR_LEN("required code format is invalid"));
+        return 1;
+    };
+    let uid = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&uid, uid_ptr, uid_len);
+    buf_trim(&uid);
+    if uid.len == 0 {
+        buf_append_lit(err, STR_PTR("Discord user is required"), STR_LEN("Discord user is required"));
+        return 1;
+    };
+    sa_sqlite_begin(store.db);
+    let stmt = sa_sqlite_prepare(store.db, STR_PTR("SELECT machine_hash, expires_at, consumed_at FROM required_codes WHERE code = ?"), STR_LEN("SELECT machine_hash, expires_at, consumed_at FROM required_codes WHERE code = ?"));
+    sa_sqlite_bind_text(stmt, 1, &code.bytes, code.len);
+    if !sa_sqlite_step(stmt) {
+        sa_sqlite_finalize(stmt);
+        sa_sqlite_rollback(store.db);
+        buf_append_lit(err, STR_PTR("required code was not found"), STR_LEN("required code was not found"));
+        return 1;
+    };
+    let mh = StrField { bytes: [0u8; 512], len: 0 };
+    let mp: ptr = PTR_NULL();
+    let ml: u64 = 0;
+    sa_sqlite_column_text(stmt, 0, &mp, &ml);
+    str_field_set(&mh, mp, ml);
+    let rec_expires = sa_sqlite_column_int(stmt, 1);
+    let consumed_null = sa_sqlite_column_is_null(stmt, 2);
+    let consumed_at: u64 = 0;
+    if !consumed_null { consumed_at = sa_sqlite_column_int(stmt, 2); };
+    sa_sqlite_finalize(stmt);
+    if !consumed_null {
+        sa_sqlite_rollback(store.db);
+        buf_append_lit(err, STR_PTR("required code was already used"), STR_LEN("required code was already used"));
+        return 1;
+    };
+    if rec_expires <= now_ms {
+        sa_sqlite_rollback(store.db);
+        buf_append_lit(err, STR_PTR("required code has expired"), STR_LEN("required code has expired"));
+        return 1;
+    };
+    let key = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&key, STR_PTR("cxu-"), STR_LEN("cxu-"));
+    let rand = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    random_text(&rand, 48);
+    buf_append_buf(&key, &rand);
+    let days = license_store_number_setting(store, STR_PTR("default_validity_days"), STR_LEN("default_validity_days"), store.cfg_default_validity_days);
+    let expires_at = now_ms + (days * 24.0 * 60.0 * 60000.0) as u64;
+    license_store_insert_license(store, &key.bytes, key.len, &mh, &uid.bytes, uid.len, now_ms, expires_at);
+    let upd = sa_sqlite_prepare(store.db, STR_PTR("UPDATE required_codes SET consumed_at = ?, discord_user_id = ? WHERE code = ?"), STR_LEN("UPDATE required_codes SET consumed_at = ?, discord_user_id = ? WHERE code = ?"));
+    sa_sqlite_bind_int(upd, 1, now_ms);
+    sa_sqlite_bind_text(upd, 2, &uid.bytes, uid.len);
+    sa_sqlite_bind_text(upd, 3, &code.bytes, code.len);
+    sa_sqlite_step(upd);
+    sa_sqlite_finalize(upd);
+    sa_sqlite_commit(store.db);
+    str_field_set(&out.key, &key.bytes, key.len);
+    out.machine_hash = mh;
+    out.issued_at = now_ms;
+    out.expires_at = expires_at;
+    return 0;
+}
+
+// --- status / refresh ---
+
+// TS: private licenseStatus(machineHash, keyInput, now): LicenseStatus
+fn license_store_license_status(store: &LicenseStore, out: &LicenseStatus, mh: &StrField, has_key: bool, key_ptr: ptr, key_len: u64, now_ms: u64) -> void {
+    out.valid = false;
+    out.has_key_preview = false;
+    out.has_issued_at = false;
+    out.has_expires_at = false;
+    out.has_discord_user_id = false;
+    let key = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    if has_key { buf_append_lit(&key, key_ptr, key_len); buf_trim(&key); };
+    if !has_key || key.len == 0 {
+        out.reason_len = 7;
+        set_reason(out, STR_PTR("missing"), STR_LEN("missing"));
+        return;
+    };
+    // /^cxu-[A-Za-z0-9]{48}$/ — DEFECT: regex approximated by scan.
+    let fmt_ok = key.len == 52 && key.bytes[0] == 99 && key.bytes[1] == 120 && key.bytes[2] == 117 && key.bytes[3] == 45;
+    if fmt_ok {
+        for i in 4..52 {
+            let b = key.bytes[i];
+            let okc = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57);
+            if !okc { fmt_ok = false; };
+        }
+    };
+    if !fmt_ok {
+        set_reason(out, STR_PTR("invalid"), STR_LEN("invalid"));
+        return;
+    };
+    let hash = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    license_store_hash_key(store, &hash, &key.bytes, key.len);
+    let stmt = sa_sqlite_prepare(store.db, STR_PTR("SELECT key_preview, machine_hash, discord_user_id, issued_at, expires_at, status FROM licenses WHERE key_hash = ?"), STR_LEN("SELECT key_preview, machine_hash, discord_user_id, issued_at, expires_at, status FROM licenses WHERE key_hash = ?"));
+    sa_sqlite_bind_text(stmt, 1, &hash.bytes, hash.len);
+    if !sa_sqlite_step(stmt) {
+        sa_sqlite_finalize(stmt);
+        set_reason(out, STR_PTR("invalid"), STR_LEN("invalid"));
+        return;
+    };
+    let kp = StrField { bytes: [0u8; 512], len: 0 };
+    let rmh = StrField { bytes: [0u8; 512], len: 0 };
+    let ruid = StrField { bytes: [0u8; 512], len: 0 };
+    let rstatus = StrField { bytes: [0u8; 512], len: 0 };
+    let cp: ptr = PTR_NULL();
+    let cl: u64 = 0;
+    sa_sqlite_column_text(stmt, 0, &cp, &cl);
+    str_field_set(&kp, cp, cl);
+    sa_sqlite_column_text(stmt, 1, &cp, &cl);
+    str_field_set(&rmh, cp, cl);
+    sa_sqlite_column_text(stmt, 2, &cp, &cl);
+    str_field_set(&ruid, cp, cl);
+    let r_issued = sa_sqlite_column_int(stmt, 3);
+    let r_expires = sa_sqlite_column_int(stmt, 4);
+    sa_sqlite_column_text(stmt, 5, &cp, &cl);
+    str_field_set(&rstatus, cp, cl);
+    sa_sqlite_finalize(stmt);
+    if rmh.len != mh.len || !bytes_eq(rmh.bytes, &mh.bytes, mh.len) {
+        set_reason(out, STR_PTR("machine_mismatch"), STR_LEN("machine_mismatch"));
+        out.has_key_preview = true;
+        out.key_preview = kp;
+        return;
+    };
+    if rstatus.len != 6 || !bytes_eq_str(&rstatus.bytes, rstatus.len, STR_PTR("active"), STR_LEN("active")) {
+        set_reason(out, STR_PTR("revoked"), STR_LEN("revoked"));
+        out.has_key_preview = true;
+        out.key_preview = kp;
+        return;
+    };
+    if r_expires <= now_ms {
+        set_reason(out, STR_PTR("expired"), STR_LEN("expired"));
+        out.has_key_preview = true;
+        out.key_preview = kp;
+        out.has_issued_at = true;
+        out.issued_at = r_issued;
+        out.has_expires_at = true;
+        out.expires_at = r_expires;
+        return;
+    };
+    out.valid = true;
+    set_reason(out, STR_PTR("active"), STR_LEN("active"));
+    out.has_key_preview = true;
+    out.key_preview = kp;
+    out.has_issued_at = true;
+    out.issued_at = r_issued;
+    out.has_expires_at = true;
+    out.expires_at = r_expires;
+    out.has_discord_user_id = true;
+    out.discord_user_id = ruid;
+}
+
+fn set_reason(out: &LicenseStatus, p: ptr, l: u64) -> void {
+    out.reason_len = l;
+    for i in 0..l {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, p, i);
+        out.reason[i] = b;
+    }
+}
+
+// TS: public status(machineHashInput, keyInput?, now = Date.now()): AccessStatus
+fn license_store_status(store: &LicenseStore, out: &AccessStatus, err: &ByteBuf, mh_ptr: ptr, mh_len: u64, has_key: bool, key_ptr: ptr, key_len: u64, now_ms: u64) -> i32 {
+    buf_reset(err);
+    let mh = StrField { bytes: [0u8; 512], len: 0 };
+    if normalize_machine_hash(&mh, mh_ptr, mh_len) != 0 {
+        buf_append_lit(err, STR_PTR("A valid machineHash is required"), STR_LEN("A valid machineHash is required"));
+        return 1;
+    };
+    license_store_license_status(store, &out.license, &mh, has_key, key_ptr, key_len, now_ms);
+    let stmt = sa_sqlite_prepare(store.db, STR_PTR("SELECT last_refreshed_at FROM machine_access WHERE machine_hash = ?"), STR_LEN("SELECT last_refreshed_at FROM machine_access WHERE machine_hash = ?"));
+    sa_sqlite_bind_text(stmt, 1, &mh.bytes, mh.len);
+    out.has_last_refreshed_at = false;
+    out.last_refreshed_at = 0;
+    if sa_sqlite_step(stmt) {
+        out.has_last_refreshed_at = true;
+        out.last_refreshed_at = sa_sqlite_column_int(stmt, 0);
+    };
+    sa_sqlite_finalize(stmt);
+    let interval_hours = license_store_number_setting(store, STR_PTR("refresh_interval_hours"), STR_LEN("refresh_interval_hours"), store.cfg_refresh_interval_hours);
+    out.refresh_interval_hours = interval_hours;
+    let interval_ms = (interval_hours * 60.0 * 60000.0) as u64;
+    out.has_next_required_refresh_at = out.has_last_refreshed_at;
+    if out.has_last_refreshed_at { out.next_required_refresh_at = out.last_refreshed_at + interval_ms; };
+    out.refresh_required = !out.has_last_refreshed_at || now_ms >= out.last_refreshed_at + interval_ms;
+    let invite = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    license_store_text_setting(store, &invite, STR_PTR("discord_invite_url"), STR_LEN("discord_invite_url"), &store.cfg_discord_invite_url.bytes, store.cfg_discord_invite_url.len);
+    str_field_set(&out.discord_invite_url, &invite.bytes, invite.len);
+    out.has_campaign = license_store_current_campaign(store, &out.campaign, now_ms);
+    return 0;
+}
+
+// TS: public prepareRefresh(machineHashInput, keyInput?, now = Date.now())
+fn license_store_prepare_refresh(store: &LicenseStore, out: &PrepareRefreshResult, err: &ByteBuf, mh_ptr: ptr, mh_len: u64, has_key: bool, key_ptr: ptr, key_len: u64, now_ms: u64) -> i32 {
+    let mh = StrField { bytes: [0u8; 512], len: 0 };
+    if normalize_machine_hash(&mh, mh_ptr, mh_len) != 0 {
+        buf_reset(err);
+        buf_append_lit(err, STR_PTR("A valid machineHash is required"), STR_LEN("A valid machineHash is required"));
+        return 1;
+    };
+    if license_store_status(store, &out.status, err, mh_ptr, mh_len, has_key, key_ptr, key_len, now_ms) != 0 { return 1; };
+    out.has_authorization_id = false;
+    out.has_authorization_expires_at = false;
+    out.has_requirement = false;
+    if !out.status.license.valid {
+        out.allowed = false;
+        let req = Requirement { required_code: StrField { bytes: [0u8; 512], len: 0 }, expires_at: 0 };
+        if license_store_create_requirement(store, &req, err, mh_ptr, mh_len, now_ms) != 0 { return 1; };
+        out.has_requirement = true;
+        out.requirement = req;
+        return 0;
+    };
+    let id = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    sa_crypto_random_uuid(&id.bytes, &id.len);
+    let auth_expires = now_ms + 10 * 60000;
+    let stmt = sa_sqlite_prepare(store.db, STR_PTR("INSERT INTO refresh_authorizations (id, machine_hash, created_at, expires_at, status) VALUES (?, ?, ?, ?, 'pending')"), STR_LEN("INSERT INTO refresh_authorizations (id, machine_hash, created_at, expires_at, status) VALUES (?, ?, ?, ?, 'pending')"));
+    sa_sqlite_bind_text(stmt, 1, &id.bytes, id.len);
+    sa_sqlite_bind_text(stmt, 2, &mh.bytes, mh.len);
+    sa_sqlite_bind_int(stmt, 3, now_ms);
+    sa_sqlite_bind_int(stmt, 4, auth_expires);
+    sa_sqlite_step(stmt);
+    sa_sqlite_finalize(stmt);
+    out.allowed = true;
+    out.has_authorization_id = true;
+    str_field_set(&out.authorization_id, &id.bytes, id.len);
+    out.has_authorization_expires_at = true;
+    out.authorization_expires_at = auth_expires;
+    return 0;
+}
+
+// TS: public completeRefresh(machineHashInput, authorizationId, success, importedModels, now = Date.now()): void
+fn license_store_complete_refresh(store: &LicenseStore, err: &ByteBuf, mh_ptr: ptr, mh_len: u64, auth_ptr: ptr, auth_len: u64, success: bool, imported_models: u64, now_ms: u64) -> i32 {
+    buf_reset(err);
+    let mh = StrField { bytes: [0u8; 512], len: 0 };
+    if normalize_machine_hash(&mh, mh_ptr, mh_len) != 0 {
+        buf_append_lit(err, STR_PTR("A valid machineHash is required"), STR_LEN("A valid machineHash is required"));
+        return 1;
+    };
+    sa_sqlite_begin(store.db);
+    let stmt = sa_sqlite_prepare(store.db, STR_PTR("SELECT machine_hash, expires_at, status FROM refresh_authorizations WHERE id = ?"), STR_LEN("SELECT machine_hash, expires_at, status FROM refresh_authorizations WHERE id = ?"));
+    sa_sqlite_bind_text(stmt, 1, auth_ptr, auth_len);
+    if !sa_sqlite_step(stmt) {
+        sa_sqlite_finalize(stmt);
+        sa_sqlite_rollback(store.db);
+        buf_append_lit(err, STR_PTR("refresh authorization was not found"), STR_LEN("refresh authorization was not found"));
+        return 1;
+    };
+    let amh = StrField { bytes: [0u8; 512], len: 0 };
+    let cp: ptr = PTR_NULL();
+    let cl: u64 = 0;
+    sa_sqlite_column_text(stmt, 0, &cp, &cl);
+    str_field_set(&amh, cp, cl);
+    let a_expires = sa_sqlite_column_int(stmt, 1);
+    let astatus = StrField { bytes: [0u8; 512], len: 0 };
+    sa_sqlite_column_text(stmt, 2, &cp, &cl);
+    str_field_set(&astatus, cp, cl);
+    sa_sqlite_finalize(stmt);
+    if amh.len != mh.len || !bytes_eq(amh.bytes, &mh.bytes, mh.len) {
+        sa_sqlite_rollback(store.db);
+        buf_append_lit(err, STR_PTR("refresh authorization was not found"), STR_LEN("refresh authorization was not found"));
+        return 1;
+    };
+    if astatus.len != 7 || !bytes_eq_str(&astatus.bytes, astatus.len, STR_PTR("pending"), STR_LEN("pending")) {
+        sa_sqlite_rollback(store.db);
+        buf_append_lit(err, STR_PTR("refresh authorization was already completed"), STR_LEN("refresh authorization was already completed"));
+        return 1;
+    };
+    if a_expires <= now_ms {
+        sa_sqlite_rollback(store.db);
+        buf_append_lit(err, STR_PTR("refresh authorization has expired"), STR_LEN("refresh authorization has expired"));
+        return 1;
+    };
+    let upd = sa_sqlite_prepare(store.db, STR_PTR("UPDATE refresh_authorizations SET status = ?, completed_at = ?, imported_models = ? WHERE id = ?"), STR_LEN("UPDATE refresh_authorizations SET status = ?, completed_at = ?, imported_models = ? WHERE id = ?"));
+    if success {
+        sa_sqlite_bind_text(upd, 1, STR_PTR("completed"), STR_LEN("completed"));
+    } else {
+        sa_sqlite_bind_text(upd, 1, STR_PTR("failed"), STR_LEN("failed"));
+    };
+    sa_sqlite_bind_int(upd, 2, now_ms);
+    sa_sqlite_bind_int(upd, 3, imported_models);
+    sa_sqlite_bind_text(upd, 4, auth_ptr, auth_len);
+    sa_sqlite_step(upd);
+    sa_sqlite_finalize(upd);
+    if success {
+        let ins = sa_sqlite_prepare(store.db, STR_PTR("INSERT INTO machine_access (machine_hash, last_refreshed_at, updated_at) VALUES (?, ?, ?) ON CONFLICT(machine_hash) DO UPDATE SET last_refreshed_at = excluded.last_refreshed_at, updated_at = excluded.updated_at"), STR_LEN("INSERT INTO machine_access (machine_hash, last_refreshed_at, updated_at) VALUES (?, ?, ?) ON CONFLICT(machine_hash) DO UPDATE SET last_refreshed_at = excluded.last_refreshed_at, updated_at = excluded.updated_at"));
+        sa_sqlite_bind_text(ins, 1, &mh.bytes, mh.len);
+        sa_sqlite_bind_int(ins, 2, now_ms);
+        sa_sqlite_bind_int(ins, 3, now_ms);
+        sa_sqlite_step(ins);
+        sa_sqlite_finalize(ins);
+    };
+    sa_sqlite_commit(store.db);
+    return 0;
+}
+
+// Presentation variant used by the console route: same query as
+// license_store_list_licenses, appending AdminLicenseRow JSON objects to
+// out (TS maps rows with String(row.x) / Number(row.x) and null checks).
+fn license_store_list_licenses_json(store: &LicenseStore, out: &ByteBuf, query_ptr: ptr, query_len: u64, limit: u64) -> u64 {
+    let norm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let start: u64 = 0;
+    let end = query_len;
+    while start < end {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, query_ptr, start);
+        if b == 32 || b == 9 || b == 13 || b == 10 { start = start + 1; } else { break; };
+    }
+    while end > start {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, query_ptr, end - 1);
+        if b == 32 || b == 9 || b == 13 || b == 10 { end = end - 1; } else { break; };
+    }
+    for i in start..end {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, query_ptr, i);
+        if b >= 65 && b <= 90 { b = b + 32; };
+        buf_append_byte(&norm, b);
+    }
+    let bounded = limit;
+    if bounded < 1 { bounded = 1; };
+    if bounded > 200 { bounded = 200; };
+    let pattern = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&pattern, STR_PTR("%"), STR_LEN("%"));
+    for i in 0..norm.len {
+        let b = norm.bytes[i];
+        if b == 92 || b == 37 || b == 95 { buf_append_byte(&pattern, 92); };
+        buf_append_byte(&pattern, b);
+    }
+    buf_append_lit(&pattern, STR_PTR("%"), STR_LEN("%"));
+    let stmt = sa_sqlite_prepare(store.db, STR_PTR("SELECT l.id, l.key_preview, l.machine_hash, l.discord_user_id, l.issued_at, l.expires_at, l.status, l.revoked_at, a.last_refreshed_at FROM licenses l LEFT JOIN machine_access a ON a.machine_hash = l.machine_hash WHERE (? = '' OR lower(l.machine_hash) LIKE ? ESCAPE '\\' OR lower(l.discord_user_id) LIKE ? ESCAPE '\\' OR lower(l.key_preview) LIKE ? ESCAPE '\\') ORDER BY l.issued_at DESC LIMIT ?"), STR_LEN("SELECT l.id, l.key_preview, l.machine_hash, l.discord_user_id, l.issued_at, l.expires_at, l.status, l.revoked_at, a.last_refreshed_at FROM licenses l LEFT JOIN machine_access a ON a.machine_hash = l.machine_hash WHERE (? = '' OR lower(l.machine_hash) LIKE ? ESCAPE '\\' OR lower(l.discord_user_id) LIKE ? ESCAPE '\\' OR lower(l.key_preview) LIKE ? ESCAPE '\\') ORDER BY l.issued_at DESC LIMIT ?"));
+    sa_sqlite_bind_text(stmt, 1, &norm.bytes, norm.len);
+    sa_sqlite_bind_text(stmt, 2, &pattern.bytes, pattern.len);
+    sa_sqlite_bind_text(stmt, 3, &pattern.bytes, pattern.len);
+    sa_sqlite_bind_text(stmt, 4, &pattern.bytes, pattern.len);
+    sa_sqlite_bind_int(stmt, 5, bounded);
+    let count: u64 = 0;
+    let text = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    while sa_sqlite_step(stmt) {
+        if count > 0 { buf_append_lit(out, STR_PTR(","), STR_LEN(",")); };
+        let cp: ptr = PTR_NULL();
+        let cl: u64 = 0;
+        buf_append_lit(out, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+        sa_sqlite_column_text(stmt, 0, &cp, &cl);
+        buf_append_escaped(out, cp, cl);
+        buf_append_lit(out, STR_PTR("\",\"keyPreview\":\""), STR_LEN("\",\"keyPreview\":\""));
+        sa_sqlite_column_text(stmt, 1, &cp, &cl);
+        buf_append_escaped(out, cp, cl);
+        buf_append_lit(out, STR_PTR("\",\"machineHash\":\""), STR_LEN("\",\"machineHash\":\""));
+        sa_sqlite_column_text(stmt, 2, &cp, &cl);
+        buf_append_escaped(out, cp, cl);
+        buf_append_lit(out, STR_PTR("\",\"discordUserId\":\""), STR_LEN("\",\"discordUserId\":\""));
+        sa_sqlite_column_text(stmt, 3, &cp, &cl);
+        buf_append_escaped(out, cp, cl);
+        buf_append_lit(out, STR_PTR("\",\"issuedAt\":"), STR_LEN("\",\"issuedAt\":"));
+        buf_append_u64(out, sa_sqlite_column_int(stmt, 4));
+        buf_append_lit(out, STR_PTR(",\"expiresAt\":"), STR_LEN(",\"expiresAt\":"));
+        buf_append_u64(out, sa_sqlite_column_int(stmt, 5));
+        buf_append_lit(out, STR_PTR(",\"status\":\""), STR_LEN(",\"status\":\""));
+        sa_sqlite_column_text(stmt, 6, &cp, &cl);
+        buf_append_escaped(out, cp, cl);
+        buf_append_lit(out, STR_PTR("\",\"revokedAt\":"), STR_LEN("\",\"revokedAt\":"));
+        if sa_sqlite_column_is_null(stmt, 7) { buf_append_lit(out, STR_PTR("null"), STR_LEN("null")); } else { buf_append_u64(out, sa_sqlite_column_int(stmt, 7)); };
+        buf_append_lit(out, STR_PTR(",\"refreshAt\":"), STR_LEN(",\"refreshAt\":"));
+        if sa_sqlite_column_is_null(stmt, 8) { buf_append_lit(out, STR_PTR("null"), STR_LEN("null")); } else { buf_append_u64(out, sa_sqlite_column_int(stmt, 8)); };
+        buf_append_lit(out, STR_PTR("}"), STR_LEN("}"));
+        count = count + 1;
+    }
+    let _t = text;
+    sa_sqlite_finalize(stmt);
+    return count;
+}

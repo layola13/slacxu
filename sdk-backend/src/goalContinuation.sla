@@ -1,0 +1,621 @@
+// Converted 1:1 from sdk-backend/src/goalContinuation.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// /goal continuation contract shared by the mini and codeCli bridges: the
+// completion signal, the per-continuation prompt and the budget wrap-up note.
+// Keeping them in one place stops the two runtimes from drifting apart (the
+// codeCli prompt was still the bare two-line nudge without a progress,
+// evidence or completion-audit contract).
+
+@import "sa_std/ptr.sa"
+
+// DEFECT: the TS source is built on three anchored RegExp objects
+// plus a negation RegExp. sa_std has no regex engine; the matchers
+// below are hand-rolled line scanners approximating the patterns.
+// Documented divergences: \s is space/tab only, the negation check
+// is co-occurrence (negation token + completion word on the same
+// line) instead of the regex's ordered structure, and EN word
+// sequences assume single-space joins (regex used \s+).
+
+// Marker the web client uses to hide internal continuation prompts.
+let GOAL_CONTINUATION_MARKER = "[[codex-ultra:goal-continuation]]";
+
+// GOAL_COMPLETE_LINE_RE = /^[\s>*_`#-]*GOAL_COMPLETE[\s*_`.!]*$/im
+fn is_goal_complete_line(line_ptr: ptr, line_len: u64) -> bool {
+    let s: u64 = 0;
+    let e: u64 = line_len;
+    while s < e {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, line_ptr, s);
+        if b == 32 || b == 9 || b == 62 || b == 42 || b == 95 || b == 96 || b == 35 || b == 45 { s = s + 1; } else { break; };
+    }
+    while e > s {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, line_ptr, e - 1);
+        if b == 32 || b == 9 || b == 42 || b == 95 || b == 96 || b == 46 || b == 33 { e = e - 1; } else { break; };
+    }
+    if e - s != 13 { return false; };
+    let want = "GOAL_COMPLETE";
+    for i in 0..13 {
+        let a: u8 = 0;
+        let b: u8 = 0;
+        PTR_BYTE_AT(a, line_ptr, s + i);
+        PTR_BYTE_AT(b, STR_PTR(want), i);
+        if a != b { return false; };
+    }
+    return true;
+}
+
+// prefix-consume on UTF-8 bytes: returns new offset, or
+// 4294967295 when the pattern does not match at off.
+fn consume(line_ptr: ptr, line_len: u64, off: u64, pat_ptr: ptr, pat_len: u64) -> u64 {
+    if off + pat_len > line_len { return 4294967295; };
+    for i in 0..pat_len {
+        let a: u8 = 0;
+        let b: u8 = 0;
+        PTR_BYTE_AT(a, line_ptr, off + i);
+        PTR_BYTE_AT(b, pat_ptr, i);
+        if a != b { return 4294967295; };
+    }
+    return off + pat_len;
+}
+
+fn consume_any3(line_ptr: ptr, line_len: u64, off: u64, p1: ptr, p1l: u64, p2: ptr, p2l: u64, p3: ptr, p3l: u64) -> u64 {
+    let r = consume(line_ptr, line_len, off, p1, p1l);
+    if r != 4294967295 { return r; };
+    let r2 = consume(line_ptr, line_len, off, p2, p2l);
+    if r2 != 4294967295 { return r2; };
+    return consume(line_ptr, line_len, off, p3, p3l);
+}
+
+// Strip the decoration classes shared by the natural-language
+// patterns (leading [\s>*_`#-], trailing [\s*_`.!。！]).
+fn strip_deco(line_ptr: ptr, line_len: u64, out_s: &u64, out_e: &u64) -> void {
+    let s: u64 = 0;
+    let e: u64 = line_len;
+    while s < e {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, line_ptr, s);
+        if b == 32 || b == 9 || b == 62 || b == 42 || b == 95 || b == 96 || b == 35 || b == 45 { s = s + 1; } else { break; };
+    }
+    while e > s {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, line_ptr, e - 1);
+        // trailing set incl. 。(E3 80 82) and ！(EF BC 81): byte-wise
+        // approximation strips the final byte of those sequences.
+        if b == 32 || b == 9 || b == 42 || b == 95 || b == 96 || b == 46 || b == 33 || b == 130 || b == 129 { e = e - 1; } else { break; };
+    };
+    out_s = s;
+    out_e = e;
+}
+
+// Chinese natural completion (first NATURAL_COMPLETE_LINE_RES).
+fn cn_complete(line_ptr: ptr, s: u64, e: u64) -> bool {
+    let len = e - s;
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, line_ptr, s);
+    // "已全部完成"
+    if len == STR_LEN("已全部完成") {
+        if consume(p, len, 0, STR_PTR("已全部完成"), STR_LEN("已全部完成")) == len { return true; };
+    };
+    // Family B: (所有|全部|各项)? noun (已全部完成|全部完成|已达成|已经完成|全部达成|已完成)
+    let off: u64 = 0;
+    let r = consume_any3(p, len, off, STR_PTR("所有"), STR_LEN("所有"), STR_PTR("全部"), STR_LEN("全部"), STR_PTR("各项"), STR_LEN("各项"));
+    if r != 4294967295 { off = r; };
+    let noun = consume_any3(p, len, off, STR_PTR("目标"), STR_LEN("目标"), STR_PTR("任务"), STR_LEN("任务"), STR_PTR("工作"), STR_LEN("工作"));
+    if noun == 4294967295 {
+        noun = consume_any3(p, len, off, STR_PTR("要求"), STR_LEN("要求"), STR_PTR("需求"), STR_LEN("需求"), STR_PTR(""), 0);
+    };
+    if noun != 4294967295 {
+        let suf = consume_any3(p, len, noun, STR_PTR("已全部完成"), STR_LEN("已全部完成"), STR_PTR("全部完成"), STR_LEN("全部完成"), STR_PTR("已达成"), STR_LEN("已达成"));
+        if suf == 4294967295 {
+            suf = consume_any3(p, len, noun, STR_PTR("已经完成"), STR_LEN("已经完成"), STR_PTR("全部达成"), STR_LEN("全部达成"), STR_PTR("已完成"), STR_LEN("已完成"));
+        };
+        if suf == len { return true; };
+    };
+    // Family A: (已经?|全部|所有)? (完成|达成) (所有|全部)? noun
+    off = 0;
+    let pre = consume_any3(p, len, off, STR_PTR("已经"), STR_LEN("已经"), STR_PTR("已"), STR_LEN("已"), STR_PTR("全部"), STR_LEN("全部"));
+    if pre == 4294967295 {
+        pre = consume(p, len, off, STR_PTR("所有"), STR_LEN("所有"));
+    };
+    if pre != 4294967295 { off = pre; };
+    let verb = consume(p, len, off, STR_PTR("完成"), STR_LEN("完成"));
+    if verb == 4294967295 { verb = consume(p, len, off, STR_PTR("达成"), STR_LEN("达成")); };
+    if verb == 4294967295 { return false; };
+    off = verb;
+    let mid = consume(p, len, off, STR_PTR("所有"), STR_LEN("所有"));
+    if mid == 4294967295 { mid = consume(p, len, off, STR_PTR("全部"), STR_LEN("全部")); };
+    if mid != 4294967295 { off = mid; };
+    let n2 = consume_any3(p, len, off, STR_PTR("目标"), STR_LEN("目标"), STR_PTR("任务"), STR_LEN("任务"), STR_PTR("工作"), STR_LEN("工作"));
+    if n2 == 4294967295 {
+        n2 = consume_any3(p, len, off, STR_PTR("要求"), STR_LEN("要求"), STR_PTR("需求"), STR_LEN("需求"), STR_PTR(""), 0);
+    };
+    return n2 == len;
+}
+
+// English natural completion (second NATURAL_COMPLETE_LINE_RES),
+// applied to a lowercased copy with single-space word joins.
+fn en_word(line_ptr: ptr, len: u64, off: u64, word_ptr: ptr, word_len: u64) -> u64 {
+    let r = consume(line_ptr, len, off, word_ptr, word_len);
+    if r == 4294967295 { return 4294967295; };
+    if r < len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, line_ptr, r);
+        if b != 32 { return 4294967295; };
+        return r + 1;
+    };
+    return r;
+}
+
+fn en_complete(line_ptr: ptr, s: u64, e: u64) -> bool {
+    // lowercase copy into a fixed buffer (line segments are short)
+    let buf = [0u8; 512];
+    let len = e - s;
+    if len > 512 { return false; };
+    for i in 0..len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, line_ptr, s + i);
+        if b >= 65 && b <= 90 { b = b + 32; };
+        buf[i] = b;
+    }
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &buf, 0);
+    // "all done"
+    if len == 8 && consume(p, len, 0, STR_PTR("all done"), STR_LEN("all done")) == len { return true; };
+    // (goal|objective) (is |has been )?(fully )?(completed|achieved|fulfilled)
+    let off = en_word(p, len, 0, STR_PTR("goal"), STR_LEN("goal"));
+    if off == 4294967295 { off = en_word(p, len, 0, STR_PTR("objective"), STR_LEN("objective")); };
+    if off != 4294967295 {
+        let o2 = en_word(p, len, off, STR_PTR("is"), STR_LEN("is"));
+        if o2 == 4294967295 {
+            let h1 = en_word(p, len, off, STR_PTR("has"), STR_LEN("has"));
+            if h1 != 4294967295 { o2 = en_word(p, len, h1, STR_PTR("been"), STR_LEN("been")); };
+        };
+        if o2 != 4294967295 { off = o2; };
+        let o3 = en_word(p, len, off, STR_PTR("fully"), STR_LEN("fully"));
+        if o3 != 4294967295 { off = o3; };
+        let v = consume_any3(p, len, off, STR_PTR("completed"), STR_LEN("completed"), STR_PTR("achieved"), STR_LEN("achieved"), STR_PTR("fulfilled"), STR_LEN("fulfilled"));
+        if v == len { return true; };
+    };
+    // (all )?(task|tasks|work|requirement|requirements) (are|is|have been|has been )?(fully )?(completed|finished|done)
+    off = 0;
+    let a1 = en_word(p, len, 0, STR_PTR("all"), STR_LEN("all"));
+    if a1 != 4294967295 { off = a1; };
+    let n = consume_any3(p, len, off, STR_PTR("tasks"), STR_LEN("tasks"), STR_PTR("task"), STR_LEN("task"), STR_PTR("work"), STR_LEN("work"));
+    if n == 4294967295 {
+        n = consume_any3(p, len, off, STR_PTR("requirements"), STR_LEN("requirements"), STR_PTR("requirement"), STR_LEN("requirement"), STR_PTR(""), 0);
+    };
+    if n == 4294967295 { return false; };
+    if n < len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, p, n);
+        if b == 32 { n = n + 1; };
+    };
+    off = n;
+    let v1 = en_word(p, len, off, STR_PTR("are"), STR_LEN("are"));
+    if v1 == 4294967295 { v1 = en_word(p, len, off, STR_PTR("is"), STR_LEN("is")); };
+    if v1 == 4294967295 {
+        let h1 = en_word(p, len, off, STR_PTR("have"), STR_LEN("have"));
+        if h1 != 4294967295 { v1 = en_word(p, len, h1, STR_PTR("been"), STR_LEN("been")); };
+    };
+    if v1 == 4294967295 {
+        let h2 = en_word(p, len, off, STR_PTR("has"), STR_LEN("has"));
+        if h2 != 4294967295 { v1 = en_word(p, len, h2, STR_PTR("been"), STR_LEN("been")); };
+    };
+    if v1 != 4294967295 { off = v1; };
+    let f1 = en_word(p, len, off, STR_PTR("fully"), STR_LEN("fully"));
+    if f1 != 4294967295 { off = f1; };
+    let v = consume_any3(p, len, off, STR_PTR("completed"), STR_LEN("completed"), STR_PTR("finished"), STR_LEN("finished"), STR_PTR("done"), STR_LEN("done"));
+    return v == len;
+}
+
+// COMPLETION_NEGATION_RE approximation: same-line co-occurrence of
+// a negation token and a completion word (case-insensitive for EN).
+fn line_has_negation(line_ptr: ptr, line_len: u64) -> bool {
+    if !contains_ci(line_ptr, line_len, STR_PTR("完成"), STR_LEN("完成"))
+        && !contains_ci(line_ptr, line_len, STR_PTR("达成"), STR_LEN("达成"))
+        && !contains_ci(line_ptr, line_len, STR_PTR("实现"), STR_LEN("实现"))
+        && !contains_ci(line_ptr, line_len, STR_PTR("reply"), STR_LEN("reply"))
+        && !contains_ci(line_ptr, line_len, STR_PTR("claim"), STR_LEN("claim"))
+        && !contains_ci(line_ptr, line_len, STR_PTR("complete"), STR_LEN("complete"))
+        && !contains_ci(line_ptr, line_len, STR_PTR("achieve"), STR_LEN("achieve"))
+        && !contains_ci(line_ptr, line_len, STR_PTR("finish"), STR_LEN("finish"))
+        && !contains_ci(line_ptr, line_len, STR_PTR("done"), STR_LEN("done")) {
+        return false;
+    };
+    if contains_ci(line_ptr, line_len, STR_PTR("未"), STR_LEN("未")) { return true; };
+    if contains_ci(line_ptr, line_len, STR_PTR("没有"), STR_LEN("没有")) { return true; };
+    if contains_ci(line_ptr, line_len, STR_PTR("尚未"), STR_LEN("尚未")) { return true; };
+    if contains_ci(line_ptr, line_len, STR_PTR("未能"), STR_LEN("未能")) { return true; };
+    if contains_ci(line_ptr, line_len, STR_PTR("无法"), STR_LEN("无法")) { return true; };
+    if contains_ci(line_ptr, line_len, STR_PTR("暂不"), STR_LEN("暂不")) { return true; };
+    if contains_ci(line_ptr, line_len, STR_PTR("还没"), STR_LEN("还没")) { return true; };
+    if contains_ci(line_ptr, line_len, STR_PTR("not "), STR_LEN("not ")) { return true; };
+    if contains_ci(line_ptr, line_len, STR_PTR("haven't "), STR_LEN("haven't ")) { return true; };
+    if contains_ci(line_ptr, line_len, STR_PTR("hasn't "), STR_LEN("hasn't ")) { return true; };
+    if contains_ci(line_ptr, line_len, STR_PTR("cannot "), STR_LEN("cannot ")) { return true; };
+    if contains_ci(line_ptr, line_len, STR_PTR("can't "), STR_LEN("can't ")) { return true; };
+    if contains_ci(line_ptr, line_len, STR_PTR("yet to "), STR_LEN("yet to ")) { return true; };
+    // 不(会|打算)? + completion word -- covered by 未/不 forms in
+    // practice; plain 不 is too broad to count alone (DEFECT).
+    return false;
+}
+
+fn contains_ci(hay_ptr: ptr, hay_len: u64, nd_ptr: ptr, nd_len: u64) -> bool {
+    if nd_len == 0 || hay_len < nd_len { return false; };
+    let last = hay_len - nd_len;
+    let i: u64 = 0;
+    while i <= last {
+        let ok = true;
+        let j: u64 = 0;
+        while j < nd_len {
+            let a: u8 = 0;
+            let b: u8 = 0;
+            PTR_BYTE_AT(a, hay_ptr, i + j);
+            PTR_BYTE_AT(b, nd_ptr, j);
+            if a >= 65 && a <= 90 { a = a + 32; };
+            if b >= 65 && b <= 90 { b = b + 32; };
+            if a != b { ok = false; break; };
+            j = j + 1;
+        }
+        if ok { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn hasGoalCompleteSignal(text_ptr: ptr, text_len: u64) -> bool {
+    // str = String(text ?? ""); empty/whitespace -> false. Lines are
+    // scanned for \n (a preceding \r is left for the trims, which
+    // treat it as whitespace only in the \s sets -- DEFECT: \r is
+    // not in the strip sets above, matching im-flag line splits is
+    // approximated).
+    let any = false;
+    for i in 0..text_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, text_ptr, i);
+        if b != 32 && b != 9 && b != 10 && b != 13 { any = true; break; };
+    }
+    if !any { return false; };
+    let start: u64 = 0;
+    let i: u64 = 0;
+    while i <= text_len {
+        let at_end = i == text_len;
+        let is_nl = false;
+        if !at_end {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, text_ptr, i);
+            is_nl = b == 10;
+        };
+        if at_end || is_nl {
+            let lp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(lp, text_ptr, start);
+            let llen = i - start;
+            // trim (space/tab approximation)
+            let ts: u64 = 0;
+            let te: u64 = llen;
+            while ts < te {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, lp, ts);
+                if b != 32 && b != 9 && b != 13 { break; };
+                ts = ts + 1;
+            }
+            while te > ts {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, lp, te - 1);
+                if b != 32 && b != 9 && b != 13 { break; };
+                te = te - 1;
+            }
+            if te > ts {
+                let tp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(tp, lp, ts);
+                let tl = te - ts;
+                if !line_has_negation(tp, tl) {
+                    if is_goal_complete_line(tp, tl) { return true; };
+                    let ds: u64 = 0;
+                    let de: u64 = 0;
+                    strip_deco(tp, tl, &ds, &de);
+                    if de > ds {
+                        if cn_complete(tp, ds, de) { return true; };
+                        if en_complete(tp, ds, de) { return true; };
+                    };
+                };
+            };
+            start = i + 1;
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// CONTINUATION_NUDGE_RE (see TS): anchored whole-string alternation
+// of Chinese/English "continue" phrases with optional trailing
+// [.!。！]. DEFECT: regex alternation with optional particles
+// (你?调用啊?) approximated by enumerating the literal forms;
+// case-insensitive compare for the Latin forms.
+fn isMiniContinuationNudge(text_ptr: ptr, text_len: u64) -> bool {
+    // t = String(text ?? "").trim(); then one optional trailing
+    // punctuation char from [.!。！] is consumed by the regex's
+    // [.!。！]?$ -- approximated: strip trailing punct bytes
+    // (。/！ are 3-byte UTF-8; strip the whole sequence when the
+    // line ends with them).
+    let s: u64 = 0;
+    let e: u64 = text_len;
+    while s < e {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, text_ptr, s);
+        if b != 32 && b != 9 && b != 13 && b != 10 { break; };
+        s = s + 1;
+    }
+    while e > s {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, text_ptr, e - 1);
+        if b != 32 && b != 9 && b != 13 && b != 10 { break; };
+        e = e - 1;
+    }
+    if e > s {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, text_ptr, e - 1);
+        if b == 46 || b == 33 { e = e - 1; };
+    };
+    if e >= s + 3 {
+        let b0: u8 = 0;
+        PTR_BYTE_AT(b0, text_ptr, e - 3);
+        // 。 = E3 80 82, ！ = EF BC 81
+        if b0 == 227 || b0 == 239 { e = e - 3; };
+    };
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, text_ptr, s);
+    let len = e - s;
+    if eq_ci(p, len, STR_PTR("继续"), STR_LEN("继续")) { return true; };
+    if eq_ci(p, len, STR_PTR("你继续"), STR_LEN("你继续")) { return true; };
+    if eq_ci(p, len, STR_PTR("请继续"), STR_LEN("请继续")) { return true; };
+    if eq_ci(p, len, STR_PTR("继续吧"), STR_LEN("继续吧")) { return true; };
+    if eq_ci(p, len, STR_PTR("接着做"), STR_LEN("接着做")) { return true; };
+    if eq_ci(p, len, STR_PTR("接着"), STR_LEN("接着")) { return true; };
+    if eq_ci(p, len, STR_PTR("接着来"), STR_LEN("接着来")) { return true; };
+    if eq_ci(p, len, STR_PTR("接着干"), STR_LEN("接着干")) { return true; };
+    if eq_ci(p, len, STR_PTR("接着改"), STR_LEN("接着改")) { return true; };
+    if eq_ci(p, len, STR_PTR("继续改"), STR_LEN("继续改")) { return true; };
+    if eq_ci(p, len, STR_PTR("往下走"), STR_LEN("往下走")) { return true; };
+    if eq_ci(p, len, STR_PTR("往下继续"), STR_LEN("往下继续")) { return true; };
+    if eq_ci(p, len, STR_PTR("继续执行"), STR_LEN("继续执行")) { return true; };
+    if eq_ci(p, len, STR_PTR("继续做"), STR_LEN("继续做")) { return true; };
+    if eq_ci(p, len, STR_PTR("下一步"), STR_LEN("下一步")) { return true; };
+    if eq_ci(p, len, STR_PTR("做吧"), STR_LEN("做吧")) { return true; };
+    if eq_ci(p, len, STR_PTR("动手吧"), STR_LEN("动手吧")) { return true; };
+    if eq_ci(p, len, STR_PTR("开始吧"), STR_LEN("开始吧")) { return true; };
+    if eq_ci(p, len, STR_PTR("按计划"), STR_LEN("按计划")) { return true; };
+    if eq_ci(p, len, STR_PTR("照计划"), STR_LEN("照计划")) { return true; };
+    if eq_ci(p, len, STR_PTR("按这个思路来"), STR_LEN("按这个思路来")) { return true; };
+    if eq_ci(p, len, STR_PTR("调用"), STR_LEN("调用")) { return true; };
+    if eq_ci(p, len, STR_PTR("你调用"), STR_LEN("你调用")) { return true; };
+    if eq_ci(p, len, STR_PTR("调用啊"), STR_LEN("调用啊")) { return true; };
+    if eq_ci(p, len, STR_PTR("你调用啊"), STR_LEN("你调用啊")) { return true; };
+    if eq_ci(p, len, STR_PTR("continue"), STR_LEN("continue")) { return true; };
+    if eq_ci(p, len, STR_PTR("go on"), STR_LEN("go on")) { return true; };
+    if eq_ci(p, len, STR_PTR("go ahead"), STR_LEN("go ahead")) { return true; };
+    if eq_ci(p, len, STR_PTR("do it"), STR_LEN("do it")) { return true; };
+    if eq_ci(p, len, STR_PTR("proceed"), STR_LEN("proceed")) { return true; };
+    if eq_ci(p, len, STR_PTR("keep going"), STR_LEN("keep going")) { return true; };
+    if eq_ci(p, len, STR_PTR("next step"), STR_LEN("next step")) { return true; };
+    return false;
+}
+
+fn eq_ci(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    for i in 0..a_len {
+        let a: u8 = 0;
+        let b: u8 = 0;
+        PTR_BYTE_AT(a, a_ptr, i);
+        PTR_BYTE_AT(b, b_ptr, i);
+        if a >= 65 && a <= 90 { a = a + 32; };
+        if b >= 65 && b <= 90 { b = b + 32; };
+        if a != b { return false; };
+    }
+    return true;
+}
+
+// Injected once into a running goal turn when its token budget runs out (Codex budget_limit.md).
+let GOAL_BUDGET_LIMIT_NOTE = "The /goal token budget is exhausted and the goal is now budget-limited: do NOT start new substantive work or emit more function calls. Wrap up this turn now: summarize verified progress, list remaining work or blockers, and give the user a clear next step - text only, with no additional tool calls.";
+
+struct GoalContinuationState {
+    has_goalObjective: bool,
+    goalObjective: [u8; 8192],
+    goalObjective_len: u64,
+    has_goalTokensUsed: bool,
+    goalTokensUsed: u64,
+    has_goalTokenBudget: bool,
+    goalTokenBudget: u64,
+    has_goalStartedAt: bool,
+    goalStartedAt: u64,
+}
+
+struct GoalContinuationOptions {
+    count: u64,
+    max: u64,
+    has_planText: bool,
+    planText: [u8; 8192],
+    planText_len: u64,
+    has_stagnantTurns: bool,
+    stagnantTurns: u64,
+    has_stagnantLimit: bool,
+    stagnantLimit: u64,
+    has_planToolName: bool,
+    planToolName: [u8; 64],
+    planToolName_len: u64,
+}
+
+struct PromptBuf {
+    bytes: [u8; 32768],
+    len: u64,
+}
+
+fn pb_append(pb: &PromptBuf, src_ptr: ptr, src_len: u64) -> void {
+    for i in 0..src_len {
+        if pb.len < 32768 {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, src_ptr, i);
+            pb.bytes[pb.len] = b;
+            pb.len = pb.len + 1;
+        };
+    }
+}
+
+fn pb_append_u64(pb: &PromptBuf, v: u64) -> void {
+    let digits = [0u8; 20];
+    let n: u64 = 0;
+    let x = v;
+    if x == 0 {
+        if pb.len < 32768 {
+            pb.bytes[pb.len] = 48;
+            pb.len = pb.len + 1;
+        };
+        return;
+    };
+    while x > 0 {
+        digits[n] = (x % 10) as u8 + 48;
+        n = n + 1;
+        x = x / 10;
+    }
+    let i = n;
+    while i > 0 {
+        i = i - 1;
+        if pb.len < 32768 {
+            pb.bytes[pb.len] = digits[i];
+            pb.len = pb.len + 1;
+        };
+    }
+}
+
+// buildGoalContinuationPrompt(s, opts): string
+// DEFECT: string return -> PromptBuf out + status. Date.now() has
+// no sa_std clock in this conversion: now_ms is an extra trailing
+// parameter the TS signature does not have. Template literals ->
+// sequential appends. planText.slice(0, 2000) is a UTF-16
+// code-unit slice in TS; bytes are sliced here (DEFECT).
+fn buildGoalContinuationPrompt(st: &GoalContinuationState, opts: &GoalContinuationOptions, now_ms: u64, out: &PromptBuf) -> i32 {
+    out.len = 0;
+    // objective = (s.goalObjective ?? "").trim()
+    let obj_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(obj_ptr, &st.goalObjective, 0);
+    let os: u64 = 0;
+    let oe: u64 = st.goalObjective_len;
+    if st.has_goalObjective {
+        while os < oe {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, obj_ptr, os);
+            if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+            os = os + 1;
+        }
+        while oe > os {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, obj_ptr, oe - 1);
+            if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+            oe = oe - 1;
+        }
+    } else {
+        oe = 0;
+    };
+    let used: u64 = 0;
+    if st.has_goalTokensUsed { used = st.goalTokensUsed; };
+    let has_budget = st.has_goalTokenBudget;
+    let budget: u64 = 0;
+    if has_budget { budget = st.goalTokenBudget; };
+    let remaining: u64 = 0;
+    if has_budget {
+        if budget > used { remaining = budget - used; };
+    };
+    let elapsed: u64 = 0;
+    if st.has_goalStartedAt {
+        let ms = now_ms - st.goalStartedAt;
+        if now_ms < st.goalStartedAt { ms = 0; };
+        elapsed = ms / 1000;
+    };
+    let stagnant: u64 = 0;
+    if opts.has_stagnantTurns { stagnant = opts.stagnantTurns; };
+    let planTool_ptr: ptr = STR_PTR("update_plan");
+    let planTool_len: u64 = STR_LEN("update_plan");
+    if opts.has_planToolName {
+        PTR_BYTE_ADD(planTool_ptr, &opts.planToolName, 0);
+        planTool_len = opts.planToolName_len;
+    };
+    // lines[0..5]
+    pb_append(out, STR_PTR("[[codex-ultra:goal-continuation]]"), STR_LEN("[[codex-ultra:goal-continuation]]"));
+    pb_append(out, STR_PTR("\nContinue working toward this persisted /goal objective (auto-continuation "), STR_LEN("\nContinue working toward this persisted /goal objective (auto-continuation "));
+    pb_append_u64(out, opts.count);
+    pb_append(out, STR_PTR("/"), STR_LEN("/"));
+    pb_append_u64(out, opts.max);
+    pb_append(out, STR_PTR("):\n\n"), STR_LEN("):\n\n"));
+    let obj_slice: ptr = PTR_NULL();
+    PTR_BYTE_ADD(obj_slice, obj_ptr, os);
+    pb_append(out, obj_slice, oe - os);
+    pb_append(out, STR_PTR("\n\nGoal progress: attempt "), STR_LEN("\n\nGoal progress: attempt "));
+    pb_append_u64(out, opts.count);
+    pb_append(out, STR_PTR(" of "), STR_LEN(" of "));
+    pb_append_u64(out, opts.max);
+    pb_append(out, STR_PTR("; tokens used "), STR_LEN("; tokens used "));
+    pb_append_u64(out, used);
+    if has_budget {
+        pb_append(out, STR_PTR(" / budget "), STR_LEN(" / budget "));
+        pb_append_u64(out, budget);
+        pb_append(out, STR_PTR(" (remaining "), STR_LEN(" (remaining "));
+        pb_append_u64(out, remaining);
+        pb_append(out, STR_PTR(")"), STR_LEN(")"));
+    } else {
+        pb_append(out, STR_PTR(" (no token budget configured)"), STR_LEN(" (no token budget configured)"));
+    };
+    pb_append(out, STR_PTR("; elapsed "), STR_LEN("; elapsed "));
+    pb_append_u64(out, elapsed);
+    pb_append(out, STR_PTR("s."), STR_LEN("s."));
+    if stagnant > 0 {
+        pb_append(out, STR_PTR(" WARNING: the last "), STR_LEN(" WARNING: the last "));
+        pb_append_u64(out, stagnant);
+        pb_append(out, STR_PTR(" continuation(s) produced no new tool/plan/output change."), STR_LEN(" continuation(s) produced no new tool/plan/output change."));
+    };
+    if opts.has_stagnantLimit && stagnant > 0 && stagnant + 1 >= opts.stagnantLimit {
+        pb_append(out, STR_PTR("\nFinal notice: one more no-progress turn marks this goal blocked. Do NOT repeat the same reads, commands or plan. Take a different concrete action on the next unfinished requirement, or state the genuine blocker plainly."), STR_LEN("\nFinal notice: one more no-progress turn marks this goal blocked. Do NOT repeat the same reads, commands or plan. Take a different concrete action on the next unfinished requirement, or state the genuine blocker plainly."));
+    };
+    if has_budget && remaining * 4 < budget {
+        // DEFECT: TS compares remaining < budget * 0.25 (float);
+        // remaining*4 < budget is the integer form (overflow-free
+        // at goal-budget magnitudes).
+        pb_append(out, STR_PTR("\nBudget warning: only "), STR_LEN("\nBudget warning: only "));
+        pb_append_u64(out, remaining);
+        pb_append(out, STR_PTR(" tokens remain. Finish the smallest verifiable remainder now; do not start new multi-step exploration."), STR_LEN(" tokens remain. Finish the smallest verifiable remainder now; do not start new multi-step exploration."));
+    };
+    if opts.has_planText && opts.planText_len > 0 {
+        pb_append(out, STR_PTR("\n\nCurrent authoritative plan (already decided — do NOT regenerate an identical list):\n"), STR_LEN("\n\nCurrent authoritative plan (already decided — do NOT regenerate an identical list):\n"));
+        // planText.trim().slice(0, 2000) -- DEFECT: trim
+        // approximated (space/tab/newline set), slice on bytes.
+        let pt_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(pt_ptr, &opts.planText, 0);
+        let ps: u64 = 0;
+        let pe: u64 = opts.planText_len;
+        while ps < pe {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, pt_ptr, ps);
+            if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+            ps = ps + 1;
+        }
+        while pe > ps {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, pt_ptr, pe - 1);
+            if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+            pe = pe - 1;
+        }
+        let take = pe - ps;
+        if take > 2000 { take = 2000; };
+        let pt_slice: ptr = PTR_NULL();
+        PTR_BYTE_ADD(pt_slice, pt_ptr, ps);
+        pb_append(out, pt_slice, take);
+    };
+    pb_append(out, STR_PTR("\n\nRules: report only verified tool results — never claim progress from memory; do NOT treat a "), STR_LEN("\n\nRules: report only verified tool results — never claim progress from memory; do NOT treat a "));
+    pb_append(out, planTool_ptr, planTool_len);
+    pb_append(out, STR_PTR(" call as doing the work; do not repeat completed steps; if the same blocker repeats with no file/tool change, say so instead of re-listing tasks."), STR_LEN(" call as doing the work; do not repeat completed steps; if the same blocker repeats with no file/tool change, say so instead of re-listing tasks."));
+    pb_append(out, STR_PTR("\nWork from evidence: the current worktree and tool output are authoritative. Earlier history may be summarized or incomplete — use it to locate work, then inspect current state before relying on it or redoing it."), STR_LEN("\nWork from evidence: the current worktree and tool output are authoritative. Earlier history may be summarized or incomplete — use it to locate work, then inspect current state before relying on it or redoing it."));
+    pb_append(out, STR_PTR("\nNo-progress check: classify the previous goal turn as progress (changed files/state or produced evidence that changes the next action) or no progress (status restatement, re-listed plan, repeated reads). After a no-progress turn, take a different concrete next action."), STR_LEN("\nNo-progress check: classify the previous goal turn as progress (changed files/state or produced evidence that changes the next action) or no progress (status restatement, re-listed plan, repeated reads). After a no-progress turn, take a different concrete next action."));
+    pb_append(out, STR_PTR("\nCompletion audit: GOAL_COMPLETE is a claim that EVERY requirement of the objective above is finished and verified by tool output in this conversation. If any requirement is missing, incomplete, or unverified — keep working instead of completing. Do not complete merely because the budget is nearly exhausted."), STR_LEN("\nCompletion audit: GOAL_COMPLETE is a claim that EVERY requirement of the objective above is finished and verified by tool output in this conversation. If any requirement is missing, incomplete, or unverified — keep working instead of completing. Do not complete merely because the budget is nearly exhausted."));
+    pb_append(out, STR_PTR("\nBlocked audit: report blocked ONLY when the same blocking condition repeats with no tool/file change; otherwise keep making progress. Never re-list the plan as a substitute for doing the work."), STR_LEN("\nBlocked audit: report blocked ONLY when the same blocking condition repeats with no tool/file change; otherwise keep making progress. Never re-list the plan as a substitute for doing the work."));
+    pb_append(out, STR_PTR("\nWhen the objective is fully achieved and every requirement is verified by tool output in this conversation, reply with exactly GOAL_COMPLETE on its own line and stop. Otherwise keep making concrete tool progress."), STR_LEN("\nWhen the objective is fully achieved and every requirement is verified by tool output in this conversation, reply with exactly GOAL_COMPLETE on its own line and stop. Otherwise keep making concrete tool progress."));
+    return 0;
+}

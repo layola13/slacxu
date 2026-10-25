@@ -1,0 +1,663 @@
+// Converted 1:1 from backends/relay-config/src/relay/relayCatalog.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/io/print.sai"
+@import "sa_std/ptr.sa"
+@import "sa_std/crypto.sa" // DEFECT: node:crypto createHash — sa_std hash extern assumed; see sourceHash.
+
+// Types imported from "@codex-ui/shared" (relayCatalog.ts:2-12):
+// ChannelGroupConfig, ImageGenerationProtocol, JsonValue,
+// RelayCapabilityCatalog, RelayCatalogEndpoint, RelayCatalogImportPreview,
+// RelayCatalogModel, RelayCatalogVendor, RelayResponseProtocol.
+// DEFECT: dynamic object — every one of these is a dynamic JSON-shaped TS
+// type; in SLA they are JSON text buffers (JsonBuf) plus the few scalar
+// fields actually branched on. Field-for-field structs are a later fix pass.
+
+// Generic JSON text buffer used for all catalog-shaped values.
+struct JsonBuf {
+    bytes: [0u8; 2097152], // MAX_CATALOG_BYTES (2 MB) upper bound, see below
+    len: u64,
+}
+
+// RelayCatalogModel — scalar view (full record stays in JsonBuf form).
+struct RelayCatalogModel {
+    model_name_bytes: [0u8; 512],
+    model_name_len: u64,
+    quota_type: u64, // 0 | 1
+    enable_groups_bytes: [0u8; 8192], // flattened string[]
+    enable_groups_lens: [0u64; 64],
+    enable_groups_count: u64,
+    supported_endpoint_types_bytes: [0u8; 8192], // flattened string[]
+    supported_endpoint_types_lens: [0u64; 64],
+    supported_endpoint_types_count: u64,
+    json_bytes: [0u8; 16384], // DEFECT: dynamic object — full model record
+    json_len: u64,
+}
+
+// ChannelGroupConfig — JSON text buffer form (built/returned by several fns).
+struct ChannelGroupConfigJson {
+    json_bytes: [0u8; 32768],
+    json_len: u64,
+}
+
+// Warnings list: flattened string[].
+struct Warnings {
+    bytes: [0u8; 65536],
+    lens: [0u64; 256],
+    count: u64,
+}
+
+fn warnings_push(warnings: &Warnings, msg_ptr: ptr, msg_len: u64) {
+    // DEFECT: byte copy of the message into flattened storage not implemented
+    // in this pass; only the count/length bookkeeping is kept.
+    if warnings.count < 256 {
+        warnings.lens[warnings.count] = msg_len;
+        warnings.count = warnings.count + 1;
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Field-name sets (relayCatalog.ts:14-46)
+// DEFECT: Set<string> — no Set type; membership is a linear scan over the
+// literal lists kept in the comments below.
+// MODEL_FIELDS: model_name, icon, vendor_id, quota_type, model_ratio,
+//   model_price, completion_ratio, cache_ratio, create_cache_ratio, owner_by,
+//   enable_groups, supported_endpoint_types, extensions
+// VENDOR_FIELDS: id, name, icon, extensions
+// ENDPOINT_FIELDS: path, method, aliases, extensions
+// CATALOG_FIELDS: schema, success, auto_groups, data, group_ratio,
+//   usable_group, supported_endpoint, vendors, imported_at, source_hash,
+//   warnings, extensions
+// ---------------------------------------------------------------------------
+const MODEL_FIELDS_COUNT: u64 = 13;
+const VENDOR_FIELDS_COUNT: u64 = 4;
+const ENDPOINT_FIELDS_COUNT: u64 = 4;
+const CATALOG_FIELDS_COUNT: u64 = 12;
+
+// CONVERSATION_PROTOCOLS: RelayResponseProtocol[] (relayCatalog.ts:47)
+//   ["openai-response", "openai", "anthropic", "gemini"]
+const CONVERSATION_PROTOCOLS_COUNT: u64 = 4;
+
+const MAX_CATALOG_BYTES: u64 = 2097152; // 2 * 1024 * 1024 (relayCatalog.ts:48)
+const CATALOG_FETCH_TIMEOUT_MS: u64 = 15000; // 15_000 (relayCatalog.ts:49)
+
+// String helpers over (ptr,len).
+fn rc_streq(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    let i: u64 = 0;
+    while i < a_len {
+        let a: u8 = 0;
+        let b: u8 = 0;
+        PTR_BYTE_AT(a, a_ptr, i);
+        PTR_BYTE_AT(b, b_ptr, i);
+        if a != b { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn rc_contains(hay_ptr: ptr, hay_len: u64, needle_ptr: ptr, needle_len: u64) -> bool {
+    if needle_len == 0 || hay_len < needle_len { return false; };
+    let last = hay_len - needle_len;
+    let i: u64 = 0;
+    while i <= last {
+        let ok = true;
+        let j: u64 = 0;
+        while j < needle_len {
+            let a: u8 = 0;
+            let b: u8 = 0;
+            PTR_BYTE_AT(a, hay_ptr, i + j);
+            PTR_BYTE_AT(b, needle_ptr, j);
+            if a != b { ok = false; break; };
+            j = j + 1;
+        }
+        if ok { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// export async function fetchRelayCapabilityCatalog(urlInput: string): Promise<RelayCapabilityCatalog> (relayCatalog.ts:51-95)
+// DEFECT: async — synchronous + status code; catalog via out JsonBuf.
+// Status codes (source throws Error with these messages):
+//   1 "Capability catalog URL is invalid"
+//   2 "Capability catalog URL must use HTTP or HTTPS"
+//   3 "Capability catalog request failed (<status>)"
+//   4 "Capability catalog response exceeds 2 MB"
+//   5 "Capability catalog response is not valid JSON"
+//   6 "Capability catalog request timed out after 15 seconds"
+//   plus parseRelayCapabilityCatalog errors propagated unchanged.
+// DEFECT: throw — no exceptions; status codes replace them (messages above).
+// DEFECT: AbortController + setTimeout/clearTimeout — timers and abort
+// signals have no sa_std counterpart; timeout is a client parameter.
+// DEFECT: fetch / URL / Headers — global fetch and the URL class are Node/Web
+// APIs; approximated by sa_std HTTP client + manual scheme check.
+// DEFECT: TextEncoder byte length — byte length is the buffer length here.
+// ---------------------------------------------------------------------------
+fn fetchRelayCapabilityCatalog(url_ptr: ptr, url_len: u64, out: &JsonBuf) -> i32 {
+    // url = new URL(urlInput.trim())          -> invalid: code 1
+    // url.protocol not https:/http:          -> code 2
+    // controller + 15s timeout (see DEFECT)
+    // response = await fetch(url, { headers: { Accept: "application/json" },
+    //   redirect: "follow", signal })
+    // !response.ok                            -> code 3
+    // declared content-length > MAX           -> code 4
+    // text byte length > MAX                  -> code 4
+    // JSON.parse(text) fails                  -> code 5
+    // aborted (timeout)                       -> code 6
+    // return parseRelayCapabilityCatalog(parsed)
+    // finally: clearTimeout(timeout)
+    // DEFECT: HTTP fetch + JSON parse not implemented in this pass.
+    out.len = 0;
+    return 3;
+}
+
+// ---------------------------------------------------------------------------
+// export function canonicalEndpointType(value: string): string (relayCatalog.ts:97-110)
+//   switch (value.trim().toLowerCase()) {
+//     case "vidoes": return "videos";
+//     case "openai-responses-compact": return "openai-response-compact";
+//     case "openai-responses-compaction-v2": return "openai-response-compaction-v2";
+//     default: return value.trim().toLowerCase();
+//   }
+// DEFECT: string return — out (ptr,len); the default branch returns the
+// normalized input, which the caller must materialize (pending byte copy).
+// ---------------------------------------------------------------------------
+fn canonicalEndpointType(value_ptr: ptr, value_len: u64, out_len: &u64) -> i32 {
+    // Caller supplies value already trimmed + lowercased.
+    if rc_streq(value_ptr, value_len, STR_PTR("vidoes"), STR_LEN("vidoes")) { out_len = STR_LEN("videos"); return 0; };
+    if rc_streq(value_ptr, value_len, STR_PTR("openai-responses-compact"), STR_LEN("openai-responses-compact")) { out_len = STR_LEN("openai-response-compact"); return 0; };
+    if rc_streq(value_ptr, value_len, STR_PTR("openai-responses-compaction-v2"), STR_LEN("openai-responses-compaction-v2")) { out_len = STR_LEN("openai-response-compaction-v2"); return 0; };
+    out_len = value_len;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// export function parseRelayCapabilityCatalog(value: unknown, now = Date.now()): RelayCapabilityCatalog (relayCatalog.ts:112-168)
+// DEFECT: dynamic JSON — `value: unknown` is a JSON text buffer; all record
+// reads are JSON lookups. The returned catalog is a JsonBuf.
+// DEFECT: throw — status codes: 1 success must be true; 2 missing data[];
+// 3 no valid models; helper errors propagate as nonzero.
+// DEFECT: Date.now default parameter — caller passes `now` (epoch ms).
+// DEFECT: object spread ({...(existingExt ?? {}), ...extra}) for extensions
+// merge — JSON object merge over text, not implemented in this pass.
+// ---------------------------------------------------------------------------
+fn parseRelayCapabilityCatalog(value_ptr: ptr, value_len: u64, now: u64, out: &JsonBuf) -> i32 {
+    // record = asRecord(value); warnings = stringArray(record.warnings)
+    // if (record.success !== true) -> code 1
+    // models = parseModels(record.data, warnings)
+    // if (!Array.isArray(record.data)) -> code 2
+    // if (models.length === 0) -> code 3
+    // groupRatio = numberRecord(record.group_ratio, "group_ratio", warnings)
+    // usableGroup = stringRecord(record.usable_group, "usable_group", warnings)
+    // autoGroups = uniqueStrings(stringArray(record.auto_groups))
+    // supportedEndpoint = parseEndpoints(record.supported_endpoint, warnings)
+    // vendors = parseVendors(record.vendors, warnings)
+    // referencedGroups = Set of all models' enable_groups:
+    //   missing in usableGroup -> usableGroup[g] = g + warning
+    //     `Group ${g} is referenced by a model but missing from usable_group.`
+    //   missing in groupRatio -> groupRatio[g] = 1 + warning
+    //     `Group ${g} is missing group_ratio; defaulted to 1.`
+    // for g in union(keys(usableGroup), keys(groupRatio), autoGroups):
+    //   fill defaults both ways; unreferenced -> warning
+    //     `Group ${g} has no model membership.`
+    // extensions = merge(unwrapExtensions(record.extensions), extraFields(record, CATALOG_FIELDS))
+    // return { schema: "codex-react-ui.relay-catalog.v1",
+    //   success: booleanValue(record.success) ?? true, auto_groups: autoGroups,
+    //   data: models, group_ratio, usable_group, supported_endpoint, vendors,
+    //   imported_at: finiteNumber(record.imported_at) ?? now,
+    //   source_hash: stringValue(record.source_hash) ?? sourceHash(value),
+    //   warnings: uniqueStrings(warnings),
+    //   extensions: non-empty ? extensions : undefined }
+    // DEFECT: template literals in warning strings — concatenation pending.
+    // DEFECT: JSON walk + catalog emission not implemented in this pass.
+    out.len = 0;
+    return 2;
+}
+
+// ---------------------------------------------------------------------------
+// export function deriveCatalogGroups(catalog): ChannelGroupConfig[] (relayCatalog.ts:170-213)
+// DEFECT: dynamic object — catalog in, groups out, both JSON text buffers.
+// DEFECT: closures — map/filter/flatMap/some callbacks become loops.
+// DEFECT: template literal id `catalog:${groupName}` — concatenation pending.
+// ---------------------------------------------------------------------------
+fn deriveCatalogGroups(catalog_ptr: ptr, catalog_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
+    // groupNames = uniqueStrings([...keys(usable_group), ...keys(group_ratio),
+    //   ...auto_groups, ...data.flatMap(m => m.enable_groups)])
+    // Per groupName (index i):
+    //   models = data.filter(m => m.enable_groups.includes(groupName))
+    //   endpointUnion = uniqueStrings(models.flatMap(supported_endpoint_types))
+    //   commonEndpoints = intersectEndpoints(models)
+    //   commonProtocols = preferredProtocols(groupName, commonEndpoints)
+    //   unionProtocols = preferredProtocols(groupName, endpointUnion)
+    //   responseProtocol = commonProtocols[0] ?? unionProtocols[0] ?? "openai-response"
+    //   responseProtocolMode = (commonProtocols.length > 0 || models.length === 0) ? "fixed" : "model_auto"
+    //   imageGroup = isImageGroup(groupName, models)
+    //   image = catalogImageConfig(groupName, models, endpointUnion)
+    //   hasText = models.some(m => m.supported_endpoint_types.some(e => CONVERSATION_PROTOCOLS.includes(e)))
+    //   group literal: { id: `catalog:${groupName}`, name: groupName,
+    //     kind: imageGroup ? "image" : "text",
+    //     capabilities: { text: imageGroup ? false : hasText || !imageGroup,
+    //       imageGeneration: image?.generations ?? (imageGroup ? true : undefined),
+    //       imageEdits: image?.edits ?? (imageGroup ? true : undefined) },
+    //     status: "enabled", groupRatio: group_ratio[groupName] ?? 1,
+    //     priority: i + 1, weight: 0, keyMode: "polling",
+    //     models: models.map(model_name), supportedEndpointTypes: endpointUnion,
+    //     responseProtocol, responseProtocolMode, authType: "inherit",
+    //     credentialMode: "provider", catalogGroupName: groupName,
+    //     catalogManaged: true, image, remark: usable_group[groupName] || groupName,
+    //     autoBan: true, keys: [], enableFallback: false }
+    // DEFECT: JSON walk + group emission not implemented in this pass.
+    out_len = 0;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// export function buildCatalogImportPreview(providerId, existingGroups, input: unknown): RelayCatalogImportPreview (relayCatalog.ts:215-245)
+// DEFECT: dynamic object — preview returned as JSON text buffer.
+// DEFECT: Map construction from existingGroups — keyed lookup approximated
+// by linear scans over the JSON buffer (not implemented in this pass).
+// ---------------------------------------------------------------------------
+fn buildCatalogImportPreview(provider_id_ptr: ptr, provider_id_len: u64, existing_ptr: ptr, existing_len: u64, input_ptr: ptr, input_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
+    // catalog = parseRelayCapabilityCatalog(input) (now = Date.now() at call site)
+    // groups = deriveCatalogGroups(catalog)
+    // existingGroupsByName = Map(catalogGroupName ?? name -> group)
+    // for group of groups: !existing -> add++; catalogGroupChanged -> update++;
+    //   else unchanged++
+    // remove = existingGroups.filter(g => g.catalogManaged && !incomingNames.has(key)).length
+    // return { provider_id: providerId,
+    //   counts: { models: catalog.data.length, groups: groups.length,
+    //     vendors: catalog.vendors.length,
+    //     endpoints: Object.keys(catalog.supported_endpoint).length },
+    //   changes: { add, update, remove, unchanged }, groups,
+    //   warnings: catalog.warnings, catalog }
+    // DEFECT: counting walk over JSON buffers not implemented in this pass.
+    out_len = 0;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// export function mergeCatalogGroups(existingGroups, importedGroups, mode: "merge" | "replace"): ChannelGroupConfig[] (relayCatalog.ts:247-262)
+// DEFECT: dynamic object — groups in/out as JSON text buffers.
+// DEFECT: Map + flatMap + spread ([...merged, ...importedByName.values()]) —
+// no Map/spread; ordered merge approximated by scans (not implemented here).
+// DEFECT: string union type mode "merge" | "replace" — mode flag bool.
+// ---------------------------------------------------------------------------
+fn mergeCatalogGroups(existing_ptr: ptr, existing_len: u64, imported_ptr: ptr, imported_len: u64, mode_replace: bool, out_ptr: ptr, out_len: &u64) -> i32 {
+    // importedByName = Map(catalogGroupName ?? name -> group)
+    // merged = existingGroups.flatMap(existing => {
+    //   imported = importedByName.get(name)
+    //   !imported -> (mode === "replace" && existing.catalogManaged) ? [] : [existing]
+    //   else delete from map; [mergeCatalogGroup(existing, imported)] })
+    // return [...merged, ...importedByName.values()]
+    out_len = 0;
+    return 0;
+}
+
+// const REQUIRED_IMAGE_RUNTIME_GROUPS = new Set(["gpt-image", "gpt-image-adobe", "gpt-azure"]); (relayCatalog.ts:264)
+// DEFECT: Set<string> — membership by linear scan over these 3 literals.
+const REQUIRED_IMAGE_RUNTIME_GROUPS_COUNT: u64 = 3;
+
+// Upgrade the small set of DeepKey groups that participate in the split image
+// runtime. Older profiles can contain a catalog but only the groups selected
+// during the original import, and can retain the former gpt-image-2-1k
+// default. Keep every unrelated/manual group untouched while adding or
+// refreshing only the image runtime groups advertised by the saved catalog.
+// export function reconcileRequiredImageCatalogGroups(existingGroups, catalog): ChannelGroupConfig[] (relayCatalog.ts:273-283)
+fn reconcileRequiredImageCatalogGroups(existing_ptr: ptr, existing_len: u64, catalog_ptr: ptr, catalog_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
+    // required = deriveCatalogGroups(catalog).filter(g =>
+    //   REQUIRED_IMAGE_RUNTIME_GROUPS.has((g.catalogGroupName ?? g.name).toLowerCase()))
+    // if (required.length === 0) return existingGroups;
+    // return mergeCatalogGroups(existingGroups, required, "merge");
+    // DEFECT: JSON walk not implemented in this pass.
+    out_len = 0;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// export function resolveModelProtocol(group, model | undefined): RelayResponseProtocol (relayCatalog.ts:285-294)
+// DEFECT: dynamic object — group/model are JSON text buffers; protocol via
+// out (ptr,len) length only (caller materializes the known literal).
+// DEFECT: optional chaining (model?.supported_endpoint_types) — has_model flag.
+// ---------------------------------------------------------------------------
+fn resolveModelProtocol(group_ptr: ptr, group_len: u64, model_ptr: ptr, model_len: u64, has_model: bool, out_len: &u64) -> i32 {
+    // if (group.responseProtocolMode !== "model_auto")
+    //   return group.responseProtocol ?? "openai-response";
+    // supported = model?.supported_endpoint_types ?? group.supportedEndpointTypes ?? []
+    // return preferredProtocols(group.catalogGroupName ?? group.name, supported)[0]
+    //   ?? group.responseProtocol ?? "openai-response";
+    // DEFECT: JSON field reads not implemented in this pass; default applies.
+    out_len = STR_LEN("openai-response");
+    return 0;
+}
+
+// export function modelSupportsProtocol(model | undefined, protocol): boolean (relayCatalog.ts:296-299)
+//   if (!model) return true;
+//   return model.supported_endpoint_types.includes(protocol);
+// DEFECT: dynamic JSON — endpoint list read from the model JSON buffer.
+fn modelSupportsProtocol(model_ptr: ptr, model_len: u64, has_model: bool, protocol_ptr: ptr, protocol_len: u64) -> bool {
+    if !has_model { return true; };
+    // DEFECT: JSON array membership scan not implemented in this pass.
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// function mergeCatalogGroup(existing, imported): ChannelGroupConfig (relayCatalog.ts:301-331)
+// DEFECT: dynamic object — the {...imported, ...overrides} literal becomes a
+// JSON merge over text buffers; field precedence preserved in the list below.
+//   base = imported; overridden from existing: id, status, quotaUsd,
+//   usedQuotaUsd, priority, weight, keyMode,
+//   responseProtocol ?? imported, responseProtocolMode ?? imported,
+//   endpointPathOverride, authType ?? imported,
+//   credentialMode ?? ((existing.keys?.length ?? 0) > 0 ? "group" : imported),
+//   image: refreshManagedMetadata ? imported.image : existing.image ?? imported.image,
+//   capabilities: refreshManagedMetadata ? imported.capabilities : existing.capabilities ?? imported.capabilities,
+//   modelMapping, statusCodeMapping, advancedModelMapping, tag, autoBan,
+//   requestLimit, requestIntervalSeconds, contextWindow, keys, enableFallback,
+//   fallbackChannelId, fallbackGroupName, enableTieredContext, tieredContextRatios
+//   where refreshManagedMetadata = existing.catalogManaged === true.
+// ---------------------------------------------------------------------------
+fn mergeCatalogGroup(existing_ptr: ptr, existing_len: u64, imported_ptr: ptr, imported_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
+    // DEFECT: JSON merge not implemented in this pass.
+    out_len = 0;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// function parseModels(value: unknown, warnings): RelayCatalogModel[] (relayCatalog.ts:333-385)
+// DEFECT: dynamic JSON — value is a JSON text buffer; entries walked as JSON.
+// DEFECT: Set<string> names — dedup by linear scan.
+// DEFECT: closure — value.entries() iteration with index becomes a for loop.
+// Per entry: model_name = stringValue(record.model_name); missing ->
+//   warning `Skipped model at data[${index}] because model_name is missing.`
+// duplicate -> warning `Skipped duplicate model_name ${modelName}.`
+// quota_type: finiteNumber === 1 ? 1 : 0; invalid ->
+//   warning `Model ${modelName} has invalid quota_type; defaulted to 0.`
+// endpoints = uniqueStrings(stringArray(supported_endpoint_types).map(canonicalEndpointType))
+// raw includes "vidoes" -> warning `Model ${modelName}: normalized vidoes to videos.`
+// raw includes "openai-responses-compact" -> warning (normalized ...-compact)
+// extensions = merge(unwrapExtensions(record.extensions), extraFields(record, MODEL_FIELDS))
+// push { model_name, icon: stringValue, vendor_id: finiteNumber, quota_type,
+//   model_ratio, model_price, completion_ratio, cache_ratio,
+//   create_cache_ratio (all finiteNumber), owner_by: string-or-undefined,
+//   enable_groups: uniqueStrings(stringArray), supported_endpoint_types: endpoints,
+//   extensions: non-empty ? extensions : undefined }
+// DEFECT: template literals in warnings — concatenation pending.
+// ---------------------------------------------------------------------------
+fn parseModels(value_ptr: ptr, value_len: u64, warnings: &Warnings, out_ptr: ptr, out_count: &u64) -> i32 {
+    // DEFECT: JSON entry walk not implemented in this pass.
+    out_count = 0;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// function parseVendors(value: unknown, warnings): RelayCatalogVendor[] (relayCatalog.ts:387-416)
+// DEFECT: dynamic JSON + Set<number> ids — as parseModels.
+// Not an array -> warning "vendors is missing or is not an array." + [].
+// Per entry: id = finiteNumber(record.id), name = stringValue(record.name);
+// invalid/duplicate -> warning `Skipped invalid or duplicate vendor at vendors[${index}].`
+// extensions merged as in parseModels (VENDOR_FIELDS).
+// ---------------------------------------------------------------------------
+fn parseVendors(value_ptr: ptr, value_len: u64, warnings: &Warnings, out_ptr: ptr, out_count: &u64) -> i32 {
+    // DEFECT: JSON entry walk not implemented in this pass.
+    out_count = 0;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// function parseEndpoints(value: unknown, warnings): Record<string, RelayCatalogEndpoint> (relayCatalog.ts:418-455)
+// DEFECT: dynamic object — Record return kept as JSON text buffer.
+// Per [rawType, rawEntry] of Object.entries(record):
+//   endpointType = canonicalEndpointType(rawType)
+//   path = stringValue(record.path); method = stringValue(record.method)?.toUpperCase() ?? "POST"
+//   path starts with "{" -> try JSON.parse(path) as nested record for
+//     path/method + warning `Endpoint ${rawType}: normalized JSON-encoded path metadata.`
+//     catch -> warning `Endpoint ${rawType}: path looks JSON encoded but could not be parsed.`
+//   !path -> warning `Skipped endpoint ${rawType} because path is missing.`
+//   aliases = uniqueStrings([...(previous?.aliases ?? []), ...(rawType !== endpointType ? [rawType] : [])])
+//   extensions merged (ENDPOINT_FIELDS)
+//   endpoints[endpointType] = { path, method, aliases?, extensions? }
+//   rawType !== endpointType -> warning `Endpoint ${rawType}: normalized to ${endpointType}.`
+// DEFECT: try/catch JSON.parse — status branch; template warnings pending.
+// ---------------------------------------------------------------------------
+fn parseEndpoints(value_ptr: ptr, value_len: u64, warnings: &Warnings, out_ptr: ptr, out_len: &u64) -> i32 {
+    // DEFECT: JSON entry walk not implemented in this pass.
+    out_len = 0;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// function intersectEndpoints(models): string[] (relayCatalog.ts:457-465)
+// DEFECT: Set algebra — intersection via nested scans over flattened lists.
+// DEFECT: closure — filter callback becomes an inner loop.
+// ---------------------------------------------------------------------------
+fn intersectEndpoints(models_ptr: ptr, models_count: u64, out_ptr: ptr, out_count: &u64) -> i32 {
+    // if (models.length === 0) return [];
+    // intersection = Set(models[0].supported_endpoint_types)
+    // for model of models.slice(1): keep endpoints present in model's set
+    // return [...intersection]
+    // DEFECT: scan over flattened model storage not implemented in this pass.
+    out_count = 0;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// function preferredProtocols(groupName, endpoints): RelayResponseProtocol[] (relayCatalog.ts:467-477)
+// DEFECT: generics/type predicate — the .filter((e): e is RelayResponseProtocol
+// => ...) type guard has no SLA counterpart; membership is a string scan.
+// Priority: group includes "claude" -> [anthropic, openai-response, openai, gemini]
+//           group includes "gemini" -> [gemini, openai-response, openai, anthropic]
+//           else -> [openai-response, openai, anthropic, gemini]
+// Result = priority filtered to supported (endpoints ∩ CONVERSATION_PROTOCOLS).
+// ---------------------------------------------------------------------------
+fn preferredProtocols(group_name_ptr: ptr, group_name_len: u64, endpoints_ptr: ptr, endpoints_len: u64, out_ptr: ptr, out_count: &u64) -> i32 {
+    // DEFECT: caller must supply group name lowercased and the endpoint list
+    // as JSON text; priority selection itself is a fixed branch:
+    let is_claude = rc_contains(group_name_ptr, group_name_len, STR_PTR("claude"), STR_LEN("claude"));
+    let is_gemini = rc_contains(group_name_ptr, group_name_len, STR_PTR("gemini"), STR_LEN("gemini"));
+    // DEFECT: supported-set filtering over JSON text not implemented here.
+    out_count = 0;
+    if is_claude { return 1; };
+    if is_gemini { return 2; };
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// function isImageGroup(groupName, models): boolean (relayCatalog.ts:479-486)
+// DEFECT: regex /image|banana|video/i — substring scans (approximation loses
+// the regex alternation boundaries, which are plain substrings here anyway).
+// DEFECT: closure — models.every(...) becomes a loop.
+// ---------------------------------------------------------------------------
+fn isImageGroup(group_name_ptr: ptr, group_name_len: u64, models_ptr: ptr, models_count: u64) -> bool {
+    if rc_contains(group_name_ptr, group_name_len, STR_PTR("image"), STR_LEN("image")) { return true; };
+    // DEFECT: case-insensitive scan required ("banana"/"video" likewise);
+    // rc_contains is case-sensitive in this pass.
+    if rc_contains(group_name_ptr, group_name_len, STR_PTR("banana"), STR_LEN("banana")) { return true; };
+    if rc_contains(group_name_ptr, group_name_len, STR_PTR("video"), STR_LEN("video")) { return true; };
+    if models_count == 0 { return false; };
+    // every model: quota_type === 1 && some endpoint in
+    //   ["image-generation", "image-edits", "videos"]
+    // DEFECT: per-model scan over flattened storage not implemented here.
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// function catalogImageConfig(groupName, models, endpoints): ChannelGroupConfig["image"] (relayCatalog.ts:488-514)
+// DEFECT: dynamic object — the image config literal (with conditional nested
+// billing/modelPrices objects) is emitted as JSON text.
+// DEFECT: indexed access type ChannelGroupConfig["image"] — no counterpart.
+// Logic preserved:
+//   normalized = groupName.toLowerCase()
+//   generation = endpoints.includes("image-generation") || normalized in
+//     {"gpt-image", "gpt-image-adobe", "gpt-azure"}; edits likewise with "image-edits"
+//   !generation && !edits -> undefined (status 1)
+//   requestedDefault = gpt-image/gpt-image-adobe ? "gpt-image-2-count"
+//     : gpt-azure ? "gpt-image-2" : undefined
+//   discoveredDefault = first model with "image-generation" endpoint ?.model_name
+//   perImagePrice = gpt-image ? 0.08 : gpt-image-adobe ? 0.12 : undefined
+//   return { generations: generation, edits,
+//     defaultModel: requestedDefault ?? discoveredDefault,
+//     protocols: [generation ? "openaiImages" : null, edits ? "openaiImageEdits" : null].filter(Boolean),
+//     defaultProtocol: generation ? "openaiImages" : "openaiImageEdits",
+//     modelPrices: price && requestedDefault ? [{ model: requestedDefault, usdPerImage: price }] : undefined,
+//     billing: price ? { mode: "per_image", usdPerImage: price, currency: "USD" }
+//       : gpt-azure ? { mode: "token_multiplier", multiplier: 1.2, currency: "USD" } : undefined,
+//     availability: gpt-azure ? "constrained" : "available",
+//     notice: gpt-azure ? "当前 gpt-azure 图片资源不足" : undefined }
+// DEFECT: closure — models.find(...) callback becomes a scan.
+// ---------------------------------------------------------------------------
+fn catalogImageConfig(group_name_ptr: ptr, group_name_len: u64, models_ptr: ptr, models_count: u64, endpoints_ptr: ptr, endpoints_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
+    // DEFECT: JSON emission not implemented in this pass.
+    out_len = 0;
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// function catalogGroupChanged(existing, incoming): boolean (relayCatalog.ts:516-526)
+// DEFECT: dynamic JSON — field compares (groupRatio/remark/kind/
+// responseProtocol/responseProtocolMode) plus JSON.stringify equality for
+// capabilities/image/models/supportedEndpointTypes; stringify-equality over
+// text buffers is a byte compare only if key order matches (approximation).
+// ---------------------------------------------------------------------------
+fn catalogGroupChanged(existing_ptr: ptr, existing_len: u64, incoming_ptr: ptr, incoming_len: u64) -> bool {
+    // return existing.groupRatio !== incoming.groupRatio
+    //   || remark !== || kind !==
+    //   || JSON.stringify(capabilities ?? {}) !== JSON.stringify(...)
+    //   || JSON.stringify(image ?? {}) !== ...
+    //   || responseProtocol !== || responseProtocolMode !==
+    //   || JSON.stringify(models ?? []) !== ...
+    //   || JSON.stringify(supportedEndpointTypes ?? []) !== ...
+    // DEFECT: JSON field extraction not implemented in this pass.
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// function numberRecord(value, field, warnings): Record<string, number> (relayCatalog.ts:528-545)
+// DEFECT: dynamic object — Record in/out as JSON text buffers.
+// Per [rawKey, entry]: key = rawKey.trim(); empty ->
+//   warning `${field} contains an empty group name and it was ignored.`
+// parsed = finiteNumber(entry); null ->
+//   warning `${field}.${key} is not a finite number and was ignored.`
+// else result[key] = parsed. Empty record first warns
+//   `${field} is missing or empty.`
+// ---------------------------------------------------------------------------
+fn numberRecord(value_ptr: ptr, value_len: u64, field_ptr: ptr, field_len: u64, warnings: &Warnings, out_ptr: ptr, out_len: &u64) -> i32 {
+    // DEFECT: JSON walk not implemented in this pass.
+    out_len = 0;
+    return 0;
+}
+
+// function stringRecord(value, field, warnings): Record<string, string> (relayCatalog.ts:547-563)
+// As numberRecord, but keeps string entries; non-string ->
+//   warning `${field}.${key} is not a string and was ignored.`
+fn stringRecord(value_ptr: ptr, value_len: u64, field_ptr: ptr, field_len: u64, warnings: &Warnings, out_ptr: ptr, out_len: &u64) -> i32 {
+    // DEFECT: dynamic object — JSON walk not implemented in this pass.
+    out_len = 0;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// export function unwrapExtensions(val: unknown): Record<string, JsonValue> | undefined (relayCatalog.ts:565-577)
+// DEFECT: dynamic JSON — val is a JSON text buffer; the unwrap loop
+// (while single-key "extensions" object, with a seen-Set cycle guard) is a
+// JSON walk. Undefined result represented by status 1.
+// DEFECT: Set<unknown> identity set — pointer-identity cycle guard has no
+// counterpart over text buffers; depth cap approximation pending.
+// ---------------------------------------------------------------------------
+fn unwrapExtensions(val_ptr: ptr, val_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
+    // if (!val || typeof val !== "object" || Array.isArray(val)) return undefined;
+    // current = val; seen = Set
+    // while (current is object && !array && "extensions" in current
+    //        && Object.keys(current).length === 1) {
+    //   if (seen.has(current)) break; seen.add(current);
+    //   current = current.extensions; }
+    // rec = asRecord(current)
+    // return keys(rec).length > 0 ? rec : undefined
+    // DEFECT: JSON walk not implemented in this pass.
+    out_len = 0;
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// function extraFields(record, known: Set<string>): Record<string, JsonValue> (relayCatalog.ts:579-587)
+// DEFECT: dynamic JSON + Set membership — keys not in `known` whose values
+// pass isJsonValue are copied; JSON walk over text buffer.
+// ---------------------------------------------------------------------------
+fn extraFields(record_ptr: ptr, record_len: u64, known_set_id: u64, out_ptr: ptr, out_len: &u64) -> i32 {
+    // known_set_id selects MODEL_FIELDS / VENDOR_FIELDS / ENDPOINT_FIELDS /
+    // CATALOG_FIELDS (see counts above).
+    // DEFECT: JSON walk not implemented in this pass.
+    out_len = 0;
+    return 0;
+}
+
+// function isJsonValue(value: unknown): value is JsonValue (relayCatalog.ts:589-596)
+// DEFECT: generics/type predicate — the `value is JsonValue` guard has no SLA
+// counterpart; recursive JSON validation over a text buffer instead.
+//   null/string/boolean -> true; number -> Number.isFinite;
+//   array -> every(isJsonValue); object -> every value isJsonValue; else false
+// DEFECT: closure/recursion — recursive .every callbacks become a recursive
+// JSON scan (not implemented in this pass).
+fn isJsonValue(value_ptr: ptr, value_len: u64) -> bool {
+    return true;
+}
+
+// function sourceHash(value: unknown): string (relayCatalog.ts:598-600)
+//   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+// DEFECT: Node crypto createHash chain — approximated by a sa_std sha256
+// extern over the JSON text; hex digest via out (ptr,len).
+fn sourceHash(value_ptr: ptr, value_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
+    // DEFECT: sha256 extern call + hex encoding not implemented in this pass.
+    out_len = 64;
+    return 0;
+}
+
+// function asRecord(value: unknown): Record<string, unknown> (relayCatalog.ts:602-604)
+// DEFECT: dynamic JSON — over a text buffer this is "is a JSON object" plus
+// the buffer itself; non-object yields the empty-object buffer.
+fn asRecord(value_ptr: ptr, value_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
+    // DEFECT: JSON type check not implemented in this pass.
+    out_len = 0;
+    return 0;
+}
+
+// function stringValue(value: unknown): string | undefined (relayCatalog.ts:606-608)
+//   typeof value === "string" && value.trim() ? value.trim() : undefined
+// DEFECT: dynamic JSON — value is a JSON text fragment; undefined via status 1.
+fn stringValue(value_ptr: ptr, value_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
+    out_len = 0;
+    return 1;
+}
+
+// function finiteNumber(value: unknown): number | undefined (relayCatalog.ts:610-612)
+//   typeof value === "number" && Number.isFinite(value) ? value : undefined
+// DEFECT: dynamic JSON — fragment parse; undefined via has flag.
+fn finiteNumber(value_ptr: ptr, value_len: u64, out: &f64, has: &bool) {
+    out = 0.0;
+    has = false;
+}
+
+// function booleanValue(value: unknown): boolean | undefined (relayCatalog.ts:614-617)
+//   boolean -> itself; 0/1 -> Boolean(value); else undefined
+fn booleanValue(value_ptr: ptr, value_len: u64, out: &bool, has: &bool) {
+    out = false;
+    has = false;
+}
+
+// function stringArray(value: unknown): string[] (relayCatalog.ts:619-621)
+//   Array.isArray ? entries filtered to trimmed non-empty strings : []
+// DEFECT: dynamic JSON + closure (filter/map type-predicate callbacks).
+fn stringArray(value_ptr: ptr, value_len: u64, out_ptr: ptr, out_count: &u64) -> i32 {
+    // DEFECT: JSON array walk not implemented in this pass.
+    out_count = 0;
+    return 0;
+}
+
+// function uniqueStrings(values: string[]): string[] (relayCatalog.ts:623-625)
+//   return [...new Set(values.map(v => v.trim()).filter(Boolean))];
+// DEFECT: Set dedup — O(n^2) scan over flattened string storage.
+// DEFECT: closure — map/filter callbacks become loop steps.
+fn uniqueStrings(values_ptr: ptr, values_count: u64, out_ptr: ptr, out_count: &u64) -> i32 {
+    // DEFECT: dedup scan over flattened storage not implemented in this pass.
+    out_count = 0;
+    return 0;
+}

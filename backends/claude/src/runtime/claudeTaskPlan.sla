@@ -1,0 +1,453 @@
+// Converted 1:1 from backends/claude/src/runtime/claudeTaskPlan.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/json.sai"
+@import "claudeCompatibleProbe.sla"
+
+// Projects the Claude CLI's task list onto the same shape Codex emits for
+// `turn/plan/updated`, so the chat waterfall and the floating task panel render
+// a Claude plan exactly like a Codex plan instead of leaving raw tool rows.
+// (Two CLI generations covered: TodoWrite whole-list replace; TaskCreate /
+// TaskUpdate incremental — see TS header comment.)
+
+// DEFECT: JsonValue inputs are dynamic JSON; here they are JSON text buffers
+// probed with sa_json_* accessors. Array/object member access on parsed JSON
+// (args.todos[i].content etc.) uses sa_json_plan_* placeholder probes — sa_std
+// has no generic nested/array JSON surface.
+// DEFECT: string-literal union ClaudeTaskPlanStatus approximated by enum + name fn.
+
+const PLAN_STATUS_PENDING: u64 = 0;
+const PLAN_STATUS_IN_PROGRESS: u64 = 1;
+const PLAN_STATUS_COMPLETED: u64 = 2;
+
+fn plan_status_name(status: u64, out: &ByteBuf) -> void {
+    if status == PLAN_STATUS_IN_PROGRESS { buf_append_lit(out, STR_PTR("in_progress"), STR_LEN("in_progress")); return; };
+    if status == PLAN_STATUS_COMPLETED { buf_append_lit(out, STR_PTR("completed"), STR_LEN("completed")); return; };
+    buf_append_lit(out, STR_PTR("pending"), STR_LEN("pending"));
+    return;
+}
+
+struct ClaudeTaskPlanStep {
+    key: [u8; 256], // tool-use id of the TaskCreate, or the todo index key
+    key_len: u64,
+    has_taskId: bool, // TS taskId?: string — the `#N` id once known
+    taskId: [u8; 64],
+    taskId_len: u64,
+    step: [u8; 4096],
+    step_len: u64,
+    status: u64, // PLAN_STATUS_*
+}
+
+struct ClaudeTaskPlanState {
+    steps: [ClaudeTaskPlanStep; 512], // DEFECT: fixed capacity — TS array unbounded
+    steps_count: u64,
+}
+
+// Tool calls whose only effect is to mutate the task list.
+// TS: const PLAN_TOOL_NAMES = new Set(["TodoWrite", "TaskCreate", "TaskUpdate"]);
+// DEFECT: Set membership approximated by comparisons.
+fn isClaudeTaskPlanTool(toolName_ptr: ptr, toolName_len: u64) -> bool {
+    if bytes_eq_buf(toolName_ptr, toolName_len, STR_PTR("TodoWrite"), STR_LEN("TodoWrite")) { return true; };
+    if bytes_eq_buf(toolName_ptr, toolName_len, STR_PTR("TaskCreate"), STR_LEN("TaskCreate")) { return true; };
+    if bytes_eq_buf(toolName_ptr, toolName_len, STR_PTR("TaskUpdate"), STR_LEN("TaskUpdate")) { return true; };
+    return false;
+}
+
+fn createClaudeTaskPlanState(out: &ClaudeTaskPlanState) -> void {
+    out.steps_count = 0;
+    return;
+}
+
+// stringValue(value): typeof value === "string" && value.trim() ? value.trim() : undefined
+// Applied to an already-probed raw string: returns true + trimmed copy when non-empty.
+fn plan_string_value(raw_ptr: ptr, raw_len: u64, out: &ByteBuf) -> bool {
+    buf_append_bytes(out, raw_ptr, raw_len);
+    buf_trim_in_place(out);
+    return out.len > 0;
+}
+
+// Fold one plan tool call into `state`. Returns false when the call carried
+// nothing projectable. input is the JsonValue as JSON text (has_input mirrors undefined).
+fn applyClaudeTaskPlanTool(state: &ClaudeTaskPlanState, toolUseId_ptr: ptr, toolUseId_len: u64, toolName_ptr: ptr, toolName_len: u64, has_input: bool, input_json_ptr: ptr, input_json_len: u64) -> bool {
+    // const args = asRecord(input);
+    // DEFECT: asRecord returns {} for non-objects; a failed parse / non-object is
+    // treated as an empty record (doc 0) by the apply_* functions.
+    let doc: u64 = 0;
+    if has_input { doc = sa_json_parse(input_json_ptr, input_json_len); };
+    let result: bool = false;
+    if bytes_eq_buf(toolName_ptr, toolName_len, STR_PTR("TodoWrite"), STR_LEN("TodoWrite")) {
+        result = applyTodoWrite(state, doc);
+    } else if bytes_eq_buf(toolName_ptr, toolName_len, STR_PTR("TaskCreate"), STR_LEN("TaskCreate")) {
+        result = applyTaskCreate(state, toolUseId_ptr, toolUseId_len, doc);
+    } else if bytes_eq_buf(toolName_ptr, toolName_len, STR_PTR("TaskUpdate"), STR_LEN("TaskUpdate")) {
+        result = applyTaskUpdate(state, doc);
+    };
+    if doc != 0 { sa_json_free(doc); };
+    return result;
+}
+
+fn applyTodoWrite(state: &ClaudeTaskPlanState, doc: u64) -> bool {
+    // const todos = Array.isArray(args.todos) ? args.todos : Array.isArray(args.tasks) ? args.tasks : null;
+    // if (!todos) return false;
+    if doc == 0 { return false; };
+    let key_ptr: ptr = STR_PTR("todos");
+    let key_len: u64 = STR_LEN("todos");
+    let has_arr: bool = false;
+    let n: u64 = sa_json_plan_array_count(doc, key_ptr, key_len, &has_arr);
+    if has_arr == false {
+        key_ptr = STR_PTR("tasks");
+        key_len = STR_LEN("tasks");
+        n = sa_json_plan_array_count(doc, key_ptr, key_len, &has_arr);
+        if has_arr == false { return false; };
+    };
+    // const steps: ClaudeTaskPlanStep[] = [];
+    let new_steps: [ClaudeTaskPlanStep; 512] = [ClaudeTaskPlanStep { key: [0u8; 256], key_len: 0, has_taskId: false, taskId: [0u8; 64], taskId_len: 0, step: [0u8; 4096], step_len: 0, status: 0 }; 512];
+    let new_count: u64 = 0;
+    let index: u64 = 0;
+    while index < n {
+        // const todo = asRecord(entry);
+        // const step = stringValue(todo.content) ?? stringValue(todo.subject) ?? stringValue(todo.step);
+        let step = ByteBuf { bytes: [0u8; 4096], len: 0 };
+        let has_step: bool = plan_entry_string(doc, key_ptr, key_len, index, STR_PTR("content"), STR_LEN("content"), &step);
+        if has_step == false { has_step = plan_entry_string(doc, key_ptr, key_len, index, STR_PTR("subject"), STR_LEN("subject"), &step); };
+        if has_step == false { has_step = plan_entry_string(doc, key_ptr, key_len, index, STR_PTR("step"), STR_LEN("step"), &step); };
+        // if (!step) continue;
+        if has_step && new_count < 512 {
+            let s = &new_steps[new_count];
+            // key: stringValue(todo.id) ?? "todo-" + index; taskId spread when id present
+            let idv = ByteBuf { bytes: [0u8; 256], len: 0 };
+            let has_id: bool = plan_entry_string(doc, key_ptr, key_len, index, STR_PTR("id"), STR_LEN("id"), &idv);
+            if has_id {
+                s.key_len = idv.len;
+                buf_copy_to(&idv, &s.key);
+                s.has_taskId = true;
+                s.taskId_len = idv.len;
+                buf_copy_to(&idv, &s.taskId);
+            } else {
+                let k = ByteBuf { bytes: [0u8; 256], len: 0 };
+                buf_append_lit(&k, STR_PTR("todo-"), STR_LEN("todo-"));
+                buf_append_u64(&k, index);
+                s.key_len = k.len;
+                buf_copy_to(&k, &s.key);
+                s.has_taskId = false;
+                s.taskId_len = 0;
+            };
+            s.step_len = step.len;
+            buf_copy_to(&step, &s.step);
+            // status: normalizeStatus(todo.status)
+            s.status = plan_entry_status(doc, key_ptr, key_len, index);
+            new_count = new_count + 1;
+        };
+        index = index + 1;
+    }
+    // if (steps.length === 0) return false; state.steps = steps; return true;
+    if new_count == 0 { return false; };
+    let i: u64 = 0;
+    while i < new_count { state.steps[i] = new_steps[i]; i = i + 1; };
+    state.steps_count = new_count;
+    return true;
+}
+
+// Probe an entry field as stringValue(): true + trimmed value when a non-empty string.
+fn plan_entry_string(doc: u64, arr_ptr: ptr, arr_len: u64, idx: u64, field_ptr: ptr, field_len: u64, out: &ByteBuf) -> bool {
+    let raw: [u8; 4096] = [0u8; 4096];
+    let n: u64 = sa_json_plan_entry_string(doc, arr_ptr, arr_len, idx, field_ptr, field_len, &raw, 4096);
+    if sa_json_plan_entry_has_string(doc, arr_ptr, arr_len, idx, field_ptr, field_len) == false { return false; };
+    return plan_string_value(&raw, n, out);
+}
+
+fn plan_entry_status(doc: u64, arr_ptr: ptr, arr_len: u64, idx: u64) -> u64 {
+    let raw: [u8; 128] = [0u8; 128];
+    let n: u64 = sa_json_plan_entry_string(doc, arr_ptr, arr_len, idx, STR_PTR("status"), STR_LEN("status"), &raw, 128);
+    if sa_json_plan_entry_has_string(doc, arr_ptr, arr_len, idx, STR_PTR("status"), STR_LEN("status")) == false { return PLAN_STATUS_PENDING; };
+    return normalizeStatus(true, &raw, n);
+}
+
+// Probe a top-level record field as stringValue().
+fn plan_field_string(doc: u64, field_ptr: ptr, field_len: u64, out: &ByteBuf) -> bool {
+    if doc == 0 { return false; };
+    let raw: [u8; 4096] = [0u8; 4096];
+    let n: u64 = sa_json_get_string(doc, field_ptr, field_len, &raw, 4096);
+    if sa_json_has(doc, field_ptr, field_len) == false { return false; };
+    // typeof check approximated: get_string yields 0 for non-strings; empty string handled by plan_string_value.
+    return plan_string_value(&raw, n, out);
+}
+
+fn applyTaskCreate(state: &ClaudeTaskPlanState, toolUseId_ptr: ptr, toolUseId_len: u64, doc: u64) -> bool {
+    // const step = stringValue(args.subject) ?? stringValue(args.content) ?? stringValue(args.description);
+    let step = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    let has_step: bool = plan_field_string(doc, STR_PTR("subject"), STR_LEN("subject"), &step);
+    if has_step == false { has_step = plan_field_string(doc, STR_PTR("content"), STR_LEN("content"), &step); };
+    if has_step == false { has_step = plan_field_string(doc, STR_PTR("description"), STR_LEN("description"), &step); };
+    if has_step == false { return false; };
+    // const existing = state.steps.find(entry => entry.key === toolUseId);
+    let i: u64 = 0;
+    while i < state.steps_count {
+        if state.steps[i].key_len == toolUseId_len && bytes_eq_buf(&state.steps[i].key, state.steps[i].key_len, toolUseId_ptr, toolUseId_len) {
+            // existing.step = step; return true;
+            state.steps[i].step_len = step.len;
+            buf_copy_to(&step, &state.steps[i].step);
+            return true;
+        };
+        i = i + 1;
+    }
+    // state.steps.push({ key: toolUseId, step, status: "pending" });
+    if state.steps_count >= 512 { return false; };
+    let s = &state.steps[state.steps_count];
+    s.key_len = toolUseId_len;
+    buf_copy_ptr_to(toolUseId_ptr, toolUseId_len, &s.key);
+    s.has_taskId = false;
+    s.taskId_len = 0;
+    s.step_len = step.len;
+    buf_copy_to(&step, &s.step);
+    s.status = PLAN_STATUS_PENDING;
+    state.steps_count = state.steps_count + 1;
+    return true;
+}
+
+fn applyTaskUpdate(state: &ClaudeTaskPlanState, doc: u64) -> bool {
+    // const taskId = stringValue(args.taskId) ?? stringValue(args.id); if (!taskId) return false;
+    let taskId = ByteBuf { bytes: [0u8; 256], len: 0 };
+    let has_id: bool = plan_field_string(doc, STR_PTR("taskId"), STR_LEN("taskId"), &taskId);
+    if has_id == false { has_id = plan_field_string(doc, STR_PTR("id"), STR_LEN("id"), &taskId); };
+    if has_id == false { return false; };
+    // const index = state.steps.findIndex(entry => entry.taskId === taskId || entry.key === taskId);
+    let index: i64 = -1;
+    let i: u64 = 0;
+    while i < state.steps_count {
+        let e = &state.steps[i];
+        let match: bool = (e.has_taskId && e.taskId_len == taskId.len && bytes_eq_buf(&e.taskId, e.taskId_len, &taskId.bytes, taskId.len)) || (e.key_len == taskId.len && bytes_eq_buf(&e.key, e.key_len, &taskId.bytes, taskId.len));
+        if match { index = i; break; };
+        i = i + 1;
+    }
+    if index < 0 { return false; };
+    // const rawStatus = stringValue(args.status);
+    let rawStatus = ByteBuf { bytes: [0u8; 128], len: 0 };
+    let has_status: bool = plan_field_string(doc, STR_PTR("status"), STR_LEN("status"), &rawStatus);
+    // if (rawStatus === "deleted") { state.steps.splice(index, 1); return true; }
+    if has_status && bytes_eq_buf(&rawStatus.bytes, rawStatus.len, STR_PTR("deleted"), STR_LEN("deleted")) {
+        // splice: shift left
+        let j: u64 = index;
+        while j + 1 < state.steps_count { state.steps[j] = state.steps[j + 1]; j = j + 1; };
+        state.steps_count = state.steps_count - 1;
+        return true;
+    };
+    // const target = state.steps[index]!; const subject = stringValue(args.subject);
+    // if (subject) target.step = subject; if (rawStatus) target.status = normalizeStatus(rawStatus);
+    // return Boolean(rawStatus || subject);
+    let subject = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    let has_subject: bool = plan_field_string(doc, STR_PTR("subject"), STR_LEN("subject"), &subject);
+    if has_subject {
+        state.steps[index].step_len = subject.len;
+        buf_copy_to(&subject, &state.steps[index].step);
+    };
+    if has_status {
+        state.steps[index].status = normalizeStatus(true, &rawStatus.bytes, rawStatus.len);
+    };
+    return has_status || has_subject;
+}
+
+// Bind the `#N` id the CLI reports back for a TaskCreate.
+// DEFECT: regex /Task\s+#(\d+)/i approximated by hand scan (case-insensitive
+// "Task", whitespace run, '#', digit run; capture = digits).
+fn bindClaudeTaskPlanResult(state: &ClaudeTaskPlanState, toolUseId_ptr: ptr, toolUseId_len: u64, resultText_ptr: ptr, resultText_len: u64) -> bool {
+    let taskId = ByteBuf { bytes: [0u8; 64], len: 0 };
+    let found: bool = false;
+    let i: u64 = 0;
+    while i + 4 <= resultText_len && found == false {
+        let c0 = PTR_BYTE_AT(resultText_ptr, i);
+        let c1 = PTR_BYTE_AT(resultText_ptr, i + 1);
+        let c2 = PTR_BYTE_AT(resultText_ptr, i + 2);
+        let c3 = PTR_BYTE_AT(resultText_ptr, i + 3);
+        if (c0 == 84 || c0 == 116) && (c1 == 97 || c1 == 65) && (c2 == 115 || c2 == 83) && (c3 == 107 || c3 == 75) {
+            let j: u64 = i + 4;
+            let ws: u64 = 0;
+            while j < resultText_len && probe_is_space(PTR_BYTE_AT(resultText_ptr, j)) { j = j + 1; ws = ws + 1; };
+            if ws > 0 && j < resultText_len && PTR_BYTE_AT(resultText_ptr, j) == 35 {
+                j = j + 1;
+                let start: u64 = j;
+                while j < resultText_len && PTR_BYTE_AT(resultText_ptr, j) >= 48 && PTR_BYTE_AT(resultText_ptr, j) <= 57 { j = j + 1; };
+                if j > start {
+                    buf_append_bytes(&taskId, PTR_ADD(resultText_ptr, start), j - start);
+                    found = true;
+                };
+            };
+        };
+        i = i + 1;
+    }
+    // const taskId = resultText.match(/Task\s+#(\d+)/i)?.[1]; if (!taskId) return false;
+    if found == false { return false; };
+    // const target = state.steps.find(entry => entry.key === toolUseId);
+    // if (!target || target.taskId === taskId) return false; target.taskId = taskId; return true;
+    let i2: u64 = 0;
+    while i2 < state.steps_count {
+        if state.steps[i2].key_len == toolUseId_len && bytes_eq_buf(&state.steps[i2].key, state.steps[i2].key_len, toolUseId_ptr, toolUseId_len) {
+            if state.steps[i2].has_taskId && state.steps[i2].taskId_len == taskId.len && bytes_eq_buf(&state.steps[i2].taskId, state.steps[i2].taskId_len, &taskId.bytes, taskId.len) { return false; };
+            state.steps[i2].has_taskId = true;
+            state.steps[i2].taskId_len = taskId.len;
+            buf_copy_to(&taskId, &state.steps[i2].taskId);
+            return true;
+        };
+        i2 = i2 + 1;
+    }
+    return false;
+}
+
+// Rebuild plan state from a persisted item.
+// Returns true + fills out when a state exists (TS returns ClaudeTaskPlanState | null).
+fn claudeTaskPlanStateFromItem(has_item: bool, item_json_ptr: ptr, item_json_len: u64, out: &ClaudeTaskPlanState) -> bool {
+    // const record = asRecord(item); if (record.type !== "plan" || !Array.isArray(record.plan)) return null;
+    if has_item == false { return false; };
+    let doc = sa_json_parse(item_json_ptr, item_json_len);
+    if doc == 0 { return false; };
+    let type_buf: [u8; 64] = [0u8; 64];
+    let type_len: u64 = sa_json_get_string(doc, STR_PTR("type"), STR_LEN("type"), &type_buf, 64);
+    if bytes_eq_buf(&type_buf, type_len, STR_PTR("plan"), STR_LEN("plan")) == false { sa_json_free(doc); return false; };
+    let has_arr: bool = false;
+    let n: u64 = sa_json_plan_array_count(doc, STR_PTR("plan"), STR_LEN("plan"), &has_arr);
+    if has_arr == false { sa_json_free(doc); return false; };
+    out.steps_count = 0;
+    let index: u64 = 0;
+    while index < n {
+        // const raw = asRecord(entry); const step = stringValue(raw.step); if (!step) continue;
+        let step = ByteBuf { bytes: [0u8; 4096], len: 0 };
+        if plan_entry_string(doc, STR_PTR("plan"), STR_LEN("plan"), index, STR_PTR("step"), STR_LEN("step"), &step) && out.steps_count < 512 {
+            let s = &out.steps[out.steps_count];
+            // key: stringValue(raw.key) ?? "plan-" + index; taskId spread when present
+            let keyv = ByteBuf { bytes: [0u8; 256], len: 0 };
+            if plan_entry_string(doc, STR_PTR("plan"), STR_LEN("plan"), index, STR_PTR("key"), STR_LEN("key"), &keyv) {
+                s.key_len = keyv.len;
+                buf_copy_to(&keyv, &s.key);
+            } else {
+                let k = ByteBuf { bytes: [0u8; 256], len: 0 };
+                buf_append_lit(&k, STR_PTR("plan-"), STR_LEN("plan-"));
+                buf_append_u64(&k, index);
+                s.key_len = k.len;
+                buf_copy_to(&k, &s.key);
+            };
+            let tid = ByteBuf { bytes: [0u8; 64], len: 0 };
+            if plan_entry_string(doc, STR_PTR("plan"), STR_LEN("plan"), index, STR_PTR("taskId"), STR_LEN("taskId"), &tid) {
+                s.has_taskId = true;
+                s.taskId_len = tid.len;
+                buf_copy_to(&tid, &s.taskId);
+            } else {
+                s.has_taskId = false;
+                s.taskId_len = 0;
+            };
+            s.step_len = step.len;
+            buf_copy_to(&step, &s.step);
+            s.status = plan_entry_status(doc, STR_PTR("plan"), STR_LEN("plan"), index);
+            out.steps_count = out.steps_count + 1;
+        };
+        index = index + 1;
+    }
+    sa_json_free(doc);
+    // return steps.length > 0 ? { steps } : null;
+    return out.steps_count > 0;
+}
+
+// The `plan` item to emit for the current list — Record<string, JsonValue> as JSON text.
+// Returns false for TS null (no steps).
+fn buildClaudeTaskPlanItem(state: &ClaudeTaskPlanState, threadId_ptr: ptr, threadId_len: u64, turnId_ptr: ptr, turnId_len: u64, out: &ByteBuf) -> bool {
+    if state.steps_count == 0 { return false; };
+    // return { type: "plan", id: "claude-plan-" + turnId, turnId, threadId, plan: [...], text: formatClaudeTaskPlanText(state), status: claudeTaskPlanStatus(state) }
+    buf_append_lit(out, STR_PTR("{\"type\":\"plan\",\"id\":\"claude-plan-"), STR_LEN("{\"type\":\"plan\",\"id\":\"claude-plan-"));
+    json_escape_into(out, turnId_ptr, turnId_len);
+    buf_append_lit(out, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    json_escape_into(out, turnId_ptr, turnId_len);
+    buf_append_lit(out, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    json_escape_into(out, threadId_ptr, threadId_len);
+    buf_append_lit(out, STR_PTR("\",\"plan\":["), STR_LEN("\",\"plan\":["));
+    // plan: state.steps.map(entry => ({ step, status, key, ...(entry.taskId ? { taskId } : {}) }))
+    let i: u64 = 0;
+    while i < state.steps_count {
+        if i > 0 { buf_append_lit(out, STR_PTR(","), STR_LEN(",")); };
+        let e = &state.steps[i];
+        buf_append_lit(out, STR_PTR("{\"step\":\""), STR_LEN("{\"step\":\""));
+        json_escape_into(out, &e.step, e.step_len);
+        buf_append_lit(out, STR_PTR("\",\"status\":\""), STR_LEN("\",\"status\":\""));
+        let st = ByteBuf { bytes: [0u8; 32], len: 0 };
+        plan_status_name(e.status, &st);
+        buf_append_bytes(out, &st.bytes, st.len);
+        buf_append_lit(out, STR_PTR("\",\"key\":\""), STR_LEN("\",\"key\":\""));
+        json_escape_into(out, &e.key, e.key_len);
+        buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+        if e.has_taskId {
+            buf_append_lit(out, STR_PTR(",\"taskId\":\""), STR_LEN(",\"taskId\":\""));
+            json_escape_into(out, &e.taskId, e.taskId_len);
+            buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+        };
+        buf_append_lit(out, STR_PTR("}"), STR_LEN("}"));
+        i = i + 1;
+    }
+    buf_append_lit(out, STR_PTR("],\"text\":\""), STR_LEN("],\"text\":\""));
+    let text = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    formatClaudeTaskPlanText(state, &text);
+    json_escape_into(out, &text.bytes, text.len);
+    buf_append_lit(out, STR_PTR("\",\"status\":\""), STR_LEN("\",\"status\":\""));
+    let status = ByteBuf { bytes: [0u8; 32], len: 0 };
+    claudeTaskPlanStatus(state, &status);
+    buf_append_bytes(out, &status.bytes, status.len);
+    buf_append_lit(out, STR_PTR("\"}"), STR_LEN("\"}"));
+    return true;
+}
+
+fn formatClaudeTaskPlanText(state: &ClaudeTaskPlanState, out: &ByteBuf) -> void {
+    // state.steps.map(entry => status === "completed" ? "- [x] " + step : status === "in_progress" ? "- [ ] " + step + " _(in progress)_" : "- [ ] " + step).join("\n")
+    let i: u64 = 0;
+    while i < state.steps_count {
+        if i > 0 { buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n")); };
+        let e = &state.steps[i];
+        if e.status == PLAN_STATUS_COMPLETED {
+            buf_append_lit(out, STR_PTR("- [x] "), STR_LEN("- [x] "));
+            buf_append_bytes(out, &e.step, e.step_len);
+        } else if e.status == PLAN_STATUS_IN_PROGRESS {
+            buf_append_lit(out, STR_PTR("- [ ] "), STR_LEN("- [ ] "));
+            buf_append_bytes(out, &e.step, e.step_len);
+            buf_append_lit(out, STR_PTR(" _(in progress)_"), STR_LEN(" _(in progress)_"));
+        } else {
+            buf_append_lit(out, STR_PTR("- [ ] "), STR_LEN("- [ ] "));
+            buf_append_bytes(out, &e.step, e.step_len);
+        };
+        i = i + 1;
+    }
+    return;
+}
+
+fn claudeTaskPlanStatus(state: &ClaudeTaskPlanState, out: &ByteBuf) -> void {
+    // if (steps.some(e => e.status === "in_progress")) return "inProgress";
+    // if (steps.every(e => e.status === "completed")) return "completed";
+    // return "pending";
+    let any_in_progress: bool = false;
+    let all_completed: bool = true;
+    let i: u64 = 0;
+    while i < state.steps_count {
+        if state.steps[i].status == PLAN_STATUS_IN_PROGRESS { any_in_progress = true; };
+        if state.steps[i].status != PLAN_STATUS_COMPLETED { all_completed = false; };
+        i = i + 1;
+    }
+    if any_in_progress { buf_append_lit(out, STR_PTR("inProgress"), STR_LEN("inProgress")); return; };
+    if all_completed { buf_append_lit(out, STR_PTR("completed"), STR_LEN("completed")); return; };
+    buf_append_lit(out, STR_PTR("pending"), STR_LEN("pending"));
+    return;
+}
+
+// fn normalizeStatus(value: JsonValue | undefined): ClaudeTaskPlanStatus
+// DEFECT: value.replace(/[_-]+/g, "").toLowerCase() approximated by byte scan.
+fn normalizeStatus(has_value: bool, value_ptr: ptr, value_len: u64) -> u64 {
+    let normalized = ByteBuf { bytes: [0u8; 128], len: 0 };
+    if has_value {
+        let i: u64 = 0;
+        while i < value_len {
+            let c = PTR_BYTE_AT(value_ptr, i);
+            if c != 95 && c != 45 {
+                if c >= 65 && c <= 90 { c = c + 32; };
+                buf_append_byte(&normalized, c);
+            };
+            i = i + 1;
+        }
+    };
+    if bytes_eq_buf(&normalized.bytes, normalized.len, STR_PTR("completed"), STR_LEN("completed")) || bytes_eq_buf(&normalized.bytes, normalized.len, STR_PTR("complete"), STR_LEN("complete")) || bytes_eq_buf(&normalized.bytes, normalized.len, STR_PTR("done"), STR_LEN("done")) { return PLAN_STATUS_COMPLETED; };
+    if bytes_eq_buf(&normalized.bytes, normalized.len, STR_PTR("inprogress"), STR_LEN("inprogress")) || bytes_eq_buf(&normalized.bytes, normalized.len, STR_PTR("running"), STR_LEN("running")) || bytes_eq_buf(&normalized.bytes, normalized.len, STR_PTR("started"), STR_LEN("started")) { return PLAN_STATUS_IN_PROGRESS; };
+    return PLAN_STATUS_PENDING;
+}

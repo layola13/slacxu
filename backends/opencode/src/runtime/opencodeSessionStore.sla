@@ -1,0 +1,526 @@
+// Converted 1:1 from backends/opencode/src/runtime/opencodeSessionStore.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/ptr.sa"
+
+// TS: import type { RuntimeDatabase } from "@cxu/sdk-backend";
+// DEFECT: RuntimeDatabase (better-sqlite3-shaped prepare/exec API) has no
+// sa_std counterpart; approximated with intent externs sa_sqlite_exec /
+// sa_sqlite_prepare / sa_sqlite_bind_text / sa_sqlite_bind_int /
+// sa_sqlite_bind_null / sa_sqlite_step / sa_sqlite_column_text /
+// sa_sqlite_column_int / sa_sqlite_column_is_null / sa_sqlite_changes /
+// sa_sqlite_finalize (MISSING in sa_std), same convention as other stores.
+// DEFECT: Date.now() -> intent extern sa_time_now_ms.
+
+// RuntimeDatabase handle (opaque sqlite connection handle).
+struct RuntimeDatabase {
+    handle: u64,
+}
+
+// Persists OpenCode CLI session and conversation metadata separately
+// from Codex thread IDs. This allows history to remain readable after
+// a server restart, and enables resuming existing conversations.
+//
+// Schema: one row per internal thread ID that uses the OpenCode backend.
+
+// TS: export interface OpencodeSessionRecord { ... }
+// Nullable string fields -> (buffer, len, has) triples. state_json
+// capacity 1048576: DEFECT: TS stateJson is an unbounded string (source
+// comments mention tens-of-MB snapshots); the fixed buffer truncates.
+struct OpencodeSessionRecord {
+    thread_id: [u8; 128],
+    thread_id_len: u64,
+    owner_id: [u8; 128],
+    owner_id_len: u64,
+    session_id: [u8; 256],
+    session_id_len: u64,
+    has_session_id: bool,
+    cli_version: [u8; 64],
+    cli_version_len: u64,
+    has_cli_version: bool,
+    model: [u8; 256],
+    model_len: u64,
+    has_model: bool,
+    cwd: [u8; 1024],
+    cwd_len: u64,
+    has_cwd: bool,
+    permission_mode: [u8; 64],
+    permission_mode_len: u64,
+    has_permission_mode: bool,
+    state_json: [u8; 1048576],
+    state_json_len: u64,
+    has_state_json: bool,
+    created_at: u64,
+    updated_at: u64,
+}
+
+// TS: interface OpencodeSessionRow { thread_id ... } (snake_case DB row).
+// Same storage shape as the record; kept as a separate struct 1:1.
+struct OpencodeSessionRow {
+    thread_id: [u8; 128],
+    thread_id_len: u64,
+    owner_id: [u8; 128],
+    owner_id_len: u64,
+    session_id: [u8; 256],
+    session_id_len: u64,
+    has_session_id: bool,
+    cli_version: [u8; 64],
+    cli_version_len: u64,
+    has_cli_version: bool,
+    model: [u8; 256],
+    model_len: u64,
+    has_model: bool,
+    cwd: [u8; 1024],
+    cwd_len: u64,
+    has_cwd: bool,
+    permission_mode: [u8; 64],
+    permission_mode_len: u64,
+    has_permission_mode: bool,
+    state_json: [u8; 1048576],
+    state_json_len: u64,
+    has_state_json: bool,
+    created_at: u64,
+    updated_at: u64,
+}
+
+// TS: Pick<OpencodeSessionRecord, "threadId"|"ownerId"|"sessionId"|"model"|"cwd">
+// DEFECT: Pick<> mapped type -> dedicated metadata struct.
+struct OpencodeSessionMetadata {
+    thread_id: [u8; 128],
+    thread_id_len: u64,
+    owner_id: [u8; 128],
+    owner_id_len: u64,
+    session_id: [u8; 256],
+    session_id_len: u64,
+    has_session_id: bool,
+    model: [u8; 256],
+    model_len: u64,
+    has_model: bool,
+    cwd: [u8; 1024],
+    cwd_len: u64,
+    has_cwd: bool,
+}
+
+// TS: OpencodeSessionRecord[] — fixed capacity 256 rows.
+struct OpencodeSessionRecordList {
+    items: [OpencodeSessionRecord; 256],
+    len: u64,
+}
+
+fn copy_field(dst: ptr, cap: u64, src: ptr, src_len: u64) -> u64 {
+    let n = src_len;
+    if n > cap { n = cap; };
+    let i: u64 = 0;
+    while i < n {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, src, i);
+        PTR_BYTE_SET(dst, i, c);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn bytes_equal(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    let i: u64 = 0;
+    while i < a_len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a_ptr, i);
+        PTR_BYTE_AT(y, b_ptr, i);
+        if x != y { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// Read one nullable text column into (buf,len,has).
+fn read_text_col(stmt: u64, col: u64, dst: ptr, cap: u64, out_len: &u64, has: &bool) -> void {
+    *has = false;
+    *out_len = 0;
+    if sa_sqlite_column_is_null(stmt, col) != 0 { return; };
+    let p: ptr = PTR_NULL();
+    let n: u64 = 0;
+    if sa_sqlite_column_text(stmt, col, &p, &n) != 0 { return; };
+    *out_len = copy_field(dst, cap, p, n);
+    *has = true;
+}
+
+// Fill an OpencodeSessionRow from the current step row of a SELECT * stmt.
+// Column order: thread_id, owner_id, session_id, cli_version, model, cwd,
+// permission_mode, state_json, created_at, updated_at.
+fn row_from_stmt(stmt: u64, row: &OpencodeSessionRow) -> void {
+    let d: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d, &row.thread_id, 0);
+    let has = false;
+    read_text_col(stmt, 0, d, 128, &row.thread_id_len, &has);
+    PTR_BYTE_ADD(d, &row.owner_id, 0);
+    read_text_col(stmt, 1, d, 128, &row.owner_id_len, &has);
+    PTR_BYTE_ADD(d, &row.session_id, 0);
+    read_text_col(stmt, 2, d, 256, &row.session_id_len, &row.has_session_id);
+    PTR_BYTE_ADD(d, &row.cli_version, 0);
+    read_text_col(stmt, 3, d, 64, &row.cli_version_len, &row.has_cli_version);
+    PTR_BYTE_ADD(d, &row.model, 0);
+    read_text_col(stmt, 4, d, 256, &row.model_len, &row.has_model);
+    PTR_BYTE_ADD(d, &row.cwd, 0);
+    read_text_col(stmt, 5, d, 1024, &row.cwd_len, &row.has_cwd);
+    PTR_BYTE_ADD(d, &row.permission_mode, 0);
+    read_text_col(stmt, 6, d, 64, &row.permission_mode_len, &row.has_permission_mode);
+    PTR_BYTE_ADD(d, &row.state_json, 0);
+    read_text_col(stmt, 7, d, 1048576, &row.state_json_len, &row.has_state_json);
+    let ca: u64 = 0;
+    sa_sqlite_column_int(stmt, 8, &ca);
+    row.created_at = ca;
+    let ua: u64 = 0;
+    sa_sqlite_column_int(stmt, 9, &ua);
+    row.updated_at = ua;
+}
+
+// Metadata columns: thread_id, owner_id, session_id, model, cwd.
+fn metadata_from_stmt(stmt: u64, out: &OpencodeSessionMetadata) -> void {
+    let d: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d, &out.thread_id, 0);
+    let has = false;
+    read_text_col(stmt, 0, d, 128, &out.thread_id_len, &has);
+    PTR_BYTE_ADD(d, &out.owner_id, 0);
+    read_text_col(stmt, 1, d, 128, &out.owner_id_len, &has);
+    PTR_BYTE_ADD(d, &out.session_id, 0);
+    read_text_col(stmt, 2, d, 256, &out.session_id_len, &out.has_session_id);
+    PTR_BYTE_ADD(d, &out.model, 0);
+    read_text_col(stmt, 3, d, 256, &out.model_len, &out.has_model);
+    PTR_BYTE_ADD(d, &out.cwd, 0);
+    read_text_col(stmt, 4, d, 1024, &out.cwd_len, &out.has_cwd);
+}
+
+// ---- TS: export class OpencodeSessionStore ----
+// DEFECT: class -> struct + function family with &OpencodeSessionStore first.
+struct OpencodeSessionStore {
+    // private readonly db: RuntimeDatabase
+    db: RuntimeDatabase,
+}
+
+// TS: constructor(private readonly db: RuntimeDatabase) { this.db.exec(`CREATE TABLE ...`); }
+fn OpencodeSessionStore_new(self_s: &OpencodeSessionStore, db_handle: u64) -> void {
+    self_s.db.handle = db_handle;
+    // DEFECT: template-literal SQL -> single literal with same text.
+    sa_sqlite_exec(db_handle, STR_PTR("CREATE TABLE IF NOT EXISTS opencode_sessions (thread_id TEXT NOT NULL, owner_id TEXT NOT NULL, session_id TEXT, cli_version TEXT, model TEXT, cwd TEXT, permission_mode TEXT, state_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (thread_id, owner_id))"), STR_LEN("CREATE TABLE IF NOT EXISTS opencode_sessions (thread_id TEXT NOT NULL, owner_id TEXT NOT NULL, session_id TEXT, cli_version TEXT, model TEXT, cwd TEXT, permission_mode TEXT, state_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (thread_id, owner_id))"));
+}
+
+// TS: upsert(input: { threadId; ownerId; sessionId?; ... }): OpencodeSessionRecord
+// Input struct: has_* = false means TS undefined OR null (both fall through
+// the `?? existing ?? null` chain identically).
+struct OpencodeUpsertInput {
+    thread_id: [u8; 128],
+    thread_id_len: u64,
+    owner_id: [u8; 128],
+    owner_id_len: u64,
+    session_id: [u8; 256],
+    session_id_len: u64,
+    has_session_id: bool,
+    cli_version: [u8; 64],
+    cli_version_len: u64,
+    has_cli_version: bool,
+    model: [u8; 256],
+    model_len: u64,
+    has_model: bool,
+    cwd: [u8; 1024],
+    cwd_len: u64,
+    has_cwd: bool,
+    permission_mode: [u8; 64],
+    permission_mode_len: u64,
+    has_permission_mode: bool,
+    state_json: [u8; 1048576],
+    state_json_len: u64,
+    has_state_json: bool,
+}
+
+// Bind text param idx from (value if has_value else existing if has_existing
+// else NULL) — the TS `input.x ?? existing?.x ?? null` coalescing.
+fn bind_coalesce(stmt: u64, idx: u64, v_ptr: ptr, v_len: u64, has_v: bool, e_ptr: ptr, e_len: u64, has_e: bool) -> void {
+    if has_v {
+        sa_sqlite_bind_text(stmt, idx, v_ptr, v_len);
+    } else if has_e {
+        sa_sqlite_bind_text(stmt, idx, e_ptr, e_len);
+    } else {
+        sa_sqlite_bind_null(stmt, idx);
+    };
+}
+
+fn OpencodeSessionStore_upsert(self_s: &OpencodeSessionStore, input: &OpencodeUpsertInput, out: &OpencodeSessionRecord) -> void {
+    // const now = Date.now();
+    let now = sa_time_now_ms();
+    // const existing = this.get(input.ownerId, input.threadId);
+    let existing = OpencodeSessionRecord { thread_id: [0u8; 128], thread_id_len: 0, owner_id: [0u8; 128], owner_id_len: 0, session_id: [0u8; 256], session_id_len: 0, has_session_id: false, cli_version: [0u8; 64], cli_version_len: 0, has_cli_version: false, model: [0u8; 256], model_len: 0, has_model: false, cwd: [0u8; 1024], cwd_len: 0, has_cwd: false, permission_mode: [0u8; 64], permission_mode_len: 0, has_permission_mode: false, state_json: [0u8; 1048576], state_json_len: 0, has_state_json: false, created_at: 0, updated_at: 0 };
+    let tid: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tid, &input.thread_id, 0);
+    let oid: ptr = PTR_NULL();
+    PTR_BYTE_ADD(oid, &input.owner_id, 0);
+    let has_existing = OpencodeSessionStore_get(self_s, oid, input.owner_id_len, tid, input.thread_id_len, &existing);
+    // this.db.prepare(`INSERT ... ON CONFLICT ... COALESCE ...`).run(...)
+    let sql = "INSERT INTO opencode_sessions (thread_id, owner_id, session_id, cli_version, model, cwd, permission_mode, state_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id, owner_id) DO UPDATE SET session_id = COALESCE(excluded.session_id, opencode_sessions.session_id), cli_version = COALESCE(excluded.cli_version, opencode_sessions.cli_version), model = COALESCE(excluded.model, opencode_sessions.model), cwd = COALESCE(excluded.cwd, opencode_sessions.cwd), permission_mode = COALESCE(excluded.permission_mode, opencode_sessions.permission_mode), state_json = COALESCE(excluded.state_json, opencode_sessions.state_json), updated_at = excluded.updated_at";
+    let stmt = sa_sqlite_prepare(self_s.db.handle, STR_PTR("INSERT INTO opencode_sessions (thread_id, owner_id, session_id, cli_version, model, cwd, permission_mode, state_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id, owner_id) DO UPDATE SET session_id = COALESCE(excluded.session_id, opencode_sessions.session_id), cli_version = COALESCE(excluded.cli_version, opencode_sessions.cli_version), model = COALESCE(excluded.model, opencode_sessions.model), cwd = COALESCE(excluded.cwd, opencode_sessions.cwd), permission_mode = COALESCE(excluded.permission_mode, opencode_sessions.permission_mode), state_json = COALESCE(excluded.state_json, opencode_sessions.state_json), updated_at = excluded.updated_at"), STR_LEN("INSERT INTO opencode_sessions (thread_id, owner_id, session_id, cli_version, model, cwd, permission_mode, state_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id, owner_id) DO UPDATE SET session_id = COALESCE(excluded.session_id, opencode_sessions.session_id), cli_version = COALESCE(excluded.cli_version, opencode_sessions.cli_version), model = COALESCE(excluded.model, opencode_sessions.model), cwd = COALESCE(excluded.cwd, opencode_sessions.cwd), permission_mode = COALESCE(excluded.permission_mode, opencode_sessions.permission_mode), state_json = COALESCE(excluded.state_json, opencode_sessions.state_json), updated_at = excluded.updated_at"));
+    let _sql = sql;
+    // run(input.threadId, input.ownerId, input.sessionId ?? existing?.sessionId ?? null, ...)
+    sa_sqlite_bind_text(stmt, 1, tid, input.thread_id_len);
+    sa_sqlite_bind_text(stmt, 2, oid, input.owner_id_len);
+    let vp: ptr = PTR_NULL();
+    let ep: ptr = PTR_NULL();
+    PTR_BYTE_ADD(vp, &input.session_id, 0);
+    PTR_BYTE_ADD(ep, &existing.session_id, 0);
+    bind_coalesce(stmt, 3, vp, input.session_id_len, input.has_session_id, ep, existing.session_id_len, has_existing && existing.has_session_id);
+    PTR_BYTE_ADD(vp, &input.cli_version, 0);
+    PTR_BYTE_ADD(ep, &existing.cli_version, 0);
+    bind_coalesce(stmt, 4, vp, input.cli_version_len, input.has_cli_version, ep, existing.cli_version_len, has_existing && existing.has_cli_version);
+    PTR_BYTE_ADD(vp, &input.model, 0);
+    PTR_BYTE_ADD(ep, &existing.model, 0);
+    bind_coalesce(stmt, 5, vp, input.model_len, input.has_model, ep, existing.model_len, has_existing && existing.has_model);
+    PTR_BYTE_ADD(vp, &input.cwd, 0);
+    PTR_BYTE_ADD(ep, &existing.cwd, 0);
+    bind_coalesce(stmt, 6, vp, input.cwd_len, input.has_cwd, ep, existing.cwd_len, has_existing && existing.has_cwd);
+    PTR_BYTE_ADD(vp, &input.permission_mode, 0);
+    PTR_BYTE_ADD(ep, &existing.permission_mode, 0);
+    bind_coalesce(stmt, 7, vp, input.permission_mode_len, input.has_permission_mode, ep, existing.permission_mode_len, has_existing && existing.has_permission_mode);
+    PTR_BYTE_ADD(vp, &input.state_json, 0);
+    PTR_BYTE_ADD(ep, &existing.state_json, 0);
+    bind_coalesce(stmt, 8, vp, input.state_json_len, input.has_state_json, ep, existing.state_json_len, has_existing && existing.has_state_json);
+    // existing?.createdAt ?? now
+    let created = now;
+    if has_existing { created = existing.created_at; };
+    sa_sqlite_bind_int(stmt, 9, created);
+    sa_sqlite_bind_int(stmt, 10, now);
+    sa_sqlite_step(stmt);
+    sa_sqlite_finalize(stmt);
+    // return this.get(input.ownerId, input.threadId)!;
+    // DEFECT: non-null assertion `!` — the re-read is assumed to succeed.
+    OpencodeSessionStore_get(self_s, oid, input.owner_id_len, tid, input.thread_id_len, out);
+}
+
+// TS: get(ownerId: string, threadId: string): OpencodeSessionRecord | null
+// Returns true + fills out when a row exists (TS null -> false).
+fn OpencodeSessionStore_get(self_s: &OpencodeSessionStore, owner_ptr: ptr, owner_len: u64, thread_ptr: ptr, thread_len: u64, out: &OpencodeSessionRecord) -> bool {
+    let stmt = sa_sqlite_prepare(self_s.db.handle, STR_PTR("SELECT * FROM opencode_sessions WHERE thread_id = ? AND owner_id = ? LIMIT 1"), STR_LEN("SELECT * FROM opencode_sessions WHERE thread_id = ? AND owner_id = ? LIMIT 1"));
+    // .get(threadId, ownerId)
+    sa_sqlite_bind_text(stmt, 1, thread_ptr, thread_len);
+    sa_sqlite_bind_text(stmt, 2, owner_ptr, owner_len);
+    let found = false;
+    if sa_sqlite_step(stmt) {
+        let row = OpencodeSessionRow { thread_id: [0u8; 128], thread_id_len: 0, owner_id: [0u8; 128], owner_id_len: 0, session_id: [0u8; 256], session_id_len: 0, has_session_id: false, cli_version: [0u8; 64], cli_version_len: 0, has_cli_version: false, model: [0u8; 256], model_len: 0, has_model: false, cwd: [0u8; 1024], cwd_len: 0, has_cwd: false, permission_mode: [0u8; 64], permission_mode_len: 0, has_permission_mode: false, state_json: [0u8; 1048576], state_json_len: 0, has_state_json: false, created_at: 0, updated_at: 0 };
+        row_from_stmt(stmt, &row);
+        OpencodeSessionStore_mapRow(self_s, &row, out);
+        found = true;
+    };
+    sa_sqlite_finalize(stmt);
+    return found;
+}
+
+// TS: findByThreadId(threadId: string): OpencodeSessionRecord | null
+fn OpencodeSessionStore_findByThreadId(self_s: &OpencodeSessionStore, thread_ptr: ptr, thread_len: u64, out: &OpencodeSessionRecord) -> bool {
+    let stmt = sa_sqlite_prepare(self_s.db.handle, STR_PTR("SELECT * FROM opencode_sessions WHERE thread_id = ? LIMIT 1"), STR_LEN("SELECT * FROM opencode_sessions WHERE thread_id = ? LIMIT 1"));
+    sa_sqlite_bind_text(stmt, 1, thread_ptr, thread_len);
+    let found = false;
+    if sa_sqlite_step(stmt) {
+        let row = OpencodeSessionRow { thread_id: [0u8; 128], thread_id_len: 0, owner_id: [0u8; 128], owner_id_len: 0, session_id: [0u8; 256], session_id_len: 0, has_session_id: false, cli_version: [0u8; 64], cli_version_len: 0, has_cli_version: false, model: [0u8; 256], model_len: 0, has_model: false, cwd: [0u8; 1024], cwd_len: 0, has_cwd: false, permission_mode: [0u8; 64], permission_mode_len: 0, has_permission_mode: false, state_json: [0u8; 1048576], state_json_len: 0, has_state_json: false, created_at: 0, updated_at: 0 };
+        row_from_stmt(stmt, &row);
+        OpencodeSessionStore_mapRow(self_s, &row, out);
+        found = true;
+    };
+    sa_sqlite_finalize(stmt);
+    return found;
+}
+
+// TS: findBySessionId(sessionId: string): OpencodeSessionRecord | null
+fn OpencodeSessionStore_findBySessionId(self_s: &OpencodeSessionStore, session_ptr: ptr, session_len: u64, out: &OpencodeSessionRecord) -> bool {
+    let stmt = sa_sqlite_prepare(self_s.db.handle, STR_PTR("SELECT * FROM opencode_sessions WHERE session_id = ? LIMIT 1"), STR_LEN("SELECT * FROM opencode_sessions WHERE session_id = ? LIMIT 1"));
+    sa_sqlite_bind_text(stmt, 1, session_ptr, session_len);
+    let found = false;
+    if sa_sqlite_step(stmt) {
+        let row = OpencodeSessionRow { thread_id: [0u8; 128], thread_id_len: 0, owner_id: [0u8; 128], owner_id_len: 0, session_id: [0u8; 256], session_id_len: 0, has_session_id: false, cli_version: [0u8; 64], cli_version_len: 0, has_cli_version: false, model: [0u8; 256], model_len: 0, has_model: false, cwd: [0u8; 1024], cwd_len: 0, has_cwd: false, permission_mode: [0u8; 64], permission_mode_len: 0, has_permission_mode: false, state_json: [0u8; 1048576], state_json_len: 0, has_state_json: false, created_at: 0, updated_at: 0 };
+        row_from_stmt(stmt, &row);
+        OpencodeSessionStore_mapRow(self_s, &row, out);
+        found = true;
+    };
+    sa_sqlite_finalize(stmt);
+    return found;
+}
+
+// Lightweight metadata read for history-restore metadata RPCs. Selects
+// only small columns and NEVER touches `state_json`, so a tens-of-MB
+// snapshot can't block the Bun event loop on the 18% metadata stage.
+// TS: getMetadata(ownerId, threadId): Pick<...> | null
+fn OpencodeSessionStore_getMetadata(self_s: &OpencodeSessionStore, owner_ptr: ptr, owner_len: u64, thread_ptr: ptr, thread_len: u64, out: &OpencodeSessionMetadata) -> bool {
+    let stmt = sa_sqlite_prepare(self_s.db.handle, STR_PTR("SELECT thread_id, owner_id, session_id, model, cwd FROM opencode_sessions WHERE thread_id = ? AND owner_id = ? LIMIT 1"), STR_LEN("SELECT thread_id, owner_id, session_id, model, cwd FROM opencode_sessions WHERE thread_id = ? AND owner_id = ? LIMIT 1"));
+    sa_sqlite_bind_text(stmt, 1, thread_ptr, thread_len);
+    sa_sqlite_bind_text(stmt, 2, owner_ptr, owner_len);
+    let found = false;
+    if sa_sqlite_step(stmt) {
+        metadata_from_stmt(stmt, out);
+        found = true;
+    };
+    sa_sqlite_finalize(stmt);
+    return found;
+}
+
+// Light fallback for native `ses_*` ids materialized under a UUID thread.
+// TS: findMetadataBySessionId(sessionId): Pick<...> | null
+fn OpencodeSessionStore_findMetadataBySessionId(self_s: &OpencodeSessionStore, session_ptr: ptr, session_len: u64, out: &OpencodeSessionMetadata) -> bool {
+    let stmt = sa_sqlite_prepare(self_s.db.handle, STR_PTR("SELECT thread_id, owner_id, session_id, model, cwd FROM opencode_sessions WHERE session_id = ? LIMIT 1"), STR_LEN("SELECT thread_id, owner_id, session_id, model, cwd FROM opencode_sessions WHERE session_id = ? LIMIT 1"));
+    sa_sqlite_bind_text(stmt, 1, session_ptr, session_len);
+    let found = false;
+    if sa_sqlite_step(stmt) {
+        metadata_from_stmt(stmt, out);
+        found = true;
+    };
+    sa_sqlite_finalize(stmt);
+    return found;
+}
+
+// Light fallback for UUID threads across owners (matches findByThreadId).
+// TS: findMetadataByThreadId(threadId): Pick<...> | null
+fn OpencodeSessionStore_findMetadataByThreadId(self_s: &OpencodeSessionStore, thread_ptr: ptr, thread_len: u64, out: &OpencodeSessionMetadata) -> bool {
+    let stmt = sa_sqlite_prepare(self_s.db.handle, STR_PTR("SELECT thread_id, owner_id, session_id, model, cwd FROM opencode_sessions WHERE thread_id = ? LIMIT 1"), STR_LEN("SELECT thread_id, owner_id, session_id, model, cwd FROM opencode_sessions WHERE thread_id = ? LIMIT 1"));
+    sa_sqlite_bind_text(stmt, 1, thread_ptr, thread_len);
+    let found = false;
+    if sa_sqlite_step(stmt) {
+        metadata_from_stmt(stmt, out);
+        found = true;
+    };
+    sa_sqlite_finalize(stmt);
+    return found;
+}
+
+// TS: listByOwner(ownerId: string): OpencodeSessionRecord[]
+fn OpencodeSessionStore_listByOwner(self_s: &OpencodeSessionStore, owner_ptr: ptr, owner_len: u64, out: &OpencodeSessionRecordList) -> void {
+    out.len = 0;
+    let stmt = sa_sqlite_prepare(self_s.db.handle, STR_PTR("SELECT * FROM opencode_sessions WHERE owner_id = ? ORDER BY updated_at DESC"), STR_LEN("SELECT * FROM opencode_sessions WHERE owner_id = ? ORDER BY updated_at DESC"));
+    sa_sqlite_bind_text(stmt, 1, owner_ptr, owner_len);
+    // .all(ownerId) — iterate steps until exhausted or capacity 256.
+    while sa_sqlite_step(stmt) {
+        if out.len >= 256 { break; };
+        let row = OpencodeSessionRow { thread_id: [0u8; 128], thread_id_len: 0, owner_id: [0u8; 128], owner_id_len: 0, session_id: [0u8; 256], session_id_len: 0, has_session_id: false, cli_version: [0u8; 64], cli_version_len: 0, has_cli_version: false, model: [0u8; 256], model_len: 0, has_model: false, cwd: [0u8; 1024], cwd_len: 0, has_cwd: false, permission_mode: [0u8; 64], permission_mode_len: 0, has_permission_mode: false, state_json: [0u8; 1048576], state_json_len: 0, has_state_json: false, created_at: 0, updated_at: 0 };
+        row_from_stmt(stmt, &row);
+        let rec = &out.items[out.len];
+        OpencodeSessionStore_mapRow(self_s, &row, rec);
+        out.len = out.len + 1;
+    }
+    sa_sqlite_finalize(stmt);
+}
+
+// Include legacy shared-local sessions when a member opens history.
+// TS: listForOwner(ownerId: string): OpencodeSessionRecord[]
+//   if (ownerId === "local") return this.listByOwner("local");
+//   const records = [...listByOwner(ownerId), ...listByOwner("local")];
+//   dedupe by threadId via Set, first wins.
+fn OpencodeSessionStore_listForOwner(self_s: &OpencodeSessionStore, owner_ptr: ptr, owner_len: u64, out: &OpencodeSessionRecordList) -> void {
+    if bytes_equal(owner_ptr, owner_len, STR_PTR("local"), STR_LEN("local")) {
+        OpencodeSessionStore_listByOwner(self_s, owner_ptr, owner_len, out);
+        return;
+    };
+    let mine = OpencodeSessionRecordList { items: [OpencodeSessionRecord; 256], len: 0 };
+    // DEFECT: allocating two 256-record lists (each record carries a 1MB
+    // state_json buffer) is a bulk-pass approximation; fix phase should
+    // stream. Kept structurally 1:1 with the TS spread+dedupe.
+    OpencodeSessionStore_listByOwner(self_s, owner_ptr, owner_len, &mine);
+    let legacy = OpencodeSessionRecordList { items: [OpencodeSessionRecord; 256], len: 0 };
+    OpencodeSessionStore_listByOwner(self_s, STR_PTR("local"), STR_LEN("local"), &legacy);
+    out.len = 0;
+    // records.filter with seen Set<threadId> -> linear scan dedupe.
+    let i: u64 = 0;
+    while i < mine.len {
+        let cand = &mine.items[i];
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, &cand.thread_id, 0);
+        let dup = false;
+        let j: u64 = 0;
+        while j < out.len {
+            let ep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep, &out.items[j].thread_id, 0);
+            if bytes_equal(ep, out.items[j].thread_id_len, cp, cand.thread_id_len) { dup = true; break; };
+            j = j + 1;
+        }
+        if !dup && out.len < 256 {
+            out.items[out.len] = mine.items[i];
+            out.len = out.len + 1;
+        };
+        i = i + 1;
+    }
+    let k: u64 = 0;
+    while k < legacy.len {
+        let cand2 = &legacy.items[k];
+        let cp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp2, &cand2.thread_id, 0);
+        let dup2 = false;
+        let j2: u64 = 0;
+        while j2 < out.len {
+            let ep2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep2, &out.items[j2].thread_id, 0);
+            if bytes_equal(ep2, out.items[j2].thread_id_len, cp2, cand2.thread_id_len) { dup2 = true; break; };
+            j2 = j2 + 1;
+        }
+        if !dup2 && out.len < 256 {
+            out.items[out.len] = legacy.items[k];
+            out.len = out.len + 1;
+        };
+        k = k + 1;
+    }
+}
+
+// TS: delete(ownerId: string, threadId: string): boolean
+fn OpencodeSessionStore_delete(self_s: &OpencodeSessionStore, owner_ptr: ptr, owner_len: u64, thread_ptr: ptr, thread_len: u64) -> bool {
+    let stmt = sa_sqlite_prepare(self_s.db.handle, STR_PTR("DELETE FROM opencode_sessions WHERE thread_id = ? AND owner_id = ?"), STR_LEN("DELETE FROM opencode_sessions WHERE thread_id = ? AND owner_id = ?"));
+    sa_sqlite_bind_text(stmt, 1, thread_ptr, thread_len);
+    sa_sqlite_bind_text(stmt, 2, owner_ptr, owner_len);
+    sa_sqlite_step(stmt);
+    // const res = ....run(threadId, ownerId); return res.changes > 0;
+    let changes: u64 = 0;
+    sa_sqlite_changes(self_s.db.handle, &changes);
+    sa_sqlite_finalize(stmt);
+    return changes > 0;
+}
+
+// TS: deleteByThreadId(threadId: string): boolean
+fn OpencodeSessionStore_deleteByThreadId(self_s: &OpencodeSessionStore, thread_ptr: ptr, thread_len: u64) -> bool {
+    let stmt = sa_sqlite_prepare(self_s.db.handle, STR_PTR("DELETE FROM opencode_sessions WHERE thread_id = ?"), STR_LEN("DELETE FROM opencode_sessions WHERE thread_id = ?"));
+    sa_sqlite_bind_text(stmt, 1, thread_ptr, thread_len);
+    sa_sqlite_step(stmt);
+    let changes: u64 = 0;
+    sa_sqlite_changes(self_s.db.handle, &changes);
+    sa_sqlite_finalize(stmt);
+    return changes > 0;
+}
+
+// TS: private mapRow(row: OpencodeSessionRow): OpencodeSessionRecord
+// DEFECT: private method -> plain function in the family (no access control).
+fn OpencodeSessionStore_mapRow(self_s: &OpencodeSessionStore, row: &OpencodeSessionRow, out: &OpencodeSessionRecord) -> void {
+    let d: ptr = PTR_NULL();
+    let s: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d, &out.thread_id, 0);
+    PTR_BYTE_ADD(s, &row.thread_id, 0);
+    out.thread_id_len = copy_field(d, 128, s, row.thread_id_len);
+    PTR_BYTE_ADD(d, &out.owner_id, 0);
+    PTR_BYTE_ADD(s, &row.owner_id, 0);
+    out.owner_id_len = copy_field(d, 128, s, row.owner_id_len);
+    PTR_BYTE_ADD(d, &out.session_id, 0);
+    PTR_BYTE_ADD(s, &row.session_id, 0);
+    out.session_id_len = copy_field(d, 256, s, row.session_id_len);
+    out.has_session_id = row.has_session_id;
+    PTR_BYTE_ADD(d, &out.cli_version, 0);
+    PTR_BYTE_ADD(s, &row.cli_version, 0);
+    out.cli_version_len = copy_field(d, 64, s, row.cli_version_len);
+    out.has_cli_version = row.has_cli_version;
+    PTR_BYTE_ADD(d, &out.model, 0);
+    PTR_BYTE_ADD(s, &row.model, 0);
+    out.model_len = copy_field(d, 256, s, row.model_len);
+    out.has_model = row.has_model;
+    PTR_BYTE_ADD(d, &out.cwd, 0);
+    PTR_BYTE_ADD(s, &row.cwd, 0);
+    out.cwd_len = copy_field(d, 1024, s, row.cwd_len);
+    out.has_cwd = row.has_cwd;
+    PTR_BYTE_ADD(d, &out.permission_mode, 0);
+    PTR_BYTE_ADD(s, &row.permission_mode, 0);
+    out.permission_mode_len = copy_field(d, 64, s, row.permission_mode_len);
+    out.has_permission_mode = row.has_permission_mode;
+    PTR_BYTE_ADD(d, &out.state_json, 0);
+    PTR_BYTE_ADD(s, &row.state_json, 0);
+    out.state_json_len = copy_field(d, 1048576, s, row.state_json_len);
+    out.has_state_json = row.has_state_json;
+    out.created_at = row.created_at;
+    out.updated_at = row.updated_at;
+}

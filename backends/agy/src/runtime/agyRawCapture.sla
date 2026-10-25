@@ -1,0 +1,276 @@
+// Converted 1:1 from backends/agy/src/runtime/agyRawCapture.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// DEFECT: interface AgyLineCapture is a closure object created by
+// a factory (createAgyLineCapture returns {push, lines, size,
+// clear} closing over buffer/totalChars). SLA: struct + fn
+// family. Lines live in one 512 KiB arena with an offset/length
+// table (capacity 4096 lines; the source caps by count AND total
+// chars — eviction drops the oldest line).
+// DEFECT: node:fs/promises + async — dump is synchronous here.
+// DEFECT: node:os tmpdir() — approximated via TMPDIR env or
+// "/tmp" (os.tmpdir also honors TMPDIR on POSIX).
+
+struct AgyLineCapture {
+    arena: [u8; 524288],
+    arena_len: u64,
+    offs: [u64; 4096],
+    lens: [u64; 4096],
+    head: u64,
+    count: u64,
+    totalChars: u64,
+    cap: u64,
+}
+
+// DEFAULT_MAX_LINES = 400, MAX_LINE_CHARS = 64 * 1024,
+// MAX_TOTAL_CHARS = 512 * 1024 (named constants in the source).
+
+// createAgyLineCapture(maxLines = 400): Number.isFinite && > 0
+// ? floor : 400. DEFECT: float floor — maxLines is u64 here.
+fn createAgyLineCapture(self: &AgyLineCapture, maxLines: u64, has_max: bool) -> void {
+    if has_max && maxLines > 0 {
+        self.cap = maxLines;
+    } else {
+        self.cap = 400;
+    };
+    self.arena_len = 0;
+    self.head = 0;
+    self.count = 0;
+    self.totalChars = 0;
+}
+
+fn AgyLineCapture_push(self: &AgyLineCapture, line_ptr: ptr, line_len: u64) -> void {
+    // stored = line truncated to MAX_LINE_CHARS.
+    let stored = line_len;
+    if stored > 65536 { stored = 65536; };
+    // Append to the arena (compacting first if needed).
+    if self.arena_len + stored > 524288 {
+        AgyLineCapture_compact(self);
+    };
+    if self.count >= 4096 { AgyLineCapture_dropOldest(self); };
+    let idx = (self.head + self.count) % 4096;
+    self.offs[idx] = self.arena_len;
+    self.lens[idx] = stored;
+    for i in 0..stored {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, line_ptr, i);
+        self.arena[self.arena_len] = b;
+        self.arena_len = self.arena_len + 1;
+    }
+    self.count = self.count + 1;
+    self.totalChars = self.totalChars + stored;
+    while self.count > self.cap || self.totalChars > 524288 {
+        if self.count == 0 { break; };
+        AgyLineCapture_dropOldest(self);
+    }
+}
+
+fn AgyLineCapture_dropOldest(self: &AgyLineCapture) -> void {
+    if self.count == 0 { return; };
+    let idx = self.head;
+    self.totalChars = self.totalChars - self.lens[idx];
+    self.head = (self.head + 1) % 4096;
+    self.count = self.count - 1;
+}
+
+// Reclaim the arena prefix freed by evictions (source keeps a
+// plain JS array; the arena is an implementation stand-in).
+fn AgyLineCapture_compact(self: &AgyLineCapture) -> void {
+    if self.count == 0 {
+        self.arena_len = 0;
+        self.head = 0;
+        return;
+    };
+    let first = self.offs[self.head];
+    if first == 0 { return; };
+    let new_len = self.arena_len - first;
+    for i in 0..new_len {
+        self.arena[i] = self.arena[first + i];
+    }
+    for k in 0..self.count {
+        let idx = (self.head + k) % 4096;
+        self.offs[idx] = self.offs[idx] - first;
+    }
+    self.arena_len = new_len;
+}
+
+// lines(): string[] — a copy; here the caller iterates via
+// AgyLineCapture_lineAt (index -> ptr/len into the arena).
+fn AgyLineCapture_lineAt(self: &AgyLineCapture, i: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    if i >= self.count { return false; };
+    let idx = (self.head + i) % 4096;
+    out_len = self.lens[idx];
+    let base: ptr = PTR_NULL();
+    PTR_BYTE_ADD(base, &self.arena, self.offs[idx]);
+    out_ptr = base;
+    return true;
+}
+
+fn AgyLineCapture_size(self: &AgyLineCapture) -> u64 {
+    return self.count;
+}
+
+fn AgyLineCapture_clear(self: &AgyLineCapture) -> void {
+    self.arena_len = 0;
+    self.head = 0;
+    self.count = 0;
+    self.totalChars = 0;
+}
+
+// shouldDumpAgyCapture(env): env.AGY_DEBUG_CAPTURE === "1".
+// DEFECT: env map — reads the real process env (the source
+// default), injected env objects have no counterpart.
+fn shouldDumpAgyCapture() -> bool {
+    let h = sa_env_get(STR_PTR("AGY_DEBUG_CAPTURE"), STR_LEN("AGY_DEBUG_CAPTURE"));
+    if h == 0 { return false; };
+    let p: ptr = sa_env_buffer_data(h);
+    let l = sa_env_buffer_len(h);
+    return l == 1 && byte_at_is(p, 0, 49);
+}
+
+// resolveAgyCaptureDir(env): env.AGY_CAPTURE_DIR?.trim() ||
+// join(tmpdir(), "agy-captures").
+fn resolveAgyCaptureDir(out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let h = sa_env_get(STR_PTR("AGY_CAPTURE_DIR"), STR_LEN("AGY_CAPTURE_DIR"));
+    if h != 0 {
+        let p: ptr = sa_env_buffer_data(h);
+        let l = sa_env_buffer_len(h);
+        // trim()
+        let start: u64 = 0;
+        while start < l && is_space(byte_at(p, start)) { start = start + 1; };
+        let end = l;
+        while end > start && is_space(byte_at(p, end - 1)) { end = end - 1; };
+        if end > start {
+            out_len = append_bytes(out, out_cap, 0, byte_off(p, start), end - start);
+            return;
+        };
+    };
+    // join(tmpdir(), "agy-captures")
+    let td = [0u8; 512];
+    let td_len: u64 = 0;
+    tmpdir_into(&td, 512, &td_len);
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, &td, td_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("/agy-captures"), STR_LEN("/agy-captures"));
+    out_len = n;
+}
+
+// sanitizeAgyCaptureName(value): replace(/[^a-zA-Z0-9_-]+/g, "_")
+// then slice(0, 80); empty -> "unknown".
+// DEFECT: RegExp — hand scan (runs of disallowed chars collapse
+// to a single '_', matching the + quantifier).
+fn sanitizeAgyCaptureName(value_ptr: ptr, value_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let n: u64 = 0;
+    let in_bad = false;
+    for i in 0..value_len {
+        let b = byte_at(value_ptr, i);
+        let good = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95 || b == 45;
+        if good {
+            if n < 80 && n < out_cap { PTR_BYTE_SET(out, n, b); n = n + 1; };
+            in_bad = false;
+        } else {
+            if !in_bad {
+                if n < 80 && n < out_cap { PTR_BYTE_SET(out, n, 95); n = n + 1; };
+                in_bad = true;
+            };
+        };
+    }
+    if n == 0 {
+        out_len = append_bytes(out, out_cap, 0, STR_PTR("unknown"), STR_LEN("unknown"));
+        return;
+    };
+    out_len = n;
+}
+
+// dumpAgyCapture(threadId, turnId, lines, env): write the lines
+// as a .jsonl file ({line} JSON per line) under the capture dir;
+// returns the file path, or null on any error.
+// DEFECT: async + fs/promises mkdir/writeFile — sync fs externs;
+// try/catch -> status fold to null.
+// The capture is passed as line ptr/len arrays (AgyLineCapture
+// contents are copied out by the caller via lineAt).
+fn dumpAgyCapture(threadId_ptr: ptr, threadId_len: u64, turnId_ptr: ptr, turnId_len: u64, cap: &AgyLineCapture, out: ptr, out_cap: u64, out_len: &u64, out_has: &bool) -> void {
+    out_has = false;
+    let dir = [0u8; 1024];
+    let dir_len: u64 = 0;
+    resolveAgyCaptureDir(&dir, 1024, &dir_len);
+    // await mkdir(dir, { recursive: true })
+    // DEFECT: mkdir — no verified std extern in this pass.
+    let name = [0u8; 2048];
+    let name_len: u64 = 0;
+    name_len = name_len + append_bytes(&name, 2048, name_len, &dir, dir_len);
+    name_len = name_len + append_bytes(&name, 2048, name_len, STR_PTR("/"), 1);
+    let san = [0u8; 128];
+    let san_len: u64 = 0;
+    sanitizeAgyCaptureName(threadId_ptr, threadId_len, &san, 128, &san_len);
+    name_len = name_len + append_bytes(&name, 2048, name_len, &san, san_len);
+    name_len = name_len + append_bytes(&name, 2048, name_len, STR_PTR("-"), 1);
+    sanitizeAgyCaptureName(turnId_ptr, turnId_len, &san, 128, &san_len);
+    name_len = name_len + append_bytes(&name, 2048, name_len, &san, san_len);
+    name_len = name_len + append_bytes(&name, 2048, name_len, STR_PTR(".jsonl"), STR_LEN(".jsonl"));
+    // body = lines.map(l => JSON.stringify({ line: l })).join("\n") + "\n"
+    let body = [0u8; 524288];
+    let body_len: u64 = 0;
+    for i in 0..cap.count {
+        let lp: ptr = PTR_NULL();
+        let ll: u64 = 0;
+        if AgyLineCapture_lineAt(cap, i, &lp, &ll) {
+            body_len = body_len + append_bytes(&body, 524288, body_len, STR_PTR("{\"line\":\""), STR_LEN("{\"line\":\""));
+            // DEFECT: JSON string escaping of the line content
+            // (JSON.stringify escapes quotes/backslashes/control
+            // chars) — raw append in this pass.
+            body_len = body_len + append_bytes(&body, 524288, body_len, lp, ll);
+            body_len = body_len + append_bytes(&body, 524288, body_len, STR_PTR("\"}\n"), STR_LEN("\"}\n"));
+        };
+    }
+    if sa_fs_write_file(&name, name_len, &body, body_len) != 0 { return; };
+    out_len = append_bytes(out, out_cap, 0, &name, name_len);
+    out_has = true;
+}
+
+// ---- local helpers ----
+
+fn byte_at(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+fn byte_at_is(p: ptr, i: u64, want: u8) -> bool {
+    return byte_at(p, i) == want;
+}
+
+fn is_space(b: u8) -> bool {
+    return b == 32 || b == 9 || b == 10 || b == 13;
+}
+
+fn byte_off(p: ptr, off: u64) -> ptr {
+    let r: ptr = PTR_NULL();
+    PTR_BYTE_ADD(r, p, off);
+    return r;
+}
+
+fn append_bytes(dst: ptr, cap: u64, at: u64, src: ptr, n: u64) -> u64 {
+    let w: u64 = 0;
+    for i in 0..n {
+        if at + w < cap {
+            PTR_BYTE_SET(dst, at + w, byte_at(src, i));
+            w = w + 1;
+        };
+    }
+    return w;
+}
+
+// tmpdir_into: os.tmpdir() — TMPDIR env or "/tmp".
+// DEFECT: os.tmpdir also consults TEMP on Windows; POSIX only.
+fn tmpdir_into(out: ptr, cap: u64, out_len: &u64) -> void {
+    let h = sa_env_get(STR_PTR("TMPDIR"), STR_LEN("TMPDIR"));
+    if h != 0 {
+        let p: ptr = sa_env_buffer_data(h);
+        let l = sa_env_buffer_len(h);
+        if l > 0 {
+            out_len = append_bytes(out, cap, 0, p, l);
+            return;
+        };
+    };
+    out_len = append_bytes(out, cap, 0, STR_PTR("/tmp"), STR_LEN("/tmp"));
+}

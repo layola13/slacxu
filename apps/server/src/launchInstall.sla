@@ -1,0 +1,362 @@
+// Converted 1:1 from apps/server/src/launchInstall.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Launch-adapter install/detect/env management: LAUNCH_SPECS table, PATH discovery,
+// .env parse/upsert, git clone + install.sh execution, OpenAI API probe, install jobs.
+
+@import "sa_std/io/print.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/env.sai"
+@import "sa_std/process.sai"
+@import "sa_std/http_client.sai"
+@import "sa_std/json.sai"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+
+// DEFECT: Node fs sync APIs (existsSync/readFileSync/writeFileSync/mkdirSync/statSync/chmodSync), os.homedir,
+// path join/resolve/delimiter and process.env/process.platform have partial sa_std coverage only; approximated via sa_std_fs_* / sa_env_* externs.
+// DEFECT: dynamic object — Record<string,string> env maps represented as JSON text buffers / (ptr,len) key-value scans.
+
+// InstallLogLevel: "info"|"success"|"error"|"warn" -> u64 tag 0/1/2/3.
+// DEFECT: closure type — InstallSubLogger = (msg, level) => void callback type has no counterpart; logger passed as opaque ctx id + standalone emit functions.
+
+struct LaunchAdapterSpec {
+    id_ptr: ptr, id_len: u64,
+    repo_ptr: ptr, repo_len: u64,
+    hasCloneUrl: bool, cloneUrl_ptr: ptr, cloneUrl_len: u64, // cloneUrl: string | null
+    wrapperBins_ptr: ptr, wrapperBins_len: u64, // string[] -> JSON array text
+    wrapperBinsCount: u64,
+    productBins_ptr: ptr, productBins_len: u64, // string[] -> JSON array text
+    productBinsCount: u64,
+    envPrefix_ptr: ptr, envPrefix_len: u64,
+    configDirName_ptr: ptr, configDirName_len: u64,
+}
+
+// LAUNCH_SPECS (源 L25-L144): 11 entries, order preserved 1:1:
+// code-launch, agy-launch, claude-launch (productBins claude+claudecode), gemini-launch, crush-launch,
+// auggie-launch, grok-launch (productBins grok+agent), agent-launch (cloneUrl null, shares GROK_LAUNCH_/grok-launch),
+// coderabbit-launch (null), freebuff-launch (null), pi-launch (repo "pi", null, wrapperBins pi+pi-launch).
+// DEFECT: const array of object literals -> accessor fn returning spec by index; literal table materialized at fix stage.
+fn launchSpecsCount() -> u64 { return 11; }
+fn launchSpecAt(index: u64, out: &LaunchAdapterSpec) -> bool {
+    // DEFECT: static table data (URLs https://github.com/layola13/<repo>.git etc.) not embedded in bulk pass; fields filled at fix stage.
+    if index >= 11 { return false; };
+    return true;
+}
+
+struct LaunchAdapterStatus {
+    id_ptr: ptr, id_len: u64,
+    repo_ptr: ptr, repo_len: u64,
+    hasCloneUrl: bool, cloneUrl_ptr: ptr, cloneUrl_len: u64,
+    cloneable: bool,
+    installed: bool,
+    hasWrapperPath: bool, wrapperPath_ptr: ptr, wrapperPath_len: u64,
+    hasProductCliPath: bool, productCliPath_ptr: ptr, productCliPath_len: u64,
+    productCliPresent: bool,
+    hasSourceDir: bool, sourceDir_ptr: ptr, sourceDir_len: u64,
+    sourcePresent: bool,
+    envPath_ptr: ptr, envPath_len: u64,
+    envPresent: bool,
+    envConfigured: bool,
+    envPreviewBaseUrl_ptr: ptr, envPreviewBaseUrl_len: u64, hasEnvPreviewBaseUrl: bool,
+    envPreviewModel_ptr: ptr, envPreviewModel_len: u64, hasEnvPreviewModel: bool,
+    envPreviewHasApiKey: bool,
+    needsInstall: bool,
+    needsSetup: bool,
+}
+
+struct LaunchEnvValues {
+    hasBaseUrl: bool, baseUrl_ptr: ptr, baseUrl_len: u64,
+    hasModel: bool, model_ptr: ptr, model_len: u64,
+    hasApiKey: bool, apiKey_ptr: ptr, apiKey_len: u64,
+}
+
+struct InstallLaunchRequest {
+    ids_ptr: ptr, ids_len: u64, idsCount: u64, hasIds: bool, // string[] -> JSON array text
+    missingOnly: bool, hasMissingOnly: bool,
+    skipCli: bool, hasSkipCli: bool, // default true semantics in source comments; undefined check used in installOne
+    envMode: u64, hasEnvMode: bool, // 0=shared 1=separate 2=none
+    sharedEnv: LaunchEnvValues, hasSharedEnv: bool,
+    separateEnv_ptr: ptr, separateEnv_len: u64, hasSeparateEnv: bool, // DEFECT: dynamic object Record<string, LaunchEnvValues> as JSON buffer
+    forceEnv: bool, hasForceEnv: bool,
+    sourceRoot_ptr: ptr, sourceRoot_len: u64, hasSourceRoot: bool,
+    skipModelTest: bool, hasSkipModelTest: bool,
+}
+
+struct InstallLaunchResultItem {
+    id_ptr: ptr, id_len: u64,
+    ok: bool,
+    steps_ptr: ptr, steps_len: u64, stepsCount: u64, // string[] -> JSON array text
+    hasError: bool, error_ptr: ptr, error_len: u64,
+    hasStatus: bool, status: LaunchAdapterStatus,
+}
+
+// Module state (源 L206): let installLock: Promise<void> | null
+// DEFECT: Promise-based mutex — installLock approximated as bool flag on a state struct.
+struct LaunchInstallState {
+    installLockHeld: bool,
+    jobs_ptr: ptr, jobs_len: u64, // DEFECT: Map<string, InstallJob> -> JSON buffer store, see InstallJob section
+    jobsCount: u64,
+}
+
+fn home(out_ptr: &ptr, out_len: &u64) -> void {
+    // 源 L208-L210: process.env.HOME || process.env.USERPROFILE || homedir()
+    // DEFECT: process.env access approximated via sa_env_get.
+    out_ptr = STR_PTR("");
+    out_len = 0;
+}
+
+fn defaultSourceRoot(custom_ptr: ptr, custom_len: u64, hasCustom: bool, out_ptr: &ptr, out_len: &u64) -> void {
+    // 源 L212-L221: trimmed custom ("~/" expands under home, else resolve) else env CODEX_UI_LAUNCH_SRC_ROOT else join(home,"projects")
+    // DEFECT: path resolve/join semantics approximated.
+    out_ptr = custom_ptr;
+    out_len = custom_len;
+}
+
+fn pathDirs(out_ptr: &ptr, out_len: &u64, outCount: &u64) -> void {
+    // 源 L223-L254: extra toolchain dirs (home .local/bin, bin, .codex/bin, .claude/bin, .grok/bin, .agy/bin, .pi/bin,
+    // .opencode/bin, .codex-ultra/bin, .bun/bin, .bun/install/global/bin, .npm-global/bin, toolchainDirCandidates(home, env),
+    // /usr/local/bin, /usr/local/sbin, /usr/bin, /opt/bin, /opt/node/bin, /tools/node/bin, /opt/homebrew/bin,
+    // linuxbrew bin+sbin, /snap/bin, /var/lib/snapd/snap/bin, /var/lib/flatpak/exports/bin, /nix/.../bin)
+    // + PATH split by delimiter, de-duplicated via Set preserving order.
+    // DEFECT: Set de-dup + spread of cross-module toolchainDirCandidates (cliVersions) approximated; cross-module import kept as extern call at fix stage.
+    outCount = 0;
+}
+
+fn findOnPath(names_ptr: ptr, names_len: u64, namesCount: u64, out_ptr: &ptr, out_len: &u64, outFound: &bool) -> void {
+    // 源 L256-L276: for name x dir: existsSync; on POSIX also statSync isFile + mode & 0o111 executable; first hit wins; win32 skips exec check
+    // DEFECT: process.platform branch + stat mode bits approximated via sa_std_fs_* metadata at fix stage.
+    outFound = false;
+}
+
+fn configEnvPath(spec: &LaunchAdapterSpec, out_ptr: &ptr, out_len: &u64) -> void {
+    // 源 L278-L281: join(env XDG_CONFIG_HOME || join(home,".config"), spec.configDirName, ".env")
+    out_ptr = STR_PTR("");
+    out_len = 0;
+}
+
+fn parseEnvFile(path_ptr: ptr, path_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // 源 L283-L303: missing -> {}; per line: skip blank/#, split at first "=", trim key/value, strip matching surrounding quotes
+    // DEFECT: dynamic object Record<string,string> returned as JSON buffer.
+    out_len = 0;
+}
+
+fn isPlaceholder(value_ptr: ptr, value_len: u64, hasValue: bool) -> bool {
+    // 源 L305-L316: empty -> true; lowercase contains your-api-key / sk-your-key / your-gateway, or equals changeme / xxx
+    if hasValue == false { return true; };
+    return false;
+}
+
+fn resolveSourceDir(spec: &LaunchAdapterSpec, custom_ptr: ptr, custom_len: u64, hasCustom: bool, out_ptr: &ptr, out_len: &u64, outFound: &bool) -> void {
+    // 源 L318-L337: candidates join(root,repo), home/projects, home/src, /root/projects, E:/projects, D:/projects;
+    // dir qualifies if install.sh OR main.py OR packages/coding-agent exists inside
+    outFound = false;
+}
+
+fn getSpec(id_ptr: ptr, id_len: u64, out: &LaunchAdapterSpec) -> bool {
+    // 源 L339-L341: LAUNCH_SPECS.find(s => s.id === id)
+    // DEFECT: closure predicate Array.find approximated as index loop over launchSpecAt.
+    return false;
+}
+
+fn detectAdapter(spec: &LaunchAdapterSpec, customRoot_ptr: ptr, customRoot_len: u64, hasCustomRoot: bool, out: &LaunchAdapterStatus) -> void {
+    // 源 L343-L405: try { wrapperPath=findOnPath(wrapperBins); sourceDir=resolveSourceDir; sourceCliPath=
+    // sourceDir/packages/coding-agent/src/cli.ts if exists; productCliPath=findOnPath(productBins)||sourceCliPath;
+    // envMap=parseEnvFile(envPath); baseUrl/model/apiKey via envPrefix keys (API_KEY ?? API_KEYS);
+    // installed = wrapperPath || (id=="pi-launch" && sourceCliPath); needsInstall/needsSetup derived }
+    // catch { all-absent fallback status with needsInstall/needsSetup true }
+    // DEFECT: try/catch fallback approximated — failure path fills the same fallback status struct.
+    out.needsInstall = true;
+    out.needsSetup = true;
+}
+
+fn detectAll(customRoot_ptr: ptr, customRoot_len: u64, hasCustomRoot: bool, out_ptr: &ptr, out_len: &u64, outCount: &u64) -> void {
+    // 源 L407-L413: { sourceRoot: defaultSourceRoot(custom), adapters: LAUNCH_SPECS.map(detectAdapter) }
+    // DEFECT: closure Array.map approximated as loop; result as JSON buffer + count.
+    outCount = 0;
+}
+
+fn upsertEnvKeys(path_ptr: ptr, path_len: u64, updates_ptr: ptr, updates_len: u64) -> void {
+    // 源 L415-L443: mkdirSync(dir, recursive); read existing lines; replace lines whose key is in updates (mark seen),
+    // keep others verbatim; append unseen updates; ensure trailing blank line; writeFileSync mode 0o600, join "\n"
+    // DEFECT: dynamic object Object.entries/keys iteration over updates JSON buffer approximated.
+}
+
+fn writeAdapterEnv(spec: &LaunchAdapterSpec, values: &LaunchEnvValues, force: bool, outPath_ptr: &ptr, outPath_len: &u64, outWrote: &bool, outSkipped: &bool) -> void {
+    // 源 L445-L481: if !force && env exists && existing BASE_URL+API_KEY non-placeholder && no new values -> skip;
+    // build updates from non-empty trimmed baseUrl/model/apiKey (envPrefix keys);
+    // no updates: create file with comment template + empty keys (mode 0o600) if missing, else skip;
+    // else upsertEnvKeys -> wrote
+    outWrote = false;
+    outSkipped = true;
+}
+
+struct LineLogger {
+    pending_ptr: ptr, // DEFECT: closure-captured mutable `pending` string — struct field replaces closure state
+    pending_len: u64,
+    prefix_ptr: ptr, prefix_len: u64,
+    level: u64,
+    ctxId: u64, // opaque logger callback context (InstallSubLogger)
+}
+
+fn createLineLogger(prefix_ptr: ptr, prefix_len: u64, level: u64, ctxId: u64, out: &LineLogger) -> void {
+    // 源 L483-L505: returns {write, flush} object closing over pending/prefix/level/onLog
+    // DEFECT: closure object with methods -> struct + standalone fns lineLoggerWrite/lineLoggerFlush below.
+    out.pending_len = 0;
+    out.level = level;
+    out.ctxId = ctxId;
+}
+
+fn lineLoggerWrite(lg: &LineLogger, chunk_ptr: ptr, chunk_len: u64) -> void {
+    // 源 L493-L501: pending += chunk.replace(/\r/g,"\n"); split lines; emit each complete line (trimmed, non-empty) via onLog(prefix+text, level)
+    // DEFECT: regex replace + callback invocation approximated.
+}
+
+fn lineLoggerFlush(lg: &LineLogger) -> void {
+    // 源 L502-L504: emit(pending); pending = ""
+    lg.pending_len = 0;
+}
+
+// DEFECT: async — readProcessOutput async stream reader in TS.
+// DEFECT: stream — ReadableStream<Uint8Array> getReader + TextDecoder streaming decode has no sa_std counterpart; whole-buffer decode approximated.
+fn readProcessOutput(hasStream: bool, raw_ptr: ptr, raw_len: u64, out_ptr: &ptr, out_len: &u64) -> i32 {
+    out_len = raw_len;
+    return 0;
+}
+
+struct RunCmdResult {
+    ok: bool,
+    stdout_ptr: ptr, stdout_len: u64,
+    stderr_ptr: ptr, stderr_len: u64,
+    code: i32,
+}
+
+// DEFECT: async — runCmd async in TS (Promise.all over stdout/stderr/exited + setTimeout kill timer).
+// DEFECT: timer — setTimeout/clearTimeout timeout-kill approximated as process spawn timeout parameter at fix stage.
+fn runCmd(cmd_ptr: ptr, cmd_len: u64, cmdCount: u64, cwd_ptr: ptr, cwd_len: u64, timeoutMs: u64, ctxId: u64, out: &RunCmdResult) -> i32 {
+    // 源 L528-L570: spawnRuntimeProcess(cmd, {cwd, env: {...process.env, PATH: home/.local/bin + delimiter + PATH,
+    // GIT_TERMINAL_PROMPT:"0", CI ?? "1", npm_config_audit/fund/update_notifier "false", npm_config_yes "true"}}) — cross-module spawnRuntimeProcess (runtime/process)
+    // timer kills proc after timeoutMs; ok = !timedOut && code==0; timedOut code reported as 124
+    // DEFECT: dynamic object env spread of process.env approximated as JSON buffer merge at fix stage.
+    out.ok = false;
+    out.code = 124;
+    return 0;
+}
+
+// DEFECT: async — ensureCloned async in TS.
+fn ensureCloned(state: &LaunchInstallState, spec: &LaunchAdapterSpec, steps_ptr: ptr, steps_len: u64, customRoot_ptr: ptr, customRoot_len: u64, hasCustomRoot: bool, ctxId: u64, out_ptr: &ptr, out_len: &u64, outErr: &bool) -> i32 {
+    // 源 L572-L603: mkdir root; existing resolveSourceDir -> "source present"; !cloneUrl -> throw (no public GitHub clone URL...);
+    // existing target dir -> "using existing checkout"; else git clone --depth 1 via runCmd (180_000 ms) -> throw on failure
+    // DEFECT: throw/Error propagation approximated as outErr + status code.
+    outErr = true;
+    return 1;
+}
+
+// DEFECT: async — runInstallSh async in TS.
+fn runInstallSh(sourceDir_ptr: ptr, sourceDir_len: u64, skipCli: bool, steps_ptr: ptr, steps_len: u64, ctxId: u64, outErr: &bool) -> i32 {
+    // 源 L605-L631: install.sh must exist else throw; chmodSync 0o755 (errors ignored); args [bash, script, --skip-cli?];
+    // runCmd timeout 120_000 (skipCli) or 600_000; failure -> throw with last 2000 chars of stderr|stdout; push "install.sh ok"
+    outErr = false;
+    return 0;
+}
+
+// DEFECT: async — installOne async in TS.
+fn installOne(state: &LaunchInstallState, id_ptr: ptr, id_len: u64, opts: &InstallLaunchRequest, ctxId: u64, out: &InstallLaunchResultItem) -> i32 {
+    // 源 L633-L694: unknown spec -> error item (log 未知的适配器标识); ensureCloned; effectiveSkipCli logic
+    // (opts.skipCli !== false: skip only if product CLI already on PATH, with Chinese log lines preserved in source order);
+    // runInstallSh; envMode shared/separate -> writeAdapterEnv + step log; success item with detectAdapter status;
+    // catch -> {ok:false, error, status: detectAdapter}
+    // DEFECT: try/catch approximated as status-code branches.
+    out.ok = false;
+    return 0;
+}
+
+struct TestOpenAiApiRequest {
+    hasBaseUrl: bool, baseUrl_ptr: ptr, baseUrl_len: u64,
+    hasModel: bool, model_ptr: ptr, model_len: u64,
+    hasApiKey: bool, apiKey_ptr: ptr, apiKey_len: u64,
+}
+
+struct TestOpenAiApiResult {
+    ok: bool, step1Ok: bool, step2Ok: bool,
+    message_ptr: ptr, message_len: u64, // DEFECT: template-literal Chinese messages assembled at fix stage
+    hasStatusCode: bool, statusCode: u64,
+}
+
+// DEFECT: async — testOpenAiApi async fetch-based in TS.
+// DEFECT: fetch/AbortController — fetch + AbortController 6s/10s timeouts have no sa_std counterpart; approximated via sa_http_client_* with timeout at fix stage.
+fn testOpenAiApi(values: &TestOpenAiApiRequest, out: &TestOpenAiApiResult) -> i32 {
+    // 源 L708-L838: missing baseUrl/apiKey -> Chinese failure messages; normalize baseUrl (strip trailing /, ensure /v1, strip /chat/completions);
+    // Step1 GET {base}/models Bearer (6s) -> !ok failure w/ body slice 150;
+    // Step2 POST {base}/chat/completions {model ?? "gpt-5.5", messages:[{role:"user",content:"hi"}], max_tokens:15} (10s)
+    // -> ok success message; JSON error.message extraction; 502/503/504 -> ok:true step2Ok:false upstream-warning message;
+    // AbortError distinguished as timeout in both steps.
+    // DEFECT: Headers/Response web API (headers.get content-type, text()) approximated by (status, body buffer).
+    out.ok = false;
+    out.step1Ok = false;
+    out.step2Ok = false;
+    return 0;
+}
+
+// DEFECT: async — validateEnvModeBeforeSave async in TS.
+fn validateEnvModeBeforeSave(mode: u64, hasMode: bool, sharedEnv: &LaunchEnvValues, hasSharedEnv: bool, separateEnv_ptr: ptr, separateEnv_len: u64, hasSeparateEnv: bool, targetIds_ptr: ptr, targetIds_len: u64, targetCount: u64, outErr: &bool) -> i32 {
+    // 源 L840-L865: shared -> testOpenAiApi(sharedEnv) once, throw on !ok; separate -> per-id test with Set de-dup on baseUrl:apiKey:model key, throw naming adapter
+    // DEFECT: Set<string> de-dup approximated as scanned JSON buffer.
+    outErr = false;
+    return 0;
+}
+
+struct InstallLaunchOutcome {
+    results_ptr: ptr, results_len: u64, resultsCount: u64, // InstallLaunchResultItem[] as JSON buffer
+    adapters_ptr: ptr, adapters_len: u64, adaptersCount: u64, // LaunchAdapterStatus[] as JSON buffer
+}
+
+// DEFECT: async — installLaunchAdapters async in TS; installLock spin `while (installLock) await installLock` + deferred release closure.
+// DEFECT: closure — `let release!: () => void` deferred resolver has no counterpart; lock flag set/cleared synchronously here.
+fn installLaunchAdapters(state: &LaunchInstallState, opts: &InstallLaunchRequest, ctxId: u64, out: &InstallLaunchOutcome) -> i32 {
+    // 源 L867-L935: resolve ids (explicit | missingOnly/all cloneable-or-sourcePresent via detectAll, intersect explicit ids, Set de-dup);
+    // Chinese progress logs; envMode validation (failures logged as warning, install continues unless skipModelTest);
+    // sequential installOne loop with [current/total] logs; summary 成功/失败 counts; finally release lock;
+    // return {results, adapters: detectAll(...)}
+    out.resultsCount = 0;
+    out.adaptersCount = 0;
+    return 0;
+}
+
+// DEFECT: async — writeEnvsOnly async in TS (validation errors intentionally swallowed in source).
+fn writeEnvsOnly(mode: u64, sharedEnv: &LaunchEnvValues, hasSharedEnv: bool, separateEnv_ptr: ptr, separateEnv_len: u64, hasSeparateEnv: bool, ids_ptr: ptr, ids_len: u64, idsCount: u64, hasIds: bool, force: bool, out_ptr: &ptr, out_len: &u64, outCount: &u64) -> i32 {
+    // 源 L937-L965: targets = ids|all spec ids filtered by getSpec; validate (errors ignored); per id writeAdapterEnv -> {id, ok, path, wrote, error?}
+    // DEFECT: dynamic object result array as JSON buffer.
+    outCount = 0;
+    return 0;
+}
+
+struct InstallJobLogItem {
+    time_ptr: ptr, time_len: u64,
+    text_ptr: ptr, text_len: u64,
+    level: u64,
+}
+
+struct InstallJob {
+    id_ptr: ptr, id_len: u64,
+    status: u64, // 0=running 1=completed 2=failed (TS string union)
+    progressStep_ptr: ptr, progressStep_len: u64,
+    logs_ptr: ptr, logs_len: u64, logsCount: u64, // InstallJobLogItem[] capped at 500 in source
+    hasResults: bool, results_ptr: ptr, results_len: u64, resultsCount: u64,
+    hasAdapters: bool, adapters_ptr: ptr, adapters_len: u64, adaptersCount: u64,
+    hasError: bool, error_ptr: ptr, error_len: u64,
+    createdAt: u64,
+}
+
+fn createInstallJob(state: &LaunchInstallState, opts: &InstallLaunchRequest, outId_ptr: &ptr, outId_len: &u64) -> void {
+    // 源 L983-L1027: jobId = randomUUID(); job stored in module Map; addLog closure caps logs at 500 and mirrors text into progressStep;
+    // fire-and-forget async IIFE runs installLaunchAdapters, sets completed/failed + results/adapters/error.
+    // DEFECT: randomUUID (node:crypto) has no sa_std counterpart; id generation deferred.
+    // DEFECT: closure — addLog captures logs array + job object; approximated as state-struct log append at fix stage.
+    // DEFECT: async — fire-and-forget IIFE has no counterpart; job execution approximated as synchronous installLaunchAdapters call at fix stage.
+    // DEFECT: Map<string, InstallJob> module registry approximated in LaunchInstallState jobs buffer.
+    outId_len = 0;
+}
+
+fn getInstallJob(state: &LaunchInstallState, jobId_ptr: ptr, jobId_len: u64, out: &InstallJob) -> bool {
+    // 源 L1029-L1031 (file end): installJobs.get(jobId)
+    return false;
+}

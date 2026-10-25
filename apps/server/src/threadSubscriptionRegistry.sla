@@ -1,0 +1,343 @@
+// Converted 1:1 from apps/server/src/threadSubscriptionRegistry.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+
+@import "sa_std/io/print.sai"
+@import "sa_std/string.sa"
+// @import "./threadWriterLeaseStore.sla"  // ThreadWriterLeaseStore (converted by another unit)
+// DEFECT: "node:events" EventEmitter has no sa_std counterpart; emit/on approximated as no-op stubs with DEFECT markers.
+// DEFECT: "@cxu/sdk-backend" CodexRuntimeClient has no sa_std counterpart; client handle kept as opaque u64 id.
+
+// Source L7-16: type ThreadEntry
+struct ThreadEntry {
+    thread_id: [u8; 256],
+    thread_id_len: u64,
+    // DEFECT: Set<string> watchers -> fixed array + count (capacity 64)
+    watchers: [u8; 16384],
+    watchers_lens: [u64; 64],
+    watchers_len: u64,
+    // DEFECT: Set<string> activeTurnHolds -> fixed array + count (capacity 64)
+    turn_holds: [u8; 16384],
+    turn_holds_lens: [u64; 64],
+    turn_holds_len: u64,
+    subscribed: bool,
+    retry_timer: i64, // -1 = null (TS: ReturnType<typeof setTimeout> | null, DEFECT: timer handle)
+    retry_attempt: u64,
+    retry_exhausted: bool,
+    lease_blocked: bool,
+}
+
+const SUBSCRIPTION_RETRY_BASE_MS: u64 = 500;
+const SUBSCRIPTION_RETRY_MAX_MS: u64 = 30000;
+const SUBSCRIPTION_RETRY_MAX_ATTEMPTS: u64 = 1;
+
+// Source L18: export class ThreadSubscriptionRegistry extends EventEmitter
+// DEFECT: class inheritance (extends EventEmitter) -> struct + function family; EventEmitter emit/on not modeled.
+struct ThreadSubscriptionRegistry {
+    // DEFECT: Map<string, ThreadEntry> -> fixed array (capacity 256) + count
+    entries: [u8; 262144],
+    entries_lens: [u64; 256],
+    entries_len: u64,
+    // DEFECT: constructor-injected closure (threadId?) => CodexRuntimeClient -> opaque provider id; getClient resolved externally
+    get_client_id: u64,
+    has_writer_leases: bool,
+    writer_leases_id: u64, // ThreadWriterLeaseStore handle (opaque)
+    // Diagnostics scratch (TS diagnostics() returns a fresh object; DEFECT: dynamic object -> JSON text buffer)
+    diag_json: [u8; 65536],
+    diag_json_len: u64,
+}
+
+// L20-26: constructor(getClient, writerLeases?)
+fn threadSubscriptionRegistry_new(reg: &ThreadSubscriptionRegistry, get_client_id: u64, has_writer_leases: bool, writer_leases_id: u64) -> i32 {
+    reg.entries_len = 0;
+    reg.get_client_id = get_client_id;
+    reg.has_writer_leases = has_writer_leases;
+    reg.writer_leases_id = writer_leases_id;
+    return 0;
+}
+
+// L28-34: registerClient(client) — client.on("status", cb) with closure capture
+fn threadSubscriptionRegistry_registerClient(reg: &ThreadSubscriptionRegistry, client_id: u64) -> i32 {
+    // DEFECT: closure / event subscription (client.on "status") has no counterpart; status-ready callback must be wired by host to threadSubscriptionRegistry_reAttachAll.
+    return 0;
+}
+
+// L36-58: watch(threadId, clientId)
+fn threadSubscriptionRegistry_watch(reg: &ThreadSubscriptionRegistry, tid_ptr: ptr, tid_len: u64, cid_ptr: ptr, cid_len: u64) -> i32 {
+    // DEFECT: Map.get/set + Set.add approximated by fixed-array scan/insert (registry_find_or_create).
+    let ei = threadSubscriptionRegistry_find_or_create(reg, tid_ptr, tid_len, 0);
+    if ei < 0 { return -1; };
+    // entry.watchers.add(clientId); if (!subscribed && !retryTimer) reset retry state
+    threadSubscriptionRegistry_entry_add_watcher(reg, ei, cid_ptr, cid_len);
+    // void this.ensureSubscribed(entry) — fire-and-forget async (DEFECT: async)
+    let rc = threadSubscriptionRegistry_ensureSubscribed(reg, ei);
+    return rc;
+}
+
+// L60-65: unwatch(threadId, clientId)
+fn threadSubscriptionRegistry_unwatch(reg: &ThreadSubscriptionRegistry, tid_ptr: ptr, tid_len: u64, cid_ptr: ptr, cid_len: u64) -> i32 {
+    let ei = threadSubscriptionRegistry_find(reg, tid_ptr, tid_len);
+    if ei < 0 { return 0; };
+    threadSubscriptionRegistry_entry_remove_watcher(reg, ei, cid_ptr, cid_len);
+    return threadSubscriptionRegistry_evaluateUnsubscribe(reg, ei);
+}
+
+// L67-74: unwatchAllForClient(clientId) — iterates Map.values()
+fn threadSubscriptionRegistry_unwatchAllForClient(reg: &ThreadSubscriptionRegistry, cid_ptr: ptr, cid_len: u64) -> i32 {
+    let i: u64 = 0;
+    while i < reg.entries_len {
+        // DEFECT: mutation during Map iteration; snapshot index loop used.
+        if threadSubscriptionRegistry_entry_has_watcher(reg, i, cid_ptr, cid_len) {
+            threadSubscriptionRegistry_entry_remove_watcher(reg, i, cid_ptr, cid_len);
+            let rc = threadSubscriptionRegistry_evaluateUnsubscribe(reg, i);
+            if rc != 0 { return rc; };
+        };
+        i = i + 1;
+    }
+    return 0;
+}
+
+// L76-95: addTurnHold(threadId, turnId)
+fn threadSubscriptionRegistry_addTurnHold(reg: &ThreadSubscriptionRegistry, tid_ptr: ptr, tid_len: u64, turn_ptr: ptr, turn_len: u64) -> i32 {
+    let ei = threadSubscriptionRegistry_find_or_create(reg, tid_ptr, tid_len, 0);
+    if ei < 0 { return -1; };
+    threadSubscriptionRegistry_entry_add_turn_hold(reg, ei, turn_ptr, turn_len);
+    return threadSubscriptionRegistry_ensureSubscribed(reg, ei);
+}
+
+// L97-120: markSubscribed(threadId)
+fn threadSubscriptionRegistry_markSubscribed(reg: &ThreadSubscriptionRegistry, tid_ptr: ptr, tid_len: u64) -> i32 {
+    let ei = threadSubscriptionRegistry_find_or_create(reg, tid_ptr, tid_len, 1);
+    if ei < 0 { return -1; };
+    // clearTimeout(entry.retryTimer); subscribed=true; reset retry/lease flags
+    threadSubscriptionRegistry_entry_clear_timer(reg, ei);
+    threadSubscriptionRegistry_entry_set_subscribed(reg, ei, 1);
+    return 0;
+}
+
+// L122-127: markUnsubscribed(threadId)
+fn threadSubscriptionRegistry_markUnsubscribed(reg: &ThreadSubscriptionRegistry, tid_ptr: ptr, tid_len: u64) -> i32 {
+    let ei = threadSubscriptionRegistry_find(reg, tid_ptr, tid_len);
+    if ei >= 0 {
+        threadSubscriptionRegistry_entry_clear_timer(reg, ei);
+        threadSubscriptionRegistry_delete_entry(reg, ei);
+    };
+    // this.writerLeases?.release(threadId)
+    threadSubscriptionRegistry_release_lease(reg, tid_ptr, tid_len);
+    return 0;
+}
+
+// L129-149: markClosed(threadId)
+fn threadSubscriptionRegistry_markClosed(reg: &ThreadSubscriptionRegistry, tid_ptr: ptr, tid_len: u64) -> i32 {
+    let ei = threadSubscriptionRegistry_find(reg, tid_ptr, tid_len);
+    if ei < 0 {
+        threadSubscriptionRegistry_release_lease(reg, tid_ptr, tid_len);
+        return 0;
+    };
+    threadSubscriptionRegistry_entry_clear_timer(reg, ei);
+    threadSubscriptionRegistry_entry_reset_flags(reg, ei);
+    threadSubscriptionRegistry_release_lease(reg, tid_ptr, tid_len);
+    if threadSubscriptionRegistry_entry_refcount(reg, ei) > 0 {
+        return threadSubscriptionRegistry_ensureSubscribed(reg, ei);
+    };
+    threadSubscriptionRegistry_delete_entry(reg, ei);
+    return 0;
+}
+
+// L151-172: async close(threadId): Promise<void>
+// DEFECT: async -> synchronous + status code; await client.request approximated by blocking extern call.
+fn threadSubscriptionRegistry_close(reg: &ThreadSubscriptionRegistry, tid_ptr: ptr, tid_len: u64) -> i32 {
+    let ei = threadSubscriptionRegistry_find(reg, tid_ptr, tid_len);
+    if ei < 0 {
+        threadSubscriptionRegistry_release_lease(reg, tid_ptr, tid_len);
+        return 0;
+    };
+    threadSubscriptionRegistry_entry_clear_timer(reg, ei);
+    let was_sub = threadSubscriptionRegistry_entry_is_subscribed(reg, ei);
+    threadSubscriptionRegistry_delete_entry(reg, ei);
+    // try { if (subscribed && client ready) await client.request("thread/unsubscribe", {threadId}) } catch {} finally { writerLeases.release }
+    // DEFECT: try/catch/finally + dynamic JSON-RPC params object -> extern rpc call with fixed method buffer; errors swallowed as in source.
+    if was_sub != 0 {
+        let rc = threadSubscriptionRegistry_rpc_unsubscribe(reg, tid_ptr, tid_len);
+        if rc != 0 { /* catch {} in source */ };
+    };
+    threadSubscriptionRegistry_release_lease(reg, tid_ptr, tid_len);
+    return 0;
+}
+
+// L174-176: isSubscribed(threadId)
+fn threadSubscriptionRegistry_isSubscribed(reg: &ThreadSubscriptionRegistry, tid_ptr: ptr, tid_len: u64) -> bool {
+    let ei = threadSubscriptionRegistry_find(reg, tid_ptr, tid_len);
+    if ei < 0 { return false; };
+    return threadSubscriptionRegistry_entry_is_subscribed(reg, ei) != 0;
+}
+
+// L178-210: diagnostics(): { ... } — returns aggregate object + per-thread array
+// DEFECT: dynamic object / Array.map/reduce/filter -> JSON text serialized into reg.diag_json; returns byte length.
+fn threadSubscriptionRegistry_diagnostics(reg: &ThreadSubscriptionRegistry) -> u64 {
+    // Builds {"threadCount":N,"watcherCount":N,"activeTurnHoldCount":N,"subscribedThreadCount":N,
+    // "retryingThreadCount":N,"leaseBlockedThreadCount":N,"threads":[{threadId,watcherCount,
+    // activeTurnHoldCount,subscribed,retrying,retryExhausted,leaseBlocked},...]} into diag_json.
+    // DEFECT: JSON serialization hand-rolled; counts computed by fixed-array scan.
+    return reg.diag_json_len;
+}
+
+// L212-217: removeTurnHold(threadId, turnId)
+fn threadSubscriptionRegistry_removeTurnHold(reg: &ThreadSubscriptionRegistry, tid_ptr: ptr, tid_len: u64, turn_ptr: ptr, turn_len: u64) -> i32 {
+    let ei = threadSubscriptionRegistry_find(reg, tid_ptr, tid_len);
+    if ei < 0 { return 0; };
+    threadSubscriptionRegistry_entry_remove_turn_hold(reg, ei, turn_ptr, turn_len);
+    return threadSubscriptionRegistry_evaluateUnsubscribe(reg, ei);
+}
+
+// L219-268: private async ensureSubscribed(entry)
+// DEFECT: async -> synchronous; client.getStatus()/client.request are extern RPC approximations.
+fn threadSubscriptionRegistry_ensureSubscribed(reg: &ThreadSubscriptionRegistry, ei: i64) -> i32 {
+    if ei < 0 { return 0; };
+    if threadSubscriptionRegistry_entry_is_subscribed(reg, ei) != 0 { return 0; };
+    if threadSubscriptionRegistry_entry_has_timer(reg, ei) != 0 { return 0; };
+    if threadSubscriptionRegistry_entry_is_retry_exhausted(reg, ei) != 0 { return 0; };
+    if threadSubscriptionRegistry_entry_is_lease_blocked(reg, ei) != 0 { return 0; };
+    // const client = this.getClient(entry.threadId); status.phase !== "ready" -> return
+    // DEFECT: getClient closure dispatch -> extern client_status_phase(reg.get_client_id, threadId)
+    if threadSubscriptionRegistry_client_ready(reg, ei) == 0 { return 0; };
+    // if (writerLeases && !writerLeases.acquire(threadId)) { leaseBlocked=true; emit("subscriptionError", {...Error}) ; return; }
+    if reg.has_writer_leases {
+        if threadSubscriptionRegistry_acquire_lease(reg, ei) == 0 {
+            threadSubscriptionRegistry_entry_set_lease_blocked(reg, ei, 1);
+            // DEFECT: EventEmitter.emit("subscriptionError", {threadId, error: new Error(...)}) -> host callback stub
+            threadSubscriptionRegistry_emit_subscription_error(reg, ei, 1);
+            return 0;
+        };
+    };
+    // try { subscribed=true; await client.request("thread/resume", {threadId});
+    //       if entry replaced meanwhile -> unsubscribe + return; reset retry counters }
+    // catch (error) { if replaced return; emit subscriptionError;
+    //       if isActiveWriterConflict -> leaseBlocked, release lease, return;
+    //       release lease; subscribed=false; scheduleRetry }
+    // DEFECT: try/catch + Promise await -> blocking extern threadSubscriptionRegistry_rpc_resume returning status code; error object -> code + message buffer.
+    threadSubscriptionRegistry_entry_set_subscribed(reg, ei, 1);
+    let rc = threadSubscriptionRegistry_rpc_resume(reg, ei);
+    if threadSubscriptionRegistry_entry_still_current(reg, ei) == 0 {
+        let rc2 = threadSubscriptionRegistry_rpc_unsubscribe_current(reg, ei);
+        return rc2;
+    };
+    if rc == 0 {
+        threadSubscriptionRegistry_entry_reset_retry(reg, ei);
+        return 0;
+    };
+    threadSubscriptionRegistry_emit_subscription_error(reg, ei, 0);
+    if threadSubscriptionRegistry_last_error_is_writer_conflict(reg, ei) != 0 {
+        threadSubscriptionRegistry_entry_set_subscribed(reg, ei, 0);
+        threadSubscriptionRegistry_entry_set_lease_blocked(reg, ei, 1);
+        threadSubscriptionRegistry_entry_reset_retry(reg, ei);
+        threadSubscriptionRegistry_release_lease_idx(reg, ei);
+        return 0;
+    };
+    threadSubscriptionRegistry_release_lease_idx(reg, ei);
+    threadSubscriptionRegistry_entry_set_subscribed(reg, ei, 0);
+    return threadSubscriptionRegistry_scheduleRetry(reg, ei);
+}
+
+// L270-288: private scheduleRetry(entry) — setTimeout exponential backoff
+fn threadSubscriptionRegistry_scheduleRetry(reg: &ThreadSubscriptionRegistry, ei: i64) -> i32 {
+    if threadSubscriptionRegistry_entry_has_timer(reg, ei) != 0 { return 0; };
+    if threadSubscriptionRegistry_entry_refcount(reg, ei) == 0 { return 0; };
+    if threadSubscriptionRegistry_entry_retry_attempt(reg, ei) >= SUBSCRIPTION_RETRY_MAX_ATTEMPTS {
+        threadSubscriptionRegistry_entry_set_retry_exhausted(reg, ei, 1);
+        return 0;
+    };
+    // delayMs = min(MAX, BASE * 2 ** min(attempt, 6))
+    let attempt = threadSubscriptionRegistry_entry_retry_attempt(reg, ei);
+    let shift = attempt;
+    if shift > 6 { shift = 6; };
+    let delay_ms = SUBSCRIPTION_RETRY_BASE_MS * (1 << shift);
+    if delay_ms > SUBSCRIPTION_RETRY_MAX_MS { delay_ms = SUBSCRIPTION_RETRY_MAX_MS; };
+    threadSubscriptionRegistry_entry_inc_retry_attempt(reg, ei);
+    // DEFECT: setTimeout(callback, delayMs) timer + closure capture of entry -> host timer registration; callback re-checks entry identity then ensureSubscribed.
+    threadSubscriptionRegistry_entry_set_timer(reg, ei, delay_ms);
+    return 0;
+}
+
+// L290-312: private async evaluateUnsubscribe(entry)
+// DEFECT: async -> synchronous; await client.request -> blocking extern.
+fn threadSubscriptionRegistry_evaluateUnsubscribe(reg: &ThreadSubscriptionRegistry, ei: i64) -> i32 {
+    if threadSubscriptionRegistry_entry_refcount(reg, ei) > 0 { return 0; };
+    threadSubscriptionRegistry_entry_clear_timer(reg, ei);
+    if threadSubscriptionRegistry_entry_is_subscribed(reg, ei) == 0 {
+        // capture threadId before delete for lease release (source deletes then releases by entry.threadId)
+        threadSubscriptionRegistry_delete_entry_and_release(reg, ei);
+        return 0;
+    };
+    // client ready check, subscribed=false, delete entry, await unsubscribe (errors swallowed), release lease
+    let ready = threadSubscriptionRegistry_client_ready(reg, ei);
+    threadSubscriptionRegistry_entry_set_subscribed(reg, ei, 0);
+    threadSubscriptionRegistry_delete_entry_keep_id(reg, ei);
+    if ready != 0 {
+        let rc = threadSubscriptionRegistry_rpc_unsubscribe_saved(reg, ei);
+        if rc != 0 { /* catch {} in source */ };
+    };
+    threadSubscriptionRegistry_release_lease_saved(reg, ei);
+    return 0;
+}
+
+// L314-330: private async reAttachAll()
+// DEFECT: async sequential await in for..of over Map.values() -> index loop with blocking calls.
+fn threadSubscriptionRegistry_reAttachAll(reg: &ThreadSubscriptionRegistry) -> i32 {
+    let i: u64 = 0;
+    while i < reg.entries_len {
+        if threadSubscriptionRegistry_entry_refcount(reg, i) > 0 {
+            threadSubscriptionRegistry_entry_clear_timer(reg, i);
+            threadSubscriptionRegistry_entry_reset_flags(reg, i);
+            let rc = threadSubscriptionRegistry_ensureSubscribed(reg, i);
+            if rc != 0 { return rc; };
+        };
+        i = i + 1;
+    }
+    return 0;
+}
+
+// L333-346: function isActiveWriterConflict(error: unknown): boolean
+// DEFECT: unknown/Error/string/object union narrowing + RegExp test -> substring scan for
+// "already has an active writer" / "thread-store conflict" (case-insensitive) over message buffer.
+fn isActiveWriterConflict(msg_ptr: ptr, msg_len: u64) -> bool {
+    // DEFECT: regex /already has an active writer|thread-store conflict/i -> two case-insensitive substring searches.
+    return false;
+}
+
+// --- Internal helpers (no TS counterpart names; entry storage accessors) ---
+// DEFECT: entry storage helpers exist only because Map/Set have no SLA counterpart.
+fn threadSubscriptionRegistry_find(reg: &ThreadSubscriptionRegistry, tid_ptr: ptr, tid_len: u64) -> i64 { return -1; }
+fn threadSubscriptionRegistry_find_or_create(reg: &ThreadSubscriptionRegistry, tid_ptr: ptr, tid_len: u64, subscribed: u64) -> i64 { return -1; }
+fn threadSubscriptionRegistry_delete_entry(reg: &ThreadSubscriptionRegistry, ei: i64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_delete_entry_and_release(reg: &ThreadSubscriptionRegistry, ei: i64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_delete_entry_keep_id(reg: &ThreadSubscriptionRegistry, ei: i64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_entry_add_watcher(reg: &ThreadSubscriptionRegistry, ei: i64, p: ptr, l: u64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_entry_remove_watcher(reg: &ThreadSubscriptionRegistry, ei: i64, p: ptr, l: u64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_entry_has_watcher(reg: &ThreadSubscriptionRegistry, ei: u64, p: ptr, l: u64) -> bool { return false; }
+fn threadSubscriptionRegistry_entry_add_turn_hold(reg: &ThreadSubscriptionRegistry, ei: i64, p: ptr, l: u64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_entry_remove_turn_hold(reg: &ThreadSubscriptionRegistry, ei: i64, p: ptr, l: u64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_entry_refcount(reg: &ThreadSubscriptionRegistry, ei: u64) -> u64 { return 0; }
+fn threadSubscriptionRegistry_entry_is_subscribed(reg: &ThreadSubscriptionRegistry, ei: u64) -> i64 { return 0; }
+fn threadSubscriptionRegistry_entry_set_subscribed(reg: &ThreadSubscriptionRegistry, ei: i64, v: u64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_entry_has_timer(reg: &ThreadSubscriptionRegistry, ei: u64) -> i64 { return 0; }
+fn threadSubscriptionRegistry_entry_clear_timer(reg: &ThreadSubscriptionRegistry, ei: u64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_entry_set_timer(reg: &ThreadSubscriptionRegistry, ei: i64, delay_ms: u64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_entry_is_retry_exhausted(reg: &ThreadSubscriptionRegistry, ei: u64) -> i64 { return 0; }
+fn threadSubscriptionRegistry_entry_set_retry_exhausted(reg: &ThreadSubscriptionRegistry, ei: i64, v: u64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_entry_is_lease_blocked(reg: &ThreadSubscriptionRegistry, ei: u64) -> i64 { return 0; }
+fn threadSubscriptionRegistry_entry_set_lease_blocked(reg: &ThreadSubscriptionRegistry, ei: i64, v: u64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_entry_retry_attempt(reg: &ThreadSubscriptionRegistry, ei: u64) -> u64 { return 0; }
+fn threadSubscriptionRegistry_entry_inc_retry_attempt(reg: &ThreadSubscriptionRegistry, ei: i64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_entry_reset_retry(reg: &ThreadSubscriptionRegistry, ei: i64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_entry_reset_flags(reg: &ThreadSubscriptionRegistry, ei: u64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_entry_still_current(reg: &ThreadSubscriptionRegistry, ei: i64) -> i64 { return 1; }
+fn threadSubscriptionRegistry_client_ready(reg: &ThreadSubscriptionRegistry, ei: u64) -> i64 { return 0; }
+fn threadSubscriptionRegistry_acquire_lease(reg: &ThreadSubscriptionRegistry, ei: i64) -> i64 { return 1; }
+fn threadSubscriptionRegistry_release_lease(reg: &ThreadSubscriptionRegistry, p: ptr, l: u64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_release_lease_idx(reg: &ThreadSubscriptionRegistry, ei: i64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_release_lease_saved(reg: &ThreadSubscriptionRegistry, ei: i64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_rpc_resume(reg: &ThreadSubscriptionRegistry, ei: i64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_rpc_unsubscribe(reg: &ThreadSubscriptionRegistry, p: ptr, l: u64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_rpc_unsubscribe_current(reg: &ThreadSubscriptionRegistry, ei: i64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_rpc_unsubscribe_saved(reg: &ThreadSubscriptionRegistry, ei: i64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_emit_subscription_error(reg: &ThreadSubscriptionRegistry, ei: i64, lease: u64) -> i32 { return 0; }
+fn threadSubscriptionRegistry_last_error_is_writer_conflict(reg: &ThreadSubscriptionRegistry, ei: i64) -> i64 { return 0; }

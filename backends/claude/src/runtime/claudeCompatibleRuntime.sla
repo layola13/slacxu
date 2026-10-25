@@ -1,0 +1,516 @@
+// Converted 1:1 from backends/claude/src/runtime/claudeCompatibleRuntime.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/json.sai"
+@import "claudeCompatibleProcessManager.sla"
+@import "claudeSessionStore.sla"
+@import "claudeCompatibleTurnProjector.sla"
+@import "claudeCompatibleProtocol.sla"
+@import "claudePermissionRegistry.sla"
+
+// DEFECT: node:events EventEmitter + node:crypto randomUUID have no SLA
+// counterparts. `extends EventEmitter` is approximated by an explicit
+// notification/stderr/exit/error queue inside the runtime struct, drained via
+// ClaudeCompatibleRuntime_drainEvent. randomUUID is a host_random_uuid placeholder.
+// DEFECT: process manager events ("message"/"stderr"/"exit"/"error" .on(...)
+// registrations) are realized by ClaudeCompatibleRuntime_pump, which drains
+// the manager queue and dispatches — TS is push-driven, SLA here is poll-driven.
+// DEFECT: JsonRpcNotification / JsonValue payloads approximated as JSON text.
+
+struct ClaudeRuntimeConfig {
+    threadId: [u8; 128],
+    threadId_len: u64,
+    ownerId: [u8; 128],
+    ownerId_len: u64,
+    cwd: [u8; 1024],
+    cwd_len: u64,
+    has_model: bool,
+    model: [u8; 256],
+    model_len: u64,
+    has_sandbox: bool,
+    sandbox: [u8; 128],
+    sandbox_len: u64,
+    has_approvalPolicy: bool,
+    approvalPolicy: [u8; 128],
+    approvalPolicy_len: u64,
+    has_env: bool,
+    env: [u8; 65536], // NodeJS.ProcessEnv as env text buffer
+    env_len: u64,
+}
+
+struct ClaudeTurnRequest {
+    prompt: [u8; 1048576],
+    prompt_len: u64,
+    has_turnId: bool,
+    turnId: [u8; 128],
+    turnId_len: u64,
+}
+
+// TS private interface PendingPermission (local to the runtime)
+struct RuntimePendingPermission {
+    claudeRequestId: [u8; 128],
+    claudeRequestId_len: u64,
+    threadId: [u8; 128],
+    threadId_len: u64,
+    turnId: [u8; 128],
+    turnId_len: u64,
+    occupied: bool,
+    serverRequestId: [u8; 256],
+    serverRequestId_len: u64,
+}
+
+const RT_EVENT_NONE: u64 = 0;
+const RT_EVENT_NOTIFICATION: u64 = 1;
+const RT_EVENT_STDERR: u64 = 2;
+const RT_EVENT_EXIT: u64 = 3;
+const RT_EVENT_ERROR: u64 = 4;
+
+// Orchestrates a single Claude-compatible CLI thread.
+// (Responsibilities / Must NOT list preserved from the TS doc comment in the defect log.)
+struct ClaudeCompatibleRuntime {
+    has_process: bool,
+    process: ClaudeCompatibleProcessManager,
+    has_ctx: bool,
+    ctx: ProjectorContext,
+    has_activeTurnId: bool,
+    activeTurnId: [u8; 128],
+    activeTurnId_len: u64,
+    // DEFECT: Map<string, PendingPermission> approximated by fixed array (capacity 128).
+    pendingPermissions: [RuntimePendingPermission; 128],
+    pendingPermissions_count: u64,
+    has_permissionRegistry: bool,
+    permissionRegistry: ClaudePermissionRegistry,
+    sessionStore: ClaudeSessionStore,
+    config: ClaudeRuntimeConfig,
+    env: [u8; 65536],
+    env_len: u64,
+    nextControlId: u64,
+    runtimeId: [u8; 256], // "rt-" + threadId
+    runtimeId_len: u64,
+    // EventEmitter output queue (notification/stderr/exit/error)
+    out_kinds: [u64; 256],
+    out_lens: [u64; 256],
+    out_texts: [u8; 1048576],
+    out_head: u64,
+    out_tail: u64,
+}
+
+fn rt_emit(rt: &ClaudeCompatibleRuntime, kind: u64, text_ptr: ptr, text_len: u64) -> void {
+    if rt.out_tail >= 256 { return; };
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < rt.out_tail { off = off + rt.out_lens[i]; i = i + 1; };
+    let j: u64 = 0;
+    while j < text_len { rt.out_texts[off + j] = PTR_BYTE_AT(text_ptr, j); j = j + 1; };
+    rt.out_lens[rt.out_tail] = text_len;
+    rt.out_kinds[rt.out_tail] = kind;
+    rt.out_tail = rt.out_tail + 1;
+    return;
+}
+
+fn ClaudeCompatibleRuntime_drainEvent(rt: &ClaudeCompatibleRuntime, out: &ByteBuf) -> u64 {
+    if rt.out_head >= rt.out_tail { return RT_EVENT_NONE; };
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < rt.out_head { off = off + rt.out_lens[i]; i = i + 1; };
+    buf_append_bytes(out, rt.out_texts + off, rt.out_lens[rt.out_head]);
+    let kind: u64 = rt.out_kinds[rt.out_head];
+    rt.out_head = rt.out_head + 1;
+    return kind;
+}
+
+// constructor(config, sessionStore, permissionRegistry = null)
+fn ClaudeCompatibleRuntime_new(rt: &ClaudeCompatibleRuntime, config: &ClaudeRuntimeConfig, sessionStore: &ClaudeSessionStore, has_permissionRegistry: bool, permissionRegistry: &ClaudePermissionRegistry, process_env_ptr: ptr, process_env_len: u64) -> void {
+    // super();
+    rt.config = config;
+    rt.sessionStore = sessionStore;
+    rt.has_permissionRegistry = has_permissionRegistry;
+    if has_permissionRegistry { rt.permissionRegistry = permissionRegistry; };
+    // this.env = config.env ?? process.env;
+    if config.has_env {
+        rt.env_len = config.env_len;
+        buf_copy_buf(&config.env, config.env_len, &rt.env);
+    } else {
+        rt.env_len = process_env_len;
+        buf_copy_ptr_to(process_env_ptr, process_env_len, &rt.env);
+    };
+    // this.runtimeId = "rt-" + this.config.threadId;
+    let rid = ByteBuf { bytes: [0u8; 256], len: 0 };
+    buf_append_lit(&rid, STR_PTR("rt-"), STR_LEN("rt-"));
+    buf_append_bytes(&rid, &config.threadId, config.threadId_len);
+    rt.runtimeId_len = rid.len;
+    buf_copy_to(&rid, &rt.runtimeId);
+    rt.has_process = false;
+    rt.has_ctx = false;
+    rt.has_activeTurnId = false;
+    rt.activeTurnId_len = 0;
+    rt.pendingPermissions_count = 0;
+    rt.nextControlId = 1;
+    rt.out_head = 0;
+    rt.out_tail = 0;
+    return;
+}
+
+fn buf_copy_buf(src: &[u8], src_len: u64, dst: &[u8]) -> void {
+    let i: u64 = 0;
+    while i < src_len { dst[i] = src[i]; i = i + 1; };
+    return;
+}
+
+// Start the Claude CLI process.
+fn ClaudeCompatibleRuntime_start(rt: &ClaudeCompatibleRuntime) -> void {
+    // if (this.process) return;
+    if rt.has_process { return; };
+    // const procConfig: ClaudeProcessConfig = { cwd, model, sandbox, approvalPolicy };
+    let procConfig = ClaudeProcessConfig { cwd: [0u8; 1024], cwd_len: rt.config.cwd_len, has_model: rt.config.has_model, model: [0u8; 256], model_len: rt.config.model_len, has_sandbox: rt.config.has_sandbox, sandbox: [0u8; 128], sandbox_len: rt.config.sandbox_len, has_approvalPolicy: rt.config.has_approvalPolicy, approvalPolicy: [0u8; 128], approvalPolicy_len: rt.config.approvalPolicy_len, has_envOverrides: false, envOverrides: [0u8; 16384], envOverrides_len: 0 };
+    buf_copy_buf(&rt.config.cwd, rt.config.cwd_len, &procConfig.cwd);
+    buf_copy_buf(&rt.config.model, rt.config.model_len, &procConfig.model);
+    buf_copy_buf(&rt.config.sandbox, rt.config.sandbox_len, &procConfig.sandbox);
+    buf_copy_buf(&rt.config.approvalPolicy, rt.config.approvalPolicy_len, &procConfig.approvalPolicy);
+    // this.process = new ClaudeCompatibleProcessManager(procConfig);
+    ClaudeCompatibleProcessManager_new(&rt.process, &procConfig);
+    rt.has_process = true;
+    // this.process.on("message"/"stderr"/"exit"/"error", ...) registrations —
+    // realized in _pump (see header DEFECT).
+    // this.process.start(this.env);
+    let err = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    let rc = ClaudeCompatibleProcessManager_start(&rt.process, &rt.env, rt.env_len, &err);
+    // DEFECT: TS start() would propagate a throw from process.start; here the
+    // error is queued as an "error" event approximation.
+    if rc != 0 { rt_emit(rt, RT_EVENT_ERROR, &err.bytes, err.len); };
+    return;
+}
+
+// Pump: drains the process manager's event queue and dispatches exactly as the
+// TS .on(...) handlers do.
+fn ClaudeCompatibleRuntime_pump(rt: &ClaudeCompatibleRuntime) -> void {
+    if rt.has_process == false { return; };
+    ClaudeCompatibleProcessManager_pump(&rt.process);
+    let payload = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    let kind: u64 = ClaudeCompatibleProcessManager_drainEvent(&rt.process, &payload);
+    while kind != MGR_EVENT_NONE {
+        if kind == MGR_EVENT_MESSAGE {
+            // this.process.on("message", msg => this.handleMessage(msg as ClaudeMessage));
+            let msg = ClaudeMessage { kind: 0, type: [0u8; 64], type_len: 0, has_session_id: false, session_id: [0u8; 128], session_id_len: 0, json: [0u8; 262144], json_len: 0 };
+            if parseClaudeMessage(&payload.bytes, payload.len, &msg) == 0 {
+                ClaudeCompatibleRuntime_handleMessage(rt, &msg);
+            };
+        };
+        if kind == MGR_EVENT_STDERR {
+            // this.process.on("stderr", text => this.emit("stderr", text));
+            rt_emit(rt, RT_EVENT_STDERR, &payload.bytes, payload.len);
+        };
+        if kind == MGR_EVENT_EXIT {
+            // this.process.on("exit", ({ code }) => { if (ctx && activeTurnId) forceTerminate...; this.process = null; this.emit("exit", { code }); });
+            let code: i64 = -1;
+            // DEFECT: exit payload destructuring { code } from the manager's JSON-text payload approximated by a JSON probe.
+            let doc = sa_json_parse(&payload.bytes, payload.len);
+            if doc != 0 { code = sa_json_get_i64(doc, STR_PTR("code"), STR_LEN("code")); sa_json_free(doc); };
+            if rt.has_ctx && rt.has_activeTurnId {
+                let reason = ByteBuf { bytes: [0u8; 256], len: 0 };
+                buf_append_lit(&reason, STR_PTR("Claude CLI process exited with code "), STR_LEN("Claude CLI process exited with code "));
+                if code == -1 { buf_append_lit(&reason, STR_PTR("null"), STR_LEN("null")); } else { buf_append_i64(&reason, code); };
+                let ev = ProjectedEvent { kind: [0u8; 64], kind_len: 0, threadId: [0u8; 128], threadId_len: 0, turnId: [0u8; 128], turnId_len: 0, json: [0u8; 262144], json_len: 0 };
+                let has_ev: bool = false;
+                forceTerminate(&rt.ctx, &reason.bytes, reason.len, &ev, &has_ev);
+                if has_ev { ClaudeCompatibleRuntime_emitEvent(rt, &ev); };
+            };
+            rt.has_process = false;
+            rt_emit(rt, RT_EVENT_EXIT, &payload.bytes, payload.len);
+        };
+        if kind == MGR_EVENT_ERROR {
+            // this.process.on("error", error => this.emit("error", error));
+            rt_emit(rt, RT_EVENT_ERROR, &payload.bytes, payload.len);
+        };
+        payload.len = 0;
+        kind = ClaudeCompatibleProcessManager_drainEvent(&rt.process, &payload);
+    }
+    return;
+}
+
+// Start a turn. Returns the turn ID immediately (copied to out_turnId).
+// DEFECT: randomUUID() approximated by host_random_uuid placeholder extern.
+fn ClaudeCompatibleRuntime_startTurn(rt: &ClaudeCompatibleRuntime, request: &ClaudeTurnRequest, out_turnId: &ByteBuf) -> void {
+    // if (!this.process) this.start();
+    if rt.has_process == false { ClaudeCompatibleRuntime_start(rt); };
+    // const turnId = request.turnId ?? randomUUID();
+    let turnId = ByteBuf { bytes: [0u8; 128], len: 0 };
+    if request.has_turnId {
+        buf_append_bytes(&turnId, &request.turnId, request.turnId_len);
+    } else {
+        host_random_uuid(&turnId);
+    };
+    rt.has_activeTurnId = true;
+    rt.activeTurnId_len = turnId.len;
+    buf_copy_to(&turnId, &rt.activeTurnId);
+    // this.ctx = createProjectorContext(this.config.threadId, turnId);
+    createProjectorContext(&rt.config.threadId, rt.config.threadId_len, &turnId.bytes, turnId.len, &rt.ctx);
+    rt.has_ctx = true;
+    // this.emitEvent({ kind: "turn/started", threadId, turnId });
+    let ev = ProjectedEvent { kind: [0u8; 64], kind_len: 0, threadId: [0u8; 128], threadId_len: 0, turnId: [0u8; 128], turnId_len: 0, json: [0u8; 262144], json_len: 0 };
+    ev.kind_len = STR_LEN("turn/started");
+    buf_copy_lit_to(STR_PTR("turn/started"), STR_LEN("turn/started"), &ev.kind);
+    ev.threadId_len = rt.config.threadId_len;
+    buf_copy_buf(&rt.config.threadId, rt.config.threadId_len, &ev.threadId);
+    ev.turnId_len = turnId.len;
+    buf_copy_to(&turnId, &ev.turnId);
+    ClaudeCompatibleRuntime_emitEvent(rt, &ev);
+    // this.process!.writeStdin({ type: "user", message: { role: "user", content: request.prompt }, parent_tool_use_id: null } as JsonValue);
+    // DEFECT: object literal + JSON.stringify approximated by manual JSON build with escaping.
+    let msg = ByteBuf { bytes: [0u8; 1048576], len: 0 };
+    buf_append_lit(&msg, STR_PTR("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\""), STR_LEN("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\""));
+    json_escape_into(&msg, &request.prompt, request.prompt_len);
+    buf_append_lit(&msg, STR_PTR("\"},\"parent_tool_use_id\":null}"), STR_LEN("\"},\"parent_tool_use_id\":null}"));
+    let werr = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    let wrc = ClaudeCompatibleProcessManager_writeStdin(&rt.process, &msg.bytes, msg.len, &werr);
+    if wrc != 0 { rt_emit(rt, RT_EVENT_ERROR, &werr.bytes, werr.len); };
+    // return turnId;
+    buf_append_bytes(out_turnId, &turnId.bytes, turnId.len);
+    return;
+}
+
+// Interrupt the active turn.
+fn ClaudeCompatibleRuntime_interrupt(rt: &ClaudeCompatibleRuntime) -> void {
+    // if (!this.process || !this.activeTurnId || !this.ctx) return;
+    if rt.has_process == false || rt.has_activeTurnId == false || rt.has_ctx == false { return; };
+    // const interruptId = "interrupt-" + this.nextControlId++;
+    let interruptId = ByteBuf { bytes: [0u8; 128], len: 0 };
+    buf_append_lit(&interruptId, STR_PTR("interrupt-"), STR_LEN("interrupt-"));
+    buf_append_u64(&interruptId, rt.nextControlId);
+    rt.nextControlId = rt.nextControlId + 1;
+    // this.process.writeStdin(buildInterruptRequest(interruptId));
+    let req = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    buildInterruptRequest(&interruptId.bytes, interruptId.len, &req);
+    let werr = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    let wrc = ClaudeCompatibleProcessManager_writeStdin(&rt.process, &req.bytes, req.len, &werr);
+    // const event = markInterrupted(this.ctx);
+    let ev = ProjectedEvent { kind: [0u8; 64], kind_len: 0, threadId: [0u8; 128], threadId_len: 0, turnId: [0u8; 128], turnId_len: 0, json: [0u8; 262144], json_len: 0 };
+    let has_ev: bool = false;
+    markInterrupted(&rt.ctx, &ev, &has_ev);
+    // if (event) { this.emitEvent(event); this.pendingPermissions.clear(); this.permissionRegistry?.cancelAllForThread(...); }
+    if has_ev {
+        ClaudeCompatibleRuntime_emitEvent(rt, &ev);
+        rt.pendingPermissions_count = 0;
+        if rt.has_permissionRegistry {
+            let cancelled = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+            ClaudePermissionRegistry_cancelAllForThread(&rt.permissionRegistry, &rt.config.threadId, rt.config.threadId_len, &cancelled);
+        };
+    };
+    return;
+}
+
+// Respond to a permission request from Claude.
+fn ClaudeCompatibleRuntime_respondToPermission(rt: &ClaudeCompatibleRuntime, serverRequestId_ptr: ptr, serverRequestId_len: u64, allowed: bool, has_denyReason: bool, denyReason_ptr: ptr, denyReason_len: u64) -> void {
+    // const pending = this.pendingPermissions.get(serverRequestId);
+    let idx: i64 = rt_pending_find(rt, serverRequestId_ptr, serverRequestId_len);
+    if idx >= 0 {
+        let pending = rt.pendingPermissions[idx];
+        // this.pendingPermissions.delete(serverRequestId); this.permissionRegistry?.consume(serverRequestId);
+        rt_pending_remove(rt, idx);
+        if rt.has_permissionRegistry {
+            let consumed = PendingClaudePermission { serverRequestId: [0u8; 256], serverRequestId_len: 0, claudeRequestId: [0u8; 128], claudeRequestId_len: 0, threadId: [0u8; 128], threadId_len: 0, ownerId: [0u8; 128], ownerId_len: 0, turnId: [0u8; 128], turnId_len: 0, runtimeId: [0u8; 256], runtimeId_len: 0, createdAt: 0, timeoutMs: 0, has_timer: false, expires_at_ms: 0, occupied: false };
+            ClaudePermissionRegistry_consume(&rt.permissionRegistry, serverRequestId_ptr, serverRequestId_len, &consumed);
+        };
+        // if (!pending || !this.process) return; this.process.writeStdin(buildControlResponse(pending.claudeRequestId, allowed, denyReason));
+        if rt.has_process == false { return; };
+        let resp = ByteBuf { bytes: [0u8; 8192], len: 0 };
+        buildControlResponse(&pending.claudeRequestId, pending.claudeRequestId_len, allowed, has_denyReason, denyReason_ptr, denyReason_len, &resp);
+        let werr = ByteBuf { bytes: [0u8; 4096], len: 0 };
+        ClaudeCompatibleProcessManager_writeStdin(&rt.process, &resp.bytes, resp.len, &werr);
+        return;
+    };
+    // else if (this.permissionRegistry) { const fromRegistry = this.permissionRegistry.consume(serverRequestId); if (fromRegistry) { if (!this.process) return; writeStdin(buildControlResponse(fromRegistry.claudeRequestId, ...)); } return; }
+    if rt.has_permissionRegistry {
+        let fromRegistry = PendingClaudePermission { serverRequestId: [0u8; 256], serverRequestId_len: 0, claudeRequestId: [0u8; 128], claudeRequestId_len: 0, threadId: [0u8; 128], threadId_len: 0, ownerId: [0u8; 128], ownerId_len: 0, turnId: [0u8; 128], turnId_len: 0, runtimeId: [0u8; 256], runtimeId_len: 0, createdAt: 0, timeoutMs: 0, has_timer: false, expires_at_ms: 0, occupied: false };
+        if ClaudePermissionRegistry_consume(&rt.permissionRegistry, serverRequestId_ptr, serverRequestId_len, &fromRegistry) {
+            if rt.has_process == false { return; };
+            let resp2 = ByteBuf { bytes: [0u8; 8192], len: 0 };
+            buildControlResponse(&fromRegistry.claudeRequestId, fromRegistry.claudeRequestId_len, allowed, has_denyReason, denyReason_ptr, denyReason_len, &resp2);
+            let werr2 = ByteBuf { bytes: [0u8; 4096], len: 0 };
+            ClaudeCompatibleProcessManager_writeStdin(&rt.process, &resp2.bytes, resp2.len, &werr2);
+        };
+        return;
+    };
+    return;
+}
+
+fn rt_pending_find(rt: &ClaudeCompatibleRuntime, id_ptr: ptr, id_len: u64) -> i64 {
+    let i: u64 = 0;
+    while i < rt.pendingPermissions_count {
+        if rt.pendingPermissions[i].occupied && rt.pendingPermissions[i].serverRequestId_len == id_len && bytes_eq_range(&rt.pendingPermissions[i].serverRequestId, id_ptr, id_len) { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn rt_pending_remove(rt: &ClaudeCompatibleRuntime, idx: u64) -> void {
+    let last: u64 = rt.pendingPermissions_count - 1;
+    if idx != last { rt.pendingPermissions[idx] = rt.pendingPermissions[last]; };
+    rt.pendingPermissions[last].occupied = false;
+    rt.pendingPermissions_count = last;
+    return;
+}
+
+fn rt_pending_set(rt: &ClaudeCompatibleRuntime, serverRequestId_ptr: ptr, serverRequestId_len: u64, claudeRequestId_ptr: ptr, claudeRequestId_len: u64, threadId_ptr: ptr, threadId_len: u64, turnId_ptr: ptr, turnId_len: u64) -> void {
+    // this.pendingPermissions.set(serverRequestId, { claudeRequestId, threadId, turnId });
+    let existing: i64 = rt_pending_find(rt, serverRequestId_ptr, serverRequestId_len);
+    let idx: u64 = 0;
+    if existing >= 0 { idx = existing; } else {
+        if rt.pendingPermissions_count >= 128 { return; };
+        idx = rt.pendingPermissions_count;
+        rt.pendingPermissions_count = rt.pendingPermissions_count + 1;
+    };
+    let e = &rt.pendingPermissions[idx];
+    e.occupied = true;
+    e.serverRequestId_len = serverRequestId_len;
+    buf_copy_ptr_to(serverRequestId_ptr, serverRequestId_len, &e.serverRequestId);
+    e.claudeRequestId_len = claudeRequestId_len;
+    buf_copy_ptr_to(claudeRequestId_ptr, claudeRequestId_len, &e.claudeRequestId);
+    e.threadId_len = threadId_len;
+    buf_copy_ptr_to(threadId_ptr, threadId_len, &e.threadId);
+    e.turnId_len = turnId_len;
+    buf_copy_ptr_to(turnId_ptr, turnId_len, &e.turnId);
+    return;
+}
+
+// Stop the Claude process and clean up.
+fn ClaudeCompatibleRuntime_stop(rt: &ClaudeCompatibleRuntime) -> void {
+    // if (this.ctx && this.activeTurnId) { const event = forceTerminate(this.ctx, "Runtime stopped"); if (event) this.emitEvent(event); }
+    if rt.has_ctx && rt.has_activeTurnId {
+        let ev = ProjectedEvent { kind: [0u8; 64], kind_len: 0, threadId: [0u8; 128], threadId_len: 0, turnId: [0u8; 128], turnId_len: 0, json: [0u8; 262144], json_len: 0 };
+        let has_ev: bool = false;
+        forceTerminate(&rt.ctx, STR_PTR("Runtime stopped"), STR_LEN("Runtime stopped"), &ev, &has_ev);
+        if has_ev { ClaudeCompatibleRuntime_emitEvent(rt, &ev); };
+    };
+    // this.process?.stop(); — TS default timeoutMs = 5000.
+    if rt.has_process { ClaudeCompatibleProcessManager_stop(&rt.process, 5000); };
+    // this.pendingPermissions.clear();
+    rt.pendingPermissions_count = 0;
+    // this.permissionRegistry?.cancelAllForRuntime(this.runtimeId);
+    if rt.has_permissionRegistry {
+        let cancelled = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+        ClaudePermissionRegistry_cancelAllForRuntime(&rt.permissionRegistry, &rt.runtimeId, rt.runtimeId_len, &cancelled);
+    };
+    return;
+}
+
+// Check if the runtime has an active (non-terminal) turn.
+fn ClaudeCompatibleRuntime_isTurnActive(rt: &ClaudeCompatibleRuntime) -> bool {
+    // return this.ctx !== null && this.ctx.turn.status === "running";
+    return rt.has_ctx && rt.ctx.turn_status == TURN_STATUS_RUNNING;
+}
+
+// Get the external session ID, if known.
+// Returns true and fills out when found (TS returns string | null).
+fn ClaudeCompatibleRuntime_getExternalSessionId(rt: &ClaudeCompatibleRuntime, out: &ByteBuf) -> bool {
+    // return this.ctx?.sessionToThread ? Array.from(entries).find(([_, v]) => v === threadId)?.[0] ?? null : null;
+    // DEFECT: Map iteration + Array.from + find with destructuring approximated by
+    // projector helper scanning the ctx session map.
+    if rt.has_ctx == false { return false; };
+    return projector_session_for_thread(&rt.ctx, &rt.config.threadId, rt.config.threadId_len, out);
+}
+
+// private handleMessage(message: ClaudeMessage): void
+fn ClaudeCompatibleRuntime_handleMessage(rt: &ClaudeCompatibleRuntime, message: &ClaudeMessage) -> void {
+    // if (!this.ctx) return;
+    if rt.has_ctx == false { return; };
+    // const events = projectMessage(message, this.ctx);
+    let events: [ProjectedEvent; 64] = [ProjectedEvent { kind: [0u8; 64], kind_len: 0, threadId: [0u8; 128], threadId_len: 0, turnId: [0u8; 128], turnId_len: 0, json: [0u8; 262144], json_len: 0 }; 64];
+    let events_count: u64 = projectMessage(message, &rt.ctx, &events, 64);
+    // Persist session ID on system/init
+    if bytes_eq_range(&message.type, STR_PTR("system"), STR_LEN("system")) {
+        // DEFECT: (message as {subtype}) casts — subtype probed from the raw JSON.
+        let doc = sa_json_parse(&message.json, message.json_len);
+        if doc != 0 {
+            let subtype: [u8; 64] = [0u8; 64];
+            let subtype_len: u64 = sa_json_get_string(doc, STR_PTR("subtype"), STR_LEN("subtype"), &subtype, 64);
+            if bytes_eq_range(&subtype, STR_PTR("init"), STR_LEN("init")) {
+                // const sessionId = (message as { session_id?: string }).session_id; if (sessionId) { ...upsert }
+                if message.has_session_id && message.session_id_len > 0 {
+                    let version: [u8; 64] = [0u8; 64];
+                    let version_len: u64 = sa_json_get_string(doc, STR_PTR("claude_code_version"), STR_LEN("claude_code_version"), &version, 64);
+                    let model: [u8; 256] = [0u8; 256];
+                    let model_len: u64 = sa_json_get_string(doc, STR_PTR("model"), STR_LEN("model"), &model, 256);
+                    let mcwd: [u8; 1024] = [0u8; 1024];
+                    let mcwd_len: u64 = sa_json_get_string(doc, STR_PTR("cwd"), STR_LEN("cwd"), &mcwd, 1024);
+                    let pm: [u8; 64] = [0u8; 64];
+                    let pm_len: u64 = sa_json_get_string(doc, STR_PTR("permissionMode"), STR_LEN("permissionMode"), &pm, 64);
+                    let rec = ClaudeSessionRecord { threadId: [0u8; 128], threadId_len: 0, ownerId: [0u8; 128], ownerId_len: 0, has_externalSessionId: false, externalSessionId: [0u8; 128], externalSessionId_len: 0, has_cliVersion: false, cliVersion: [0u8; 64], cliVersion_len: 0, has_model: false, model: [0u8; 256], model_len: 0, has_cwd: false, cwd: [0u8; 1024], cwd_len: 0, has_permissionMode: false, permissionMode: [0u8; 64], permissionMode_len: 0, has_configDir: false, configDir: [0u8; 1024], configDir_len: 0, has_stateJson: false, stateJson: [0u8; 262144], stateJson_len: 0, createdAt: 0, updatedAt: 0 };
+                    // this.sessionStore.upsert({ threadId, ownerId, externalSessionId: sessionId, cliVersion: version ?? null, model: model ?? null, cwd: cwd ?? null, permissionMode: permissionMode ?? null });
+                    ClaudeSessionStore_upsert(&rt.sessionStore, &rt.config.threadId, rt.config.threadId_len, &rt.config.ownerId, rt.config.ownerId_len, true, &message.session_id, message.session_id_len, version_len > 0, &version, version_len, model_len > 0, &model, model_len, mcwd_len > 0, &mcwd, mcwd_len, pm_len > 0, &pm, pm_len, false, STR_PTR(""), 0, false, STR_PTR(""), 0, &rec);
+                };
+            };
+            sa_json_free(doc);
+        };
+    };
+    // Track permission requests
+    if bytes_eq_range(&message.type, STR_PTR("control_request"), STR_LEN("control_request")) {
+        // const req = (message as { request_id?: string; request?: { subtype?: string } });
+        let doc2 = sa_json_parse(&message.json, message.json_len);
+        if doc2 != 0 {
+            let request_id: [u8; 128] = [0u8; 128];
+            let request_id_len: u64 = sa_json_get_string(doc2, STR_PTR("request_id"), STR_LEN("request_id"), &request_id, 128);
+            let rsubtype: [u8; 64] = [0u8; 64];
+            let rsubtype_len: u64 = sa_json_get_nested_string(doc2, STR_PTR("request"), STR_LEN("request"), STR_PTR("subtype"), STR_LEN("subtype"), &rsubtype, 64);
+            // if (req.request?.subtype === "can_use_tool" && req.request_id && this.activeTurnId)
+            if bytes_eq_range(&rsubtype, STR_PTR("can_use_tool"), STR_LEN("can_use_tool")) && request_id_len > 0 && rt.has_activeTurnId {
+                // const serverRequestId = this.permissionRegistry ? registry.register({...}) : "claude-perm-" + req.request_id;
+                let serverRequestId = ByteBuf { bytes: [0u8; 256], len: 0 };
+                if rt.has_permissionRegistry {
+                    ClaudePermissionRegistry_register(&rt.permissionRegistry, &request_id, request_id_len, &rt.config.threadId, rt.config.threadId_len, &rt.config.ownerId, rt.config.ownerId_len, &rt.activeTurnId, rt.activeTurnId_len, &rt.runtimeId, rt.runtimeId_len, false, 0, &serverRequestId);
+                } else {
+                    buf_append_lit(&serverRequestId, STR_PTR("claude-perm-"), STR_LEN("claude-perm-"));
+                    buf_append_bytes(&serverRequestId, &request_id, request_id_len);
+                };
+                // this.pendingPermissions.set(serverRequestId, { claudeRequestId: req.request_id, threadId, turnId: this.activeTurnId });
+                rt_pending_set(rt, &serverRequestId.bytes, serverRequestId.len, &request_id, request_id_len, &rt.config.threadId, rt.config.threadId_len, &rt.activeTurnId, rt.activeTurnId_len);
+                // Override the requestId in projected events with the server-facing ID:
+                // for (const ev of events) if (ev.kind === "item/permissionRequest") (ev as {requestId}).requestId = serverRequestId;
+                // DEFECT: in-place mutation of a typed event field approximated by
+                // rewriting the event's requestId field in the projector struct.
+                let ei: u64 = 0;
+                while ei < events_count {
+                    if bytes_eq_range(&events[ei].kind, STR_PTR("item/permissionRequest"), STR_LEN("item/permissionRequest")) {
+                        events[ei].requestId_len = serverRequestId.len;
+                        buf_copy_to(&serverRequestId, &events[ei].requestId);
+                    };
+                    ei = ei + 1;
+                }
+            };
+            sa_json_free(doc2);
+        };
+    };
+    // Check for terminal state: const terminalEvent = events.find(e => e.kind === "turn/completed" || "turn/failed" || "turn/interrupted");
+    let has_terminal: bool = false;
+    let ti: u64 = 0;
+    while ti < events_count {
+        if bytes_eq_range(&events[ti].kind, STR_PTR("turn/completed"), STR_LEN("turn/completed")) || bytes_eq_range(&events[ti].kind, STR_PTR("turn/failed"), STR_LEN("turn/failed")) || bytes_eq_range(&events[ti].kind, STR_PTR("turn/interrupted"), STR_LEN("turn/interrupted")) { has_terminal = true; };
+        ti = ti + 1;
+    }
+    if has_terminal {
+        // this.activeTurnId = null; this.pendingPermissions.clear(); this.permissionRegistry?.cancelAllForThread(threadId);
+        rt.has_activeTurnId = false;
+        rt.activeTurnId_len = 0;
+        rt.pendingPermissions_count = 0;
+        if rt.has_permissionRegistry {
+            let cancelled = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+            ClaudePermissionRegistry_cancelAllForThread(&rt.permissionRegistry, &rt.config.threadId, rt.config.threadId_len, &cancelled);
+        };
+    };
+    // for (const event of events) this.emitEvent(event);
+    let fi: u64 = 0;
+    while fi < events_count {
+        ClaudeCompatibleRuntime_emitEvent(rt, &events[fi]);
+        fi = fi + 1;
+    }
+    return;
+}
+
+// private emitEvent(event: ProjectedEvent): void
+fn ClaudeCompatibleRuntime_emitEvent(rt: &ClaudeCompatibleRuntime, event: &ProjectedEvent) -> void {
+    // const notification = toNotification(event); this.emit("notification", notification as JsonRpcNotification);
+    let notification = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    toNotification(event, &notification);
+    rt_emit(rt, RT_EVENT_NOTIFICATION, &notification.bytes, notification.len);
+    return;
+}

@@ -1,0 +1,803 @@
+// Converted 1:1 from apps/duck2api/src/duckgo/stream.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/ts_math.sa"
+@import "response.sla"
+@import "tool-simulation.sla"
+@import "tokens.sla"
+
+// Port of duckgo.Handler (internal/duckgo/request.go:1020-1189): incremental
+// playgame tool-simulation parser (ToolSimulationStream, request.go:630-1019)
+// plus text/reasoning passthrough.
+//
+// DEFECT: async/await + closures (emitPart, markFirst, enc, the emit*
+// helpers) become fns over explicit state structs. The `write` callback is
+// an opaque sink handle written via intent extern sa_sink_write_line
+// (0 = ok; nonzero models the TS write() throw that aborts with null).
+// The `countTokens` callback parameter is collapsed to the concrete
+// count_token from tokens.sla (the only function server.sla ever passes).
+// DEFECT: ReadableStream reader + streaming TextDecoder (UTF-8) become
+// intent externs sa_body_read_chunk / sa_body_close; the decoder's
+// incremental UTF-8 handling lives inside the extern.
+// DEFECT: Record<string, unknown> response objects are assembled as JSON
+// text in ByteBufs (field order mirrors the TS object literals).
+
+// TS: export interface StreamStats { start; promptTokens; cachedTokens; effort }
+struct StreamStats {
+    start: u64,
+    prompt_tokens: u64,
+    cached_tokens: u64,
+    effort: StrField,
+}
+
+// TS: export interface StreamResult { text; outputTokens; ttftMs; totalMs; toolCalls }
+struct StreamResult {
+    text: ByteBuf,
+    output_tokens: u64,
+    ttft_ms: u64,
+    total_ms: u64,
+    tool_calls: ToolCallList,
+}
+
+// TS: export interface ConsumeOptions { body; requestModel; reasoningEffort;
+// toolSimulation; stream; stats; write; countTokens }
+struct ConsumeOptions {
+    has_body: bool,
+    body: u64,
+    request_model: StrField,
+    reasoning_effort: StrField,
+    tool_simulation: bool,
+    stream: bool,
+    stats: StreamStats,
+    sink: u64,
+}
+
+// ---------------------------------------------------------------------------
+// consumeUpstream (chat completions projection)
+// ---------------------------------------------------------------------------
+
+struct ChatConsumeState {
+    text: ByteBuf,
+    tool_calls: ToolCallList,
+    tool_parser: ToolSimulationStream,
+    first_token: bool,
+    ttft_ms: u64,
+}
+
+fn chat_mark_first(st: &ChatConsumeState, opts: &ConsumeOptions) -> void {
+    if !st.first_token {
+        st.first_token = true;
+        st.ttft_ms = sa_time_now_ms() - opts.stats.start;
+    };
+}
+
+// write one `data: <json>\n\n` SSE line; false = write threw (abort)
+fn chat_write_chunk(sink: u64, chunk_json: &ByteBuf) -> bool {
+    let line = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&line, STR_PTR("data: "), STR_LEN("data: "));
+    buf_append_buf(&line, chunk_json);
+    buf_append_lit(&line, STR_PTR("\n\n"), STR_LEN("\n\n"));
+    return sa_sink_write_line(sink, &line.bytes, line.len) == 0;
+}
+
+// TS: const emitPart = async (part) => Promise<boolean>
+fn chat_emit_part(st: &ChatConsumeState, opts: &ConsumeOptions, part: &ToolSimulationPart) -> bool {
+    if part.has_tool_call {
+        if st.tool_calls.len < 64 {
+            st.tool_calls.calls[st.tool_calls.len] = part.call;
+            st.tool_calls.len = st.tool_calls.len + 1;
+        };
+        if opts.stream {
+            let json = ByteBuf { bytes: [0u8; 40960], len: 0 };
+            tool_call_chunk_with_model(&json, &part.call, &opts.request_model.bytes, opts.request_model.len, st.tool_calls.len - 1);
+            if !chat_write_chunk(opts.sink, &json) { return false; };
+        };
+        return true;
+    };
+    if !part.has_text || part.text.len == 0 {
+        if !opts.stream { return true; };
+        if !part.has_text { return true; };
+        // stream + empty text: TS still appends "" (no-op) and skips write
+        return true;
+    };
+    buf_append_buf(&st.text, &part.text);
+    if opts.stream {
+        let json = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        text_chunk_with_model(&json, &part.text.bytes, part.text.len, &opts.request_model.bytes, opts.request_model.len);
+        if !chat_write_chunk(opts.sink, &json) { return false; };
+    };
+    return true;
+}
+
+// TS: export async function consumeUpstream(opts): Promise<StreamResult | null>
+// Returns 0 and fills result, or 1 for the TS null return.
+fn consume_upstream(opts: &ConsumeOptions, result: &StreamResult) -> i32 {
+    let st = ChatConsumeState { text: ByteBuf { bytes: [0u8; 40960], len: 0 }, tool_calls: ToolCallList { calls: [ToolCall { has_index: false, index: 0, id: [0u8; 128], id_len: 0, typ: [0u8; 32], typ_len: 0, fn_name: [0u8; 128], fn_name_len: 0, fn_arguments: [0u8; 4096], fn_arguments_len: 0 }; 64], len: 0 }, tool_parser: ToolSimulationStream { pending: ToolSimPending { bytes: [0u8; 262144], len: 0 }, next_call: 0 }, first_token: false, ttft_ms: 0 };
+    if opts.has_body {
+        let buf = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let upstream_failed = false;
+        let done_all = false;
+        while !done_all {
+            let chunk = ByteBuf { bytes: [0u8; 40960], len: 0 };
+            let done = false;
+            sa_body_read_chunk(opts.body, &chunk, &done);
+            if chunk.len > 0 { buf_append_buf(&buf, &chunk); };
+            if done { done_all = true; };
+            let fatal = false;
+            while 1 == 1 {
+                let nl = find_byte(&buf.bytes, buf.len, 10);
+                if nl == 4294967295 { break; };
+                let line = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                buf_append_lit(&line, &buf.bytes, nl);
+                buf_drop_front(&buf, nl + 1);
+                // line.replace(/\r$/, "")
+                if line.len > 0 && line.bytes[line.len - 1] == 13 { line.len = line.len - 1; };
+                if line.len < 6 { continue; };
+                // payload = line.slice(6) — strips the "data: " prefix positionally
+                let payload = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                let pp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(pp, line.bytes, 6);
+                buf_append_lit(&payload, pp, line.len - 6);
+                if starts_with(&payload.bytes, payload.len, STR_PTR("[DONE]"), STR_LEN("[DONE]")) { continue; };
+                let event: u64 = 0;
+                if sa_json_parse(&payload.bytes, payload.len, &event) != 0 || event == 0 { continue; };
+                // Strict Go parity: missing/non-success action aborts.
+                let ap: ptr = PTR_NULL();
+                let al: u64 = 0;
+                sa_event_action(event, &ap, &al);
+                if !(al == 7 && bytes_eq_str(ap, al, STR_PTR("success"), STR_LEN("success"))) {
+                    upstream_failed = true;
+                    break;
+                };
+                let rp: ptr = PTR_NULL();
+                let rl: u64 = 0;
+                sa_event_role(event, &rp, &rl);
+                if rl == 15 && bytes_eq_str(rp, rl, STR_PTR("tool-invocation"), STR_LEN("tool-invocation")) {
+                    // Search waterfall projection (deliberate delta from Go).
+                    let sp: ptr = PTR_NULL();
+                    let sl: u64 = 0;
+                    sa_event_state(event, &sp, &sl);
+                    if sl == 4 && bytes_eq_str(sp, sl, STR_PTR("call"), STR_LEN("call")) {
+                        let np: ptr = PTR_NULL();
+                        let nl2: u64 = 0;
+                        let has_name = sa_event_tool_name(event, &np, &nl2) == 0 && nl2 > 0;
+                        let ip: ptr = PTR_NULL();
+                        let il: u64 = 0;
+                        let has_id = sa_event_tool_call_id(event, &ip, &il) == 0;
+                        let gp: ptr = PTR_NULL();
+                        let gl: u64 = 0;
+                        let has_args = sa_event_tool_arguments(event, &gp, &gl) == 0 && gl > 0;
+                        let call = ToolCall { has_index: false, index: 0, id: [0u8; 128], id_len: 0, typ: [0u8; 32], typ_len: 0, fn_name: [0u8; 128], fn_name_len: 0, fn_arguments: [0u8; 4096], fn_arguments_len: 0 };
+                        if native_tool_call(&call, has_name, np, nl2, has_id, ip, il, has_args, gp, gl) {
+                            chat_mark_first(&st, opts);
+                            if st.tool_calls.len < 64 {
+                                st.tool_calls.calls[st.tool_calls.len] = call;
+                                st.tool_calls.len = st.tool_calls.len + 1;
+                            };
+                            if opts.stream {
+                                let json = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                                tool_call_chunk_with_model(&json, &call, &opts.request_model.bytes, opts.request_model.len, st.tool_calls.len - 1);
+                                if !chat_write_chunk(opts.sink, &json) { fatal = true; break; };
+                            };
+                        };
+                    };
+                    continue;
+                };
+                if rl == 9 && bytes_eq_str(rp, rl, STR_PTR("reasoning"), STR_LEN("reasoning")) {
+                    let eff_none = opts.reasoning_effort.len == 4 && bytes_eq_str(&opts.reasoning_effort.bytes, opts.reasoning_effort.len, STR_PTR("none"), STR_LEN("none"));
+                    if !eff_none {
+                        chat_mark_first(&st, opts);
+                        let tp: ptr = PTR_NULL();
+                        let tl: u64 = 0;
+                        sa_event_text(event, &tp, &tl);
+                        if tl > 0 && opts.stream {
+                            let mp: ptr = PTR_NULL();
+                            let ml: u64 = 0;
+                            let use_model = &opts.request_model;
+                            if sa_event_model(event, &mp, &ml) == 0 && ml > 0 {
+                                let json = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                                reasoning_chunk_with_model(&json, tp, tl, mp, ml);
+                                if !chat_write_chunk(opts.sink, &json) { fatal = true; break; };
+                            } else {
+                                let json = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                                reasoning_chunk_with_model(&json, tp, tl, &use_model.bytes, use_model.len);
+                                if !chat_write_chunk(opts.sink, &json) { fatal = true; break; };
+                            };
+                        };
+                    };
+                };
+                let mp2: ptr = PTR_NULL();
+                let ml2: u64 = 0;
+                if sa_event_message(event, &mp2, &ml2) == 0 && ml2 > 0 {
+                    chat_mark_first(&st, opts);
+                    if opts.tool_simulation {
+                        let parts = ToolSimParts { parts: [ToolSimulationPart { has_text: false, text: ByteBuf { bytes: [0u8; 40960], len: 0 }, has_tool_call: false, call: ToolCall { has_index: false, index: 0, id: [0u8; 128], id_len: 0, typ: [0u8; 32], typ_len: 0, fn_name: [0u8; 128], fn_name_len: 0, fn_arguments: [0u8; 4096], fn_arguments_len: 0 } }; 64], len: 0 };
+                        tool_simulation_stream_push(&st.tool_parser, &parts, mp2, ml2);
+                        for pi in 0..parts.len {
+                            if !chat_emit_part(&st, opts, &parts.parts[pi]) { fatal = true; break; };
+                        }
+                        if fatal { break; };
+                    } else {
+                        buf_append_lit(&st.text, mp2, ml2);
+                        if opts.stream {
+                            let em: ptr = PTR_NULL();
+                            let eml: u64 = 0;
+                            let json = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                            if sa_event_model(event, &em, &eml) == 0 && eml > 0 {
+                                text_chunk_with_model(&json, mp2, ml2, em, eml);
+                            } else {
+                                text_chunk_with_model(&json, mp2, ml2, &opts.request_model.bytes, opts.request_model.len);
+                            };
+                            if !chat_write_chunk(opts.sink, &json) { fatal = true; break; };
+                        };
+                    };
+                };
+            }
+            if fatal { upstream_failed = true; };
+            if upstream_failed { break; };
+        }
+        // finally: cancel on failure + releaseLock — one close extern.
+        sa_body_close(opts.body, upstream_failed);
+        if upstream_failed { return 1; };
+    };
+    if opts.tool_simulation {
+        let parts = ToolSimParts { parts: [ToolSimulationPart { has_text: false, text: ByteBuf { bytes: [0u8; 40960], len: 0 }, has_tool_call: false, call: ToolCall { has_index: false, index: 0, id: [0u8; 128], id_len: 0, typ: [0u8; 32], typ_len: 0, fn_name: [0u8; 128], fn_name_len: 0, fn_arguments: [0u8; 4096], fn_arguments_len: 0 } }; 64], len: 0 };
+        tool_simulation_stream_flush(&st.tool_parser, &parts);
+        for pi in 0..parts.len {
+            let part = parts.parts[pi];
+            if part.has_tool_call {
+                if st.tool_calls.len < 64 {
+                    st.tool_calls.calls[st.tool_calls.len] = part.call;
+                    st.tool_calls.len = st.tool_calls.len + 1;
+                };
+                if opts.stream {
+                    let json = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                    tool_call_chunk_with_model(&json, &part.call, &opts.request_model.bytes, opts.request_model.len, st.tool_calls.len - 1);
+                    if !chat_write_chunk(opts.sink, &json) { return 1; };
+                };
+                continue;
+            };
+            if part.has_text { buf_append_buf(&st.text, &part.text); };
+            if opts.stream && part.has_text && part.text.len > 0 {
+                let json = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                text_chunk_with_model(&json, &part.text.bytes, part.text.len, &opts.request_model.bytes, opts.request_model.len);
+                if !chat_write_chunk(opts.sink, &json) { return 1; };
+            };
+        }
+    };
+    let output_tokens = count_token(&st.text.bytes, st.text.len);
+    let total_ms = sa_time_now_ms() - opts.stats.start;
+    if opts.stream {
+        let finish = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        if st.tool_calls.len > 0 {
+            buf_append_lit(&finish, STR_PTR("tool_calls"), STR_LEN("tool_calls"));
+        } else {
+            buf_append_lit(&finish, STR_PTR("stop"), STR_LEN("stop"));
+        };
+        let json = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        stop_chunk_with_model(&json, &finish.bytes, finish.len, &opts.request_model.bytes, opts.request_model.len);
+        if !chat_write_chunk(opts.sink, &json) { return 1; };
+        let ujson = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        usage_chunk(&ujson, &opts.request_model.bytes, opts.request_model.len, opts.stats.prompt_tokens, output_tokens, opts.stats.cached_tokens, st.ttft_ms, total_ms, &opts.stats.effort.bytes, opts.stats.effort.len);
+        if !chat_write_chunk(opts.sink, &ujson) { return 1; };
+    };
+    result.text = st.text;
+    result.output_tokens = output_tokens;
+    result.ttft_ms = st.ttft_ms;
+    result.total_ms = total_ms;
+    result.tool_calls = st.tool_calls;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// consumeUpstreamResponses (Responses API projection)
+// ---------------------------------------------------------------------------
+
+// TS: export interface ConsumeResponsesOptions — same fields as ConsumeOptions.
+// TS: export interface StreamResponsesResult extends StreamResult { response }
+struct StreamResponsesResult {
+    base: StreamResult,
+    response_json: ByteBuf,
+}
+
+struct ResponsesConsumeState {
+    seq: u64,
+    response_id: StrField,
+    message_id: StrField,
+    text: ByteBuf,
+    tool_calls: ToolCallList,
+    tool_parser: ToolSimulationStream,
+    pending_native: ToolCallList,
+    native_awaiting: bool,
+    ttft_ms: u64,
+    first_token: bool,
+    text_item_opened: bool,
+    output_index: u64,
+}
+
+fn responses_mark_first(st: &ResponsesConsumeState, opts: &ConsumeOptions) -> void {
+    if !st.first_token {
+        st.first_token = true;
+        st.ttft_ms = sa_time_now_ms() - opts.stats.start;
+    };
+}
+
+fn responses_clear_native_pending(st: &ResponsesConsumeState) -> void {
+    st.pending_native.len = 0;
+    st.native_awaiting = false;
+}
+
+// TS: const enc = (type, fields) => `event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`
+// json_body carries the pre-rendered fields object contents (without the
+// leading "type" member, which is emitted first here).
+fn responses_write_event(sink: u64, type_ptr: ptr, type_len: u64, fields_json: &ByteBuf) -> bool {
+    let line = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&line, STR_PTR("event: "), STR_LEN("event: "));
+    buf_append_lit(&line, type_ptr, type_len);
+    buf_append_lit(&line, STR_PTR("\ndata: {\"type\":\""), STR_LEN("\ndata: {\"type\":\""));
+    buf_append_lit(&line, type_ptr, type_len);
+    buf_append_lit(&line, STR_PTR("\""), STR_LEN("\""));
+    if fields_json.len > 0 {
+        buf_append_lit(&line, STR_PTR(","), STR_LEN(","));
+        buf_append_buf(&line, fields_json);
+    };
+    buf_append_lit(&line, STR_PTR("}\n\n"), STR_LEN("}\n\n"));
+    return sa_sink_write_line(sink, &line.bytes, line.len) == 0;
+}
+
+// the in-progress response object (also embedded in response.created)
+fn responses_in_progress_json(out: &ByteBuf, st: &ResponsesConsumeState, opts: &ConsumeOptions) -> void {
+    buf_reset(out);
+    buf_append_lit(out, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+    buf_append_escaped(out, &st.response_id.bytes, st.response_id.len);
+    buf_append_lit(out, STR_PTR("\",\"object\":\"response\",\"created_at\":"), STR_LEN("\",\"object\":\"response\",\"created_at\":"));
+    buf_append_u64(out, ts_math_rounding(sa_time_now_ms() / 1000.0, 0));
+    buf_append_lit(out, STR_PTR(",\"status\":\"in_progress\",\"model\":\""), STR_LEN(",\"status\":\"in_progress\",\"model\":\""));
+    buf_append_escaped(out, &opts.request_model.bytes, opts.request_model.len);
+    buf_append_lit(out, STR_PTR("\",\"output\":[],\"usage\":{\"input_tokens\":"), STR_LEN("\",\"output\":[],\"usage\":{\"input_tokens\":"));
+    buf_append_u64(out, opts.stats.prompt_tokens);
+    buf_append_lit(out, STR_PTR(",\"output_tokens\":0,\"total_tokens\":"), STR_LEN(",\"output_tokens\":0,\"total_tokens\":"));
+    buf_append_u64(out, opts.stats.prompt_tokens);
+    buf_append_lit(out, STR_PTR("}}"), STR_LEN("}}"));
+}
+
+// TS: const emitResponseToolCall = async (call, outputIndex) => Promise<boolean>
+fn responses_emit_tool_call(st: &ResponsesConsumeState, opts: &ConsumeOptions, call: &ToolCall, output_index: u64) -> bool {
+    if st.tool_calls.len < 64 {
+        st.tool_calls.calls[st.tool_calls.len] = *call;
+        st.tool_calls.len = st.tool_calls.len + 1;
+    };
+    if !opts.stream { return true; };
+    // item.id = call.id || `call_duck2api_${toolCalls.length}` (post-push length)
+    let item_id = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    if call.id_len > 0 {
+        buf_append_lit(&item_id, call.id, call.id_len);
+    } else {
+        buf_append_lit(&item_id, STR_PTR("call_duck2api_"), STR_LEN("call_duck2api_"));
+        buf_append_u64(&item_id, st.tool_calls.len);
+    };
+    // item JSON (in_progress form)
+    let item = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&item, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+    buf_append_escaped(&item, &item_id.bytes, item_id.len);
+    buf_append_lit(&item, STR_PTR("\",\"type\":\"function_call\",\"status\":\"in_progress\",\"call_id\":\""), STR_LEN("\",\"type\":\"function_call\",\"status\":\"in_progress\",\"call_id\":\""));
+    buf_append_escaped(&item, call.id, call.id_len);
+    buf_append_lit(&item, STR_PTR("\",\"name\":\""), STR_LEN("\",\"name\":\""));
+    buf_append_escaped(&item, call.fn_name, call.fn_name_len);
+    buf_append_lit(&item, STR_PTR("\"}"), STR_LEN("\"}"));
+    let fields = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&fields, STR_PTR("\"sequence_number\":"), STR_LEN("\"sequence_number\":"));
+    buf_append_u64(&fields, st.seq);
+    st.seq = st.seq + 1;
+    buf_append_lit(&fields, STR_PTR(",\"output_index\":"), STR_LEN(",\"output_index\":"));
+    buf_append_u64(&fields, output_index);
+    buf_append_lit(&fields, STR_PTR(",\"item\":"), STR_LEN(",\"item\":"));
+    buf_append_buf(&fields, &item);
+    if !responses_write_event(opts.sink, STR_PTR("response.output_item.added"), STR_LEN("response.output_item.added"), &fields) { return false; };
+    // arguments delta
+    buf_reset(&fields);
+    buf_append_lit(&fields, STR_PTR("\"sequence_number\":"), STR_LEN("\"sequence_number\":"));
+    buf_append_u64(&fields, st.seq);
+    st.seq = st.seq + 1;
+    buf_append_lit(&fields, STR_PTR(",\"item_id\":\""), STR_LEN(",\"item_id\":\""));
+    buf_append_escaped(&fields, &item_id.bytes, item_id.len);
+    buf_append_lit(&fields, STR_PTR("\",\"output_index\":"), STR_LEN("\",\"output_index\":"));
+    buf_append_u64(&fields, output_index);
+    buf_append_lit(&fields, STR_PTR(",\"delta\":\""), STR_LEN(",\"delta\":\""));
+    buf_append_escaped(&fields, call.fn_arguments, call.fn_arguments_len);
+    buf_append_lit(&fields, STR_PTR("\""), STR_LEN("\""));
+    if !responses_write_event(opts.sink, STR_PTR("response.function_call_arguments.delta"), STR_LEN("response.function_call_arguments.delta"), &fields) { return false; };
+    // arguments done (TS uses `text` key here)
+    buf_reset(&fields);
+    buf_append_lit(&fields, STR_PTR("\"sequence_number\":"), STR_LEN("\"sequence_number\":"));
+    buf_append_u64(&fields, st.seq);
+    st.seq = st.seq + 1;
+    buf_append_lit(&fields, STR_PTR(",\"item_id\":\""), STR_LEN(",\"item_id\":\""));
+    buf_append_escaped(&fields, &item_id.bytes, item_id.len);
+    buf_append_lit(&fields, STR_PTR("\",\"output_index\":"), STR_LEN("\",\"output_index\":"));
+    buf_append_u64(&fields, output_index);
+    buf_append_lit(&fields, STR_PTR(",\"text\":\""), STR_LEN(",\"text\":\""));
+    buf_append_escaped(&fields, call.fn_arguments, call.fn_arguments_len);
+    buf_append_lit(&fields, STR_PTR("\""), STR_LEN("\""));
+    if !responses_write_event(opts.sink, STR_PTR("response.function_call_arguments.done"), STR_LEN("response.function_call_arguments.done"), &fields) { return false; };
+    // output_item.done with the completed item
+    let done_item = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&done_item, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+    buf_append_escaped(&done_item, &item_id.bytes, item_id.len);
+    buf_append_lit(&done_item, STR_PTR("\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\""), STR_LEN("\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\""));
+    buf_append_escaped(&done_item, call.id, call.id_len);
+    buf_append_lit(&done_item, STR_PTR("\",\"name\":\""), STR_LEN("\",\"name\":\""));
+    buf_append_escaped(&done_item, call.fn_name, call.fn_name_len);
+    buf_append_lit(&done_item, STR_PTR("\",\"arguments\":\""), STR_LEN("\",\"arguments\":\""));
+    buf_append_escaped(&done_item, call.fn_arguments, call.fn_arguments_len);
+    buf_append_lit(&done_item, STR_PTR("\"}"), STR_LEN("\"}"));
+    buf_reset(&fields);
+    buf_append_lit(&fields, STR_PTR("\"sequence_number\":"), STR_LEN("\"sequence_number\":"));
+    buf_append_u64(&fields, st.seq);
+    st.seq = st.seq + 1;
+    buf_append_lit(&fields, STR_PTR(",\"output_index\":"), STR_LEN(",\"output_index\":"));
+    buf_append_u64(&fields, output_index);
+    buf_append_lit(&fields, STR_PTR(",\"item\":"), STR_LEN(",\"item\":"));
+    buf_append_buf(&fields, &done_item);
+    if !responses_write_event(opts.sink, STR_PTR("response.output_item.done"), STR_LEN("response.output_item.done"), &fields) { return false; };
+    return true;
+}
+
+// TS: const emitResponseText = async (value) => Promise<boolean>
+fn responses_emit_text(st: &ResponsesConsumeState, opts: &ConsumeOptions, value_ptr: ptr, value_len: u64) -> bool {
+    if value_len == 0 { return true; };
+    buf_append_lit(&st.text, value_ptr, value_len);
+    if !opts.stream { return true; };
+    let fields = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&fields, STR_PTR("\"sequence_number\":"), STR_LEN("\"sequence_number\":"));
+    buf_append_u64(&fields, st.seq);
+    st.seq = st.seq + 1;
+    buf_append_lit(&fields, STR_PTR(",\"output_index\":"), STR_LEN(",\"output_index\":"));
+    buf_append_u64(&fields, st.output_index);
+    buf_append_lit(&fields, STR_PTR(",\"content_index\":0,\"item_id\":\""), STR_LEN(",\"content_index\":0,\"item_id\":\""));
+    buf_append_escaped(&fields, &st.message_id.bytes, st.message_id.len);
+    buf_append_lit(&fields, STR_PTR("\",\"delta\":\""), STR_LEN("\",\"delta\":\""));
+    buf_append_escaped(&fields, value_ptr, value_len);
+    buf_append_lit(&fields, STR_PTR("\""), STR_LEN("\""));
+    return responses_write_event(opts.sink, STR_PTR("response.output_text.delta"), STR_LEN("response.output_text.delta"), &fields);
+}
+
+// TS: const ensureResponseTextItem = async () => Promise<boolean>
+fn responses_ensure_text_item(st: &ResponsesConsumeState, opts: &ConsumeOptions) -> bool {
+    if st.text_item_opened || !opts.stream {
+        st.text_item_opened = true;
+        return true;
+    };
+    st.text_item_opened = true;
+    let item = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&item, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+    buf_append_escaped(&item, &st.message_id.bytes, st.message_id.len);
+    buf_append_lit(&item, STR_PTR("\",\"type\":\"message\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}"), STR_LEN("\",\"type\":\"message\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}"));
+    let fields = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&fields, STR_PTR("\"sequence_number\":"), STR_LEN("\"sequence_number\":"));
+    buf_append_u64(&fields, st.seq);
+    st.seq = st.seq + 1;
+    buf_append_lit(&fields, STR_PTR(",\"output_index\":"), STR_LEN(",\"output_index\":"));
+    buf_append_u64(&fields, st.output_index);
+    buf_append_lit(&fields, STR_PTR(",\"item\":"), STR_LEN(",\"item\":"));
+    buf_append_buf(&fields, &item);
+    if !responses_write_event(opts.sink, STR_PTR("response.output_item.added"), STR_LEN("response.output_item.added"), &fields) { return false; };
+    buf_reset(&fields);
+    buf_append_lit(&fields, STR_PTR("\"sequence_number\":"), STR_LEN("\"sequence_number\":"));
+    buf_append_u64(&fields, st.seq);
+    st.seq = st.seq + 1;
+    buf_append_lit(&fields, STR_PTR(",\"output_index\":"), STR_LEN(",\"output_index\":"));
+    buf_append_u64(&fields, st.output_index);
+    buf_append_lit(&fields, STR_PTR(",\"content_index\":0,\"item_id\":\""), STR_LEN(",\"content_index\":0,\"item_id\":\""));
+    buf_append_escaped(&fields, &st.message_id.bytes, st.message_id.len);
+    buf_append_lit(&fields, STR_PTR("\",\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}"), STR_LEN("\",\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}"));
+    return responses_write_event(opts.sink, STR_PTR("response.content_part.added"), STR_LEN("response.content_part.added"), &fields);
+}
+
+// TS: const closeResponseTextItem = async () => Promise<boolean>
+// Uses the CUMULATIVE text (this.text) for the done events, as in TS.
+fn responses_close_text_item(st: &ResponsesConsumeState, opts: &ConsumeOptions) -> bool {
+    if !st.text_item_opened { return true; };
+    st.text_item_opened = false;
+    if !opts.stream { return true; };
+    let fields = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&fields, STR_PTR("\"sequence_number\":"), STR_LEN("\"sequence_number\":"));
+    buf_append_u64(&fields, st.seq);
+    st.seq = st.seq + 1;
+    buf_append_lit(&fields, STR_PTR(",\"output_index\":"), STR_LEN(",\"output_index\":"));
+    buf_append_u64(&fields, st.output_index);
+    buf_append_lit(&fields, STR_PTR(",\"content_index\":0,\"item_id\":\""), STR_LEN(",\"content_index\":0,\"item_id\":\""));
+    buf_append_escaped(&fields, &st.message_id.bytes, st.message_id.len);
+    buf_append_lit(&fields, STR_PTR("\",\"text\":\""), STR_LEN("\",\"text\":\""));
+    buf_append_escaped(&fields, &st.text.bytes, st.text.len);
+    buf_append_lit(&fields, STR_PTR("\""), STR_LEN("\""));
+    if !responses_write_event(opts.sink, STR_PTR("response.output_text.done"), STR_LEN("response.output_text.done"), &fields) { return false; };
+    buf_reset(&fields);
+    buf_append_lit(&fields, STR_PTR("\"sequence_number\":"), STR_LEN("\"sequence_number\":"));
+    buf_append_u64(&fields, st.seq);
+    st.seq = st.seq + 1;
+    buf_append_lit(&fields, STR_PTR(",\"output_index\":"), STR_LEN(",\"output_index\":"));
+    buf_append_u64(&fields, st.output_index);
+    buf_append_lit(&fields, STR_PTR(",\"content_index\":0,\"item_id\":\""), STR_LEN(",\"content_index\":0,\"item_id\":\""));
+    buf_append_escaped(&fields, &st.message_id.bytes, st.message_id.len);
+    buf_append_lit(&fields, STR_PTR("\",\"part\":{\"type\":\"output_text\",\"text\":\""), STR_LEN("\",\"part\":{\"type\":\"output_text\",\"text\":\""));
+    buf_append_escaped(&fields, &st.text.bytes, st.text.len);
+    buf_append_lit(&fields, STR_PTR("\",\"annotations\":[]}"), STR_LEN("\",\"annotations\":[]}"));
+    if !responses_write_event(opts.sink, STR_PTR("response.content_part.done"), STR_LEN("response.content_part.done"), &fields) { return false; };
+    buf_reset(&fields);
+    buf_append_lit(&fields, STR_PTR("\"sequence_number\":"), STR_LEN("\"sequence_number\":"));
+    buf_append_u64(&fields, st.seq);
+    st.seq = st.seq + 1;
+    buf_append_lit(&fields, STR_PTR(",\"output_index\":"), STR_LEN(",\"output_index\":"));
+    buf_append_u64(&fields, st.output_index);
+    buf_append_lit(&fields, STR_PTR(",\"item\":{\"id\":\""), STR_LEN(",\"item\":{\"id\":\""));
+    buf_append_escaped(&fields, &st.message_id.bytes, st.message_id.len);
+    buf_append_lit(&fields, STR_PTR("\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\""), STR_LEN("\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\""));
+    buf_append_escaped(&fields, &st.text.bytes, st.text.len);
+    buf_append_lit(&fields, STR_PTR("\",\"annotations\":[]}]}"), STR_LEN("\",\"annotations\":[]}]}"));
+    if !responses_write_event(opts.sink, STR_PTR("response.output_item.done"), STR_LEN("response.output_item.done"), &fields) { return false; };
+    st.output_index = st.output_index + 1;
+    return true;
+}
+
+// the completed response object (returned for non-stream; embedded in
+// response.completed for stream)
+fn responses_completed_json(out: &ByteBuf, st: &ResponsesConsumeState, opts: &ConsumeOptions, output_tokens: u64, total_ms: u64) -> void {
+    buf_reset(out);
+    buf_append_lit(out, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+    buf_append_escaped(out, &st.response_id.bytes, st.response_id.len);
+    buf_append_lit(out, STR_PTR("\",\"object\":\"response\",\"created_at\":"), STR_LEN("\",\"object\":\"response\",\"created_at\":"));
+    buf_append_u64(out, ts_math_rounding(sa_time_now_ms() / 1000.0, 0));
+    buf_append_lit(out, STR_PTR(",\"status\":\"completed\",\"model\":\""), STR_LEN(",\"status\":\"completed\",\"model\":\""));
+    buf_append_escaped(out, &opts.request_model.bytes, opts.request_model.len);
+    buf_append_lit(out, STR_PTR("\",\"output\":["), STR_LEN("\",\"output\":["));
+    let first = true;
+    if st.text.len > 0 || st.tool_calls.len == 0 {
+        buf_append_lit(out, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+        buf_append_escaped(out, &st.message_id.bytes, st.message_id.len);
+        buf_append_lit(out, STR_PTR("\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\""), STR_LEN("\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\""));
+        buf_append_escaped(out, &st.text.bytes, st.text.len);
+        buf_append_lit(out, STR_PTR("\",\"annotations\":[]}]}"), STR_LEN("\",\"annotations\":[]}]}"));
+        first = false;
+    };
+    for ci in 0..st.tool_calls.len {
+        if !first { buf_append_lit(out, STR_PTR(","), STR_LEN(",")); };
+        first = false;
+        let call = st.tool_calls.calls[ci];
+        buf_append_lit(out, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+        buf_append_escaped(out, call.id, call.id_len);
+        buf_append_lit(out, STR_PTR("\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\""), STR_LEN("\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\""));
+        buf_append_escaped(out, call.id, call.id_len);
+        buf_append_lit(out, STR_PTR("\",\"name\":\""), STR_LEN("\",\"name\":\""));
+        buf_append_escaped(out, call.fn_name, call.fn_name_len);
+        buf_append_lit(out, STR_PTR("\",\"arguments\":\""), STR_LEN("\",\"arguments\":\""));
+        buf_append_escaped(out, call.fn_arguments, call.fn_arguments_len);
+        buf_append_lit(out, STR_PTR("\"}"), STR_LEN("\"}"));
+    }
+    buf_append_lit(out, STR_PTR("],\"output_text\":\""), STR_LEN("],\"output_text\":\""));
+    buf_append_escaped(out, &st.text.bytes, st.text.len);
+    buf_append_lit(out, STR_PTR("\",\"usage\":{\"input_tokens\":"), STR_LEN("\",\"usage\":{\"input_tokens\":"));
+    buf_append_u64(out, opts.stats.prompt_tokens);
+    buf_append_lit(out, STR_PTR(",\"output_tokens\":"), STR_LEN(",\"output_tokens\":"));
+    buf_append_u64(out, output_tokens);
+    buf_append_lit(out, STR_PTR(",\"total_tokens\":"), STR_LEN(",\"total_tokens\":"));
+    buf_append_u64(out, opts.stats.prompt_tokens + output_tokens);
+    buf_append_lit(out, STR_PTR("},\"timing\":{"), STR_LEN("},\"timing\":{"));
+    let tfirst = true;
+    if st.ttft_ms > 0 {
+        buf_append_lit(out, STR_PTR("\"ttft_ms\":"), STR_LEN("\"ttft_ms\":"));
+        buf_append_u64(out, st.ttft_ms);
+        tfirst = false;
+    };
+    if total_ms > 0 {
+        if !tfirst { buf_append_lit(out, STR_PTR(","), STR_LEN(",")); };
+        buf_append_lit(out, STR_PTR("\"total_ms\":"), STR_LEN("\"total_ms\":"));
+        buf_append_u64(out, total_ms);
+    };
+    buf_append_lit(out, STR_PTR("}"), STR_LEN("}"));
+    if opts.stats.effort.len > 0 {
+        buf_append_lit(out, STR_PTR(",\"reasoning_effort\":\""), STR_LEN(",\"reasoning_effort\":\""));
+        buf_append_escaped(out, &opts.stats.effort.bytes, opts.stats.effort.len);
+        buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+    };
+    buf_append_lit(out, STR_PTR("}"), STR_LEN("}"));
+}
+
+// TS: export async function consumeUpstreamResponses(opts): Promise<StreamResponsesResult | null>
+fn consume_upstream_responses(opts: &ConsumeOptions, result: &StreamResponsesResult) -> i32 {
+    let st = ResponsesConsumeState { seq: 1, response_id: StrField { bytes: [0u8; 512], len: 0 }, message_id: StrField { bytes: [0u8; 512], len: 0 }, text: ByteBuf { bytes: [0u8; 40960], len: 0 }, tool_calls: ToolCallList { calls: [ToolCall { has_index: false, index: 0, id: [0u8; 128], id_len: 0, typ: [0u8; 32], typ_len: 0, fn_name: [0u8; 128], fn_name_len: 0, fn_arguments: [0u8; 4096], fn_arguments_len: 0 }; 64], len: 0 }, tool_parser: ToolSimulationStream { pending: ToolSimPending { bytes: [0u8; 262144], len: 0 }, next_call: 0 }, pending_native: ToolCallList { calls: [ToolCall { has_index: false, index: 0, id: [0u8; 128], id_len: 0, typ: [0u8; 32], typ_len: 0, fn_name: [0u8; 128], fn_name_len: 0, fn_arguments: [0u8; 4096], fn_arguments_len: 0 }; 64], len: 0 }, native_awaiting: false, ttft_ms: 0, first_token: false, text_item_opened: false, output_index: 0 };
+    // responseId = `resp_${randomUUID().replaceAll("-", "")}`; messageId likewise
+    str_field_set(&st.response_id, STR_PTR("resp_"), STR_LEN("resp_"));
+    sa_crypto_random_uuid_hex(&st.response_id.bytes, &st.response_id.len, 5);
+    str_field_set(&st.message_id, STR_PTR("msg_"), STR_LEN("msg_"));
+    sa_crypto_random_uuid_hex(&st.message_id.bytes, &st.message_id.len, 4);
+    if opts.stream {
+        let inprog = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        responses_in_progress_json(&inprog, &st, opts);
+        let fields = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        buf_append_lit(&fields, STR_PTR("\"sequence_number\":"), STR_LEN("\"sequence_number\":"));
+        buf_append_u64(&fields, st.seq);
+        st.seq = st.seq + 1;
+        buf_append_lit(&fields, STR_PTR(",\"response\":"), STR_LEN(",\"response\":"));
+        buf_append_buf(&fields, &inprog);
+        // TS: this first write is awaited WITHOUT try/catch — a throw
+        // propagates (not a null return); the sink extern cannot throw,
+        // so the result is ignored here (logged divergence).
+        responses_write_event(opts.sink, STR_PTR("response.created"), STR_LEN("response.created"), &fields);
+    };
+    if opts.has_body {
+        let buf = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let upstream_failed = false;
+        let done_all = false;
+        while !done_all {
+            let chunk = ByteBuf { bytes: [0u8; 40960], len: 0 };
+            let done = false;
+            sa_body_read_chunk(opts.body, &chunk, &done);
+            if chunk.len > 0 { buf_append_buf(&buf, &chunk); };
+            if done { done_all = true; };
+            let fatal = false;
+            while 1 == 1 {
+                let nl = find_byte(&buf.bytes, buf.len, 10);
+                if nl == 4294967295 { break; };
+                let line = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                buf_append_lit(&line, &buf.bytes, nl);
+                buf_drop_front(&buf, nl + 1);
+                if line.len > 0 && line.bytes[line.len - 1] == 13 { line.len = line.len - 1; };
+                if line.len < 6 { continue; };
+                let payload = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                let pp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(pp, line.bytes, 6);
+                buf_append_lit(&payload, pp, line.len - 6);
+                if starts_with(&payload.bytes, payload.len, STR_PTR("[DONE]"), STR_LEN("[DONE]")) { continue; };
+                let event: u64 = 0;
+                if sa_json_parse(&payload.bytes, payload.len, &event) != 0 || event == 0 { continue; };
+                let ap: ptr = PTR_NULL();
+                let al: u64 = 0;
+                sa_event_action(event, &ap, &al);
+                if !(al == 7 && bytes_eq_str(ap, al, STR_PTR("success"), STR_LEN("success"))) {
+                    upstream_failed = true;
+                    break;
+                };
+                let rp: ptr = PTR_NULL();
+                let rl: u64 = 0;
+                sa_event_role(event, &rp, &rl);
+                if rl == 15 && bytes_eq_str(rp, rl, STR_PTR("tool-invocation"), STR_LEN("tool-invocation")) {
+                    if opts.tool_simulation {
+                        let sp: ptr = PTR_NULL();
+                        let sl: u64 = 0;
+                        sa_event_state(event, &sp, &sl);
+                        if sl == 4 && bytes_eq_str(sp, sl, STR_PTR("call"), STR_LEN("call")) {
+                            let np: ptr = PTR_NULL();
+                            let nl2: u64 = 0;
+                            let has_name = sa_event_tool_name(event, &np, &nl2) == 0 && nl2 > 0;
+                            let ip: ptr = PTR_NULL();
+                            let il: u64 = 0;
+                            let has_id = sa_event_tool_call_id(event, &ip, &il) == 0;
+                            let gp: ptr = PTR_NULL();
+                            let gl: u64 = 0;
+                            let has_args = sa_event_tool_arguments(event, &gp, &gl) == 0 && gl > 0;
+                            let call = ToolCall { has_index: false, index: 0, id: [0u8; 128], id_len: 0, typ: [0u8; 32], typ_len: 0, fn_name: [0u8; 128], fn_name_len: 0, fn_arguments: [0u8; 4096], fn_arguments_len: 0 };
+                            if native_tool_call(&call, has_name, np, nl2, has_id, ip, il, has_args, gp, gl) {
+                                if st.pending_native.len < 64 {
+                                    st.pending_native.calls[st.pending_native.len] = call;
+                                    st.pending_native.len = st.pending_native.len + 1;
+                                };
+                                st.native_awaiting = true;
+                            };
+                        };
+                    };
+                    continue;
+                };
+                if rl == 9 && bytes_eq_str(rp, rl, STR_PTR("reasoning"), STR_LEN("reasoning")) {
+                    let eff_none = opts.reasoning_effort.len == 4 && bytes_eq_str(&opts.reasoning_effort.bytes, opts.reasoning_effort.len, STR_PTR("none"), STR_LEN("none"));
+                    if !eff_none {
+                        responses_mark_first(&st, opts);
+                        let tp: ptr = PTR_NULL();
+                        let tl: u64 = 0;
+                        sa_event_text(event, &tp, &tl);
+                        if tl > 0 {
+                            if !responses_ensure_text_item(&st, opts) { upstream_failed = true; break; };
+                            if !opts.stream {
+                                if !responses_emit_text(&st, opts, tp, tl) { upstream_failed = true; break; };
+                            } else {
+                                let fields = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                                buf_append_lit(&fields, STR_PTR("\"sequence_number\":"), STR_LEN("\"sequence_number\":"));
+                                buf_append_u64(&fields, st.seq);
+                                st.seq = st.seq + 1;
+                                buf_append_lit(&fields, STR_PTR(",\"item_id\":\""), STR_LEN(",\"item_id\":\""));
+                                buf_append_escaped(&fields, &st.message_id.bytes, st.message_id.len);
+                                buf_append_lit(&fields, STR_PTR("\",\"delta\":\""), STR_LEN("\",\"delta\":\""));
+                                buf_append_escaped(&fields, tp, tl);
+                                buf_append_lit(&fields, STR_PTR("\""), STR_LEN("\""));
+                                if !responses_write_event(opts.sink, STR_PTR("response.reasoning_text.delta"), STR_LEN("response.reasoning_text.delta"), &fields) { fatal = true; break; };
+                            };
+                        };
+                    };
+                    continue;
+                };
+                let mp2: ptr = PTR_NULL();
+                let ml2: u64 = 0;
+                if sa_event_message(event, &mp2, &ml2) == 0 && ml2 > 0 {
+                    if st.native_awaiting { responses_clear_native_pending(&st); };
+                    responses_mark_first(&st, opts);
+                    if opts.tool_simulation {
+                        if !responses_ensure_text_item(&st, opts) { upstream_failed = true; break; };
+                        let parts = ToolSimParts { parts: [ToolSimulationPart { has_text: false, text: ByteBuf { bytes: [0u8; 40960], len: 0 }, has_tool_call: false, call: ToolCall { has_index: false, index: 0, id: [0u8; 128], id_len: 0, typ: [0u8; 32], typ_len: 0, fn_name: [0u8; 128], fn_name_len: 0, fn_arguments: [0u8; 4096], fn_arguments_len: 0 } }; 64], len: 0 };
+                        tool_simulation_stream_push(&st.tool_parser, &parts, mp2, ml2);
+                        for pi in 0..parts.len {
+                            if parts.parts[pi].has_tool_call {
+                                if !responses_close_text_item(&st, opts) { upstream_failed = true; break; };
+                                let oi = st.output_index;
+                                st.output_index = st.output_index + 1;
+                                if !responses_emit_tool_call(&st, opts, &parts.parts[pi].call, oi) { upstream_failed = true; break; };
+                            } else {
+                                if !responses_ensure_text_item(&st, opts) { upstream_failed = true; break; };
+                                let has_t = parts.parts[pi].has_text;
+                                if has_t {
+                                    if !responses_emit_text(&st, opts, &parts.parts[pi].text.bytes, parts.parts[pi].text.len) { upstream_failed = true; break; };
+                                } else {
+                                    if !responses_emit_text(&st, opts, STR_PTR(""), 0) { upstream_failed = true; break; };
+                                };
+                            };
+                        }
+                        if upstream_failed { break; };
+                    } else {
+                        if !responses_ensure_text_item(&st, opts) { upstream_failed = true; break; };
+                        if !responses_emit_text(&st, opts, mp2, ml2) { upstream_failed = true; break; };
+                    };
+                };
+            }
+            if fatal { upstream_failed = true; };
+            if upstream_failed { break; };
+        }
+        sa_body_close(opts.body, upstream_failed);
+        if upstream_failed { return 1; };
+    };
+    if opts.tool_simulation {
+        if !responses_ensure_text_item(&st, opts) { return 1; };
+        let parts = ToolSimParts { parts: [ToolSimulationPart { has_text: false, text: ByteBuf { bytes: [0u8; 40960], len: 0 }, has_tool_call: false, call: ToolCall { has_index: false, index: 0, id: [0u8; 128], id_len: 0, typ: [0u8; 32], typ_len: 0, fn_name: [0u8; 128], fn_name_len: 0, fn_arguments: [0u8; 4096], fn_arguments_len: 0 } }; 64], len: 0 };
+        tool_simulation_stream_flush(&st.tool_parser, &parts);
+        for pi in 0..parts.len {
+            if parts.parts[pi].has_tool_call {
+                if !responses_close_text_item(&st, opts) { return 1; };
+                let oi = st.output_index;
+                st.output_index = st.output_index + 1;
+                if !responses_emit_tool_call(&st, opts, &parts.parts[pi].call, oi) { return 1; };
+            } else {
+                if !responses_ensure_text_item(&st, opts) { return 1; };
+                if parts.parts[pi].has_text {
+                    if !responses_emit_text(&st, opts, &parts.parts[pi].text.bytes, parts.parts[pi].text.len) { return 1; };
+                } else {
+                    if !responses_emit_text(&st, opts, STR_PTR(""), 0) { return 1; };
+                };
+            };
+        }
+    };
+    // Pending native calls recover only when no plain-text continuation arrived.
+    for ci in 0..st.pending_native.len {
+        if !responses_close_text_item(&st, opts) { return 1; };
+        let oi = st.output_index;
+        st.output_index = st.output_index + 1;
+        if !responses_emit_tool_call(&st, opts, &st.pending_native.calls[ci], oi) { return 1; };
+    }
+    if !responses_close_text_item(&st, opts) { return 1; };
+    let output_tokens = count_token(&st.text.bytes, st.text.len);
+    let total_ms = sa_time_now_ms() - opts.stats.start;
+    responses_completed_json(&result.response_json, &st, opts, output_tokens, total_ms);
+    if opts.stream {
+        let fields = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        buf_append_lit(&fields, STR_PTR("\"sequence_number\":"), STR_LEN("\"sequence_number\":"));
+        buf_append_u64(&fields, st.seq);
+        st.seq = st.seq + 1;
+        buf_append_lit(&fields, STR_PTR(",\"response\":"), STR_LEN(",\"response\":"));
+        buf_append_buf(&fields, &result.response_json);
+        if !responses_write_event(opts.sink, STR_PTR("response.completed"), STR_LEN("response.completed"), &fields) { return 1; };
+        if sa_sink_write_line(opts.sink, STR_PTR("data: [DONE]\n\n"), STR_LEN("data: [DONE]\n\n")) != 0 { return 1; };
+    };
+    result.base.text = st.text;
+    result.base.output_tokens = output_tokens;
+    result.base.ttft_ms = st.ttft_ms;
+    result.base.total_ms = total_ms;
+    result.base.tool_calls = st.tool_calls;
+    return 0;
+}

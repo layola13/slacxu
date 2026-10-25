@@ -1,0 +1,238 @@
+// Converted 1:1 from backends/grok/src/runtime/grokCompatibleTurnProjector.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/io/print.sai"
+@import "grokCompatibleProtocol.sla"
+
+// DEFECT: dynamic JSON — JsonValue / JsonRpcNotification (from @codex-ui/shared) and every `item: Record<string, JsonValue>` payload are JSON text buffers (ptr,len) in SLA; projected events are a tagged struct instead of the TS discriminated union.
+// GrokProjectedEvent union -> kind tag: 0=turn/started 1=turn/completed 2=turn/failed 3=turn/interrupted 4=item/agentMessage/delta 5=item/reasoning/textDelta 6=item/started 7=item/completed 8=system/init
+struct GrokProjectedEvent {
+    kind: u64,
+    threadId_ptr: ptr,
+    threadId_len: u64,
+    turnId_ptr: ptr,
+    turnId_len: u64,
+    has_error: bool,
+    error_ptr: ptr,
+    error_len: u64,
+    // itemId (delta kinds) / item JSON (started/completed kinds)
+    itemId_ptr: ptr,
+    itemId_len: u64,
+    delta_ptr: ptr,
+    delta_len: u64,
+    item_ptr: ptr,
+    item_len: u64,
+    // system/init fields
+    sessionId_ptr: ptr,
+    sessionId_len: u64,
+    has_cwd: bool,
+    cwd_ptr: ptr,
+    cwd_len: u64,
+    // DEFECT: dynamic array — tools?: string[] kept as JSON text buffer.
+    tools_ptr: ptr,
+    tools_len: u64,
+}
+
+// DEFECT: Map<string, Record<string, JsonValue>> (activeToolItems) and Set<string> (emittedTaskStarts) have no SLA equivalents; both are fixed-capacity key arrays (capacity 64, estimated from per-turn tool-call volume) + len, keyed by (ptr,len) callId byte equality.
+struct GrokProjectorContext {
+    threadId_ptr: ptr,
+    threadId_len: u64,
+    turnId_ptr: ptr,
+    turnId_len: u64,
+    has_sessionId: bool,
+    sessionId_ptr: ptr,
+    sessionId_len: u64,
+    // status: "running" | "completed" | "failed" | "interrupted" -> 0=running 1=completed 2=failed 3=interrupted
+    status: u64,
+    textSegmentSeq: u64,
+    currentAssistantItemId_ptr: ptr,
+    currentAssistantItemId_len: u64,
+    // DEFECT: JS string accumulation (currentAssistantText += data) — growable string approximated by a fixed byte buffer capacity 65536 + len.
+    currentAssistantText_len: u64,
+    hasStartedCurrentAssistantMessage: bool,
+    hasCompletedCurrentAssistantMessage: bool,
+    hasStartedCurrentReasoning: bool,
+    hasCompletedCurrentReasoning: bool,
+    currentReasoningItemId_ptr: ptr,
+    currentReasoningItemId_len: u64,
+    currentReasoningText_len: u64,
+    assistantItemId_ptr: ptr,
+    assistantItemId_len: u64,
+    reasoningItemId_ptr: ptr,
+    reasoningItemId_len: u64,
+    assistantText_len: u64,
+    reasoningText_len: u64,
+    hasStartedTurn: bool,
+    hasStartedAgentMessage: bool,
+    activeToolItems_len: u64,
+    emittedTaskStarts_len: u64,
+}
+
+fn createGrokProjectorContext(threadId_ptr: ptr, threadId_len: u64, turnId_ptr: ptr, turnId_len: u64, out_ctx: &GrokProjectorContext) -> void {
+    // const initialAssistantItemId = `grok-msg-${turnId}-0`;
+    // const initialReasoningItemId = `grok-thought-${turnId}-0`;
+    // DEFECT: template literals (`grok-msg-${turnId}-0`) have no SLA string interpolation; ids are built by byte-buffer concatenation in the fix phase.
+    out_ctx.threadId_ptr = threadId_ptr;
+    out_ctx.threadId_len = threadId_len;
+    out_ctx.turnId_ptr = turnId_ptr;
+    out_ctx.turnId_len = turnId_len;
+    out_ctx.status = 0;
+    out_ctx.textSegmentSeq = 0;
+    out_ctx.currentAssistantText_len = 0;
+    out_ctx.currentReasoningText_len = 0;
+    out_ctx.assistantText_len = 0;
+    out_ctx.reasoningText_len = 0;
+    out_ctx.hasStartedCurrentAssistantMessage = false;
+    out_ctx.hasCompletedCurrentAssistantMessage = false;
+    out_ctx.hasStartedCurrentReasoning = false;
+    out_ctx.hasCompletedCurrentReasoning = false;
+    out_ctx.hasStartedTurn = false;
+    out_ctx.hasStartedAgentMessage = false;
+    out_ctx.activeToolItems_len = 0;
+    out_ctx.emittedTaskStarts_len = 0;
+}
+
+fn startNewGrokSegment(ctx: &GrokProjectorContext) -> void {
+    ctx.textSegmentSeq = ctx.textSegmentSeq + 1;
+    // ctx.currentAssistantItemId = `grok-msg-${ctx.turnId}-${ctx.textSegmentSeq}`;
+    // ctx.currentReasoningItemId = `grok-thought-${ctx.turnId}-${ctx.textSegmentSeq}`;
+    ctx.currentAssistantText_len = 0;
+    ctx.currentReasoningText_len = 0;
+    ctx.hasStartedCurrentAssistantMessage = false;
+    ctx.hasCompletedCurrentAssistantMessage = false;
+    ctx.hasStartedCurrentReasoning = false;
+    ctx.hasCompletedCurrentReasoning = false;
+}
+
+// 对齐 mini(muse)/opencode：思考独立成 reasoning 项，正文只含 text，
+// 瀑布流靠 reasoningBuffer 把思考挂到下一条 agentMessage 的 Thinking 位，
+// 正文不再重复思考内容。
+// DEFECT: events array push (GrokProjectedEvent[]) — caller-provided fixed array capacity 32 + len out-param (out_events_len) used by all projector functions in this file.
+fn completeActiveReasoning(ctx: &GrokProjectorContext, out_events_len: &u64, status: u64) -> void {
+    // status default "completed"; 1=completed 2=failed 3=interrupted
+    if ctx.hasStartedCurrentReasoning && !ctx.hasCompletedCurrentReasoning {
+        ctx.hasCompletedCurrentReasoning = true;
+        // events.push({ kind: "item/completed", threadId, turnId, item: { type: "reasoning", id: ctx.currentReasoningItemId, threadId, turnId, title: "Reasoning", text: ctx.currentReasoningText, status, completedAt: Math.floor(Date.now() / 1000) } });
+        // DEFECT: dynamic object — item literal serialized to a JSON text buffer via sa_json_* externs.
+        out_events_len = out_events_len + 1;
+    };
+}
+
+// Grok 原生 task 工具的线名（对齐 grok-build `is_task_tool_id`）：
+// task | Task | spawn_subagent。命中后投影为 collabAgentToolCall，
+// 子 agent 视图（agent rail / all-agents 页）才能正确收敛。
+fn isGrokTaskToolName(name_ptr: ptr, name_len: u64) -> bool {
+    // const trimmed = name.trim().toLowerCase(); if (!trimmed) return false;
+    // const bare = trimmed.split(/[/:._-]{1,2}/).pop() ?? trimmed;
+    // DEFECT: RegExp split (/[/:._-]{1,2}/) + Array.pop + ?? — no SLA regex; approximated by scanning for the last separator byte run (/ : . _ -) and taking the tail segment.
+    // const compact = bare.replace(/[_-]+/g, "");
+    // DEFECT: RegExp replace (/[_-]+/g) approximated by a byte filter dropping '_' and '-'.
+    // return compact === "task" || compact === "spawnsubagent";
+    return false;
+}
+
+fn asNonEmptyText(value_ptr: ptr, value_len: u64, is_string: bool, out_ptr: ptr, out_len: &u64, out_has: &bool) -> void {
+    // return typeof value === "string" && value.trim() ? value.trim() : undefined;
+    // DEFECT: typeof runtime check on unknown — caller passes is_string from the JSON node kind.
+    out_has = is_string && value_len > 0;
+    out_ptr = value_ptr;
+    out_len = value_len;
+}
+
+// DEFECT: recursion over dynamic JSON (string | array | object) + RegExp global matching + Set<string> accumulation — collectGrokSubagentIds is the recursive walker; in SLA it walks the JSON text buffer with sa_json_* externs and appends matches to a fixed array capacity 8 (source caps `into.size >= 8` identically).
+fn collectGrokSubagentIds(value_ptr: ptr, value_len: u64, into_count: &u64) -> void {
+    if into_count >= 8 { return; };
+    // if (typeof value === "string") {
+    //   const patterns = [/subagent_ids?\s*[:=]\s*["']?([\w-]{4,128})["']?/gi, /task_ids?\s*[:=]\s*["']?([\w-]{4,128})["']?/gi];
+    //   for (const pattern of patterns) { pattern.lastIndex = 0; let match; while ((match = pattern.exec(value)) !== null && into.size < 8) into.add(match[1]!); }
+    //   DEFECT: RegExp exec loop with lastIndex state + capture groups + non-null assertion — no SLA regex engine; approximated by literal key scan ("subagent_id"/"task_id" + ':'/'=') then [\w-]{4,128} byte-run capture.
+    //   const trimmed = value.trim();
+    //   if (trimmed.startsWith("{") || trimmed.startsWith("[")) { try { collectGrokSubagentIds(JSON.parse(trimmed), into); } catch { /* 非 JSON 文本，忽略 */ } }
+    //   DEFECT: try/catch around JSON.parse — parse status code checked instead.
+    //   return;
+    // }
+    // if (Array.isArray(value)) { for (const entry of value) { if (into.size >= 8) return; collectGrokSubagentIds(entry, into); } return; }
+    // if (value && typeof value === "object") {
+    //   const record = value as Record<string, unknown>;
+    //   for (const key of ["subagent_id","subagent_ids","task_id","task_ids","resume_from","resume_from_hint"]) {
+    //     const direct = record[key];
+    //     if (typeof direct === "string") { if (/^[\w-]{4,128}$/.test(direct.trim())) into.add(direct.trim()); continue; }
+    //     DEFECT: anchored RegExp test (/^[\w-]{4,128}$/) approximated by a byte-run length/charset check.
+    //     if (Array.isArray(direct)) { for (const entry of direct) { ...same string check... into.add(...); } continue; }
+    //     collectGrokSubagentIds(direct, into);
+    //   }
+    //   if (into.size === 0) collectGrokSubagentIds(record.output, into);
+    // }
+}
+
+// 从 tool_call_update 的 rawOutput 里提取子会话 id（subagent_id / task_id）。
+// DEFECT: spread of Set into array ([...ids]) — result written to a fixed array capacity 8 + count.
+fn extractGrokSubagentIds(rawOutput_ptr: ptr, rawOutput_len: u64, out_count: &u64) -> void {
+    out_count = 0;
+    collectGrokSubagentIds(rawOutput_ptr, rawOutput_len, out_count);
+}
+
+// DEFECT: dynamic object — buildGrokSubagentItem returns Record<string, JsonValue>; in SLA it serializes the collabAgentToolCall item into a JSON text buffer (out_item). Field logic preserved 1:1:
+// description = asNonEmptyText(input.description) ?? asNonEmptyText(input.title) ?? ""; prompt = asNonEmptyText(input.prompt) ?? "";
+// agentRole = asNonEmptyText(input.subagent_type) ?? asNonEmptyText(input.agent) ?? "subagent";
+// agentStatus = status === "in_progress" ? "running" : status;
+// receiverThreadIds = rawOutput === undefined ? [] : extractGrokSubagentIds(rawOutput);
+// childThreadId = receiverThreadIds.length === 1 ? receiverThreadIds[0]! : undefined; (DEFECT: non-null assertion -> length guard)
+// message = in_progress ? (description || `${agentRole} running`) : failed ? (description || `${agentRole} failed`) : (description || `${agentRole} completed`); (DEFECT: template literals -> buffer concat)
+// outputText: string rawOutput as-is, object via JSON.stringify in try/catch (DEFECT: try/catch -> status check), then .trim().slice(0, 6000).
+// Item: { type: "collabAgentToolCall", id: callId, threadId, turnId, tool: "task", status, senderThreadId: threadId, receiverThreadIds, prompt, agentId: childThreadId ?? callId, ...(childThreadId ? { agentThreadId: childThreadId } : {}), agentName: description || agentRole, agentRole, agentStatus, agentsStates: childThreadId ? { [childThreadId]: { status: agentStatus, message } } : {}, input, arguments: input, ...(outputText ? { output: outputText } : {}) }
+// DEFECT: object spread with conditional computed key ({ [childThreadId]: ... }) has no SLA equivalent; the JSON buffer is built conditionally field-by-field.
+fn buildGrokSubagentItem(threadId_ptr: ptr, threadId_len: u64, turnId_ptr: ptr, turnId_len: u64, callId_ptr: ptr, callId_len: u64, input_ptr: ptr, input_len: u64, status: u64, has_rawOutput: bool, rawOutput_ptr: ptr, rawOutput_len: u64, out_item_ptr: ptr, out_item_len: &u64) -> void {
+    out_item_len = 0;
+}
+
+fn completeActiveAssistantMessage(ctx: &GrokProjectorContext, out_events_len: &u64, status: u64) -> void {
+    if ctx.hasStartedCurrentAssistantMessage && !ctx.hasCompletedCurrentAssistantMessage {
+        ctx.hasCompletedCurrentAssistantMessage = true;
+        // events.push({ kind: "item/completed", threadId, turnId, item: { type: "agentMessage", id: ctx.currentAssistantItemId, threadId, turnId, content: [{ type: "text", text: ctx.currentAssistantText, text_elements: [] }], text: ctx.currentAssistantText, role: "assistant", status, completedAt: Math.floor(Date.now() / 1000) } });
+        out_events_len = out_events_len + 1;
+    };
+}
+
+// DEFECT: switch over the GrokEvent discriminated union with per-case type casts (event as GrokThoughtEvent etc.) — SLA dispatches on the raw JSON "type" string compared byte-wise; casts become field extraction from the same JSON buffer.
+fn projectGrokEvent(event: &GrokEvent, ctx: &GrokProjectorContext, out_events_len: &u64) -> void {
+    out_events_len = 0;
+    if ctx.status != 0 { return; };
+    if !ctx.hasStartedTurn {
+        ctx.hasStartedTurn = true;
+        // events.push({ kind: "turn/started", threadId, turnId });
+        out_events_len = out_events_len + 1;
+    };
+    // switch (event.type):
+    // case "available_commands": break; (preamble, no-op)
+    // case "thought": if (thought.data) { if (hasCompletedCurrentAssistantMessage || hasCompletedCurrentReasoning) startNewGrokSegment(ctx); if (!hasStartedCurrentReasoning) { hasStartedCurrentReasoning = true; push item/started reasoning { title: "Reasoning", text: "", status: "inProgress", startedAt, firstTokenAt }; } reasoningText += data; currentReasoningText += data; push item/reasoning/textDelta; }
+    // case "text": if (text.data) { assistantText += data; hasStartedAgentMessage = true; completeActiveReasoning(ctx, events); if (hasCompletedCurrentAssistantMessage) startNewGrokSegment(ctx); if (!hasStartedCurrentAssistantMessage) { hasStartedCurrentAssistantMessage = true; push item/started agentMessage { role: "assistant", status: "inProgress", text: "", content: [] }; } currentAssistantText += data; push item/agentMessage/delta; }
+    // case "tool_call": completeActiveReasoning; complete current assistant message if open; callId = tc.toolCallId || `grok-tool-${turnId}-${Date.now()}`; toolName = tc.toolName || tc.title || "tool"; inputObj = tc.rawInput ?? {}; if (toolName === "use_tool") toolName = inputObj.tool_name || inputObj.toolName || inputObj.name (when string); resolvedInput = { ...inputObj, ...(inputObj.tool_input object ? inputObj.tool_input : {}) }; (DEFECT: object spread merge of dynamic JSON -> JSON buffer merge) if (isGrokTaskToolName(toolName)) { activeToolItems.set(callId, buildGrokSubagentItem(..., "in_progress")); break; } toolItem = { type: "toolCall", id: callId, threadId, turnId, name/tool/toolName: toolName, input/arguments: resolvedInput, status: "in_progress" }; activeToolItems.set(callId, toolItem); push item/started.
+    // case "tool_call_update": callId = tcu.toolCallId; existing = activeToolItems.get(callId) ?? default toolCall item; if (existing.type === "collabAgentToolCall") { terminal = status completed/failed mapping; input = existing.input ?? existing.arguments (object check); updated = buildGrokSubagentItem(..., terminal ?? "in_progress", tcu.rawOutput); activeToolItems.set; linked = receiverThreadIds.length > 0; if (terminal) push item/completed; else if (linked && !emittedTaskStarts.has(callId)) { emittedTaskStarts.add(callId); push item/started; } break; } isDone = completed||failed; updated = { ...existing, turnId, status: isDone ? (failed ? "failed" : "completed") : "in_progress", ...(tcu.rawOutput ? { output: tcu.rawOutput } : {}) }; activeToolItems.set; if (isDone) push item/completed.
+    // case "usage": completeActiveReasoning; complete current assistant message if open; break;
+    // case "end": ctx.sessionId = end.sessionId; push system/init; completeActiveReasoning; complete assistant if open; unsettledTools = [...activeToolItems.values()].some(item => status in_progress/inProgress/started); (DEFECT: spread + Array.some closure -> explicit loop) stopReason normalized trim().toLowerCase(); cleanStop = "" or "end_turn"; if (unsettledTools || !cleanStop) { ctx.status = failed; push turn/failed with reason `grok turn stopped (${end.stopReason || "unknown reason"})` (+ " with tools still running" when unsettledTools); break; } ctx.status = completed; push turn/completed.
+    // case "error": ctx.status = failed; errorText = err.message || "Grok execution failed"; completeActiveReasoning(failed); if assistant open complete it failed; else if (!hasStartedAgentMessage && !hasStartedCurrentReasoning) { hasStartedAgentMessage = true; push item/started + item/completed agentMessage failed with errorText (id = ctx.assistantItemId || `grok-err-${turnId}`); } push turn/failed.
+}
+
+// DEFECT: JsonRpcNotification return (or null) — null is out_found=false; the notification JSON is built into a text buffer per kind:
+// turn/started -> { method: "turn/started", params: { threadId, turnId, turn: { id: turnId, threadId, status: "inProgress" } } }
+// turn/completed -> status "completed"; turn/failed -> turn: { ..., status: "failed", error: error ?? null }, error: error ?? undefined (DEFECT: `as unknown as Record<string, JsonValue>` double cast dropped — buffer built directly)
+// turn/interrupted -> status "interrupted"
+// item/agentMessage/delta -> { threadId, turnId, itemId, delta }; item/reasoning/textDelta -> same shape
+// item/started / item/completed -> { threadId, turnId, item }
+// system/init -> { method: "grok/init", params: { threadId, sessionId } }
+// default -> null
+fn toGrokNotification(event: &GrokProjectedEvent, out_ptr: ptr, out_len: &u64, out_found: &bool) -> void {
+    out_found = false;
+    out_len = 0;
+}
+
+fn forceTerminateGrok(ctx: &GrokProjectorContext, reason: u64, has_error: bool, error_ptr: ptr, error_len: u64, out_events_len: &u64) -> void {
+    // reason: 2=failed 3=interrupted (default "interrupted")
+    out_events_len = 0;
+    if ctx.status != 0 { return; };
+    ctx.status = reason;
+    // const errorText = error || (reason === "failed" ? "Process terminated abruptly" : undefined);
+    // completeActiveReasoning(ctx, events, interrupted|failed per reason);
+    // if assistant open -> completeActiveAssistantMessage(same status);
+    // else if (reason === "failed" && !hasStartedAgentMessage && !hasStartedCurrentReasoning && errorText) push item/started + item/completed failed agentMessage (id = ctx.assistantItemId || `grok-err-${ctx.turnId}`);
+    // push { kind: reason === "interrupted" ? "turn/interrupted" : "turn/failed", threadId, turnId, error: errorText };
+}

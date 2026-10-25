@@ -1,0 +1,145 @@
+// Converted 1:1 from backends/command-code/src/runtime/commandCodeRuntime.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// Process-wide registry for the shared Command Code bridge.
+//
+// One bridge per server process; per-turn CLI processes are
+// spawned by the bridge itself. All CLI state lives under the
+// isolated home (HOME override at spawn), never the user's real
+// `~/.commandcode`.
+//
+// DEFECT: module-level mutable singletons (let sharedBridge,
+// const boundThreads: Set<string>) — SLA has no module globals or
+// Set; state is gathered into CommandCodeRuntimeRegistry, created
+// once by the host and passed by reference. boundThreads is a
+// fixed (ptr,len) array, capacity 1024 thread ids (source has
+// no cap).
+// DEFECT: optional callback parameter onCreate — SLA has no
+// closures/fn values in this position; the callback invocation is
+// dropped (creation is observable via has_bridge after the call).
+@import "./commandCodeAgentBridge.sla"
+
+struct CommandCodeRuntimeRegistry {
+    bridge: CommandCodeAgentBridge,
+    has_bridge: bool,
+    boundThreads_ptr: [ptr; 1024],
+    boundThreads_len: [u64; 1024],
+    boundThreads_count: u64,
+}
+
+fn CommandCodeRuntimeRegistry_new(self: &CommandCodeRuntimeRegistry) -> void {
+    self.has_bridge = false;
+    self.boundThreads_count = 0;
+}
+
+fn commandCodeRuntime_boundHas(self: &CommandCodeRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64) -> bool {
+    for i in 0..self.boundThreads_count {
+        if self.boundThreads_len[i] == threadId_len {
+            if bytes_eq(self.boundThreads_ptr[i], threadId_ptr, threadId_len) { return true; };
+        };
+    }
+    return false;
+}
+
+fn commandCodeRuntime_boundAdd(self: &CommandCodeRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64) -> void {
+    if commandCodeRuntime_boundHas(self, threadId_ptr, threadId_len) { return; };
+    if self.boundThreads_count < 1024 {
+        self.boundThreads_ptr[self.boundThreads_count] = threadId_ptr;
+        self.boundThreads_len[self.boundThreads_count] = threadId_len;
+        self.boundThreads_count = self.boundThreads_count + 1;
+    };
+}
+
+fn commandCodeRuntime_boundDelete(self: &CommandCodeRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64) -> void {
+    for i in 0..self.boundThreads_count {
+        if self.boundThreads_len[i] == threadId_len {
+            if bytes_eq(self.boundThreads_ptr[i], threadId_ptr, threadId_len) {
+                let last = self.boundThreads_count - 1;
+                self.boundThreads_ptr[i] = self.boundThreads_ptr[last];
+                self.boundThreads_len[i] = self.boundThreads_len[last];
+                self.boundThreads_count = last;
+                return;
+            };
+        };
+    }
+}
+
+// defaultCommandCodeHomeDir(dataDir): join(dataDir, "command-code").
+// DEFECT: node:path join — approximated by byte concat with '/'
+// into the caller's buffer (no Windows separator handling).
+fn defaultCommandCodeHomeDir(dataDir_ptr: ptr, dataDir_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let n: u64 = 0;
+    for i in 0..dataDir_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, dataDir_ptr, i);
+        if n < out_cap { PTR_BYTE_SET(out, n, b); n = n + 1; };
+    }
+    if n < out_cap { PTR_BYTE_SET(out, n, 47); n = n + 1; };
+    let suffix = "command-code";
+    let sp: ptr = STR_PTR(suffix);
+    for j in 0..12 {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, sp, j);
+        if n < out_cap { PTR_BYTE_SET(out, n, b); n = n + 1; };
+    }
+    out_len = n;
+}
+
+// ensureCommandCodeBridge(dataDir, onCreate?): creates the shared
+// bridge on first use. DEFECT: onCreate callback dropped.
+fn ensureCommandCodeBridge(self: &CommandCodeRuntimeRegistry, dataDir_ptr: ptr, dataDir_len: u64) -> &CommandCodeAgentBridge {
+    if !self.has_bridge {
+        // TS: sharedBridge = new CommandCodeAgentBridge(defaultCommandCodeHomeDir(dataDir))
+        // DEFECT: heap allocation/new — bridge is embedded by value.
+        let dirbuf = [0u8; 1024];
+        let dirlen: u64 = 0;
+        defaultCommandCodeHomeDir(dataDir_ptr, dataDir_len, &dirbuf, 1024, &dirlen);
+        CommandCodeAgentBridge_new(&self.bridge, &dirbuf, dirlen);
+        self.has_bridge = true;
+    };
+    return &self.bridge;
+}
+
+fn ensureCommandCodeBridgeForThread(self: &CommandCodeRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64, has_threadId: bool, dataDir_ptr: ptr, dataDir_len: u64) -> &CommandCodeAgentBridge {
+    let bridge = ensureCommandCodeBridge(self, dataDir_ptr, dataDir_len);
+    if has_threadId { commandCodeRuntime_boundAdd(self, threadId_ptr, threadId_len); };
+    return bridge;
+}
+
+fn existingCommandCodeBridgeForThread(self: &CommandCodeRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64, out_has: &bool) -> &CommandCodeAgentBridge {
+    out_has = false;
+    if !self.has_bridge { return &self.bridge; };
+    if commandCodeRuntime_boundHas(self, threadId_ptr, threadId_len) || CommandCodeAgentBridge_hasSession(&self.bridge, threadId_ptr, threadId_len) {
+        out_has = true;
+    };
+    return &self.bridge;
+}
+
+fn bindCommandCodeThreadBridge(self: &CommandCodeRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64, bridge: &CommandCodeAgentBridge) -> void {
+    // DEFECT: TS assigns the passed bridge object by reference;
+    // SLA copies the struct by value.
+    self.bridge = bridge;
+    self.has_bridge = true;
+    commandCodeRuntime_boundAdd(self, threadId_ptr, threadId_len);
+}
+
+fn releaseCommandCodeThreadBridge(self: &CommandCodeRuntimeRegistry, threadId_ptr: ptr, threadId_len: u64) -> void {
+    commandCodeRuntime_boundDelete(self, threadId_ptr, threadId_len);
+}
+
+fn stopCommandCodeRuntime(self: &CommandCodeRuntimeRegistry) -> void {
+    if self.has_bridge { CommandCodeAgentBridge_stop(&self.bridge); };
+    self.has_bridge = false;
+    self.boundThreads_count = 0;
+}
+
+// bytes_eq helper (local copy; see clineRuntime.sla note).
+fn bytes_eq(a: ptr, b: ptr, n: u64) -> bool {
+    for i in 0..n {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a, i);
+        PTR_BYTE_AT(y, b, i);
+        if x != y { return false; };
+    }
+    return true;
+}

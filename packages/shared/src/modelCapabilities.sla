@@ -1,0 +1,771 @@
+// Converted 1:1 from packages/shared/src/modelCapabilities.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Conventions: string -> (ptr,len); produced strings -> caller StrBuf;
+// string lists -> StrList (fixed cap 32); optional -> value + _present.
+// DEFECT (file-wide): TS RegExp patterns have no sa_std counterpart;
+// each pattern is approximated by a hand-rolled matcher (segment /
+// substring checks) and marked at its definition. Case-insensitivity
+// is handled by lowercasing inputs first where the TS code does.
+
+@import "sa_std/string.sa"
+@import "sa_std/json.sai"
+
+struct StrRef {
+    ptr: ptr,
+    len: u64,
+}
+
+struct StrBuf {
+    bytes: [u8; 2048],
+    len: u64,
+}
+
+struct StrList {
+    items: [StrRef; 32],
+    len: u64,
+}
+
+// ReasoningEffortValue = string (alias)
+struct ReasoningEffortValue {
+    value_ptr: ptr,
+    value_len: u64,
+}
+
+// ModelVerbosity: "low" = 0, "medium" = 1, "high" = 2
+struct ModelVerbosity {
+    value: u64,
+}
+
+struct ModelCapabilityDescriptor {
+    reasoningEfforts: StrList,
+    reasoningEfforts_present: bool,
+    contextWindow: f64,
+    contextWindow_present: bool,
+    maxOutputTokens: f64,
+    maxOutputTokens_present: bool,
+    verbosity: u64,
+    verbosity_present: bool,
+    supportsVerbosity: bool,
+    supportsVerbosity_present: bool,
+    // source: "upstream" = 0, "catalog" = 1, "inferred" = 2
+    source: u64,
+    source_present: bool,
+}
+
+struct ModelContextVariant {
+    model_ptr: ptr,
+    model_len: u64,
+    baseModel_ptr: ptr,
+    baseModel_len: u64,
+    contextWindow: f64,
+}
+
+// ---------- small string helpers (local; TS String methods) ----------
+
+fn str_trim(p: ptr, l: u64, out_p: &ptr, out_l: &u64) -> void {
+    let s: u64 = 0;
+    let e: u64 = l;
+    while s < e {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, p, s);
+        if b == 32 || b == 9 || b == 10 || b == 13 { s = s + 1; } else { break; };
+    }
+    while e > s {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, p, e - 1);
+        if b == 32 || b == 9 || b == 10 || b == 13 { e = e - 1; } else { break; };
+    }
+    let np: ptr = PTR_NULL();
+    PTR_BYTE_ADD(np, p, s);
+    *out_p = np;
+    *out_l = e - s;
+}
+
+fn byte_at(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+fn str_eq_lit(p: ptr, l: u64, lit_ptr: ptr, lit_len: u64) -> bool {
+    if l != lit_len { return false; };
+    for i in 0..l {
+        if byte_at(p, i) != byte_at(lit_ptr, i) { return false; };
+    }
+    return true;
+}
+
+fn str_contains(p: ptr, l: u64, n_ptr: ptr, n_len: u64) -> bool {
+    if n_len == 0 || l < n_len { return false; };
+    let last = l - n_len;
+    for i in 0..last + 1 {
+        let ok = true;
+        for j in 0..n_len {
+            if byte_at(p, i + j) != byte_at(n_ptr, j) { ok = false; break; };
+        }
+        if ok { return true; };
+    }
+    return false;
+}
+
+fn str_starts(p: ptr, l: u64, n_ptr: ptr, n_len: u64) -> bool {
+    if l < n_len { return false; };
+    for j in 0..n_len {
+        if byte_at(p, j) != byte_at(n_ptr, j) { return false; };
+    }
+    return true;
+}
+
+fn str_ends(p: ptr, l: u64, n_ptr: ptr, n_len: u64) -> bool {
+    if l < n_len { return false; };
+    let off = l - n_len;
+    for j in 0..n_len {
+        if byte_at(p, off + j) != byte_at(n_ptr, j) { return false; };
+    }
+    return true;
+}
+
+fn buf_putc(b: &StrBuf, c: u8) -> void {
+    if b.len < 2048 { b.bytes[b.len] = c; b.len = b.len + 1; };
+}
+
+fn buf_append(b: &StrBuf, p: ptr, l: u64) -> void {
+    for i in 0..l { buf_putc(b, byte_at(p, i)); }
+}
+
+fn buf_lower_copy(b: &StrBuf, p: ptr, l: u64) -> void {
+    b.len = 0;
+    for i in 0..l {
+        let c = byte_at(p, i);
+        if c >= 65 && c <= 90 { c = c + 32; };
+        buf_putc(b, c);
+    }
+}
+
+// segment check: does any '/'- or '-'-delimited context contain the
+// needle at a pattern boundary (approx of (?:^|[\/-])needle(?:[\/-]|$))
+fn pat_segment(p: ptr, l: u64, n_ptr: ptr, n_len: u64) -> bool {
+    if n_len == 0 || l < n_len { return false; };
+    let last = l - n_len;
+    for i in 0..last + 1 {
+        let before_ok = false;
+        if i == 0 { before_ok = true; };
+        if i > 0 {
+            let pb = byte_at(p, i - 1);
+            if pb == 47 || pb == 45 { before_ok = true; };
+        };
+        if before_ok {
+            let ok = true;
+            for j in 0..n_len {
+                if byte_at(p, i + j) != byte_at(n_ptr, j) { ok = false; break; };
+            }
+            if ok {
+                let end = i + n_len;
+                if end == l { return true; };
+                let nb = byte_at(p, end);
+                if nb == 47 || nb == 45 { return true; };
+            };
+        };
+    }
+    return false;
+}
+
+// DEFAULT_REASONING_EFFORTS = ["low", "medium", "high"]
+fn default_reasoning_effort_at(idx: u64, out: &StrRef) -> bool {
+    if idx == 0 { out.ptr = STR_PTR("low"); out.len = STR_LEN("low"); return true; };
+    if idx == 1 { out.ptr = STR_PTR("medium"); out.len = STR_LEN("medium"); return true; };
+    if idx == 2 { out.ptr = STR_PTR("high"); out.len = STR_LEN("high"); return true; };
+    return false;
+}
+
+fn descriptor_empty(out: &ModelCapabilityDescriptor) -> void {
+    out.reasoningEfforts.len = 0;
+    out.reasoningEfforts_present = false;
+    out.contextWindow = 0.0; out.contextWindow_present = false;
+    out.maxOutputTokens = 0.0; out.maxOutputTokens_present = false;
+    out.verbosity = 0; out.verbosity_present = false;
+    out.supportsVerbosity = false; out.supportsVerbosity_present = false;
+    out.source = 0; out.source_present = false;
+}
+
+fn list_push(l: &StrList, p: ptr, len: u64) -> void {
+    if l.len < 32 { l.items[l.len] = StrRef { ptr: p, len: len }; l.len = l.len + 1; };
+}
+
+fn list_contains(l: &StrList, p: ptr, len: u64) -> bool {
+    for i in 0..l.len {
+        if str_eq_lit(l.items[i].ptr, l.items[i].len, p, len) { return true; };
+    }
+    return false;
+}
+
+// uniqueStrings: Set dedupe, order-preserving.
+fn uniqueStrings(dst: &StrList, src: &StrList) -> void {
+    dst.len = 0;
+    for i in 0..src.len {
+        if !list_contains(dst, src.items[i].ptr, src.items[i].len) {
+            list_push(dst, src.items[i].ptr, src.items[i].len);
+        };
+    }
+}
+
+// ---------- pattern matchers (DEFECT: RegExp approximations) ----------
+// All matchers receive the NORMALIZED (lowercased, dash-collapsed) id,
+// as in TS where patterns run on normalizedModelId output or with /i.
+
+// CLAUDE_1M_MODEL_PATTERN:
+// claude-(fable-5|mythos-5(-preview)?|mythos-preview|opus-5|opus-4-[678]|sonnet-5|sonnet-4-6) at segment bounds
+fn re_claude_1m(p: ptr, l: u64) -> bool {
+    if !pat_segment(p, l, STR_PTR("claude"), STR_LEN("claude")) { return false; };
+    if pat_segment(p, l, STR_PTR("fable-5"), STR_LEN("fable-5")) { return true; };
+    if pat_segment(p, l, STR_PTR("mythos-5"), STR_LEN("mythos-5")) { return true; };
+    if pat_segment(p, l, STR_PTR("mythos-preview"), STR_LEN("mythos-preview")) { return true; };
+    if pat_segment(p, l, STR_PTR("opus-5"), STR_LEN("opus-5")) { return true; };
+    if pat_segment(p, l, STR_PTR("opus-4-6"), STR_LEN("opus-4-6")) { return true; };
+    if pat_segment(p, l, STR_PTR("opus-4-7"), STR_LEN("opus-4-7")) { return true; };
+    if pat_segment(p, l, STR_PTR("opus-4-8"), STR_LEN("opus-4-8")) { return true; };
+    if pat_segment(p, l, STR_PTR("sonnet-5"), STR_LEN("sonnet-5")) { return true; };
+    if pat_segment(p, l, STR_PTR("sonnet-4-6"), STR_LEN("sonnet-4-6")) { return true; };
+    return false;
+}
+
+// CLAUDE_XHIGH_MODEL_PATTERN: claude-(fable-5|mythos-5|opus-5|opus-4-[78]|sonnet-5)
+fn re_claude_xhigh(p: ptr, l: u64) -> bool {
+    if !pat_segment(p, l, STR_PTR("claude"), STR_LEN("claude")) { return false; };
+    if pat_segment(p, l, STR_PTR("fable-5"), STR_LEN("fable-5")) { return true; };
+    if pat_segment(p, l, STR_PTR("mythos-5"), STR_LEN("mythos-5")) { return true; };
+    if pat_segment(p, l, STR_PTR("opus-5"), STR_LEN("opus-5")) { return true; };
+    if pat_segment(p, l, STR_PTR("opus-4-7"), STR_LEN("opus-4-7")) { return true; };
+    if pat_segment(p, l, STR_PTR("opus-4-8"), STR_LEN("opus-4-8")) { return true; };
+    if pat_segment(p, l, STR_PTR("sonnet-5"), STR_LEN("sonnet-5")) { return true; };
+    return false;
+}
+
+// CLAUDE_NATIVE_EFFORT_MODEL_PATTERN: claude-(fable|opus|sonnet)
+fn re_claude_native_effort(p: ptr, l: u64) -> bool {
+    if !pat_segment(p, l, STR_PTR("claude"), STR_LEN("claude")) { return false; };
+    if pat_segment(p, l, STR_PTR("fable"), STR_LEN("fable")) { return true; };
+    if pat_segment(p, l, STR_PTR("opus"), STR_LEN("opus")) { return true; };
+    if pat_segment(p, l, STR_PTR("sonnet"), STR_LEN("sonnet")) { return true; };
+    return false;
+}
+
+// GPT_XHIGH_MODEL_PATTERN: gpt-5-(4(-mini)?|5)
+fn re_gpt_xhigh(p: ptr, l: u64) -> bool {
+    if pat_segment(p, l, STR_PTR("gpt-5-4"), STR_LEN("gpt-5-4")) { return true; };
+    if pat_segment(p, l, STR_PTR("gpt-5-5"), STR_LEN("gpt-5-5")) { return true; };
+    return false;
+}
+
+// GPT_6_MODEL_PATTERN: gpt-6(-|$)
+fn re_gpt_6(p: ptr, l: u64) -> bool {
+    return pat_segment(p, l, STR_PTR("gpt-6"), STR_LEN("gpt-6"));
+}
+
+// GPT_56_MODEL_PATTERN: gpt-5-6([.-]|$)
+fn re_gpt_56(p: ptr, l: u64) -> bool {
+    if pat_segment(p, l, STR_PTR("gpt-5-6"), STR_LEN("gpt-5-6")) { return true; };
+    // the '.' boundary variant of the original pattern
+    return str_contains(p, l, STR_PTR("gpt-5-6."), STR_LEN("gpt-5-6."));
+}
+
+// MODEL_VERBOSITY_DEFAULTS table (pattern -> verbosity tag).
+// Returns true + sets out_tag when a row matches; rows are ordered.
+fn verbosity_default_for(np: ptr, nl: u64, out_tag: &u64) -> bool {
+    if pat_segment(np, nl, STR_PTR("gpt-5-4-mini"), STR_LEN("gpt-5-4-mini")) { *out_tag = 1; return true; };
+    if pat_segment(np, nl, STR_PTR("gpt-daybreak-red"), STR_LEN("gpt-daybreak-red")) { *out_tag = 2; return true; };
+    if pat_segment(np, nl, STR_PTR("gpt-6"), STR_LEN("gpt-6")) { *out_tag = 0; return true; };
+    if pat_segment(np, nl, STR_PTR("gpt-5-6"), STR_LEN("gpt-5-6")) { *out_tag = 0; return true; };
+    if pat_segment(np, nl, STR_PTR("gpt-5-2"), STR_LEN("gpt-5-2")) { *out_tag = 0; return true; };
+    if pat_segment(np, nl, STR_PTR("gpt-5-4"), STR_LEN("gpt-5-4")) { *out_tag = 0; return true; };
+    if pat_segment(np, nl, STR_PTR("gpt-5-5"), STR_LEN("gpt-5-5")) { *out_tag = 0; return true; };
+    if pat_segment(np, nl, STR_PTR("gpt-daybreak-blue"), STR_LEN("gpt-daybreak-blue")) { *out_tag = 0; return true; };
+    if pat_segment(np, nl, STR_PTR("codex-auto-review"), STR_LEN("codex-auto-review")) { *out_tag = 0; return true; };
+    return false;
+}
+
+// ---------- converted functions (source order) ----------
+
+// normalizeModelVerbosity(value: unknown) — SLA form takes the raw
+// string form; non-string unknown -> pass len 0 with is_string=false.
+// Returns false for TS undefined; out_tag: 0 low, 1 medium, 2 high.
+fn normalizeModelVerbosity(v_ptr: ptr, v_len: u64, is_string: bool, out_tag: &u64) -> bool {
+    if !is_string { return false; };
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    str_trim(v_ptr, v_len, &tp, &tl);
+    let buf = StrBuf { bytes: [0u8; 2048], len: 0 };
+    buf_lower_copy(&buf, tp, tl);
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &buf.bytes, 0);
+    if str_eq_lit(bp, buf.len, STR_PTR("low"), STR_LEN("low")) { *out_tag = 0; return true; };
+    if str_eq_lit(bp, buf.len, STR_PTR("medium"), STR_LEN("medium")) { *out_tag = 1; return true; };
+    if str_eq_lit(bp, buf.len, STR_PTR("high"), STR_LEN("high")) { *out_tag = 2; return true; };
+    return false;
+}
+
+// stripModelContextVariant(model) -> { baseModel, contextWindow? }
+// baseModel written into out_base (StrBuf); has_cw mirrors TS optional.
+// DEFECT: TS regex /\[(\d+(\.\d+)?)\s*([km])\]$/i -> manual tail parse.
+fn stripModelContextVariant(model_ptr: ptr, model_len: u64, out_base: &StrBuf, cw: &f64, has_cw: &bool) -> void {
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    str_trim(model_ptr, model_len, &tp, &tl);
+    *has_cw = false;
+    *cw = 0.0;
+    out_base.len = 0;
+    // find trailing "]" then scan back to "["
+    if tl >= 3 && byte_at(tp, tl - 1) == 93 {
+        let open: i64 = -1;
+        let i: u64 = tl - 1;
+        while i > 0 {
+            i = i - 1;
+            if byte_at(tp, i) == 91 { open = i as i64; break; };
+            if byte_at(tp, i) == 93 { break; };
+        }
+        if open >= 0 {
+            let oi = open as u64;
+            // parse inside (oi+1 .. tl-1): digits[.digits] spaces* (k|m)
+            let j = oi + 1;
+            let amount: f64 = 0.0;
+            let digits = false;
+            let frac: f64 = 0.0;
+            let frac_div: f64 = 1.0;
+            let in_frac = false;
+            let unit: u8 = 0;
+            let valid = true;
+            while j < tl - 1 {
+                let c = byte_at(tp, j);
+                if c >= 48 && c <= 57 {
+                    digits = true;
+                    if in_frac { frac_div = frac_div * 10.0; frac = frac + (c - 48) as f64 / frac_div; } else { amount = amount * 10.0 + (c - 48) as f64; };
+                } else if c == 46 && !in_frac {
+                    in_frac = true;
+                } else if c == 32 || c == 9 {
+                    // spaces before unit allowed
+                } else if c == 107 || c == 109 || c == 75 || c == 77 {
+                    unit = c;
+                } else {
+                    valid = false;
+                    break;
+                };
+                j = j + 1;
+            }
+            if valid && digits && unit != 0 {
+                let mult: f64 = 1000.0;
+                if unit == 109 || unit == 77 { mult = 1000000.0; };
+                let total = (amount + frac) * mult;
+                if total > 0.0 {
+                    *cw = total + 0.5;
+                    let iv = *cw as i64;
+                    *cw = iv as f64;
+                    *has_cw = true;
+                };
+                // baseModel = value.slice(0, match.index).trim()
+                let bp2: ptr = PTR_NULL();
+                let bl2: u64 = 0;
+                str_trim(tp, oi, &bp2, &bl2);
+                buf_append(out_base, bp2, bl2);
+                return;
+            };
+        };
+    };
+    buf_append(out_base, tp, tl);
+}
+
+// Variant used by tokenPricing.sla (out-params ptr/len form).
+fn stripModelContextVariant2(model_ptr: ptr, model_len: u64, base_p: &ptr, base_l: &u64, cw: &f64, has_cw: &bool) -> void {
+    let buf = StrBuf { bytes: [0u8; 2048], len: 0 };
+    stripModelContextVariant(model_ptr, model_len, &buf, cw, has_cw);
+    // DEFECT: StrBuf is stack-local here; fix phase must give the
+    // result a caller-owned buffer. Callers in this pass use the
+    // StrBuf form (stripModelContextVariant) instead.
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &buf.bytes, 0);
+    *base_p = bp;
+    *base_l = buf.len;
+}
+
+// normalizedModelId(model): baseModel.trim().toLowerCase()
+//   .replace(/[._\s]+/g, "-").replace(/-+/g, "-")
+// Output written to out (StrBuf).
+fn normalizedModelId(model_ptr: ptr, model_len: u64, out: &StrBuf) -> void {
+    let base = StrBuf { bytes: [0u8; 2048], len: 0 };
+    let cw: f64 = 0.0;
+    let has_cw = false;
+    stripModelContextVariant(model_ptr, model_len, &base, &cw, &has_cw);
+    out.len = 0;
+    let prev_dash = false;
+    for i in 0..base.len {
+        let c = base.bytes[i];
+        if c >= 65 && c <= 90 { c = c + 32; };
+        if c == 46 || c == 95 || c == 32 || c == 9 || c == 10 || c == 13 {
+            c = 45;
+        };
+        if c == 45 {
+            if prev_dash { continue; };
+            prev_dash = true;
+        } else {
+            prev_dash = false;
+        };
+        buf_putc(out, c);
+    }
+}
+
+fn normalized_ptr(nbuf: &StrBuf, out_p: &ptr) -> void {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &nbuf.bytes, 0);
+    *out_p = p;
+}
+
+// inferModelVerbosity(model) -> verbosity tag or undefined(false)
+fn inferModelVerbosity(model_ptr: ptr, model_len: u64, out_tag: &u64) -> bool {
+    let nb = StrBuf { bytes: [0u8; 2048], len: 0 };
+    normalizedModelId(model_ptr, model_len, &nb);
+    let np: ptr = PTR_NULL();
+    normalized_ptr(&nb, &np);
+    return verbosity_default_for(np, nb.len, out_tag);
+}
+
+// inferModelCapabilities(model) -> ModelCapabilityDescriptor
+fn inferModelCapabilities(model_ptr: ptr, model_len: u64, out: &ModelCapabilityDescriptor) -> void {
+    descriptor_empty(out);
+    let nb = StrBuf { bytes: [0u8; 2048], len: 0 };
+    normalizedModelId(model_ptr, model_len, &nb);
+    let np: ptr = PTR_NULL();
+    normalized_ptr(&nb, &np);
+    let nl = nb.len;
+    // opencode family prefix ^(opencode|oc|opencode-zen|opencode-go)[/-](.+)$
+    let bare_off: u64 = 0;
+    let is_oc = false;
+    if str_starts(np, nl, STR_PTR("opencode-zen-"), STR_LEN("opencode-zen-")) { is_oc = true; bare_off = 13; };
+    if !is_oc && str_starts(np, nl, STR_PTR("opencode-go-"), STR_LEN("opencode-go-")) { is_oc = true; bare_off = 12; };
+    if !is_oc && str_starts(np, nl, STR_PTR("opencode-"), STR_LEN("opencode-")) { is_oc = true; bare_off = 9; };
+    if !is_oc && str_starts(np, nl, STR_PTR("opencode/"), STR_LEN("opencode/")) { is_oc = true; bare_off = 9; };
+    if !is_oc && str_starts(np, nl, STR_PTR("oc-"), STR_LEN("oc-")) { is_oc = true; bare_off = 3; };
+    if !is_oc && str_starts(np, nl, STR_PTR("oc/"), STR_LEN("oc/")) { is_oc = true; bare_off = 3; };
+    if is_oc {
+        let bp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(bp, np, bare_off);
+        let bl = nl - bare_off;
+        if str_eq_lit(bp, bl, STR_PTR("big-pickle"), STR_LEN("big-pickle")) {
+            out.contextWindow = 200000.0; out.contextWindow_present = true;
+            out.source = 2; out.source_present = true;
+            return;
+        };
+        if str_ends(bp, bl, STR_PTR("-free"), STR_LEN("-free")) || str_ends(bp, bl, STR_PTR(":free"), STR_LEN(":free")) {
+            out.contextWindow = 1000000.0; out.contextWindow_present = true;
+            out.source = 2; out.source_present = true;
+            return;
+        };
+    };
+    // muse-spark-<suffix>
+    if pat_segment(np, nl, STR_PTR("muse-spark"), STR_LEN("muse-spark")) {
+        out.contextWindow = 1000000.0; out.contextWindow_present = true;
+        out.source = 2; out.source_present = true;
+        return;
+    };
+    if re_gpt_56(np, nl) || re_gpt_6(np, nl) {
+        fill_efforts(out, 6);
+        out.source = 2; out.source_present = true;
+        return;
+    };
+    if re_gpt_xhigh(np, nl) {
+        fill_efforts(out, 4);
+        out.source = 2; out.source_present = true;
+        return;
+    };
+    if re_claude_native_effort(np, nl) {
+        fill_efforts(out, 6);
+        if re_claude_1m(np, nl) {
+            out.contextWindow = 1000000.0; out.contextWindow_present = true;
+            out.maxOutputTokens = 128000.0; out.maxOutputTokens_present = true;
+        };
+        out.source = 2; out.source_present = true;
+        return;
+    };
+    if !re_claude_1m(np, nl) { return; };
+    fill_efforts(out, 3);
+    // mythos preview: claude-mythos-(5-)?preview
+    let mythos_preview = pat_segment(np, nl, STR_PTR("mythos-preview"), STR_LEN("mythos-preview")) || pat_segment(np, nl, STR_PTR("mythos-5-preview"), STR_LEN("mythos-5-preview"));
+    if re_claude_xhigh(np, nl) && !mythos_preview {
+        push_effort(out, STR_PTR("xhigh"), STR_LEN("xhigh"));
+    };
+    // CLAUDE_MAX_MODEL_PATTERN == CLAUDE_1M_MODEL_PATTERN (const alias)
+    push_effort(out, STR_PTR("max"), STR_LEN("max"));
+    push_effort(out, STR_PTR("ultra"), STR_LEN("ultra"));
+    out.contextWindow = 1000000.0; out.contextWindow_present = true;
+    out.maxOutputTokens = 128000.0; out.maxOutputTokens_present = true;
+    out.source = 2; out.source_present = true;
+}
+
+// count: 3 = defaults only, 4 = +xhigh, 6 = +xhigh+max+ultra
+fn fill_efforts(out: &ModelCapabilityDescriptor, count: u64) -> void {
+    out.reasoningEfforts.len = 0;
+    let r = StrRef { ptr: PTR_NULL(), len: 0 };
+    for i in 0..3 {
+        if default_reasoning_effort_at(i, &r) { list_push(&out.reasoningEfforts, r.ptr, r.len); };
+    }
+    if count >= 4 { push_effort(out, STR_PTR("xhigh"), STR_LEN("xhigh")); };
+    if count >= 6 {
+        push_effort(out, STR_PTR("max"), STR_LEN("max"));
+        push_effort(out, STR_PTR("ultra"), STR_LEN("ultra"));
+    };
+    out.reasoningEfforts_present = true;
+}
+
+fn push_effort(out: &ModelCapabilityDescriptor, p: ptr, l: u64) -> void {
+    list_push(&out.reasoningEfforts, p, l);
+    out.reasoningEfforts_present = true;
+}
+
+// resolveModelVerbosity(model, explicit?) -> tag or undefined(false)
+// explicit passed as descriptor + has_explicit flag.
+fn resolveModelVerbosity(model_ptr: ptr, model_len: u64, explicit: &ModelCapabilityDescriptor, has_explicit: bool, out_tag: &u64) -> bool {
+    if has_explicit && explicit.supportsVerbosity_present && !explicit.supportsVerbosity { return false; };
+    if has_explicit && explicit.verbosity_present { *out_tag = explicit.verbosity; return true; };
+    if has_explicit && explicit.supportsVerbosity_present && explicit.supportsVerbosity { *out_tag = 0; return true; };
+    return inferModelVerbosity(model_ptr, model_len, out_tag);
+}
+
+// mergeModelCapabilities(model, explicit?) -> descriptor
+// DEFECT: TS spread of defined-only fields -> explicit _present flags.
+fn mergeModelCapabilities(model_ptr: ptr, model_len: u64, explicit: &ModelCapabilityDescriptor, has_explicit: bool, out: &ModelCapabilityDescriptor) -> void {
+    descriptor_empty(out);
+    let inferred = ModelCapabilityDescriptor { reasoningEfforts: StrList { items: [StrRef { ptr: PTR_NULL(), len: 0 }; 32], len: 0 }, reasoningEfforts_present: false, contextWindow: 0.0, contextWindow_present: false, maxOutputTokens: 0.0, maxOutputTokens_present: false, verbosity: 0, verbosity_present: false, supportsVerbosity: false, supportsVerbosity_present: false, source: 0, source_present: false };
+    inferModelCapabilities(model_ptr, model_len, &inferred);
+    // reasoning efforts: normalize both lists (TS normalizeReasoningEfforts
+    // also accepts record-shaped entries; here lists are already strings)
+    let merged = StrList { items: [StrRef { ptr: PTR_NULL(), len: 0 }; 32], len: 0 };
+    if has_explicit && explicit.reasoningEfforts_present && explicit.reasoningEfforts.len > 0 {
+        let both = StrList { items: [StrRef { ptr: PTR_NULL(), len: 0 }; 32], len: 0 };
+        for i in 0..explicit.reasoningEfforts.len { list_push(&both, explicit.reasoningEfforts.items[i].ptr, explicit.reasoningEfforts.items[i].len); };
+        for i2 in 0..inferred.reasoningEfforts.len { list_push(&both, inferred.reasoningEfforts.items[i2].ptr, inferred.reasoningEfforts.items[i2].len); };
+        uniqueStrings(&merged, &both);
+    } else {
+        uniqueStrings(&merged, &inferred.reasoningEfforts);
+    };
+    if merged.len > 0 {
+        out.reasoningEfforts = merged;
+        out.reasoningEfforts_present = true;
+    };
+    // contextWindow
+    let base = StrBuf { bytes: [0u8; 2048], len: 0 };
+    let vcw: f64 = 0.0;
+    let has_vcw = false;
+    stripModelContextVariant(model_ptr, model_len, &base, &vcw, &has_vcw);
+    if has_explicit && explicit.contextWindow_present && explicit.contextWindow > 0.0 {
+        let r = explicit.contextWindow + 0.5;
+        let iv = r as i64;
+        out.contextWindow = iv as f64; out.contextWindow_present = true;
+    } else if has_vcw {
+        out.contextWindow = vcw; out.contextWindow_present = true;
+    } else if inferred.contextWindow_present {
+        out.contextWindow = inferred.contextWindow; out.contextWindow_present = true;
+    };
+    // maxOutputTokens
+    if has_explicit && explicit.maxOutputTokens_present && explicit.maxOutputTokens > 0.0 {
+        let r = explicit.maxOutputTokens + 0.5;
+        let iv = r as i64;
+        out.maxOutputTokens = iv as f64; out.maxOutputTokens_present = true;
+    } else if inferred.maxOutputTokens_present {
+        out.maxOutputTokens = inferred.maxOutputTokens; out.maxOutputTokens_present = true;
+    };
+    // verbosity (+ supportsVerbosity: true when resolved, per TS)
+    let vtag: u64 = 0;
+    if resolveModelVerbosity(model_ptr, model_len, explicit, has_explicit, &vtag) {
+        out.verbosity = vtag; out.verbosity_present = true;
+        out.supportsVerbosity = true; out.supportsVerbosity_present = true;
+    };
+    if has_explicit && explicit.source_present {
+        out.source = explicit.source; out.source_present = true;
+    } else if inferred.source_present {
+        out.source = inferred.source; out.source_present = true;
+    };
+}
+
+// resolveReasoningEfforts(model, explicit?) -> StrList (out param)
+fn resolveReasoningEfforts(model_ptr: ptr, model_len: u64, explicit: &ModelCapabilityDescriptor, has_explicit: bool, out: &StrList) -> void {
+    let merged = ModelCapabilityDescriptor { reasoningEfforts: StrList { items: [StrRef { ptr: PTR_NULL(), len: 0 }; 32], len: 0 }, reasoningEfforts_present: false, contextWindow: 0.0, contextWindow_present: false, maxOutputTokens: 0.0, maxOutputTokens_present: false, verbosity: 0, verbosity_present: false, supportsVerbosity: false, supportsVerbosity_present: false, source: 0, source_present: false };
+    mergeModelCapabilities(model_ptr, model_len, explicit, has_explicit, &merged);
+    out.len = 0;
+    if merged.reasoningEfforts_present && merged.reasoningEfforts.len > 0 {
+        for i in 0..merged.reasoningEfforts.len { list_push(out, merged.reasoningEfforts.items[i].ptr, merged.reasoningEfforts.items[i].len); };
+        return;
+    };
+    let r = StrRef { ptr: PTR_NULL(), len: 0 };
+    for i2 in 0..3 {
+        if default_reasoning_effort_at(i2, &r) { list_push(out, r.ptr, r.len); };
+    }
+}
+
+// resolveModelContextWindow(model, explicit?, groupContextWindow?)
+// group: pass has_group=false when TS arg is undefined.
+fn resolveModelContextWindow(model_ptr: ptr, model_len: u64, explicit: &ModelCapabilityDescriptor, has_explicit: bool, group_cw: f64, has_group: bool, out_v: &f64) -> bool {
+    let base = StrBuf { bytes: [0u8; 2048], len: 0 };
+    let vcw: f64 = 0.0;
+    let has_vcw = false;
+    stripModelContextVariant(model_ptr, model_len, &base, &vcw, &has_vcw);
+    if has_vcw { *out_v = vcw; return true; };
+    if has_group && group_cw > 0.0 {
+        let r = group_cw + 0.5;
+        let iv = r as i64;
+        *out_v = iv as f64;
+        return true;
+    };
+    let merged = ModelCapabilityDescriptor { reasoningEfforts: StrList { items: [StrRef { ptr: PTR_NULL(), len: 0 }; 32], len: 0 }, reasoningEfforts_present: false, contextWindow: 0.0, contextWindow_present: false, maxOutputTokens: 0.0, maxOutputTokens_present: false, verbosity: 0, verbosity_present: false, supportsVerbosity: false, supportsVerbosity_present: false, source: 0, source_present: false };
+    mergeModelCapabilities(model_ptr, model_len, explicit, has_explicit, &merged);
+    // TS: if merged.contextWindow && source !== "inferred" return it;
+    // then return merged.contextWindow (possibly undefined).
+    if merged.contextWindow_present {
+        *out_v = merged.contextWindow;
+        return true;
+    };
+    return false;
+}
+
+// resolveModelMaxOutputTokens(model, explicit?)
+fn resolveModelMaxOutputTokens(model_ptr: ptr, model_len: u64, explicit: &ModelCapabilityDescriptor, has_explicit: bool, out_v: &f64) -> bool {
+    let merged = ModelCapabilityDescriptor { reasoningEfforts: StrList { items: [StrRef { ptr: PTR_NULL(), len: 0 }; 32], len: 0 }, reasoningEfforts_present: false, contextWindow: 0.0, contextWindow_present: false, maxOutputTokens: 0.0, maxOutputTokens_present: false, verbosity: 0, verbosity_present: false, supportsVerbosity: false, supportsVerbosity_present: false, source: 0, source_present: false };
+    mergeModelCapabilities(model_ptr, model_len, explicit, has_explicit, &merged);
+    if merged.maxOutputTokens_present { *out_v = merged.maxOutputTokens; return true; };
+    return false;
+}
+
+// modelChoiceDisplayName(model, label?) -> string into out (StrBuf)
+// DEFECT: TS template literal + toUpperCase on the suffix; suffix
+// case-fold approximates ASCII letters only.
+fn modelChoiceDisplayName(model_ptr: ptr, model_len: u64, label_ptr: ptr, label_len: u64, has_label: bool, out: &StrBuf) -> void {
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    str_trim(model_ptr, model_len, &tp, &tl);
+    let base = StrBuf { bytes: [0u8; 2048], len: 0 };
+    let cw: f64 = 0.0;
+    let has_cw = false;
+    stripModelContextVariant(tp, tl, &base, &cw, &has_cw);
+    // suffix = value.slice(baseModel.length).trim() — approximated by
+    // re-deriving the "[...]" tail from the trimmed value.
+    let lp: ptr = PTR_NULL();
+    let ll: u64 = 0;
+    if has_label { str_trim(label_ptr, label_len, &lp, &ll); };
+    out.len = 0;
+    if has_label && ll > 0 {
+        buf_append(out, lp, ll);
+    } else if has_cw {
+        buf_append(out, &base.bytes[0], base.len);
+    } else {
+        buf_append(out, tp, tl);
+    };
+    if !has_cw { return; };
+    // if resolved already carries a context variant, return as-is
+    let rcw: f64 = 0.0;
+    let rhas = false;
+    let rbase = StrBuf { bytes: [0u8; 2048], len: 0 };
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &out.bytes, 0);
+    stripModelContextVariant(rp, out.len, &rbase, &rcw, &rhas);
+    if rhas { return; };
+    // append " " + suffix.toUpperCase() — suffix is the "[..]" tail of value
+    buf_putc(out, 32);
+    let i: u64 = 0;
+    let started = false;
+    while i < tl {
+        let c = byte_at(tp, i);
+        if c == 91 { started = true; };
+        if started {
+            if c >= 97 && c <= 122 { c = c - 32; };
+            buf_putc(out, c);
+        };
+        i = i + 1;
+    }
+}
+
+// expandModelContextVariants(models: StrList) -> StrList (out)
+// DEFECT: Set<string> -> StrList linear-scan dedupe (list_contains).
+fn expandModelContextVariants(models: &StrList, out: &StrList) -> void {
+    out.len = 0;
+    for i in 0..models.len {
+        let mp = models.items[i].ptr;
+        let ml = models.items[i].len;
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        str_trim(mp, ml, &tp, &tl);
+        if tl == 0 { continue; };
+        if list_contains(out, tp, tl) { continue; };
+        list_push(out, tp, tl);
+        let caps = ModelCapabilityDescriptor { reasoningEfforts: StrList { items: [StrRef { ptr: PTR_NULL(), len: 0 }; 32], len: 0 }, reasoningEfforts_present: false, contextWindow: 0.0, contextWindow_present: false, maxOutputTokens: 0.0, maxOutputTokens_present: false, verbosity: 0, verbosity_present: false, supportsVerbosity: false, supportsVerbosity_present: false, source: 0, source_present: false };
+        inferModelCapabilities(tp, tl, &caps);
+        if caps.contextWindow_present && caps.contextWindow == 1000000.0 {
+            let base = StrBuf { bytes: [0u8; 2048], len: 0 };
+            let cw: f64 = 0.0;
+            let has_cw = false;
+            stripModelContextVariant(tp, tl, &base, &cw, &has_cw);
+            if !has_cw {
+                // variant string `${value}[1m]` — built in a static-ish
+                // scratch: DEFECT: buffer lifetime (fix phase: arena).
+                let vb = StrBuf { bytes: [0u8; 2048], len: 0 };
+                buf_append(&vb, tp, tl);
+                buf_append(&vb, STR_PTR("[1m]"), STR_LEN("[1m]"));
+                let vp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(vp, &vb.bytes, 0);
+                if !list_contains(out, vp, vb.len) { list_push(out, vp, vb.len); };
+            };
+        };
+    }
+}
+
+// normalizeReasoningEfforts(values: unknown) — SLA form consumes a
+// sa_json array node (0 = not an array). String items pass through;
+// record items contribute the first string among reasoningEffort /
+// reasoning_effort / value / id. Trim, length <= 64, drop "minimal".
+// DEFECT: dynamic JSON (unknown) + flatMap closure -> manual loop;
+// JSON node accessors assumed (see tokenUsage.sla finite note).
+fn normalizeReasoningEfforts(values_node: u64, out: &StrList) -> void {
+    out.len = 0;
+    if values_node == 0 { return; };
+    let count: u64 = 0;
+    if sa_json_array_len(values_node, &count) != 0 { return; };
+    let raw = StrList { items: [StrRef { ptr: PTR_NULL(), len: 0 }; 32], len: 0 };
+    for i in 0..count {
+        let el: u64 = 0;
+        if sa_json_array_get(values_node, i, &el) != 0 { continue; };
+        let sp: ptr = PTR_NULL();
+        let sl: u64 = 0;
+        if sa_json_string_len(el, &sl) == 0 {
+            sp = sa_json_string_ptr(el);
+            list_push(&raw, sp, sl);
+            continue;
+        };
+        // record-shaped entry
+        let keys = StrList { items: [StrRef { ptr: PTR_NULL(), len: 0 }; 32], len: 0 };
+        list_push(&keys, STR_PTR("reasoningEffort"), STR_LEN("reasoningEffort"));
+        list_push(&keys, STR_PTR("reasoning_effort"), STR_LEN("reasoning_effort"));
+        list_push(&keys, STR_PTR("value"), STR_LEN("value"));
+        list_push(&keys, STR_PTR("id"), STR_LEN("id"));
+        for k in 0..keys.len {
+            let fnode: u64 = 0;
+            if sa_json_object_get(el, keys.items[k].ptr, keys.items[k].len, &fnode) == 0 {
+                let fl: u64 = 0;
+                if sa_json_string_len(fnode, &fl) == 0 {
+                    list_push(&raw, sa_json_string_ptr(fnode), fl);
+                    break;
+                };
+            };
+        }
+    };
+    // trim + filter + dedupe (TS: map trim, filter len 1..64 and
+    // lowercase != "minimal", then uniqueStrings)
+    let filtered = StrList { items: [StrRef { ptr: PTR_NULL(), len: 0 }; 32], len: 0 };
+    for i2 in 0..raw.len {
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        str_trim(raw.items[i2].ptr, raw.items[i2].len, &tp, &tl);
+        if tl == 0 || tl > 64 { continue; };
+        let lb = StrBuf { bytes: [0u8; 2048], len: 0 };
+        buf_lower_copy(&lb, tp, tl);
+        let lp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(lp2, &lb.bytes, 0);
+        if str_eq_lit(lp2, lb.len, STR_PTR("minimal"), STR_LEN("minimal")) { continue; };
+        list_push(&filtered, tp, tl);
+    }
+    uniqueStrings(out, &filtered);
+}

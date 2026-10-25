@@ -1,0 +1,2828 @@
+// Converted 1:1 from backends/agy/src/runtime/agyCompatibleProxy.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// A local HTTP proxy that lets the Antigravity CLI talk to
+// OpenAI-compatible / Responses / Anthropic relays by
+// translating Gemini Code Assist requests. In this pass the
+// HTTP serving surface is the sa_std built-in HTTP server
+// (declared by use), requests are handled by the pure
+// AgyProxyServer_handleRequest fn over (method, path, body)
+// producing a response buffer, and upstream streaming is
+// buffered (the emitted Gemini chunk sequence is preserved;
+// true incremental forwarding is a repair-phase item).
+// The two fixture JSON imports (agy_load_code_assist_resp_
+// fixture.json / agy_models_resp_fixture.json) are read as
+// sibling files through the fixture_text shim — the mirror
+// keeps the .json files beside this .sla exactly as the
+// source tree does.
+//
+// TS semantics note (user directive 2026-10-26): trim /
+// trimEnd / toLowerCase bind the sa_std ts face
+// (@ts_str_trim in ts_string.sa; case folding stays a local
+// span fn — no @ts_* case fn exists in the inventory).
+
+@import "sa_std/http_server.sai"
+@import "sa_std/http_client.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/json.sai"
+@import "../../../../../sdk-backend/src/process.sla"
+
+// ---- fixtures ----
+
+// fixture_text(name, out, out_cap, out_len): raw text of a
+// sibling fixture file (host shim in this pass).
+fn fixture_text(name_ptr: ptr, name_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> i32;
+
+// DEFAULT_LOAD_RESP: the loadCodeAssist fixture as a doc.
+fn default_load_resp() -> u64 {
+    let text = [0u8; 1048576];
+    let text_len: u64 = 0;
+    if fixture_text(STR_PTR("agy_load_code_assist_resp_fixture.json"), STR_LEN("agy_load_code_assist_resp_fixture.json"), &text, 1048576, &text_len) != 0 { return 0; };
+    return sa_json_parse(&text, text_len);
+}
+
+// mergeModelIds(values, preferred): trimmed, de-duplicated
+// [preferred, ...values] string list (Set -> seen list).
+struct AgyNameList {
+    items: [u8; 8192],
+    off: [u64; 256],
+    slen: [u64; 256],
+    count: u64,
+    used: u64,
+}
+
+fn name_list_push(l: &AgyNameList, p: ptr, n: u64) -> void {
+    for i in 0..l.count {
+        if l.slen[i] == n && bytes_eq(slot(&l.items, l.off[i]), p, n) { return; };
+    }
+    if l.count >= 256 { return; };
+    l.off[l.count] = l.used;
+    l.slen[l.count] = n;
+    for i in 0..n {
+        if l.used < 8192 { l.items[l.used] = byte_at(p, i); l.used = l.used + 1; };
+    }
+    l.count = l.count + 1;
+}
+
+fn merge_model_ids(values_doc: u64, preferred_ptr: ptr, preferred_len: u64, out: &AgyNameList) -> void {
+    out.count = 0;
+    out.used = 0;
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    ts_trim_span(preferred_ptr, preferred_len, &tp, &tl);
+    if tl > 0 { name_list_push(out, tp, tl); };
+    let count: u64 = 0;
+    if values_doc != 0 && sa_json_array_len(values_doc, &count) == 0 {
+        for i in 0..count {
+            let v: u64 = 0;
+            sa_json_array_get(values_doc, i, &v);
+            if v == 0 { continue; };
+            let is_str = false;
+            json_node_is_string(v, &is_str);
+            if !is_str { continue; };
+            let vp: ptr = PTR_NULL();
+            let vl: u64 = 0;
+            json_node_string(v, &vp, &vl);
+            ts_trim_span(vp, vl, &tp, &tl);
+            if tl > 0 { name_list_push(out, tp, tl); };
+        }
+    };
+}
+
+// buildModelsResp(cliModel, targetModel, displayName?):
+// deep-clone the models fixture, pick a template entry,
+// stamp the cli model entry, and merge the cli model id
+// into every id list. Returns the response doc.
+fn buildModelsResp(cli_ptr: ptr, cli_len: u64, target_ptr: ptr, target_len: u64, display_ptr: ptr, display_len: u64, has_display: bool) -> u64 {
+    let text = [0u8; 1048576];
+    let text_len: u64 = 0;
+    if fixture_text(STR_PTR("agy_models_resp_fixture.json"), STR_LEN("agy_models_resp_fixture.json"), &text, 1048576, &text_len) != 0 { return 0; };
+    let base = sa_json_parse(&text, text_len);
+    if base == 0 { return 0; };
+    let models: u64 = 0;
+    if sa_json_object_get(base, STR_PTR("models"), STR_LEN("models"), &models) != 0 || models == 0 {
+        models = json_object_new();
+        sa_json_object_set(base, STR_PTR("models"), STR_LEN("models"), models);
+    };
+    // template = models[cliModel] ?? models[defaultId] ??
+    // first object value ?? literal fallback
+    let template: u64 = 0;
+    sa_json_object_get(models, cli_ptr, cli_len, &template);
+    if template == 0 {
+        let def_ptr: ptr = PTR_NULL();
+        let def_len: u64 = 0;
+        if sa_json_object_get_string(base, STR_PTR("defaultAgentModelId"), STR_LEN("defaultAgentModelId"), &def_ptr, &def_len) == 0 {
+            sa_json_object_get(models, def_ptr, def_len, &template);
+        };
+    };
+    if template == 0 {
+        json_object_first_value(models, &template);
+    };
+    let entry: u64 = 0;
+    if template != 0 {
+        entry = json_deep_clone(template);
+    } else {
+        entry = sa_json_parse(STR_PTR("{\"supportsImages\":true,\"supportsThinking\":true,\"thinkingBudget\":4000,\"recommended\":true,\"maxTokens\":1048576,\"maxOutputTokens\":65536,\"tokenizerType\":\"LLAMA_WITH_SPECIAL\",\"quotaInfo\":{\"remainingFraction\":1.0},\"model\":\"MODEL_PLACEHOLDER_M20\",\"apiProvider\":\"API_PROVIDER_GOOGLE_GEMINI\",\"modelProvider\":\"MODEL_PROVIDER_GOOGLE\"}"), STR_LEN("{\"supportsImages\":true,\"supportsThinking\":true,\"thinkingBudget\":4000,\"recommended\":true,\"maxTokens\":1048576,\"maxOutputTokens\":65536,\"tokenizerType\":\"LLAMA_WITH_SPECIAL\",\"quotaInfo\":{\"remainingFraction\":1.0},\"model\":\"MODEL_PLACEHOLDER_M20\",\"apiProvider\":\"API_PROVIDER_GOOGLE_GEMINI\",\"modelProvider\":\"MODEL_PROVIDER_GOOGLE\"}"));
+    };
+    if has_display && display_len > 0 {
+        sa_json_object_set_string(entry, STR_PTR("displayName"), STR_LEN("displayName"), display_ptr, display_len);
+    } else if target_len > 0 {
+        sa_json_object_set_string(entry, STR_PTR("displayName"), STR_LEN("displayName"), target_ptr, target_len);
+    } else {
+        sa_json_object_set_string(entry, STR_PTR("displayName"), STR_LEN("displayName"), cli_ptr, cli_len);
+    };
+    // The CLI resolves the internal model key from this
+    // field, not only from the surrounding models map.
+    sa_json_object_set_string(entry, STR_PTR("model"), STR_LEN("model"), cli_ptr, cli_len);
+    sa_json_object_set_bool(entry, STR_PTR("recommended"), STR_LEN("recommended"), true);
+    sa_json_object_set(models, cli_ptr, cli_len, entry);
+    sa_json_object_set_string(base, STR_PTR("defaultAgentModelId"), STR_LEN("defaultAgentModelId"), cli_ptr, cli_len);
+    let keys = [STR_PTR("commandModelIds"), STR_PTR("tabModelIds"), STR_PTR("imageGenerationModelIds"), STR_PTR("mqueryModelIds"), STR_PTR("webSearchModelIds"), STR_PTR("commitMessageModelIds")];
+    let key_lens = [STR_LEN("commandModelIds"), STR_LEN("tabModelIds"), STR_LEN("imageGenerationModelIds"), STR_LEN("mqueryModelIds"), STR_LEN("webSearchModelIds"), STR_LEN("commitMessageModelIds")];
+    for ki in 0..6 {
+        let arr: u64 = 0;
+        sa_json_object_get(base, keys[ki], key_lens[ki], &arr);
+        let list = AgyNameList{ items: [0u8; 8192], off: [0u64; 256], slen: [0u64; 256], count: 0, used: 0 };
+        merge_model_ids(arr, cli_ptr, cli_len, &list);
+        sa_json_object_set(base, keys[ki], key_lens[ki], name_list_to_json(&list));
+    }
+    // agentModelSorts[0].groups[0].modelIds merge
+    let sorts: u64 = 0;
+    let sorts_len: u64 = 0;
+    if sa_json_object_get(base, STR_PTR("agentModelSorts"), STR_LEN("agentModelSorts"), &sorts) != 0 || sorts == 0 || sa_json_array_len(sorts, &sorts_len) != 0 || sorts_len == 0 {
+        sorts = sa_json_parse(STR_PTR("[{\"displayName\":\"Recommended\",\"groups\":[{\"modelIds\":[]}]}]"), STR_LEN("[{\"displayName\":\"Recommended\",\"groups\":[{\"modelIds\":[]}]}]"));
+        sa_json_object_set(base, STR_PTR("agentModelSorts"), STR_LEN("agentModelSorts"), sorts);
+    };
+    let first_sort: u64 = 0;
+    sa_json_array_get(sorts, 0, &first_sort);
+    if first_sort == 0 {
+        first_sort = json_object_new();
+        sa_json_array_set(sorts, 0, first_sort);
+    };
+    let groups: u64 = 0;
+    let groups_len: u64 = 0;
+    if sa_json_object_get(first_sort, STR_PTR("groups"), STR_LEN("groups"), &groups) != 0 || groups == 0 || sa_json_array_len(groups, &groups_len) != 0 || groups_len == 0 {
+        groups = sa_json_parse(STR_PTR("[{\"modelIds\":[]}]"), STR_LEN("[{\"modelIds\":[]}]"));
+        sa_json_object_set(first_sort, STR_PTR("groups"), STR_LEN("groups"), groups);
+    };
+    let first_group: u64 = 0;
+    sa_json_array_get(groups, 0, &first_group);
+    if first_group == 0 {
+        first_group = json_object_new();
+        sa_json_array_set(groups, 0, first_group);
+    };
+    let mids: u64 = 0;
+    sa_json_object_get(first_group, STR_PTR("modelIds"), STR_LEN("modelIds"), &mids);
+    let list = AgyNameList{ items: [0u8; 8192], off: [0u64; 256], slen: [0u64; 256], count: 0, used: 0 };
+    merge_model_ids(mids, cli_ptr, cli_len, &list);
+    sa_json_object_set(first_group, STR_PTR("modelIds"), STR_LEN("modelIds"), name_list_to_json(&list));
+    return base;
+}
+
+fn name_list_to_json(l: &AgyNameList) -> u64 {
+    let text = [0u8; 16384];
+    let n: u64 = 0;
+    n = n + append_bytes(&text, 16384, n, STR_PTR("["), 1);
+    for i in 0..l.count {
+        if i > 0 { n = n + append_bytes(&text, 16384, n, STR_PTR(","), 1); };
+        n = n + append_bytes(&text, 16384, n, STR_PTR("\""), 1);
+        n = n + append_bytes(&text, 16384, n, slot(&l.items, l.off[i]), l.slen[i]);
+        n = n + append_bytes(&text, 16384, n, STR_PTR("\""), 1);
+    }
+    n = n + append_bytes(&text, 16384, n, STR_PTR("]"), 1);
+    return sa_json_parse(&text, n);
+}
+
+// unwrapGenerateRequest(raw)
+fn unwrapGenerateRequest(raw: u64) -> u64 {
+    if raw == 0 { return raw; };
+    let inner: u64 = 0;
+    if sa_json_object_get(raw, STR_PTR("request"), STR_LEN("request"), &inner) == 0 && inner != 0 {
+        let probe: u64 = 0;
+        if sa_json_object_get(inner, STR_PTR("contents"), STR_LEN("contents"), &probe) == 0 || sa_json_object_get(inner, STR_PTR("systemInstruction"), STR_LEN("systemInstruction"), &probe) == 0 {
+            return inner;
+        };
+    };
+    return raw;
+}
+
+// geminiToOpenAiMessages(req): returns the messages array
+// as JSON text.
+fn geminiToOpenAiMessages(req: u64, out: ptr, out_cap: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("["), 1);
+    let count: u64 = 0;
+    // systemInstruction -> system message
+    let sys: u64 = 0;
+    if req != 0 && sa_json_object_get(req, STR_PTR("systemInstruction"), STR_LEN("systemInstruction"), &sys) == 0 && sys != 0 {
+        let parts: u64 = 0;
+        let sys_text = [0u8; 262144];
+        let sys_text_len: u64 = 0;
+        if sa_json_object_get(sys, STR_PTR("parts"), STR_LEN("parts"), &parts) == 0 {
+            let pc: u64 = 0;
+            if sa_json_array_len(parts, &pc) == 0 {
+                for i in 0..pc {
+                    let part: u64 = 0;
+                    sa_json_array_get(parts, i, &part);
+                    let t_ptr: ptr = PTR_NULL();
+                    let t_len: u64 = 0;
+                    if part != 0 && sa_json_object_get_string(part, STR_PTR("text"), STR_LEN("text"), &t_ptr, &t_len) == 0 {
+                        sys_text_len = sys_text_len + append_bytes(&sys_text, 262144, sys_text_len, t_ptr, t_len);
+                    };
+                }
+            };
+        };
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        ts_trim_span(&sys_text, sys_text_len, &tp, &tl);
+        if tl > 0 {
+            n = append_message_text(out, out_cap, n, &count, STR_PTR("system"), STR_LEN("system"), &sys_text, sys_text_len, false, PTR_NULL(), 0);
+        };
+    };
+    let contents: u64 = 0;
+    let cc: u64 = 0;
+    if req != 0 && sa_json_object_get(req, STR_PTR("contents"), STR_LEN("contents"), &contents) == 0 && sa_json_array_len(contents, &cc) == 0 {
+        for mi in 0..cc {
+            let msg: u64 = 0;
+            sa_json_array_get(contents, mi, &msg);
+            if msg == 0 { continue; };
+            let role_ptr: ptr = STR_PTR("user");
+            let role_len: u64 = 4;
+            let rv_ptr: ptr = PTR_NULL();
+            let rv_len: u64 = 0;
+            if sa_json_object_get_string(msg, STR_PTR("role"), STR_LEN("role"), &rv_ptr, &rv_len) == 0 && rv_len > 0 { role_ptr = rv_ptr; role_len = rv_len; };
+            if str_is(role_ptr, role_len, STR_PTR("model"), 5) { role_ptr = STR_PTR("assistant"); role_len = STR_LEN("assistant"); };
+            let parts: u64 = 0;
+            let pc: u64 = 0;
+            let content_text = [0u8; 262144];
+            let content_len: u64 = 0;
+            let tool_calls = [0u8; 262144];
+            let tool_calls_len: u64 = 0;
+            let tool_calls_count: u64 = 0;
+            let tool_resps = [0u8; 262144];
+            let tool_resps_len: u64 = 0;
+            let tool_resps_count: u64 = 0;
+            if sa_json_object_get(msg, STR_PTR("parts"), STR_LEN("parts"), &parts) == 0 && sa_json_array_len(parts, &pc) == 0 {
+                for pi in 0..pc {
+                    let part: u64 = 0;
+                    sa_json_array_get(parts, pi, &part);
+                    if part == 0 { continue; };
+                    let text_node: u64 = 0;
+                    if sa_json_object_get(part, STR_PTR("text"), STR_LEN("text"), &text_node) == 0 && text_node != 0 {
+                        let not_null = false;
+                        json_node_is_null(text_node, &not_null);
+                        if !not_null {
+                            let t_ptr: ptr = PTR_NULL();
+                            let t_len: u64 = 0;
+                            json_node_string_coerce(text_node, &t_ptr, &t_len);
+                            content_len = content_len + append_bytes(&content_text, 262144, content_len, t_ptr, t_len);
+                            continue;
+                        };
+                    };
+                    let fc: u64 = 0;
+                    if sa_json_object_get(part, STR_PTR("functionCall"), STR_LEN("functionCall"), &fc) == 0 && fc != 0 {
+                        let name_ptr: ptr = PTR_NULL();
+                        let name_len: u64 = 0;
+                        if sa_json_object_get_string(fc, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len) != 0 || name_len == 0 { name_ptr = STR_PTR("tool"); name_len = 4; };
+                        let id_ptr: ptr = PTR_NULL();
+                        let id_len: u64 = 0;
+                        if sa_json_object_get_string(fc, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len) != 0 || id_len == 0 { id_ptr = name_ptr; id_len = name_len; };
+                        let args_node: u64 = 0;
+                        let args_text = [0u8; 65536];
+                        let args_text_len: u64 = 0;
+                        if sa_json_object_get(fc, STR_PTR("args"), STR_LEN("args"), &args_node) == 0 && args_node != 0 {
+                            let is_str = false;
+                            json_node_is_string(args_node, &is_str);
+                            if is_str {
+                                // string args pass through raw
+                                let ap: ptr = PTR_NULL();
+                                let al: u64 = 0;
+                                json_node_string(args_node, &ap, &al);
+                                args_text_len = buf_copy(&args_text, 65536, ap, al);
+                            } else {
+                                args_text_len = stringify_into(args_node, &args_text, 65536);
+                                if args_text_len == 0 { args_text_len = buf_copy(&args_text, 65536, STR_PTR("{}"), 2); };
+                            };
+                        } else {
+                            args_text_len = buf_copy(&args_text, 65536, STR_PTR("{}"), 2);
+                        };
+                        if tool_calls_count > 0 { tool_calls_len = tool_calls_len + append_bytes(&tool_calls, 262144, tool_calls_len, STR_PTR(","), 1); };
+                        tool_calls_len = tool_calls_len + append_bytes(&tool_calls, 262144, tool_calls_len, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+                        tool_calls_len = tool_calls_len + append_bytes(&tool_calls, 262144, tool_calls_len, id_ptr, id_len);
+                        tool_calls_len = tool_calls_len + append_bytes(&tool_calls, 262144, tool_calls_len, STR_PTR("\",\"type\":\"function\",\"function\":{\"name\":\""), STR_LEN("\",\"type\":\"function\",\"function\":{\"name\":\""));
+                        tool_calls_len = tool_calls_len + append_bytes(&tool_calls, 262144, tool_calls_len, name_ptr, name_len);
+                        tool_calls_len = tool_calls_len + append_bytes(&tool_calls, 262144, tool_calls_len, STR_PTR("\",\"arguments\":\""), STR_LEN("\",\"arguments\":\""));
+                        tool_calls_len = tool_calls_len + append_bytes(&tool_calls, 262144, tool_calls_len, &args_text, args_text_len);
+                        tool_calls_len = tool_calls_len + append_bytes(&tool_calls, 262144, tool_calls_len, STR_PTR("\"}}"), 3);
+                        tool_calls_count = tool_calls_count + 1;
+                        continue;
+                    };
+                    let fr: u64 = 0;
+                    if sa_json_object_get(part, STR_PTR("functionResponse"), STR_LEN("functionResponse"), &fr) == 0 && fr != 0 {
+                        let name_ptr: ptr = PTR_NULL();
+                        let name_len: u64 = 0;
+                        if sa_json_object_get_string(fr, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len) != 0 || name_len == 0 { name_ptr = STR_PTR("tool"); name_len = 4; };
+                        let id_ptr: ptr = PTR_NULL();
+                        let id_len: u64 = 0;
+                        if sa_json_object_get_string(fr, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len) != 0 || id_len == 0 { id_ptr = name_ptr; id_len = name_len; };
+                        let resp_node: u64 = 0;
+                        let resp_text = [0u8; 65536];
+                        let resp_text_len: u64 = 0;
+                        if sa_json_object_get(fr, STR_PTR("response"), STR_LEN("response"), &resp_node) == 0 && resp_node != 0 {
+                            let is_str = false;
+                            json_node_is_string(resp_node, &is_str);
+                            if is_str {
+                                let rp: ptr = PTR_NULL();
+                                let rl: u64 = 0;
+                                json_node_string(resp_node, &rp, &rl);
+                                resp_text_len = buf_copy(&resp_text, 65536, rp, rl);
+                            } else {
+                                resp_text_len = stringify_into(resp_node, &resp_text, 65536);
+                            };
+                        };
+                        if tool_resps_count > 0 { tool_resps_len = tool_resps_len + append_bytes(&tool_resps, 262144, tool_resps_len, STR_PTR(","), 1); };
+                        tool_resps_len = tool_resps_len + append_bytes(&tool_resps, 262144, tool_resps_len, STR_PTR("{\"role\":\"tool\",\"tool_call_id\":\""), STR_LEN("{\"role\":\"tool\",\"tool_call_id\":\""));
+                        tool_resps_len = tool_resps_len + append_bytes(&tool_resps, 262144, tool_resps_len, id_ptr, id_len);
+                        tool_resps_len = tool_resps_len + append_bytes(&tool_resps, 262144, tool_resps_len, STR_PTR("\",\"content\":\""), STR_LEN("\",\"content\":\""));
+                        tool_resps_len = tool_resps_len + append_bytes(&tool_resps, 262144, tool_resps_len, &resp_text, resp_text_len);
+                        tool_resps_len = tool_resps_len + append_bytes(&tool_resps, 262144, tool_resps_len, STR_PTR("\"}"), 2);
+                        tool_resps_count = tool_resps_count + 1;
+                    };
+                }
+            };
+            // openaiMsg assembly
+            if content_len > 0 || tool_calls_count > 0 {
+                if count > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+                count = count + 1;
+                n = n + append_bytes(out, out_cap, n, STR_PTR("{\"role\":\""), STR_LEN("{\"role\":\""));
+                n = n + append_bytes(out, out_cap, n, role_ptr, role_len);
+                n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"content\":"), STR_LEN("\",\"content\":"));
+                if tool_calls_count > 0 && content_len == 0 {
+                    n = n + append_bytes(out, out_cap, n, STR_PTR("null"), 4);
+                } else {
+                    n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+                    n = n + append_bytes(out, out_cap, n, &content_text, content_len);
+                    n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+                };
+                if tool_calls_count > 0 {
+                    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"tool_calls\":["), STR_LEN(",\"tool_calls\":["));
+                    n = n + append_bytes(out, out_cap, n, &tool_calls, tool_calls_len);
+                    n = n + append_bytes(out, out_cap, n, STR_PTR("]"), 1);
+                };
+                n = n + append_bytes(out, out_cap, n, STR_PTR("}"), 1);
+            };
+            if tool_resps_count > 0 {
+                if count > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+                count = count + 1;
+                n = n + append_bytes(out, out_cap, n, &tool_resps, tool_resps_len);
+                // multiple tool responses count as separate
+                // messages in the source's spread push
+                count = count + tool_resps_count - 1;
+            };
+        }
+    };
+    if count == 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"role\":\"user\",\"content\":\"(empty request)\"}"), STR_LEN("{\"role\":\"user\",\"content\":\"(empty request)\"}"));
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR("]"), 1);
+    return n;
+}
+
+// append_message_text: one {"role","content"} message.
+fn append_message_text(out: ptr, out_cap: u64, n: u64, count: &u64, role_ptr: ptr, role_len: u64, text_ptr: ptr, text_len: u64, has_tc: bool, tc_ptr: ptr, tc_len: u64) -> u64 {
+    if count > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+    count = count + 1;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"role\":\""), STR_LEN("{\"role\":\""));
+    n = n + append_bytes(out, out_cap, n, role_ptr, role_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"content\":\""), STR_LEN("\",\"content\":\""));
+    n = n + append_bytes(out, out_cap, n, text_ptr, text_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\"}"), 2);
+    return n;
+}
+
+// geminiAllowedToolNames(req) -> AgyNameList
+fn geminiAllowedToolNames(req: u64, out: &AgyNameList) -> void {
+    out.count = 0;
+    out.used = 0;
+    let cfg: u64 = 0;
+    let tc: u64 = 0;
+    if req == 0 || sa_json_object_get(req, STR_PTR("toolConfig"), STR_LEN("toolConfig"), &tc) != 0 || tc == 0 || sa_json_object_get(tc, STR_PTR("functionCallingConfig"), STR_LEN("functionCallingConfig"), &cfg) != 0 || cfg == 0 { return; };
+    let names: u64 = 0;
+    let nc: u64 = 0;
+    if sa_json_object_get(cfg, STR_PTR("allowedFunctionNames"), STR_LEN("allowedFunctionNames"), &names) != 0 || sa_json_array_len(names, &nc) != 0 { return; };
+    for i in 0..nc {
+        let v: u64 = 0;
+        sa_json_array_get(names, i, &v);
+        let vp: ptr = PTR_NULL();
+        let vl: u64 = 0;
+        json_node_string_coerce(v, &vp, &vl);
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        ts_trim_span(vp, vl, &tp, &tl);
+        if tl > 0 { name_list_push(out, tp, tl); };
+    }
+}
+
+fn name_list_has(l: &AgyNameList, p: ptr, n: u64) -> bool {
+    for i in 0..l.count {
+        if l.slen[i] == n && bytes_eq(slot(&l.items, l.off[i]), p, n) { return true; };
+    }
+    return false;
+}
+
+// normalizeSchema(node): recursive — arrays map, objects
+// rebuild with "type" string values lowercased, scalars
+// pass through. Builder shims (json_object_new /
+// json_array_new / set / push) are declared by use.
+fn normalizeSchema(node: u64) -> u64 {
+    if node == 0 { return 0; };
+    let is_arr = false;
+    json_node_is_array(node, &is_arr);
+    if is_arr {
+        let out = json_array_new();
+        let count: u64 = 0;
+        sa_json_array_len(node, &count);
+        for i in 0..count {
+            let v: u64 = 0;
+            sa_json_array_get(node, i, &v);
+            sa_json_array_push(out, normalizeSchema(v));
+        }
+        return out;
+    };
+    let is_obj = false;
+    json_node_is_object(node, &is_obj);
+    if is_obj {
+        let out = json_object_new();
+        json_object_each(node, out, STR_PTR(""), 0);
+        return out;
+    };
+    return node;
+}
+
+// json_object_each: helper for normalizeSchema — iterates
+// the source object's keys (json_object_keys shim) and
+// writes normalized values into `out`.
+fn json_object_each(src: u64, out: u64, unused_ptr: ptr, unused_len: u64) -> void {
+    let keys = [0u8; 16384];
+    let keys_len = json_object_keys(src, &keys, 16384);
+    let pos: u64 = 0;
+    while pos < keys_len {
+        let kend = find_byte(&keys, keys_len, pos, 10);
+        if kend == 4294967295 { kend = keys_len; };
+        let klen = kend - pos;
+        let v: u64 = 0;
+        sa_json_object_get(src, byte_off(&keys, pos), klen, &v);
+        if klen == 4 && bytes_eq(byte_off(&keys, pos), STR_PTR("type"), 4) {
+            let is_str = false;
+            json_node_is_string(v, &is_str);
+            if is_str {
+                let vp: ptr = PTR_NULL();
+                let vl: u64 = 0;
+                json_node_string(v, &vp, &vl);
+                let lowered = [0u8; 256];
+                let lowered_len = to_lower(&lowered, 256, vp, vl);
+                sa_json_object_set_string(out, byte_off(&keys, pos), klen, &lowered, lowered_len);
+                pos = kend + 1;
+                continue;
+            };
+        };
+        sa_json_object_set(out, byte_off(&keys, pos), klen, normalizeSchema(v));
+        pos = kend + 1;
+    }
+}
+
+// geminiToolsToOpenAi(req): tools array as JSON text.
+fn geminiToolsToOpenAi(req: u64, out: ptr, out_cap: u64, out_count: &u64) -> u64 {
+    let allowed = AgyNameList{ items: [0u8; 8192], off: [0u64; 256], slen: [0u64; 256], count: 0, used: 0 };
+    geminiAllowedToolNames(req, &allowed);
+    let n: u64 = 0;
+    out_count = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("["), 1);
+    let tools: u64 = 0;
+    let tc: u64 = 0;
+    if req == 0 || sa_json_object_get(req, STR_PTR("tools"), STR_LEN("tools"), &tools) != 0 || sa_json_array_len(tools, &tc) != 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("]"), 1);
+        return n;
+    };
+    for ti in 0..tc {
+        let t: u64 = 0;
+        sa_json_array_get(tools, ti, &t);
+        if t == 0 { continue; };
+        let fds: u64 = 0;
+        let fc: u64 = 0;
+        if sa_json_object_get(t, STR_PTR("functionDeclarations"), STR_LEN("functionDeclarations"), &fds) != 0 || sa_json_array_len(fds, &fc) != 0 { continue; };
+        for fi in 0..fc {
+            let fd: u64 = 0;
+            sa_json_array_get(fds, fi, &fd);
+            if fd == 0 { continue; };
+            let name_ptr: ptr = PTR_NULL();
+            let name_len: u64 = 0;
+            if sa_json_object_get_string(fd, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len) != 0 || name_len == 0 { continue; };
+            if allowed.count > 0 && !name_list_has(&allowed, name_ptr, name_len) { continue; };
+            let params: u64 = 0;
+            if sa_json_object_get(fd, STR_PTR("parameters"), STR_LEN("parameters"), &params) != 0 || params == 0 {
+                params = sa_json_parse(STR_PTR("{\"type\":\"object\",\"properties\":{}}"), STR_LEN("{\"type\":\"object\",\"properties\":{}}"));
+            };
+            let normalized = normalizeSchema(params);
+            let params_text = [0u8; 65536];
+            let params_text_len = stringify_into(normalized, &params_text, 65536);
+            let desc_ptr: ptr = PTR_NULL();
+            let desc_len: u64 = 0;
+            if sa_json_object_get_string(fd, STR_PTR("description"), STR_LEN("description"), &desc_ptr, &desc_len) != 0 { desc_ptr = STR_PTR(""); desc_len = 0; };
+            if out_count > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+            out_count = out_count + 1;
+            n = n + append_bytes(out, out_cap, n, STR_PTR("{\"type\":\"function\",\"function\":{\"name\":\""), STR_LEN("{\"type\":\"function\",\"function\":{\"name\":\""));
+            n = n + append_bytes(out, out_cap, n, name_ptr, name_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"description\":\""), STR_LEN("\",\"description\":\""));
+            n = n + append_bytes(out, out_cap, n, desc_ptr, desc_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"parameters\":"), STR_LEN("\",\"parameters\":"));
+            n = n + append_bytes(out, out_cap, n, &params_text, params_text_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("}}"), 2);
+        }
+    }
+    n = n + append_bytes(out, out_cap, n, STR_PTR("]"), 1);
+    return n;
+}
+
+// geminiToolChoiceToOpenAi(req, hasTools): kind codes
+// 0 undefined / 1 "none" / 2 "required" / 3 "auto" /
+// 4 specific function (name in out).
+fn geminiToolChoiceToOpenAi(req: u64, has_tools: bool, out_name: ptr, out_name_cap: u64, out_name_len: &u64) -> u64 {
+    out_name_len = 0;
+    if !has_tools { return 0; };
+    let cfg: u64 = 0;
+    let tc: u64 = 0;
+    if req == 0 || sa_json_object_get(req, STR_PTR("toolConfig"), STR_LEN("toolConfig"), &tc) != 0 || tc == 0 || sa_json_object_get(tc, STR_PTR("functionCallingConfig"), STR_LEN("functionCallingConfig"), &cfg) != 0 || cfg == 0 { return 0; };
+    let mode_ptr: ptr = PTR_NULL();
+    let mode_len: u64 = 0;
+    json_node_string_coerce_mode(cfg, &mode_ptr, &mode_len);
+    let upper = [0u8; 64];
+    let upper_len = to_upper(&upper, 64, mode_ptr, mode_len);
+    if str_is(&upper, upper_len, STR_PTR("NONE"), 4) { return 1; };
+    if str_is(&upper, upper_len, STR_PTR("ANY"), 3) {
+        let allowed = AgyNameList{ items: [0u8; 8192], off: [0u64; 256], slen: [0u64; 256], count: 0, used: 0 };
+        geminiAllowedToolNames(req, &allowed);
+        if allowed.count == 1 {
+            out_name_len = buf_copy(out_name, out_name_cap, slot(&allowed.items, allowed.off[0]), allowed.slen[0]);
+            return 4;
+        };
+        return 2;
+    };
+    if str_is(&upper, upper_len, STR_PTR("AUTO"), 4) || str_is(&upper, upper_len, STR_PTR("VALIDATED"), STR_LEN("VALIDATED")) { return 3; };
+    return 0;
+}
+
+// mode field read for geminiToolChoiceToOpenAi.
+fn json_node_string_coerce_mode(cfg: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    out_ptr = PTR_NULL();
+    out_len = 0;
+    sa_json_object_get_string(cfg, STR_PTR("mode"), STR_LEN("mode"), out_ptr, out_len);
+}
+
+// buildOpenAiPayload(raw, targetModel, options): payload
+// as JSON text. Options: reasoningEffort (ptr,len,has),
+// maxTokens / maxCompletionTokens (i64, has).
+fn buildOpenAiPayload(raw: u64, target_ptr: ptr, target_len: u64, effort_ptr: ptr, effort_len: u64, has_effort: bool, opt_max_tokens: i64, has_opt_max_tokens: bool, opt_max_completion: i64, has_opt_max_completion: bool, out: ptr, out_cap: u64) -> u64 {
+    let req = unwrapGenerateRequest(raw);
+    let messages = [0u8; 524288];
+    let messages_len = geminiToOpenAiMessages(req, &messages, 524288);
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"model\":\""), STR_LEN("{\"model\":\""));
+    n = n + append_bytes(out, out_cap, n, target_ptr, target_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"messages\":"), STR_LEN("\",\"messages\":"));
+    n = n + append_bytes(out, out_cap, n, &messages, messages_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"stream\":true"), STR_LEN(",\"stream\":true"));
+    let tools = [0u8; 262144];
+    let tools_count: u64 = 0;
+    let tools_len = geminiToolsToOpenAi(req, &tools, 262144, &tools_count);
+    let has_max_tokens = false;
+    if tools_count > 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"tools\":"), STR_LEN(",\"tools\":"));
+        n = n + append_bytes(out, out_cap, n, &tools, tools_len);
+        let choice_name = [0u8; 256];
+        let choice_name_len: u64 = 0;
+        let choice = geminiToolChoiceToOpenAi(req, true, &choice_name, 256, &choice_name_len);
+        if choice == 1 {
+            n = n + append_bytes(out, out_cap, n, STR_PTR(",\"tool_choice\":\"none\""), STR_LEN(",\"tool_choice\":\"none\""));
+        } else if choice == 2 {
+            n = n + append_bytes(out, out_cap, n, STR_PTR(",\"tool_choice\":\"required\""), STR_LEN(",\"tool_choice\":\"required\""));
+        } else if choice == 3 {
+            n = n + append_bytes(out, out_cap, n, STR_PTR(",\"tool_choice\":\"auto\""), STR_LEN(",\"tool_choice\":\"auto\""));
+        } else if choice == 4 {
+            n = n + append_bytes(out, out_cap, n, STR_PTR(",\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\""), STR_LEN(",\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\""));
+            n = n + append_bytes(out, out_cap, n, &choice_name, choice_name_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\"}}"), 3);
+        };
+    };
+    let gen: u64 = 0;
+    if sa_json_object_get(req, STR_PTR("generationConfig"), STR_LEN("generationConfig"), &gen) == 0 && gen != 0 {
+        let max_out: i64 = 0;
+        if json_node_number(gen, STR_PTR("maxOutputTokens"), STR_LEN("maxOutputTokens"), &max_out) && max_out > 0 {
+            let capped = max_out;
+            if capped > 16384 { capped = 16384; };
+            n = n + append_bytes(out, out_cap, n, STR_PTR(",\"max_tokens\":"), STR_LEN(",\"max_tokens\":"));
+            n = n + append_i64(out, out_cap, n, capped);
+            has_max_tokens = true;
+        };
+        let temp: f64 = 0.0;
+        let has_temp = false;
+        json_node_number_f64(gen, STR_PTR("temperature"), STR_LEN("temperature"), &temp, &has_temp);
+        if has_temp {
+            n = n + append_bytes(out, out_cap, n, STR_PTR(",\"temperature\":"), STR_LEN(",\"temperature\":"));
+            n = n + append_f64(out, out_cap, n, temp);
+        };
+    };
+    if has_effort {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"reasoning_effort\":\""), STR_LEN(",\"reasoning_effort\":\""));
+        n = n + append_bytes(out, out_cap, n, effort_ptr, effort_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    };
+    if has_opt_max_completion && opt_max_completion > 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"max_completion_tokens\":"), STR_LEN(",\"max_completion_tokens\":"));
+        n = n + append_i64(out, out_cap, n, opt_max_completion);
+    };
+    if has_opt_max_tokens && opt_max_tokens > 0 && !has_max_tokens {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"max_tokens\":"), STR_LEN(",\"max_tokens\":"));
+        n = n + append_i64(out, out_cap, n, opt_max_tokens);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR("}"), 1);
+    return n;
+}
+
+// ---- endpoints + protocol ----
+
+// resolveOpenAiChatEndpoint(baseUrl)
+fn resolveOpenAiChatEndpoint(base_ptr: ptr, base_len: u64, out: ptr, out_cap: u64) -> u64 {
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    ts_trim_span(base_ptr, base_len, &tp, &tl);
+    tl = trim_trailing_slashes(tp, tl);
+    if ends_with(tp, tl, STR_PTR("/chat/completions"), STR_LEN("/chat/completions")) { return buf_copy(out, out_cap, tp, tl); };
+    let n = buf_copy(out, out_cap, tp, tl);
+    if ends_with(tp, tl, STR_PTR("/v1"), 3) {
+        return n + append_bytes(out, out_cap, n, STR_PTR("/chat/completions"), STR_LEN("/chat/completions"));
+    };
+    return n + append_bytes(out, out_cap, n, STR_PTR("/v1/chat/completions"), STR_LEN("/v1/chat/completions"));
+}
+
+// resolveResponsesEndpoint(baseUrl)
+fn resolveResponsesEndpoint(base_ptr: ptr, base_len: u64, out: ptr, out_cap: u64) -> u64 {
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    ts_trim_span(base_ptr, base_len, &tp, &tl);
+    tl = trim_trailing_slashes(tp, tl);
+    if ends_with(tp, tl, STR_PTR("/responses"), STR_LEN("/responses")) { return buf_copy(out, out_cap, tp, tl); };
+    let n = buf_copy(out, out_cap, tp, tl);
+    if ends_with(tp, tl, STR_PTR("/v1"), 3) {
+        return n + append_bytes(out, out_cap, n, STR_PTR("/responses"), STR_LEN("/responses"));
+    };
+    return n + append_bytes(out, out_cap, n, STR_PTR("/v1/responses"), STR_LEN("/v1/responses"));
+}
+
+// resolveAnthropicMessagesEndpoint(baseUrl)
+fn resolveAnthropicMessagesEndpoint(base_ptr: ptr, base_len: u64, out: ptr, out_cap: u64) -> u64 {
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    ts_trim_span(base_ptr, base_len, &tp, &tl);
+    tl = trim_trailing_slashes(tp, tl);
+    if ends_with(tp, tl, STR_PTR("/messages"), STR_LEN("/messages")) { return buf_copy(out, out_cap, tp, tl); };
+    let n = buf_copy(out, out_cap, tp, tl);
+    if ends_with(tp, tl, STR_PTR("/v1"), 3) {
+        return n + append_bytes(out, out_cap, n, STR_PTR("/messages"), STR_LEN("/messages"));
+    };
+    return n + append_bytes(out, out_cap, n, STR_PTR("/v1/messages"), STR_LEN("/v1/messages"));
+}
+
+fn trim_trailing_slashes(p: ptr, n: u64) -> u64 {
+    let len = n;
+    while len > 0 && byte_at(p, len - 1) == 47 { len = len - 1; };
+    return len;
+}
+
+fn ends_with(p: ptr, n: u64, suf_ptr: ptr, suf_len: u64) -> bool {
+    if n < suf_len { return false; };
+    return bytes_eq(byte_off(p, n - suf_len), suf_ptr, suf_len);
+}
+
+fn contains_ci(p: ptr, n: u64, needle_ptr: ptr, needle_len: u64) -> bool {
+    if needle_len == 0 { return true; };
+    if n < needle_len { return false; };
+    let i: u64 = 0;
+    while i + needle_len <= n {
+        let ok = true;
+        let j: u64 = 0;
+        while j < needle_len {
+            let a = byte_at(p, i + j);
+            if a >= 65 && a <= 90 { a = a + 32; };
+            if a != byte_at(needle_ptr, j) { ok = false; break; };
+            j = j + 1;
+        }
+        if ok { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// isGeminiNativeProtocol(protocol?, targetBaseUrl?)
+fn isGeminiNativeProtocol(proto_ptr: ptr, proto_len: u64, has_proto: bool, base_ptr: ptr, base_len: u64, has_base: bool) -> bool {
+    if has_proto && str_is(proto_ptr, proto_len, STR_PTR("gemini"), STR_LEN("gemini")) { return true; };
+    if has_base {
+        // /generativelanguage\.googleapis\.com/i
+        if contains_ci(base_ptr, base_len, STR_PTR("generativelanguage.googleapis.com"), STR_LEN("generativelanguage.googleapis.com")) { return true; };
+        if find_substr(base_ptr, base_len, STR_PTR("/v1beta"), STR_LEN("/v1beta")) != 4294967295 { return true; };
+    };
+    return false;
+}
+
+// AgyUpstreamProtocol codes: 0 gemini / 1 openai /
+// 2 openai-response / 3 anthropic.
+// normalizeAgyUpstreamProtocol(protocol?, targetBaseUrl?)
+fn normalizeAgyUpstreamProtocol(proto_ptr: ptr, proto_len: u64, has_proto: bool, base_ptr: ptr, base_len: u64, has_base: bool) -> u64 {
+    if isGeminiNativeProtocol(proto_ptr, proto_len, has_proto, base_ptr, base_len, has_base) { return 0; };
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    ts_trim_span(proto_ptr, proto_len, &tp, &tl);
+    let lowered = [0u8; 128];
+    let lowered_len = to_lower(&lowered, 128, tp, tl);
+    if str_is(&lowered, lowered_len, STR_PTR("openai-response"), STR_LEN("openai-response")) || str_is(&lowered, lowered_len, STR_PTR("openai-responses"), STR_LEN("openai-responses")) || str_is(&lowered, lowered_len, STR_PTR("responses"), STR_LEN("responses")) { return 2; };
+    if str_is(&lowered, lowered_len, STR_PTR("anthropic"), STR_LEN("anthropic")) || str_is(&lowered, lowered_len, STR_PTR("claude"), STR_LEN("claude")) || str_is(&lowered, lowered_len, STR_PTR("messages"), STR_LEN("messages")) { return 3; };
+    if str_is(&lowered, lowered_len, STR_PTR("gemini"), STR_LEN("gemini")) || str_is(&lowered, lowered_len, STR_PTR("google"), STR_LEN("google")) || str_is(&lowered, lowered_len, STR_PTR("vertex"), STR_LEN("vertex")) { return 0; };
+    return 1;
+}
+
+// resolveGeminiStreamEndpoint(targetBaseUrl, model)
+fn resolveGeminiStreamEndpoint(base_ptr: ptr, base_len: u64, model_ptr: ptr, model_len: u64, out: ptr, out_cap: u64) -> u64 {
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    ts_trim_span(base_ptr, base_len, &tp, &tl);
+    tl = trim_trailing_slashes(tp, tl);
+    let base = [0u8; 2048];
+    let base_len = buf_copy(&base, 2048, tp, tl);
+    if base_len == 0 {
+        base_len = buf_copy(&base, 2048, STR_PTR("https://generativelanguage.googleapis.com"), STR_LEN("https://generativelanguage.googleapis.com"));
+    };
+    if find_substr(&base, base_len, STR_PTR(":streamGenerateContent"), STR_LEN(":streamGenerateContent")) != 4294967295 || find_substr(&base, base_len, STR_PTR(":generateContent"), STR_LEN(":generateContent")) != 4294967295 {
+        return buf_copy(out, out_cap, &base, base_len);
+    };
+    let clean_ptr: ptr = model_ptr;
+    let clean_len = model_len;
+    if model_len > 7 && bytes_eq(model_ptr, STR_PTR("models/"), 7) { clean_ptr = byte_off(model_ptr, 7); clean_len = model_len - 7; };
+    let n = buf_copy(out, out_cap, &base, base_len);
+    if ends_with(&base, base_len, STR_PTR("/v1beta"), STR_LEN("/v1beta")) || ends_with(&base, base_len, STR_PTR("/v1"), 3) {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("/models/"), STR_LEN("/models/"));
+    } else {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("/v1beta/models/"), STR_LEN("/v1beta/models/"));
+    };
+    n = n + append_bytes(out, out_cap, n, clean_ptr, clean_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(":streamGenerateContent?alt=sse"), STR_LEN(":streamGenerateContent?alt=sse"));
+    return n;
+}
+
+fn find_substr(p: ptr, n: u64, needle_ptr: ptr, needle_len: u64) -> u64 {
+    if needle_len == 0 { return 0; };
+    if n < needle_len { return 4294967295; };
+    let i: u64 = 0;
+    while i + needle_len <= n {
+        if bytes_eq(byte_off(p, i), needle_ptr, needle_len) { return i; };
+        i = i + 1;
+    }
+    return 4294967295;
+}
+
+// ---- payload mappers (operate on the OpenAI payload doc) ----
+
+// payload_field_text helpers read fields off the payload
+// doc produced by buildOpenAiPayload (re-parsed).
+fn payload_messages(payload: u64, out: &u64) -> bool {
+    return payload != 0 && sa_json_object_get(payload, STR_PTR("messages"), STR_LEN("messages"), out) == 0 && out != 0;
+}
+
+// openAiPayloadToResponsesBody(openAiPayload, model): JSON
+// text.
+fn openAiPayloadToResponsesBody(payload: u64, model_ptr: ptr, model_len: u64, out: ptr, out_cap: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"model\":\""), STR_LEN("{\"model\":\""));
+    n = n + append_bytes(out, out_cap, n, model_ptr, model_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"input\":["), STR_LEN("\",\"input\":["));
+    let input_count: u64 = 0;
+    let instructions = [0u8; 262144];
+    let instructions_len: u64 = 0;
+    let instructions_count: u64 = 0;
+    let messages: u64 = 0;
+    let mc: u64 = 0;
+    if payload_messages(payload, &messages) && sa_json_array_len(messages, &mc) == 0 {
+        for mi in 0..mc {
+            let msg: u64 = 0;
+            sa_json_array_get(messages, mi, &msg);
+            if msg == 0 { continue; };
+            let role_ptr: ptr = PTR_NULL();
+            let role_len: u64 = 0;
+            if sa_json_object_get_string(msg, STR_PTR("role"), STR_LEN("role"), &role_ptr, &role_len) != 0 || role_len == 0 { role_ptr = STR_PTR("user"); role_len = 4; };
+            let content_ptr: ptr = PTR_NULL();
+            let content_len: u64 = 0;
+            let has_content_str = sa_json_object_get_string(msg, STR_PTR("content"), STR_LEN("content"), &content_ptr, &content_len) == 0;
+            if str_is(role_ptr, role_len, STR_PTR("system"), STR_LEN("system")) || str_is(role_ptr, role_len, STR_PTR("developer"), STR_LEN("developer")) {
+                if has_content_str && content_len > 0 {
+                    if instructions_count > 0 { instructions_len = instructions_len + append_bytes(&instructions, 262144, instructions_len, STR_PTR("\n\n"), 2); };
+                    instructions_len = instructions_len + append_bytes(&instructions, 262144, instructions_len, content_ptr, content_len);
+                    instructions_count = instructions_count + 1;
+                };
+                continue;
+            };
+            if str_is(role_ptr, role_len, STR_PTR("tool"), 4) {
+                let tcid_ptr: ptr = PTR_NULL();
+                let tcid_len: u64 = 0;
+                sa_json_object_get_string(msg, STR_PTR("tool_call_id"), STR_LEN("tool_call_id"), &tcid_ptr, &tcid_len);
+                let content_text = [0u8; 65536];
+                let content_text_len: u64 = 0;
+                if has_content_str {
+                    content_text_len = buf_copy(&content_text, 65536, content_ptr, content_len);
+                } else {
+                    let cnode: u64 = 0;
+                    if sa_json_object_get(msg, STR_PTR("content"), STR_LEN("content"), &cnode) == 0 { content_text_len = stringify_into(cnode, &content_text, 65536); };
+                };
+                if input_count > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+                input_count = input_count + 1;
+                n = n + append_bytes(out, out_cap, n, STR_PTR("{\"type\":\"function_call_output\",\"call_id\":\""), STR_LEN("{\"type\":\"function_call_output\",\"call_id\":\""));
+                n = n + append_bytes(out, out_cap, n, tcid_ptr, tcid_len);
+                n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"output\":\""), STR_LEN("\",\"output\":\""));
+                n = n + append_bytes(out, out_cap, n, &content_text, content_text_len);
+                n = n + append_bytes(out, out_cap, n, STR_PTR("\"}"), 2);
+                continue;
+            };
+            if has_content_str && content_len > 0 {
+                if input_count > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+                input_count = input_count + 1;
+                n = n + append_bytes(out, out_cap, n, STR_PTR("{\"type\":\"message\",\"role\":\""), STR_LEN("{\"type\":\"message\",\"role\":\""));
+                n = n + append_bytes(out, out_cap, n, role_ptr, role_len);
+                n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"content\":\""), STR_LEN("\",\"content\":\""));
+                n = n + append_bytes(out, out_cap, n, content_ptr, content_len);
+                n = n + append_bytes(out, out_cap, n, STR_PTR("\"}"), 2);
+            };
+            let tcs: u64 = 0;
+            let tcc: u64 = 0;
+            if sa_json_object_get(msg, STR_PTR("tool_calls"), STR_LEN("tool_calls"), &tcs) == 0 && sa_json_array_len(tcs, &tcc) == 0 {
+                for ti in 0..tcc {
+                    let tc: u64 = 0;
+                    sa_json_array_get(tcs, ti, &tc);
+                    if tc == 0 { continue; };
+                    let fnn: u64 = 0;
+                    sa_json_object_get(tc, STR_PTR("function"), STR_LEN("function"), &fnn);
+                    let name_ptr: ptr = PTR_NULL();
+                    let name_len: u64 = 0;
+                    if fnn != 0 && sa_json_object_get_string(fnn, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len) != 0 || name_len == 0 { name_ptr = STR_PTR("tool"); name_len = 4; };
+                    let args_text = [0u8; 65536];
+                    let args_text_len: u64 = 0;
+                    let args_node: u64 = 0;
+                    if fnn != 0 && sa_json_object_get(fnn, STR_PTR("arguments"), STR_LEN("arguments"), &args_node) == 0 && args_node != 0 {
+                        let is_str = false;
+                        json_node_is_string(args_node, &is_str);
+                        if is_str {
+                            let ap: ptr = PTR_NULL();
+                            let al: u64 = 0;
+                            json_node_string(args_node, &ap, &al);
+                            args_text_len = buf_copy(&args_text, 65536, ap, al);
+                        } else {
+                            args_text_len = stringify_into(args_node, &args_text, 65536);
+                        };
+                    };
+                    let id_ptr: ptr = PTR_NULL();
+                    let id_len: u64 = 0;
+                    if sa_json_object_get_string(tc, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len) != 0 || id_len == 0 { id_ptr = STR_PTR("call-agy"); id_len = STR_LEN("call-agy"); };
+                    if input_count > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+                    input_count = input_count + 1;
+                    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"type\":\"function_call\",\"call_id\":\""), STR_LEN("{\"type\":\"function_call\",\"call_id\":\""));
+                    n = n + append_bytes(out, out_cap, n, id_ptr, id_len);
+                    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"name\":\""), STR_LEN("\",\"name\":\""));
+                    n = n + append_bytes(out, out_cap, n, name_ptr, name_len);
+                    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"arguments\":\""), STR_LEN("\",\"arguments\":\""));
+                    n = n + append_bytes(out, out_cap, n, &args_text, args_text_len);
+                    n = n + append_bytes(out, out_cap, n, STR_PTR("\"}"), 2);
+                }
+            };
+        }
+    };
+    if input_count == 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"type\":\"message\",\"role\":\"user\",\"content\":\"(empty request)\"}"), STR_LEN("{\"type\":\"message\",\"role\":\"user\",\"content\":\"(empty request)\"}"));
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR("],\"stream\":false"), STR_LEN("],\"stream\":false"));
+    if instructions_count > 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"instructions\":\""), STR_LEN(",\"instructions\":\""));
+        n = n + append_bytes(out, out_cap, n, &instructions, instructions_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    };
+    let tools: u64 = 0;
+    let tc_count: u64 = 0;
+    if payload != 0 && sa_json_object_get(payload, STR_PTR("tools"), STR_LEN("tools"), &tools) == 0 && sa_json_array_len(tools, &tc_count) == 0 && tc_count > 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"tools\":["), STR_LEN(",\"tools\":["));
+        for ti in 0..tc_count {
+            let t: u64 = 0;
+            sa_json_array_get(tools, ti, &t);
+            let fnn: u64 = 0;
+            if t != 0 { sa_json_object_get(t, STR_PTR("function"), STR_LEN("function"), &fnn); };
+            let src = if fnn != 0 { fnn } else { t };
+            let name_ptr: ptr = PTR_NULL();
+            let name_len: u64 = 0;
+            if src != 0 && sa_json_object_get_string(src, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len) != 0 || name_len == 0 { name_ptr = STR_PTR("tool"); name_len = 4; };
+            let desc_ptr: ptr = PTR_NULL();
+            let desc_len: u64 = 0;
+            if src != 0 { sa_json_object_get_string(src, STR_PTR("description"), STR_LEN("description"), &desc_ptr, &desc_len); };
+            let params_text = [0u8; 65536];
+            let params_text_len: u64 = 0;
+            let params_node: u64 = 0;
+            if src != 0 && sa_json_object_get(src, STR_PTR("parameters"), STR_LEN("parameters"), &params_node) == 0 && params_node != 0 {
+                params_text_len = stringify_into(params_node, &params_text, 65536);
+            } else {
+                params_text_len = buf_copy(&params_text, 65536, STR_PTR("{\"type\":\"object\",\"properties\":{}}"), STR_LEN("{\"type\":\"object\",\"properties\":{}}"));
+            };
+            if ti > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+            n = n + append_bytes(out, out_cap, n, STR_PTR("{\"type\":\"function\",\"name\":\""), STR_LEN("{\"type\":\"function\",\"name\":\""));
+            n = n + append_bytes(out, out_cap, n, name_ptr, name_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"description\":\""), STR_LEN("\",\"description\":\""));
+            n = n + append_bytes(out, out_cap, n, desc_ptr, desc_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"parameters\":"), STR_LEN("\",\"parameters\":"));
+            n = n + append_bytes(out, out_cap, n, &params_text, params_text_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("}"), 1);
+        }
+        n = n + append_bytes(out, out_cap, n, STR_PTR("],\"tool_choice\":\"auto\""), STR_LEN("],\"tool_choice\":\"auto\""));
+    };
+    let temp: f64 = 0.0;
+    let has_temp = false;
+    if payload != 0 { json_node_number_f64(payload, STR_PTR("temperature"), STR_LEN("temperature"), &temp, &has_temp); };
+    if has_temp {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"temperature\":"), STR_LEN(",\"temperature\":"));
+        n = n + append_f64(out, out_cap, n, temp);
+    };
+    let max_tokens: i64 = 0;
+    if payload != 0 && json_node_number(payload, STR_PTR("max_tokens"), STR_LEN("max_tokens"), &max_tokens) {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"max_output_tokens\":"), STR_LEN(",\"max_output_tokens\":"));
+        n = n + append_i64(out, out_cap, n, max_tokens);
+    };
+    let effort_ptr: ptr = PTR_NULL();
+    let effort_len: u64 = 0;
+    if payload != 0 && sa_json_object_get_string(payload, STR_PTR("reasoning_effort"), STR_LEN("reasoning_effort"), &effort_ptr, &effort_len) == 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"reasoning\":{\"effort\":\""), STR_LEN(",\"reasoning\":{\"effort\":\""));
+        n = n + append_bytes(out, out_cap, n, effort_ptr, effort_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\"}"), 2);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR("}"), 1);
+    return n;
+}
+
+// openAiPayloadToAnthropicBody(openAiPayload, model,
+// maxTokens = 8192): JSON text.
+fn openAiPayloadToAnthropicBody(payload: u64, model_ptr: ptr, model_len: u64, max_tokens: i64, out: ptr, out_cap: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"model\":\""), STR_LEN("{\"model\":\""));
+    n = n + append_bytes(out, out_cap, n, model_ptr, model_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"max_tokens\":"), STR_LEN("\",\"max_tokens\":"));
+    n = n + append_i64(out, out_cap, n, max_tokens);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"messages\":["), STR_LEN(",\"messages\":["));
+    let msg_count: u64 = 0;
+    let system_texts = [0u8; 262144];
+    let system_len: u64 = 0;
+    let system_count: u64 = 0;
+    let messages: u64 = 0;
+    let mc: u64 = 0;
+    if payload_messages(payload, &messages) && sa_json_array_len(messages, &mc) == 0 {
+        for mi in 0..mc {
+            let msg: u64 = 0;
+            sa_json_array_get(messages, mi, &msg);
+            if msg == 0 { continue; };
+            let role_ptr: ptr = PTR_NULL();
+            let role_len: u64 = 0;
+            if sa_json_object_get_string(msg, STR_PTR("role"), STR_LEN("role"), &role_ptr, &role_len) != 0 || role_len == 0 { role_ptr = STR_PTR("user"); role_len = 4; };
+            let content_ptr: ptr = PTR_NULL();
+            let content_len: u64 = 0;
+            let has_content_str = sa_json_object_get_string(msg, STR_PTR("content"), STR_LEN("content"), &content_ptr, &content_len) == 0;
+            if str_is(role_ptr, role_len, STR_PTR("system"), STR_LEN("system")) || str_is(role_ptr, role_len, STR_PTR("developer"), STR_LEN("developer")) {
+                if has_content_str && content_len > 0 {
+                    if system_count > 0 { system_len = system_len + append_bytes(&system_texts, 262144, system_len, STR_PTR("\n\n"), 2); };
+                    system_len = system_len + append_bytes(&system_texts, 262144, system_len, content_ptr, content_len);
+                    system_count = system_count + 1;
+                };
+                continue;
+            };
+            if str_is(role_ptr, role_len, STR_PTR("tool"), 4) {
+                let tcid_ptr: ptr = PTR_NULL();
+                let tcid_len: u64 = 0;
+                sa_json_object_get_string(msg, STR_PTR("tool_call_id"), STR_LEN("tool_call_id"), &tcid_ptr, &tcid_len);
+                let content_text = [0u8; 65536];
+                let content_text_len: u64 = 0;
+                if has_content_str {
+                    content_text_len = buf_copy(&content_text, 65536, content_ptr, content_len);
+                } else {
+                    let cnode: u64 = 0;
+                    if sa_json_object_get(msg, STR_PTR("content"), STR_LEN("content"), &cnode) == 0 { content_text_len = stringify_into(cnode, &content_text, 65536); };
+                };
+                if msg_count > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+                msg_count = msg_count + 1;
+                n = n + append_bytes(out, out_cap, n, STR_PTR("{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\""), STR_LEN("{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\""));
+                n = n + append_bytes(out, out_cap, n, tcid_ptr, tcid_len);
+                n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"content\":\""), STR_LEN("\",\"content\":\""));
+                n = n + append_bytes(out, out_cap, n, &content_text, content_text_len);
+                n = n + append_bytes(out, out_cap, n, STR_PTR("\"}]}"), 4);
+                continue;
+            };
+            // blocks: text + tool_use entries
+            let blocks = [0u8; 262144];
+            let blocks_len: u64 = 0;
+            let blocks_count: u64 = 0;
+            if has_content_str && content_len > 0 {
+                blocks_len = blocks_len + append_bytes(&blocks, 262144, blocks_len, STR_PTR("{\"type\":\"text\",\"text\":\""), STR_LEN("{\"type\":\"text\",\"text\":\""));
+                blocks_len = blocks_len + append_bytes(&blocks, 262144, blocks_len, content_ptr, content_len);
+                blocks_len = blocks_len + append_bytes(&blocks, 262144, blocks_len, STR_PTR("\"}"), 2);
+                blocks_count = blocks_count + 1;
+            };
+            let tcs: u64 = 0;
+            let tcc: u64 = 0;
+            if sa_json_object_get(msg, STR_PTR("tool_calls"), STR_LEN("tool_calls"), &tcs) == 0 && sa_json_array_len(tcs, &tcc) == 0 {
+                for ti in 0..tcc {
+                    let tc: u64 = 0;
+                    sa_json_array_get(tcs, ti, &tc);
+                    if tc == 0 { continue; };
+                    let fnn: u64 = 0;
+                    sa_json_object_get(tc, STR_PTR("function"), STR_LEN("function"), &fnn);
+                    let input_text = [0u8; 65536];
+                    let input_text_len: u64 = 0;
+                    let args_node: u64 = 0;
+                    if fnn != 0 && sa_json_object_get(fnn, STR_PTR("arguments"), STR_LEN("arguments"), &args_node) == 0 && args_node != 0 {
+                        let is_str = false;
+                        json_node_is_string(args_node, &is_str);
+                        if is_str {
+                            let ap: ptr = PTR_NULL();
+                            let al: u64 = 0;
+                            json_node_string(args_node, &ap, &al);
+                            let parsed = sa_json_parse(ap, al);
+                            if parsed != 0 {
+                                input_text_len = stringify_into(parsed, &input_text, 65536);
+                            } else {
+                                input_text_len = input_text_len + append_bytes(&input_text, 65536, input_text_len, STR_PTR("{\"_raw\":\""), STR_LEN("{\"_raw\":\""));
+                                input_text_len = input_text_len + append_bytes(&input_text, 65536, input_text_len, ap, al);
+                                input_text_len = input_text_len + append_bytes(&input_text, 65536, input_text_len, STR_PTR("\"}"), 2);
+                            };
+                        } else {
+                            input_text_len = stringify_into(args_node, &input_text, 65536);
+                        };
+                    };
+                    if input_text_len == 0 { input_text_len = buf_copy(&input_text, 65536, STR_PTR("{}"), 2); };
+                    let name_ptr: ptr = PTR_NULL();
+                    let name_len: u64 = 0;
+                    if fnn != 0 && sa_json_object_get_string(fnn, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len) != 0 || name_len == 0 { name_ptr = STR_PTR("tool"); name_len = 4; };
+                    let id_ptr: ptr = PTR_NULL();
+                    let id_len: u64 = 0;
+                    if sa_json_object_get_string(tc, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len) != 0 || id_len == 0 { id_ptr = STR_PTR("toolu-agy"); id_len = STR_LEN("toolu-agy"); };
+                    if blocks_count > 0 { blocks_len = blocks_len + append_bytes(&blocks, 262144, blocks_len, STR_PTR(","), 1); };
+                    blocks_count = blocks_count + 1;
+                    blocks_len = blocks_len + append_bytes(&blocks, 262144, blocks_len, STR_PTR("{\"type\":\"tool_use\",\"id\":\""), STR_LEN("{\"type\":\"tool_use\",\"id\":\""));
+                    blocks_len = blocks_len + append_bytes(&blocks, 262144, blocks_len, id_ptr, id_len);
+                    blocks_len = blocks_len + append_bytes(&blocks, 262144, blocks_len, STR_PTR("\",\"name\":\""), STR_LEN("\",\"name\":\""));
+                    blocks_len = blocks_len + append_bytes(&blocks, 262144, blocks_len, name_ptr, name_len);
+                    blocks_len = blocks_len + append_bytes(&blocks, 262144, blocks_len, STR_PTR("\",\"input\":"), STR_LEN("\",\"input\":"));
+                    blocks_len = blocks_len + append_bytes(&blocks, 262144, blocks_len, &input_text, input_text_len);
+                    blocks_len = blocks_len + append_bytes(&blocks, 262144, blocks_len, STR_PTR("}"), 1);
+                }
+            };
+            if blocks_count == 0 {
+                blocks_len = buf_copy(&blocks, 262144, STR_PTR("{\"type\":\"text\",\"text\":\"(empty)\"}"), STR_LEN("{\"type\":\"text\",\"text\":\"(empty)\"}"));
+            };
+            if msg_count > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+            msg_count = msg_count + 1;
+            n = n + append_bytes(out, out_cap, n, STR_PTR("{\"role\":\""), STR_LEN("{\"role\":\""));
+            if str_is(role_ptr, role_len, STR_PTR("assistant"), STR_LEN("assistant")) {
+                n = n + append_bytes(out, out_cap, n, STR_PTR("assistant"), STR_LEN("assistant"));
+            } else {
+                n = n + append_bytes(out, out_cap, n, STR_PTR("user"), 4);
+            };
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"content\":["), STR_LEN("\",\"content\":["));
+            n = n + append_bytes(out, out_cap, n, &blocks, blocks_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("]}"), 2);
+        }
+    };
+    if msg_count == 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"(empty request)\"}]}"), STR_LEN("{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"(empty request)\"}]}"));
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR("],\"stream\":false"), STR_LEN("],\"stream\":false"));
+    if system_count > 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"system\":\""), STR_LEN(",\"system\":\""));
+        n = n + append_bytes(out, out_cap, n, &system_texts, system_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    };
+    let temp: f64 = 0.0;
+    let has_temp = false;
+    if payload != 0 { json_node_number_f64(payload, STR_PTR("temperature"), STR_LEN("temperature"), &temp, &has_temp); };
+    if has_temp {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"temperature\":"), STR_LEN(",\"temperature\":"));
+        n = n + append_f64(out, out_cap, n, temp);
+    };
+    let tools: u64 = 0;
+    let tc_count: u64 = 0;
+    if payload != 0 && sa_json_object_get(payload, STR_PTR("tools"), STR_LEN("tools"), &tools) == 0 && sa_json_array_len(tools, &tc_count) == 0 && tc_count > 0 {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"tools\":["), STR_LEN(",\"tools\":["));
+        for ti in 0..tc_count {
+            let t: u64 = 0;
+            sa_json_array_get(tools, ti, &t);
+            let fnn: u64 = 0;
+            if t != 0 { sa_json_object_get(t, STR_PTR("function"), STR_LEN("function"), &fnn); };
+            let src = if fnn != 0 { fnn } else { t };
+            let name_ptr: ptr = PTR_NULL();
+            let name_len: u64 = 0;
+            if src != 0 && sa_json_object_get_string(src, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len) != 0 || name_len == 0 { name_ptr = STR_PTR("tool"); name_len = 4; };
+            let desc_ptr: ptr = PTR_NULL();
+            let desc_len: u64 = 0;
+            if src != 0 { sa_json_object_get_string(src, STR_PTR("description"), STR_LEN("description"), &desc_ptr, &desc_len); };
+            let params_text = [0u8; 65536];
+            let params_text_len: u64 = 0;
+            let params_node: u64 = 0;
+            if src != 0 && sa_json_object_get(src, STR_PTR("parameters"), STR_LEN("parameters"), &params_node) == 0 && params_node != 0 {
+                params_text_len = stringify_into(params_node, &params_text, 65536);
+            } else {
+                params_text_len = buf_copy(&params_text, 65536, STR_PTR("{\"type\":\"object\",\"properties\":{}}"), STR_LEN("{\"type\":\"object\",\"properties\":{}}"));
+            };
+            if ti > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+            n = n + append_bytes(out, out_cap, n, STR_PTR("{\"name\":\""), STR_LEN("{\"name\":\""));
+            n = n + append_bytes(out, out_cap, n, name_ptr, name_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"description\":\""), STR_LEN("\",\"description\":\""));
+            n = n + append_bytes(out, out_cap, n, desc_ptr, desc_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"input_schema\":"), STR_LEN("\",\"input_schema\":"));
+            n = n + append_bytes(out, out_cap, n, &params_text, params_text_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("}"), 1);
+        }
+        n = n + append_bytes(out, out_cap, n, STR_PTR("]"), 1);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR("}"), 1);
+    return n;
+}
+
+// ---- upstream result parsers ----
+
+struct AgyParsedUpstreamResult {
+    text: [u8; 262144],
+    text_len: u64,
+    reasoning: [u8; 262144],
+    reasoning_len: u64,
+    tc_id: [u8; 8192],
+    tc_id_off: [u64; 32],
+    tc_id_len: [u64; 32],
+    tc_name: [u8; 8192],
+    tc_name_off: [u64; 32],
+    tc_name_len: [u64; 32],
+    tc_args: [u8; 262144],
+    tc_args_off: [u64; 32],
+    tc_args_len: [u64; 32],
+    tc_count: u64,
+    tc_used: u64,
+    usage_input: i64,
+    usage_output: i64,
+    usage_total: i64,
+}
+
+fn parsed_push_tool(r: &AgyParsedUpstreamResult, id_ptr: ptr, id_len: u64, name_ptr: ptr, name_len: u64, args_ptr: ptr, args_len: u64) -> void {
+    if r.tc_count >= 32 { return; };
+    let i = r.tc_count;
+    // ids/names live in fixed 256-byte slots; args in the
+    // shared arena.
+    r.tc_id_len[i] = buf_copy(byte_off(&r.tc_id, i * 256), 256, id_ptr, id_len);
+    r.tc_name_len[i] = buf_copy(byte_off(&r.tc_name, i * 256), 256, name_ptr, name_len);
+    r.tc_args_off[i] = r.tc_used;
+    r.tc_args_len[i] = args_len;
+    for k in 0..args_len {
+        if r.tc_used < 262144 { r.tc_args[r.tc_used] = byte_at(args_ptr, k); r.tc_used = r.tc_used + 1; };
+    }
+    r.tc_count = r.tc_count + 1;
+}
+
+fn parsed_tool_id(r: &AgyParsedUpstreamResult, i: u64, out_len: &u64) -> ptr {
+    out_len = r.tc_id_len[i];
+    return byte_off(&r.tc_id, i * 256);
+}
+
+fn parsed_tool_name(r: &AgyParsedUpstreamResult, i: u64, out_len: &u64) -> ptr {
+    out_len = r.tc_name_len[i];
+    return byte_off(&r.tc_name, i * 256);
+}
+
+fn parsed_tool_args(r: &AgyParsedUpstreamResult, i: u64, out_len: &u64) -> ptr {
+    out_len = r.tc_args_len[i];
+    return byte_off(&r.tc_args, r.tc_args_off[i]);
+}
+
+// parseResponsesUpstreamResult(json)
+fn parseResponsesUpstreamResult(json: u64, r: &AgyParsedUpstreamResult) -> void {
+    r.text_len = 0;
+    r.reasoning_len = 0;
+    r.tc_count = 0;
+    r.tc_used = 0;
+    r.usage_input = 0;
+    r.usage_output = 0;
+    r.usage_total = 0;
+    if json == 0 { return; };
+    let ot_ptr: ptr = PTR_NULL();
+    let ot_len: u64 = 0;
+    if sa_json_object_get_string(json, STR_PTR("output_text"), STR_LEN("output_text"), &ot_ptr, &ot_len) == 0 {
+        r.text_len = buf_copy(&r.text, 262144, ot_ptr, ot_len);
+    };
+    let output: u64 = 0;
+    let oc: u64 = 0;
+    if sa_json_object_get(json, STR_PTR("output"), STR_LEN("output"), &output) == 0 && sa_json_array_len(output, &oc) == 0 {
+        for oi in 0..oc {
+            let item: u64 = 0;
+            sa_json_array_get(output, oi, &item);
+            if item == 0 { continue; };
+            let type_ptr: ptr = PTR_NULL();
+            let type_len: u64 = 0;
+            sa_json_object_get_string(item, STR_PTR("type"), STR_LEN("type"), &type_ptr, &type_len);
+            if str_is(type_ptr, type_len, STR_PTR("message"), STR_LEN("message")) {
+                let content: u64 = 0;
+                let cc2: u64 = 0;
+                if sa_json_object_get(item, STR_PTR("content"), STR_LEN("content"), &content) == 0 && sa_json_array_len(content, &cc2) == 0 {
+                    for pi in 0..cc2 {
+                        let part: u64 = 0;
+                        sa_json_array_get(content, pi, &part);
+                        let t_ptr: ptr = PTR_NULL();
+                        let t_len: u64 = 0;
+                        if part != 0 && sa_json_object_get_string(part, STR_PTR("text"), STR_LEN("text"), &t_ptr, &t_len) == 0 && r.text_len == 0 {
+                            r.text_len = r.text_len + append_bytes(&r.text, 262144, r.text_len, t_ptr, t_len);
+                        };
+                    }
+                };
+            } else if str_is(type_ptr, type_len, STR_PTR("reasoning"), STR_LEN("reasoning")) {
+                for pass in 0..2 {
+                    let arr: u64 = 0;
+                    let ac: u64 = 0;
+                    let key = if pass == 0 { STR_PTR("summary") } else { STR_PTR("content") };
+                    let key_len = if pass == 0 { STR_LEN("summary") } else { STR_LEN("content") };
+                    if sa_json_object_get(item, key, key_len, &arr) == 0 && sa_json_array_len(arr, &ac) == 0 {
+                        for bi in 0..ac {
+                            let b: u64 = 0;
+                            sa_json_array_get(arr, bi, &b);
+                            let t_ptr: ptr = PTR_NULL();
+                            let t_len: u64 = 0;
+                            if b != 0 && sa_json_object_get_string(b, STR_PTR("text"), STR_LEN("text"), &t_ptr, &t_len) == 0 {
+                                r.reasoning_len = r.reasoning_len + append_bytes(&r.reasoning, 262144, r.reasoning_len, t_ptr, t_len);
+                            };
+                        }
+                    };
+                }
+            } else if str_is(type_ptr, type_len, STR_PTR("function_call"), STR_LEN("function_call")) {
+                let id_ptr: ptr = PTR_NULL();
+                let id_len: u64 = 0;
+                if sa_json_object_get_string(item, STR_PTR("call_id"), STR_LEN("call_id"), &id_ptr, &id_len) != 0 || id_len == 0 {
+                    if sa_json_object_get_string(item, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len) != 0 || id_len == 0 { id_ptr = STR_PTR("call-agy"); id_len = STR_LEN("call-agy"); };
+                };
+                let name_ptr: ptr = PTR_NULL();
+                let name_len: u64 = 0;
+                if sa_json_object_get_string(item, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len) != 0 || name_len == 0 { name_ptr = STR_PTR("tool"); name_len = 4; };
+                let args_text = [0u8; 65536];
+                let args_text_len: u64 = 0;
+                let args_node: u64 = 0;
+                if sa_json_object_get(item, STR_PTR("arguments"), STR_LEN("arguments"), &args_node) == 0 && args_node != 0 {
+                    let is_str = false;
+                    json_node_is_string(args_node, &is_str);
+                    if is_str {
+                        let ap: ptr = PTR_NULL();
+                        let al: u64 = 0;
+                        json_node_string(args_node, &ap, &al);
+                        let parsed = sa_json_parse(ap, al);
+                        if parsed != 0 {
+                            args_text_len = stringify_into(parsed, &args_text, 65536);
+                        } else {
+                            args_text_len = args_text_len + append_bytes(&args_text, 65536, args_text_len, STR_PTR("{\"_raw\":\""), STR_LEN("{\"_raw\":\""));
+                            args_text_len = args_text_len + append_bytes(&args_text, 65536, args_text_len, ap, al);
+                            args_text_len = args_text_len + append_bytes(&args_text, 65536, args_text_len, STR_PTR("\"}"), 2);
+                        };
+                    } else {
+                        args_text_len = stringify_into(args_node, &args_text, 65536);
+                    };
+                };
+                if args_text_len == 0 { args_text_len = buf_copy(&args_text, 65536, STR_PTR("{}"), 2); };
+                parsed_push_tool(r, id_ptr, id_len, name_ptr, name_len, &args_text, args_text_len);
+            };
+        }
+    };
+    let usage: u64 = 0;
+    if sa_json_object_get(json, STR_PTR("usage"), STR_LEN("usage"), &usage) == 0 && usage != 0 {
+        json_node_number(usage, STR_PTR("input_tokens"), STR_LEN("input_tokens"), &r.usage_input);
+        json_node_number(usage, STR_PTR("output_tokens"), STR_LEN("output_tokens"), &r.usage_output);
+        json_node_number(usage, STR_PTR("total_tokens"), STR_LEN("total_tokens"), &r.usage_total);
+    };
+}
+
+// parseAnthropicUpstreamResult(json)
+fn parseAnthropicUpstreamResult(json: u64, r: &AgyParsedUpstreamResult) -> void {
+    r.text_len = 0;
+    r.reasoning_len = 0;
+    r.tc_count = 0;
+    r.tc_used = 0;
+    r.usage_input = 0;
+    r.usage_output = 0;
+    r.usage_total = 0;
+    if json == 0 { return; };
+    let content: u64 = 0;
+    let cc: u64 = 0;
+    if sa_json_object_get(json, STR_PTR("content"), STR_LEN("content"), &content) == 0 && sa_json_array_len(content, &cc) == 0 {
+        for bi in 0..cc {
+            let b: u64 = 0;
+            sa_json_array_get(content, bi, &b);
+            if b == 0 { continue; };
+            let type_ptr: ptr = PTR_NULL();
+            let type_len: u64 = 0;
+            sa_json_object_get_string(b, STR_PTR("type"), STR_LEN("type"), &type_ptr, &type_len);
+            if str_is(type_ptr, type_len, STR_PTR("text"), 4) {
+                let t_ptr: ptr = PTR_NULL();
+                let t_len: u64 = 0;
+                if sa_json_object_get_string(b, STR_PTR("text"), STR_LEN("text"), &t_ptr, &t_len) == 0 {
+                    r.text_len = r.text_len + append_bytes(&r.text, 262144, r.text_len, t_ptr, t_len);
+                };
+            } else if str_is(type_ptr, type_len, STR_PTR("tool_use"), STR_LEN("tool_use")) {
+                let id_ptr: ptr = PTR_NULL();
+                let id_len: u64 = 0;
+                if sa_json_object_get_string(b, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len) != 0 || id_len == 0 { id_ptr = STR_PTR("toolu-agy"); id_len = STR_LEN("toolu-agy"); };
+                let name_ptr: ptr = PTR_NULL();
+                let name_len: u64 = 0;
+                if sa_json_object_get_string(b, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len) != 0 || name_len == 0 { name_ptr = STR_PTR("tool"); name_len = 4; };
+                let input_node: u64 = 0;
+                let input_text = [0u8; 65536];
+                let input_text_len: u64 = 0;
+                if sa_json_object_get(b, STR_PTR("input"), STR_LEN("input"), &input_node) == 0 && input_node != 0 {
+                    input_text_len = stringify_into(input_node, &input_text, 65536);
+                };
+                if input_text_len == 0 { input_text_len = buf_copy(&input_text, 65536, STR_PTR("{}"), 2); };
+                parsed_push_tool(r, id_ptr, id_len, name_ptr, name_len, &input_text, input_text_len);
+            };
+        }
+    };
+    let usage: u64 = 0;
+    if sa_json_object_get(json, STR_PTR("usage"), STR_LEN("usage"), &usage) == 0 && usage != 0 {
+        json_node_number(usage, STR_PTR("input_tokens"), STR_LEN("input_tokens"), &r.usage_input);
+        json_node_number(usage, STR_PTR("output_tokens"), STR_LEN("output_tokens"), &r.usage_output);
+        r.usage_total = r.usage_input + r.usage_output;
+    };
+}
+
+// ---- AgyProxyServer ----
+
+// AgyProxyConfig (interface): string fields are (ptr,len)
+// pairs into caller/config-doc storage; apiKeys is a small
+// list; environmentVars is a newline-joined env snapshot;
+// provider/group stay config docs.
+struct AgyProxyConfig {
+    targetBaseUrl_ptr: ptr,
+    targetBaseUrl_len: u64,
+    targetModel_ptr: ptr,
+    targetModel_len: u64,
+    protocol_ptr: ptr,
+    protocol_len: u64,
+    has_protocol: bool,
+    apiKeys: [u8; 4096],
+    apiKeys_off: [u64; 8],
+    apiKeys_len: [u64; 8],
+    apiKeys_count: u64,
+    apiKeys_used: u64,
+    threadId_ptr: ptr,
+    threadId_len: u64,
+    has_threadId: bool,
+    provider: u64,
+    group: u64,
+    modelDisplayName_ptr: ptr,
+    modelDisplayName_len: u64,
+    has_modelDisplayName: bool,
+    agyCliModel_ptr: ptr,
+    agyCliModel_len: u64,
+    has_agyCliModel: bool,
+    reasoningEffort_ptr: ptr,
+    reasoningEffort_len: u64,
+    has_reasoningEffort: bool,
+    maxTokens: i64,
+    has_maxTokens: bool,
+    maxCompletionTokens: i64,
+    has_maxCompletionTokens: bool,
+    verbose: bool,
+    environmentVars_ptr: ptr,
+    environmentVars_len: u64,
+    has_environmentVars: bool,
+}
+
+// AgyHttpResponse: one fully-buffered response.
+struct AgyHttpResponse {
+    status: i32,
+    body: [u8; 4194304],
+    body_len: u64,
+    is_sse: bool,
+}
+
+// The server struct shape matches the uses in agyBridge.sla
+// (config_ptr/config_len hold the raw config JSON text the
+// bridge passes; arena/eventQueue kept for shape compat).
+struct AgyProxyServer {
+    config: AgyProxyConfig,
+    config_ptr: ptr,
+    config_len: u64,
+    url: [u8; 1024],
+    url_len: u64,
+    running: bool,
+    server: u64,
+    has_server: bool,
+    port: u32,
+    arena: [u8; 262144],
+    arena_len: u64,
+    eventQueue: [u8; 262144],
+    eventQueue_len: u64,
+    resp: AgyHttpResponse,
+    upstream: [u8; 4194304],
+    upstream_len: u64,
+}
+
+fn AgyProxyConfig_blank() -> AgyProxyConfig {
+    return AgyProxyConfig{ targetBaseUrl_ptr: PTR_NULL(), targetBaseUrl_len: 0, targetModel_ptr: PTR_NULL(), targetModel_len: 0, protocol_ptr: PTR_NULL(), protocol_len: 0, has_protocol: false, apiKeys: [0u8; 4096], apiKeys_off: [0u64; 8], apiKeys_len: [0u64; 8], apiKeys_count: 0, apiKeys_used: 0, threadId_ptr: PTR_NULL(), threadId_len: 0, has_threadId: false, provider: 0, group: 0, modelDisplayName_ptr: PTR_NULL(), modelDisplayName_len: 0, has_modelDisplayName: false, agyCliModel_ptr: PTR_NULL(), agyCliModel_len: 0, has_agyCliModel: false, reasoningEffort_ptr: PTR_NULL(), reasoningEffort_len: 0, has_reasoningEffort: false, maxTokens: 0, has_maxTokens: false, maxCompletionTokens: 0, has_maxCompletionTokens: false, verbose: false, environmentVars_ptr: PTR_NULL(), environmentVars_len: 0, has_environmentVars: false };
+}
+
+fn AgyProxyServer_blank() -> AgyProxyServer {
+    return AgyProxyServer{ config: AgyProxyConfig_blank(), config_ptr: PTR_NULL(), config_len: 0, url: [0u8; 1024], url_len: 0, running: false, server: 0, has_server: false, port: 0, arena: [0u8; 262144], arena_len: 0, eventQueue: [0u8; 262144], eventQueue_len: 0, resp: AgyHttpResponse{ status: 200, body: [0u8; 4194304], body_len: 0, is_sse: false }, upstream: [0u8; 4194304], upstream_len: 0 };
+}
+
+// configFromJson: parse a config JSON text into the struct
+// (the bridge passes configs as JSON text).
+fn AgyProxyServer_configFromJson(self: &AgyProxyServer, text_ptr: ptr, text_len: u64) -> void {
+    self.config_ptr = text_ptr;
+    self.config_len = text_len;
+    let doc = sa_json_parse(text_ptr, text_len);
+    if doc == 0 { return; };
+    let cfg = &self.config;
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    if sa_json_object_get_string(doc, STR_PTR("targetBaseUrl"), STR_LEN("targetBaseUrl"), &v_ptr, &v_len) == 0 { cfg.targetBaseUrl_ptr = v_ptr; cfg.targetBaseUrl_len = v_len; };
+    if sa_json_object_get_string(doc, STR_PTR("targetModel"), STR_LEN("targetModel"), &v_ptr, &v_len) == 0 { cfg.targetModel_ptr = v_ptr; cfg.targetModel_len = v_len; };
+    if sa_json_object_get_string(doc, STR_PTR("protocol"), STR_LEN("protocol"), &v_ptr, &v_len) == 0 { cfg.protocol_ptr = v_ptr; cfg.protocol_len = v_len; cfg.has_protocol = true; };
+    if sa_json_object_get_string(doc, STR_PTR("threadId"), STR_LEN("threadId"), &v_ptr, &v_len) == 0 { cfg.threadId_ptr = v_ptr; cfg.threadId_len = v_len; cfg.has_threadId = true; };
+    if sa_json_object_get_string(doc, STR_PTR("modelDisplayName"), STR_LEN("modelDisplayName"), &v_ptr, &v_len) == 0 { cfg.modelDisplayName_ptr = v_ptr; cfg.modelDisplayName_len = v_len; cfg.has_modelDisplayName = true; };
+    if sa_json_object_get_string(doc, STR_PTR("agyCliModel"), STR_LEN("agyCliModel"), &v_ptr, &v_len) == 0 { cfg.agyCliModel_ptr = v_ptr; cfg.agyCliModel_len = v_len; cfg.has_agyCliModel = true; };
+    if sa_json_object_get_string(doc, STR_PTR("reasoningEffort"), STR_LEN("reasoningEffort"), &v_ptr, &v_len) == 0 { cfg.reasoningEffort_ptr = v_ptr; cfg.reasoningEffort_len = v_len; cfg.has_reasoningEffort = true; };
+    let keys: u64 = 0;
+    let kc: u64 = 0;
+    cfg.apiKeys_count = 0;
+    cfg.apiKeys_used = 0;
+    if sa_json_object_get(doc, STR_PTR("apiKeys"), STR_LEN("apiKeys"), &keys) == 0 && sa_json_array_len(keys, &kc) == 0 {
+        for i in 0..kc {
+            if cfg.apiKeys_count >= 8 { break; };
+            let item: u64 = 0;
+            sa_json_array_get(keys, i, &item);
+            let kp: ptr = PTR_NULL();
+            let kl: u64 = 0;
+            json_node_string(item, &kp, &kl);
+            cfg.apiKeys_off[cfg.apiKeys_count] = cfg.apiKeys_used;
+            cfg.apiKeys_len[cfg.apiKeys_count] = kl;
+            for k in 0..kl {
+                if cfg.apiKeys_used < 4096 { cfg.apiKeys[cfg.apiKeys_used] = byte_at(kp, k); cfg.apiKeys_used = cfg.apiKeys_used + 1; };
+            }
+            cfg.apiKeys_count = cfg.apiKeys_count + 1;
+        }
+    };
+    let num: i64 = 0;
+    if json_node_number(doc, STR_PTR("maxTokens"), STR_LEN("maxTokens"), &num) { cfg.maxTokens = num; cfg.has_maxTokens = true; };
+    if json_node_number(doc, STR_PTR("maxCompletionTokens"), STR_LEN("maxCompletionTokens"), &num) { cfg.maxCompletionTokens = num; cfg.has_maxCompletionTokens = true; };
+    let b = false;
+    if sa_json_object_get_bool(doc, STR_PTR("verbose"), STR_LEN("verbose"), &b) == 0 { cfg.verbose = b; };
+    sa_json_object_get(doc, STR_PTR("provider"), STR_LEN("provider"), &cfg.provider);
+    sa_json_object_get(doc, STR_PTR("group"), STR_LEN("group"), &cfg.group);
+}
+
+// AgyProxyServer_new(self, config): constructor form used
+// by agyBridge for struct configs.
+fn AgyProxyServer_new(self: &AgyProxyServer, cfg: &AgyProxyConfig) -> void {
+    self.config = *cfg;
+    self.running = false;
+    self.has_server = false;
+    self.port = 0;
+    self.url_len = 0;
+}
+
+// AgyProxyServer_new_json(self, configText): the form
+// agyBridge.sla calls with a JSON text config.
+fn AgyProxyServer_new_json(self: &AgyProxyServer, text_ptr: ptr, text_len: u64) -> void {
+    self.config = AgyProxyConfig_blank();
+    self.running = false;
+    self.has_server = false;
+    self.port = 0;
+    self.url_len = 0;
+    AgyProxyServer_configFromJson(self, text_ptr, text_len);
+}
+
+// updateConfig(partial): field-wise merge (spread in the
+// source); apiKeys replaced only when the partial carries
+// a non-empty list in this pass.
+fn AgyProxyServer_updateConfig(self: &AgyProxyServer, partial: &AgyProxyConfig) -> void {
+    let cfg = &self.config;
+    if partial.targetBaseUrl_len > 0 { cfg.targetBaseUrl_ptr = partial.targetBaseUrl_ptr; cfg.targetBaseUrl_len = partial.targetBaseUrl_len; };
+    if partial.targetModel_len > 0 { cfg.targetModel_ptr = partial.targetModel_ptr; cfg.targetModel_len = partial.targetModel_len; };
+    if partial.has_protocol { cfg.protocol_ptr = partial.protocol_ptr; cfg.protocol_len = partial.protocol_len; cfg.has_protocol = true; };
+    if partial.apiKeys_count > 0 { cfg.apiKeys = partial.apiKeys; cfg.apiKeys_off = partial.apiKeys_off; cfg.apiKeys_len = partial.apiKeys_len; cfg.apiKeys_count = partial.apiKeys_count; cfg.apiKeys_used = partial.apiKeys_used; };
+    if partial.has_threadId { cfg.threadId_ptr = partial.threadId_ptr; cfg.threadId_len = partial.threadId_len; cfg.has_threadId = true; };
+    if partial.provider != 0 { cfg.provider = partial.provider; };
+    if partial.group != 0 { cfg.group = partial.group; };
+    if partial.has_modelDisplayName { cfg.modelDisplayName_ptr = partial.modelDisplayName_ptr; cfg.modelDisplayName_len = partial.modelDisplayName_len; cfg.has_modelDisplayName = true; };
+    if partial.has_agyCliModel { cfg.agyCliModel_ptr = partial.agyCliModel_ptr; cfg.agyCliModel_len = partial.agyCliModel_len; cfg.has_agyCliModel = true; };
+    if partial.has_reasoningEffort { cfg.reasoningEffort_ptr = partial.reasoningEffort_ptr; cfg.reasoningEffort_len = partial.reasoningEffort_len; cfg.has_reasoningEffort = true; };
+    if partial.has_maxTokens { cfg.maxTokens = partial.maxTokens; cfg.has_maxTokens = true; };
+    if partial.has_maxCompletionTokens { cfg.maxCompletionTokens = partial.maxCompletionTokens; cfg.has_maxCompletionTokens = true; };
+    cfg.verbose = partial.verbose;
+    if partial.has_environmentVars { cfg.environmentVars_ptr = partial.environmentVars_ptr; cfg.environmentVars_len = partial.environmentVars_len; cfg.has_environmentVars = true; };
+}
+
+// AgyProxyServer_updateConfigJson: JSON-text partial (the
+// form agyBridge.sla calls).
+fn AgyProxyServer_updateConfigJson(self: &AgyProxyServer, text_ptr: ptr, text_len: u64) -> void {
+    let blank = AgyProxyServer_blank();
+    blank.config = self.config;
+    AgyProxyServer_configFromJson(&blank, text_ptr, text_len);
+    AgyProxyServer_updateConfig(self, &blank.config);
+    self.config_ptr = text_ptr;
+    self.config_len = text_len;
+}
+
+// url getter (source: `http://127.0.0.1:${port}`).
+fn AgyProxyServer_url(self: &AgyProxyServer, out: ptr, out_cap: u64) -> u64 {
+    return buf_copy(out, out_cap, &self.url, self.url_len);
+}
+
+// start(): bind 127.0.0.1:0 via the std HTTP server surface
+// (http_server_bind shim in this pass) and record the url.
+fn AgyProxyServer_start(self: &AgyProxyServer) -> i32 {
+    if self.has_server { return 0; };
+    let handle: u64 = 0;
+    let port: u32 = 0;
+    if http_server_bind(STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"), 0, &handle, &port) != 0 { return 1; };
+    self.server = handle;
+    self.has_server = true;
+    self.running = true;
+    self.port = port;
+    self.url_len = 0;
+    self.url_len = self.url_len + append_bytes(&self.url, 1024, self.url_len, STR_PTR("http://127.0.0.1:"), STR_LEN("http://127.0.0.1:"));
+    self.url_len = self.url_len + append_u64(&self.url, 1024, self.url_len, port as u64);
+    return 0;
+}
+
+fn AgyProxyServer_stop(self: &AgyProxyServer) -> void {
+    if self.has_server {
+        http_server_close(self.server);
+        self.has_server = false;
+        self.server = 0;
+        self.port = 0;
+    };
+    self.running = false;
+}
+
+// openCodeHeaders: openCodeThreadHeaders(threadId, "agy")
+// from sdk-backend (declared by use) — returns header text
+// (Name: value lines).
+fn openCodeHeaders(self: &AgyProxyServer, out: ptr, out_cap: u64) -> u64 {
+    return open_code_thread_headers(self.config.threadId_ptr, self.config.threadId_len, self.config.has_threadId, STR_PTR("agy"), 3, out, out_cap);
+}
+
+// env_lookup_in(snapshot, key): value of KEY= in the
+// newline-joined environmentVars snapshot.
+fn env_lookup_in(snap_ptr: ptr, snap_len: u64, key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    out_ptr = PTR_NULL();
+    out_len = 0;
+    let pos: u64 = 0;
+    while pos < snap_len {
+        let eol = find_byte(snap_ptr, snap_len, pos, 10);
+        if eol == 4294967295 { eol = snap_len; };
+        let eq = find_byte(snap_ptr, eol, pos, 61);
+        if eq != 4294967295 && eq - pos == key_len && bytes_eq(byte_off(snap_ptr, pos), key_ptr, key_len) {
+            out_ptr = byte_off(snap_ptr, eq + 1);
+            out_len = eol - eq - 1;
+            return true;
+        };
+        pos = eol + 1;
+    }
+    return false;
+}
+
+// effective_key_at(self, attempt): the attempt-th key of
+// upstreamKeys() ("" past the end / when none).
+fn effective_key_count(self: &AgyProxyServer) -> u64 {
+    if self.config.apiKeys_count > 0 { return self.config.apiKeys_count; };
+    return 1;
+}
+
+fn effective_key_at(self: &AgyProxyServer, attempt: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    out_ptr = PTR_NULL();
+    out_len = 0;
+    if self.config.apiKeys_count > 0 {
+        if attempt < self.config.apiKeys_count {
+            out_ptr = byte_off(&self.config.apiKeys, self.config.apiKeys_off[attempt]);
+            out_len = self.config.apiKeys_len[attempt];
+        };
+        return;
+    };
+    if self.config.has_environmentVars {
+        let v_ptr: ptr = PTR_NULL();
+        let v_len: u64 = 0;
+        if env_lookup_in(self.config.environmentVars_ptr, self.config.environmentVars_len, STR_PTR("GEMINI_API_KEY"), STR_LEN("GEMINI_API_KEY"), &v_ptr, &v_len) && v_len > 0 {
+            out_ptr = v_ptr;
+            out_len = v_len;
+            return;
+        };
+        if env_lookup_in(self.config.environmentVars_ptr, self.config.environmentVars_len, STR_PTR("API_KEY"), STR_LEN("API_KEY"), &v_ptr, &v_len) && v_len > 0 {
+            out_ptr = v_ptr;
+            out_len = v_len;
+        };
+    };
+}
+
+// ---- response helpers ----
+
+fn resp_reset(self: &AgyProxyServer) -> void {
+    self.resp.status = 200;
+    self.resp.body_len = 0;
+    self.resp.is_sse = false;
+}
+
+fn resp_write_head_sse(self: &AgyProxyServer) -> void {
+    self.resp.status = 200;
+    self.resp.is_sse = true;
+}
+
+// sendJson(res, status, data)
+fn sendJson(self: &AgyProxyServer, status: i32, data: u64) -> void {
+    self.resp.status = status;
+    self.resp.is_sse = false;
+    self.resp.body_len = stringify_pretty_into(data, &self.resp.body, 4194304);
+}
+
+// sendGeminiChunk(res, obj, isGeminiEndpoint): one SSE
+// `data: <formatted>\n\n` frame (formatAgyGeminiResponse
+// from agyGeminiResponse.sla).
+fn sendGeminiChunk(self: &AgyProxyServer, obj: u64, is_gemini_endpoint: bool) -> void {
+    self.resp.body_len = self.resp.body_len + append_bytes(&self.resp.body, 4194304, self.resp.body_len, STR_PTR("data: "), STR_LEN("data: "));
+    let formatted = [0u8; 1048576];
+    let formatted_len = formatAgyGeminiResponse(obj, is_gemini_endpoint, &formatted, 1048576);
+    self.resp.body_len = self.resp.body_len + append_bytes(&self.resp.body, 4194304, self.resp.body_len, &formatted, formatted_len);
+    self.resp.body_len = self.resp.body_len + append_bytes(&self.resp.body, 4194304, self.resp.body_len, STR_PTR("\n\n"), 2);
+}
+
+// sendGeminiChunkText: chunk from a raw JSON text object
+// (handlers build chunk JSON as text in this pass).
+fn sendGeminiChunkText(self: &AgyProxyServer, obj_ptr: ptr, obj_len: u64, is_gemini_endpoint: bool) -> void {
+    let doc = sa_json_parse(obj_ptr, obj_len);
+    sendGeminiChunk(self, doc, is_gemini_endpoint);
+}
+
+// sendGeminiError(res, message, statusCode, isGemini):
+// NEVER an HTTP error to agy.exe — always a 200 SSE stream
+// carrying "[Antigravity Error] <message>" as a model text
+// chunk with finishReason STOP (agy.exe intercepts 4xx/5xx
+// as Code Assist auth failure and opens the OAuth window).
+fn sendGeminiError(self: &AgyProxyServer, msg_ptr: ptr, msg_len: u64, status_code: i32, is_gemini_endpoint: bool) -> void {
+    if !self.resp.is_sse && self.resp.body_len == 0 {
+        resp_write_head_sse(self);
+    };
+    let chunk = [0u8; 262144];
+    let chunk_len: u64 = 0;
+    chunk_len = chunk_len + append_bytes(&chunk, 262144, chunk_len, STR_PTR("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"[Antigravity Error] "), STR_LEN("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"[Antigravity Error] "));
+    chunk_len = chunk_len + append_bytes(&chunk, 262144, chunk_len, msg_ptr, msg_len);
+    chunk_len = chunk_len + append_bytes(&chunk, 262144, chunk_len, STR_PTR("\"}]},\"finishReason\":\"STOP\"}]}}"), STR_LEN("\"}]},\"finishReason\":\"STOP\"}]}}"));
+    sendGeminiChunkText(self, &chunk, chunk_len, is_gemini_endpoint);
+}
+
+// ---- upstream fetch (buffered) ----
+
+struct UpstreamResult {
+    status: i32,
+    json: u64,
+    raw_ptr: ptr,
+    raw_len: u64,
+    ctype_ptr: ptr,
+    ctype_len: u64,
+    ok: bool,
+}
+
+// fetch_attempt: one POST with the given key; fills the
+// server upstream buffer + result. extra_gemini_key adds
+// the x-goog-api-key header (Gemini-native path).
+fn fetch_attempt(self: &AgyProxyServer, url_ptr: ptr, url_len: u64, body_ptr: ptr, body_len: u64, key_ptr: ptr, key_len: u64, accept_ptr: ptr, accept_len: u64, extra_gemini_key: bool, r: &UpstreamResult) -> void {
+    let headers = [0u8; 8192];
+    let headers_len: u64 = 0;
+    headers_len = headers_len + append_bytes(&headers, 8192, headers_len, STR_PTR("Content-Type: application/json\nAccept: "), STR_LEN("Content-Type: application/json\nAccept: "));
+    headers_len = headers_len + append_bytes(&headers, 8192, headers_len, accept_ptr, accept_len);
+    headers_len = headers_len + append_bytes(&headers, 8192, headers_len, STR_PTR("\n"), 1);
+    let oc = [0u8; 4096];
+    let oc_len = openCodeHeaders(self, &oc, 4096);
+    headers_len = headers_len + append_bytes(&headers, 8192, headers_len, &oc, oc_len);
+    if key_len > 0 {
+        if extra_gemini_key {
+            headers_len = headers_len + append_bytes(&headers, 8192, headers_len, STR_PTR("x-goog-api-key: "), STR_LEN("x-goog-api-key: "));
+            headers_len = headers_len + append_bytes(&headers, 8192, headers_len, key_ptr, key_len);
+            headers_len = headers_len + append_bytes(&headers, 8192, headers_len, STR_PTR("\n"), 1);
+        };
+        headers_len = headers_len + append_bytes(&headers, 8192, headers_len, STR_PTR("Authorization: Bearer "), STR_LEN("Authorization: Bearer "));
+        headers_len = headers_len + append_bytes(&headers, 8192, headers_len, key_ptr, key_len);
+        headers_len = headers_len + append_bytes(&headers, 8192, headers_len, STR_PTR("\n"), 1);
+    };
+    let status: i32 = 0;
+    let ctype_ptr: ptr = PTR_NULL();
+    let ctype_len: u64 = 0;
+    self.upstream_len = 0;
+    let rc = upstream_post(url_ptr, url_len, &headers, headers_len, body_ptr, body_len, &self.upstream, 4194304, &self.upstream_len, &status, &ctype_ptr, &ctype_len);
+    if rc != 0 {
+        r.status = 0;
+        r.ok = false;
+        r.json = 0;
+        r.raw_ptr = PTR_NULL();
+        r.raw_len = 0;
+        r.ctype_ptr = PTR_NULL();
+        r.ctype_len = 0;
+        return;
+    };
+    r.status = status;
+    r.ok = status >= 200 && status < 300;
+    r.raw_ptr = &self.upstream;
+    r.raw_len = self.upstream_len;
+    r.ctype_ptr = ctype_ptr;
+    r.ctype_len = ctype_len;
+    r.json = sa_json_parse(&self.upstream, self.upstream_len);
+}
+
+// retryable(status): 401/402/429/5xx key-rotation set.
+fn retryable(status: i32) -> bool {
+    return status == 401 || status == 402 || status == 429 || (status >= 500 && status <= 599);
+}
+
+// error_detail_of(raw): parsed.error?.message ||
+// parsed.message || raw.
+fn error_detail_of(raw_ptr: ptr, raw_len: u64, out: ptr, out_cap: u64) -> u64 {
+    let doc = sa_json_parse(raw_ptr, raw_len);
+    if doc != 0 {
+        let err: u64 = 0;
+        let m_ptr: ptr = PTR_NULL();
+        let m_len: u64 = 0;
+        if sa_json_object_get(doc, STR_PTR("error"), STR_LEN("error"), &err) == 0 && err != 0 && sa_json_object_get_string(err, STR_PTR("message"), STR_LEN("message"), &m_ptr, &m_len) == 0 && m_len > 0 {
+            return buf_copy(out, out_cap, m_ptr, m_len);
+        };
+        if sa_json_object_get_string(doc, STR_PTR("message"), STR_LEN("message"), &m_ptr, &m_len) == 0 && m_len > 0 {
+            return buf_copy(out, out_cap, m_ptr, m_len);
+        };
+    };
+    return buf_copy(out, out_cap, raw_ptr, raw_len);
+}
+
+// http_error_text(status, detail): "HTTP <s>: <detail>" —
+// unless the detail already starts with "HTTP".
+fn http_error_text(status: i32, detail_ptr: ptr, detail_len: u64, out: ptr, out_cap: u64) -> u64 {
+    if detail_len >= 4 && bytes_eq(detail_ptr, STR_PTR("HTTP"), 4) {
+        return buf_copy(out, out_cap, detail_ptr, detail_len);
+    };
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("HTTP "), STR_LEN("HTTP "));
+    n = n + append_i64(out, out_cap, n, status as i64);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(": "), 2);
+    n = n + append_bytes(out, out_cap, n, detail_ptr, detail_len);
+    return n;
+}
+
+// postUpstreamJson(url, bodyText): key-rotation buffered
+// POST returning the last/best result into `r`.
+fn postUpstreamJson(self: &AgyProxyServer, url_ptr: ptr, url_len: u64, body_ptr: ptr, body_len: u64, r: &UpstreamResult) -> void {
+    let keys = effective_key_count(self);
+    let last_status: i32 = 502;
+    let last_raw = [0u8; 8192];
+    let last_raw_len: u64 = 0;
+    for attempt in 0..keys {
+        let key_ptr: ptr = PTR_NULL();
+        let key_len: u64 = 0;
+        effective_key_at(self, attempt, &key_ptr, &key_len);
+        let att = UpstreamResult{ status: 0, json: 0, raw_ptr: PTR_NULL(), raw_len: 0, ctype_ptr: PTR_NULL(), ctype_len: 0, ok: false };
+        fetch_attempt(self, url_ptr, url_len, body_ptr, body_len, key_ptr, key_len, STR_PTR("application/json"), STR_LEN("application/json"), false, &att);
+        if att.status == 0 {
+            // fetch threw: keep the message as raw
+            last_raw_len = buf_copy(&last_raw, 8192, STR_PTR("fetch failed"), STR_LEN("fetch failed"));
+            continue;
+        };
+        let parsed = att.json;
+        let has_error = false;
+        if parsed != 0 {
+            let e: u64 = 0;
+            if sa_json_object_get(parsed, STR_PTR("error"), STR_LEN("error"), &e) == 0 && e != 0 {
+                let is_null = false;
+                json_node_is_null(e, &is_null);
+                has_error = !is_null;
+            };
+        };
+        if att.ok && !has_error {
+            r.status = att.status;
+            r.json = parsed;
+            r.raw_ptr = att.raw_ptr;
+            r.raw_len = att.raw_len;
+            r.ok = true;
+            return;
+        };
+        last_status = att.status;
+        last_raw_len = buf_copy(&last_raw, 8192, att.raw_ptr, att.raw_len);
+        if retryable(att.status) { continue; };
+        r.status = att.status;
+        r.json = parsed;
+        r.raw_ptr = att.raw_ptr;
+        r.raw_len = att.raw_len;
+        r.ok = false;
+        return;
+    }
+    r.status = last_status;
+    r.raw_ptr = &last_raw;
+    r.raw_len = last_raw_len;
+    r.json = sa_json_parse(&last_raw, last_raw_len);
+    if r.json == 0 {
+        let wrap = [0u8; 16384];
+        let wrap_len: u64 = 0;
+        wrap_len = wrap_len + append_bytes(&wrap, 16384, wrap_len, STR_PTR("{\"_raw\":\""), STR_LEN("{\"_raw\":\""));
+        wrap_len = wrap_len + append_bytes(&wrap, 16384, wrap_len, &last_raw, last_raw_len);
+        wrap_len = wrap_len + append_bytes(&wrap, 16384, wrap_len, STR_PTR("\"}"), 2);
+        r.json = sa_json_parse(&wrap, wrap_len);
+    };
+    r.ok = false;
+}
+
+// upstreamDetail(result)
+fn upstreamDetail(r: &UpstreamResult, out: ptr, out_cap: u64) -> u64 {
+    let detail = [0u8; 8192];
+    let detail_len: u64 = 0;
+    let err: u64 = 0;
+    if r.json != 0 && sa_json_object_get(r.json, STR_PTR("error"), STR_LEN("error"), &err) == 0 && err != 0 {
+        let is_obj = false;
+        json_node_is_object(err, &is_obj);
+        if is_obj {
+            let m_ptr: ptr = PTR_NULL();
+            let m_len: u64 = 0;
+            if sa_json_object_get_string(err, STR_PTR("message"), STR_LEN("message"), &m_ptr, &m_len) == 0 && m_len > 0 {
+                detail_len = buf_copy(&detail, 8192, m_ptr, m_len);
+            } else {
+                detail_len = stringify_into(err, &detail, 8192);
+            };
+        } else {
+            let e_ptr: ptr = PTR_NULL();
+            let e_len: u64 = 0;
+            json_node_string_coerce(err, &e_ptr, &e_len);
+            detail_len = buf_copy(&detail, 8192, e_ptr, e_len);
+        };
+    };
+    if detail_len == 0 { detail_len = buf_copy(&detail, 8192, r.raw_ptr, r.raw_len); };
+    if detail_len > 0 {
+        let n: u64 = 0;
+        n = n + append_bytes(out, out_cap, n, STR_PTR("HTTP "), STR_LEN("HTTP "));
+        n = n + append_i64(out, out_cap, n, r.status as i64);
+        n = n + append_bytes(out, out_cap, n, STR_PTR(": "), 2);
+        n = n + append_bytes(out, out_cap, n, &detail, detail_len);
+        return n;
+    };
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("HTTP "), STR_LEN("HTTP "));
+    n = n + append_i64(out, out_cap, n, r.status as i64);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(": Upstream request failed"), STR_LEN(": Upstream request failed"));
+    return n;
+}
+
+// emitParsedAsGemini(res, parsed, isGemini)
+fn emitParsedAsGemini(self: &AgyProxyServer, parsed: &AgyParsedUpstreamResult, is_gemini_endpoint: bool) -> void {
+    resp_write_head_sse(self);
+    if parsed.reasoning_len > 0 {
+        let chunk = [0u8; 524288];
+        let chunk_len: u64 = 0;
+        chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\""), STR_LEN("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\""));
+        chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, &parsed.reasoning, parsed.reasoning_len);
+        chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("\",\"thought\":true}]}}]}}"), STR_LEN("\",\"thought\":true}]}}]}}"));
+        sendGeminiChunkText(self, &chunk, chunk_len, is_gemini_endpoint);
+    };
+    if parsed.text_len > 0 {
+        let chunk = [0u8; 524288];
+        let chunk_len: u64 = 0;
+        chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\""), STR_LEN("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\""));
+        chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, &parsed.text, parsed.text_len);
+        chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("\"}]}}]}}"), STR_LEN("\"}]}}]}}"));
+        sendGeminiChunkText(self, &chunk, chunk_len, is_gemini_endpoint);
+    };
+    for ti in 0..parsed.tc_count {
+        let id_len: u64 = 0;
+        let id_ptr = parsed_tool_id(parsed, ti, &id_len);
+        let name_len: u64 = 0;
+        let name_ptr = parsed_tool_name(parsed, ti, &name_len);
+        let args_len: u64 = 0;
+        let args_ptr = parsed_tool_args(parsed, ti, &args_len);
+        let chunk = [0u8; 524288];
+        let chunk_len: u64 = 0;
+        chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\""), STR_LEN("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\""));
+        chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, name_ptr, name_len);
+        chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("\",\"args\":"), STR_LEN("\",\"args\":"));
+        chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, args_ptr, args_len);
+        if id_len > 0 {
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR(",\"id\":\""), STR_LEN(",\"id\":\""));
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, id_ptr, id_len);
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("\""), 1);
+        };
+        chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("}}]}}]}}"), STR_LEN("}}]}}]}}"));
+        sendGeminiChunkText(self, &chunk, chunk_len, is_gemini_endpoint);
+    };
+    let fin = [0u8; 1024];
+    let fin_len: u64 = 0;
+    fin_len = fin_len + append_bytes(&fin, 1024, fin_len, STR_PTR("{\"response\":{"), STR_LEN("{\"response\":{"));
+    if parsed.usage_total > 0 {
+        fin_len = fin_len + append_bytes(&fin, 1024, fin_len, STR_PTR("\"usageMetadata\":{\"promptTokenCount\":"), STR_LEN("\"usageMetadata\":{\"promptTokenCount\":"));
+        fin_len = fin_len + append_i64(&fin, 1024, fin_len, parsed.usage_input);
+        fin_len = fin_len + append_bytes(&fin, 1024, fin_len, STR_PTR(",\"candidatesTokenCount\":"), STR_LEN(",\"candidatesTokenCount\":"));
+        fin_len = fin_len + append_i64(&fin, 1024, fin_len, parsed.usage_output);
+        fin_len = fin_len + append_bytes(&fin, 1024, fin_len, STR_PTR(",\"totalTokenCount\":"), STR_LEN(",\"totalTokenCount\":"));
+        fin_len = fin_len + append_i64(&fin, 1024, fin_len, parsed.usage_total);
+        fin_len = fin_len + append_bytes(&fin, 1024, fin_len, STR_PTR("},"), 2);
+    };
+    fin_len = fin_len + append_bytes(&fin, 1024, fin_len, STR_PTR("\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[]},\"finishReason\":\"STOP\"}]}}"), STR_LEN("\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[]},\"finishReason\":\"STOP\"}]}}"));
+    sendGeminiChunkText(self, &fin, fin_len, is_gemini_endpoint);
+}
+
+// ---- request routing ----
+
+// AgyProxyServer_handleRequest(self, method, path, body):
+// fills self.resp. (readBody is the host pump's job in this
+// pass.)
+fn AgyProxyServer_handleRequest(self: &AgyProxyServer, method_ptr: ptr, method_len: u64, path_ptr: ptr, path_len: u64, body_ptr: ptr, body_len: u64) -> void {
+    resp_reset(self);
+    let method = [0u8; 16];
+    let method_len2 = to_upper(&method, 16, method_ptr, method_len);
+    if str_is(&method, method_len2, STR_PTR("GET"), 3) {
+        if path_len == 1 && byte_at(path_ptr, 0) == 47 || path_len == 0 || str_is(path_ptr, path_len, STR_PTR("/healthz"), STR_LEN("/healthz")) {
+            let doc = json_object_new();
+            sa_json_object_set_bool(doc, STR_PTR("ok"), 2, true);
+            sa_json_object_set_string(doc, STR_PTR("model"), STR_LEN("model"), self.config.targetModel_ptr, self.config.targetModel_len);
+            sa_json_object_set_string(doc, STR_PTR("base"), STR_LEN("base"), self.config.targetBaseUrl_ptr, self.config.targetBaseUrl_len);
+            sendJson(self, 200, doc);
+            return;
+        };
+        let empty = json_object_new();
+        sendJson(self, 200, empty);
+        return;
+    };
+    if str_is(&method, method_len2, STR_PTR("POST"), 4) {
+        if find_substr(path_ptr, path_len, STR_PTR("loadCodeAssist"), STR_LEN("loadCodeAssist")) != 4294967295 {
+            let doc = default_load_resp();
+            self.resp.status = 200;
+            self.resp.body_len = stringify_pretty_into(doc, &self.resp.body, 4194304);
+            return;
+        };
+        if find_substr(path_ptr, path_len, STR_PTR("fetchAvailableModels"), STR_LEN("fetchAvailableModels")) != 4294967295 {
+            let cli_ptr = self.config.targetModel_ptr;
+            let cli_len = self.config.targetModel_len;
+            if self.config.has_agyCliModel { cli_ptr = self.config.agyCliModel_ptr; cli_len = self.config.agyCliModel_len; };
+            if cli_len == 0 { cli_ptr = STR_PTR("gemini-3.8-flash-low"); cli_len = STR_LEN("gemini-3.8-flash-low"); };
+            let doc = buildModelsResp(cli_ptr, cli_len, self.config.targetModel_ptr, self.config.targetModel_len, self.config.modelDisplayName_ptr, self.config.modelDisplayName_len, self.config.has_modelDisplayName);
+            self.resp.status = 200;
+            self.resp.body_len = stringify_pretty_into(doc, &self.resp.body, 4194304);
+            return;
+        };
+        if find_substr(path_ptr, path_len, STR_PTR("retrieveUserQuotaSummary"), STR_LEN("retrieveUserQuotaSummary")) != 4294967295 {
+            let doc = sa_json_parse(STR_PTR("{\"quotaSummary\":{\"remainingCredits\":999999}}"), STR_LEN("{\"quotaSummary\":{\"remainingCredits\":999999}}"));
+            self.resp.status = 200;
+            self.resp.body_len = stringify_pretty_into(doc, &self.resp.body, 4194304);
+            return;
+        };
+        if find_substr(path_ptr, path_len, STR_PTR("listExperiments"), STR_LEN("listExperiments")) != 4294967295 {
+            let doc = sa_json_parse(STR_PTR("{\"experiments\":[]}"), STR_LEN("{\"experiments\":[]}"));
+            self.resp.status = 200;
+            self.resp.body_len = stringify_pretty_into(doc, &self.resp.body, 4194304);
+            return;
+        };
+        if find_substr(path_ptr, path_len, STR_PTR("fetchUserInfo"), STR_LEN("fetchUserInfo")) != 4294967295 {
+            let doc = sa_json_parse(STR_PTR("{\"userEmail\":\"agy-proxy@local\",\"userName\":\"agy-proxy\"}"), STR_LEN("{\"userEmail\":\"agy-proxy@local\",\"userName\":\"agy-proxy\"}"));
+            self.resp.status = 200;
+            self.resp.body_len = stringify_pretty_into(doc, &self.resp.body, 4194304);
+            return;
+        };
+        if find_substr(path_ptr, path_len, STR_PTR("streamGenerateContent"), STR_LEN("streamGenerateContent")) != 4294967295 || find_substr(path_ptr, path_len, STR_PTR("generateContent"), STR_LEN("generateContent")) != 4294967295 {
+            let is_gemini = isAgyGeminiEndpoint(path_ptr, path_len);
+            let proto = normalizeAgyUpstreamProtocol(self.config.protocol_ptr, self.config.protocol_len, self.config.has_protocol, self.config.targetBaseUrl_ptr, self.config.targetBaseUrl_len, true);
+            if proto == 0 {
+                handleGeminiNativeGenerate(self, body_ptr, body_len, is_gemini);
+            } else if proto == 2 {
+                handleResponsesUpstream(self, body_ptr, body_len, is_gemini);
+            } else if proto == 3 {
+                handleAnthropicUpstream(self, body_ptr, body_len, is_gemini);
+            } else {
+                handleGenerate(self, body_ptr, body_len, is_gemini);
+            };
+            return;
+        };
+        let empty = json_object_new();
+        sendJson(self, 200, empty);
+        return;
+    };
+    let empty = json_object_new();
+    sendJson(self, 200, empty);
+}
+
+// handleResponsesUpstream
+fn handleResponsesUpstream(self: &AgyProxyServer, body_ptr: ptr, body_len: u64, is_gemini_endpoint: bool) -> void {
+    let raw: u64 = 0;
+    if body_len > 0 {
+        raw = sa_json_parse(body_ptr, body_len);
+        if raw == 0 {
+            sendGeminiError(self, STR_PTR("Invalid JSON: parse error"), STR_LEN("Invalid JSON: parse error"), 400, is_gemini_endpoint);
+            return;
+        };
+    } else {
+        raw = json_object_new();
+    };
+    let payload_text = [0u8; 1048576];
+    let payload_text_len = buildOpenAiPayload(raw, self.config.targetModel_ptr, self.config.targetModel_len, self.config.reasoningEffort_ptr, self.config.reasoningEffort_len, self.config.has_reasoningEffort, self.config.maxTokens, self.config.has_maxTokens, self.config.maxCompletionTokens, self.config.has_maxCompletionTokens, &payload_text, 1048576);
+    let payload = sa_json_parse(&payload_text, payload_text_len);
+    let resp_body = [0u8; 1048576];
+    let resp_body_len = openAiPayloadToResponsesBody(payload, self.config.targetModel_ptr, self.config.targetModel_len, &resp_body, 1048576);
+    let url = [0u8; 2048];
+    let url_len = resolveResponsesEndpoint(self.config.targetBaseUrl_ptr, self.config.targetBaseUrl_len, &url, 2048);
+    let result = UpstreamResult{ status: 0, json: 0, raw_ptr: PTR_NULL(), raw_len: 0, ctype_ptr: PTR_NULL(), ctype_len: 0, ok: false };
+    postUpstreamJson(self, &url, url_len, &resp_body, resp_body_len, &result);
+    let has_error = false;
+    if result.json != 0 {
+        let e: u64 = 0;
+        if sa_json_object_get(result.json, STR_PTR("error"), STR_LEN("error"), &e) == 0 && e != 0 {
+            let is_null = false;
+            json_node_is_null(e, &is_null);
+            has_error = !is_null;
+        };
+    };
+    if result.status < 200 || result.status >= 300 || has_error {
+        let detail = [0u8; 8192];
+        let detail_len = upstreamDetail(&result, &detail, 8192);
+        sendGeminiError(self, &detail, detail_len, result.status, is_gemini_endpoint);
+        return;
+    };
+    let parsed = AgyParsedUpstreamResult{ text: [0u8; 262144], text_len: 0, reasoning: [0u8; 262144], reasoning_len: 0, tc_id: [0u8; 8192], tc_id_off: [0u64; 32], tc_id_len: [0u64; 32], tc_name: [0u8; 8192], tc_name_off: [0u64; 32], tc_name_len: [0u64; 32], tc_args: [0u8; 262144], tc_args_off: [0u64; 32], tc_args_len: [0u64; 32], tc_count: 0, tc_used: 0, usage_input: 0, usage_output: 0, usage_total: 0 };
+    parseResponsesUpstreamResult(result.json, &parsed);
+    emitParsedAsGemini(self, &parsed, is_gemini_endpoint);
+}
+
+// handleAnthropicUpstream
+fn handleAnthropicUpstream(self: &AgyProxyServer, body_ptr: ptr, body_len: u64, is_gemini_endpoint: bool) -> void {
+    let raw: u64 = 0;
+    if body_len > 0 {
+        raw = sa_json_parse(body_ptr, body_len);
+        if raw == 0 {
+            sendGeminiError(self, STR_PTR("Invalid JSON: parse error"), STR_LEN("Invalid JSON: parse error"), 400, is_gemini_endpoint);
+            return;
+        };
+    } else {
+        raw = json_object_new();
+    };
+    let payload_text = [0u8; 1048576];
+    let payload_text_len = buildOpenAiPayload(raw, self.config.targetModel_ptr, self.config.targetModel_len, self.config.reasoningEffort_ptr, self.config.reasoningEffort_len, self.config.has_reasoningEffort, self.config.maxTokens, self.config.has_maxTokens, self.config.maxCompletionTokens, self.config.has_maxCompletionTokens, &payload_text, 1048576);
+    let payload = sa_json_parse(&payload_text, payload_text_len);
+    let max_tokens: i64 = 8192;
+    let mt: i64 = 0;
+    if payload != 0 && json_node_number(payload, STR_PTR("max_tokens"), STR_LEN("max_tokens"), &mt) && mt > 0 {
+        max_tokens = mt;
+        if max_tokens > 16384 { max_tokens = 16384; };
+    };
+    let anth_body = [0u8; 1048576];
+    let anth_body_len = openAiPayloadToAnthropicBody(payload, self.config.targetModel_ptr, self.config.targetModel_len, max_tokens, &anth_body, 1048576);
+    let url = [0u8; 2048];
+    let url_len = resolveAnthropicMessagesEndpoint(self.config.targetBaseUrl_ptr, self.config.targetBaseUrl_len, &url, 2048);
+    let result = UpstreamResult{ status: 0, json: 0, raw_ptr: PTR_NULL(), raw_len: 0, ctype_ptr: PTR_NULL(), ctype_len: 0, ok: false };
+    postUpstreamJson(self, &url, url_len, &anth_body, anth_body_len, &result);
+    let has_error = false;
+    if result.json != 0 {
+        let e: u64 = 0;
+        if sa_json_object_get(result.json, STR_PTR("error"), STR_LEN("error"), &e) == 0 && e != 0 {
+            let is_null = false;
+            json_node_is_null(e, &is_null);
+            has_error = !is_null;
+        };
+    };
+    if result.status < 200 || result.status >= 300 || has_error {
+        let detail = [0u8; 8192];
+        let detail_len = upstreamDetail(&result, &detail, 8192);
+        sendGeminiError(self, &detail, detail_len, result.status, is_gemini_endpoint);
+        return;
+    };
+    let parsed = AgyParsedUpstreamResult{ text: [0u8; 262144], text_len: 0, reasoning: [0u8; 262144], reasoning_len: 0, tc_id: [0u8; 8192], tc_id_off: [0u64; 32], tc_id_len: [0u64; 32], tc_name: [0u8; 8192], tc_name_off: [0u64; 32], tc_name_len: [0u64; 32], tc_args: [0u8; 262144], tc_args_off: [0u64; 32], tc_args_len: [0u64; 32], tc_count: 0, tc_used: 0, usage_input: 0, usage_output: 0, usage_total: 0 };
+    parseAnthropicUpstreamResult(result.json, &parsed);
+    emitParsedAsGemini(self, &parsed, is_gemini_endpoint);
+}
+
+// handleGeminiNativeGenerate: forward the unwrapped body
+// to the Gemini stream endpoint with key rotation; SSE
+// bodies forward through forwardAgyGeminiStream, plain
+// JSON answers re-emit as one chunk (or error).
+fn handleGeminiNativeGenerate(self: &AgyProxyServer, body_ptr: ptr, body_len: u64, is_gemini_endpoint: bool) -> void {
+    let parsed = sa_json_parse(body_ptr, body_len);
+    if parsed == 0 {
+        sendGeminiError(self, STR_PTR("Invalid JSON body"), STR_LEN("Invalid JSON body"), 400, is_gemini_endpoint);
+        return;
+    };
+    let unwrapped = unwrapGenerateRequest(parsed);
+    let body_text = [0u8; 1048576];
+    let body_text_len = stringify_into(unwrapped, &body_text, 1048576);
+    let url = [0u8; 2048];
+    let url_len = resolveGeminiStreamEndpoint(self.config.targetBaseUrl_ptr, self.config.targetBaseUrl_len, self.config.targetModel_ptr, self.config.targetModel_len, &url, 2048);
+    let keys = effective_key_count(self);
+    let best = UpstreamResult{ status: 0, json: 0, raw_ptr: PTR_NULL(), raw_len: 0, ctype_ptr: PTR_NULL(), ctype_len: 0, ok: false };
+    let last_err = [0u8; 8192];
+    let last_err_len: u64 = 0;
+    let last_status: i32 = 500;
+    let have_best = false;
+    for attempt in 0..keys {
+        let key_ptr: ptr = PTR_NULL();
+        let key_len: u64 = 0;
+        effective_key_at(self, attempt, &key_ptr, &key_len);
+        let att = UpstreamResult{ status: 0, json: 0, raw_ptr: PTR_NULL(), raw_len: 0, ctype_ptr: PTR_NULL(), ctype_len: 0, ok: false };
+        fetch_attempt(self, &url, url_len, &body_text, body_text_len, key_ptr, key_len, STR_PTR("text/event-stream, application/json"), STR_LEN("text/event-stream, application/json"), true, &att);
+        if att.status == 0 {
+            last_err_len = buf_copy(&last_err, 8192, STR_PTR("fetch failed"), STR_LEN("fetch failed"));
+            if attempt < keys - 1 { continue; };
+            break;
+        };
+        if att.ok {
+            best = att;
+            have_best = true;
+            break;
+        };
+        let detail = [0u8; 8192];
+        let detail_len = error_detail_of(att.raw_ptr, att.raw_len, &detail, 8192);
+        last_err_len = http_error_text(att.status, &detail, detail_len, &last_err, 8192);
+        last_status = att.status;
+        if retryable(att.status) {
+            if attempt < keys - 1 { continue; };
+        };
+        best = att;
+        have_best = true;
+        break;
+    }
+    if !have_best || !best.ok {
+        let status_code = if have_best { best.status } else { last_status };
+        let msg = [0u8; 8192];
+        let msg_len: u64 = 0;
+        if last_err_len > 0 {
+            msg_len = buf_copy(&msg, 8192, &last_err, last_err_len);
+        } else {
+            msg_len = buf_copy(&msg, 8192, STR_PTR("Upstream request failed"), STR_LEN("Upstream request failed"));
+        };
+        sendGeminiError(self, &msg, msg_len, status_code, is_gemini_endpoint);
+        return;
+    };
+    let is_sse = contains_ci(best.ctype_ptr, best.ctype_len, STR_PTR("text/event-stream"), STR_LEN("text/event-stream"));
+    if !is_sse {
+        let json = best.json;
+        if json != 0 {
+            let err: u64 = 0;
+            if sa_json_object_get(json, STR_PTR("error"), STR_LEN("error"), &err) == 0 && err != 0 {
+                let is_null = false;
+                json_node_is_null(err, &is_null);
+                if !is_null {
+                    let d_ptr: ptr = PTR_NULL();
+                    let d_len: u64 = 0;
+                    if sa_json_object_get_string(err, STR_PTR("message"), STR_LEN("message"), &d_ptr, &d_len) != 0 || d_len == 0 {
+                        // JSON.stringify(error) fallback
+                        let err_text = [0u8; 8192];
+                        d_len = stringify_into(err, &err_text, 8192);
+                        d_ptr = &err_text;
+                        sendGeminiError(self, d_ptr, d_len, 400, is_gemini_endpoint);
+                        return;
+                    };
+                    let code: i64 = 0;
+                    let err_status: i32 = 400;
+                    if json_node_number(err, STR_PTR("code"), 4, &code) && code >= 400 && code < 600 { err_status = code as i32; };
+                    sendGeminiError(self, d_ptr, d_len, err_status, is_gemini_endpoint);
+                    return;
+                };
+            };
+            resp_write_head_sse(self);
+            sendGeminiChunk(self, json, is_gemini_endpoint);
+            return;
+        };
+        // unparseable body: pass through raw
+        self.resp.status = 200;
+        self.resp.is_sse = false;
+        self.resp.body_len = buf_copy(&self.resp.body, 4194304, best.raw_ptr, best.raw_len);
+        return;
+    };
+    resp_write_head_sse(self);
+    let forwarded = [0u8; 4194304];
+    let forwarded_len = forwardAgyGeminiStream(best.raw_ptr, best.raw_len, is_gemini_endpoint, &forwarded, 4194304);
+    self.resp.body_len = self.resp.body_len + append_bytes(&self.resp.body, 4194304, self.resp.body_len, &forwarded, forwarded_len);
+}
+
+// handleGenerate: OpenAI chat-completions upstream. The
+// SSE stream is buffered in this pass and replayed line by
+// line; emitted Gemini chunks match the source's sequence
+// (text / reasoning / accumulated tool calls / final).
+fn handleGenerate(self: &AgyProxyServer, body_ptr: ptr, body_len: u64, is_gemini_endpoint: bool) -> void {
+    let raw: u64 = 0;
+    if body_len > 0 {
+        raw = sa_json_parse(body_ptr, body_len);
+        if raw == 0 {
+            let doc = json_object_new();
+            sa_json_object_set_string(doc, STR_PTR("error"), STR_LEN("error"), STR_PTR("Invalid JSON: parse error"), STR_LEN("Invalid JSON: parse error"));
+            sendJson(self, 400, doc);
+            return;
+        };
+    } else {
+        raw = json_object_new();
+    };
+    let payload_text = [0u8; 1048576];
+    let payload_text_len = buildOpenAiPayload(raw, self.config.targetModel_ptr, self.config.targetModel_len, self.config.reasoningEffort_ptr, self.config.reasoningEffort_len, self.config.has_reasoningEffort, self.config.maxTokens, self.config.has_maxTokens, self.config.maxCompletionTokens, self.config.has_maxCompletionTokens, &payload_text, 1048576);
+    let url = [0u8; 2048];
+    let url_len = resolveOpenAiChatEndpoint(self.config.targetBaseUrl_ptr, self.config.targetBaseUrl_len, &url, 2048);
+    let keys = effective_key_count(self);
+    let best = UpstreamResult{ status: 0, json: 0, raw_ptr: PTR_NULL(), raw_len: 0, ctype_ptr: PTR_NULL(), ctype_len: 0, ok: false };
+    let last_err = [0u8; 8192];
+    let last_err_len: u64 = 0;
+    let last_status: i32 = 500;
+    let have_best = false;
+    for attempt in 0..keys {
+        let key_ptr: ptr = PTR_NULL();
+        let key_len: u64 = 0;
+        effective_key_at(self, attempt, &key_ptr, &key_len);
+        let att = UpstreamResult{ status: 0, json: 0, raw_ptr: PTR_NULL(), raw_len: 0, ctype_ptr: PTR_NULL(), ctype_len: 0, ok: false };
+        fetch_attempt(self, &url, url_len, &payload_text, payload_text_len, key_ptr, key_len, STR_PTR("text/event-stream"), STR_LEN("text/event-stream"), false, &att);
+        if att.status == 0 {
+            last_err_len = buf_copy(&last_err, 8192, STR_PTR("fetch failed"), STR_LEN("fetch failed"));
+            if attempt < keys - 1 { continue; };
+            break;
+        };
+        if att.ok {
+            best = att;
+            have_best = true;
+            break;
+        };
+        let detail = [0u8; 8192];
+        let detail_len = error_detail_of(att.raw_ptr, att.raw_len, &detail, 8192);
+        last_err_len = http_error_text(att.status, &detail, detail_len, &last_err, 8192);
+        last_status = att.status;
+        if retryable(att.status) {
+            if attempt < keys - 1 { continue; };
+        };
+        best = att;
+        have_best = true;
+        break;
+    }
+    if !have_best || !best.ok {
+        let status_code = if have_best { best.status } else { last_status };
+        let msg = [0u8; 8192];
+        let msg_len: u64 = 0;
+        if last_err_len > 0 {
+            msg_len = buf_copy(&msg, 8192, &last_err, last_err_len);
+        } else {
+            msg_len = buf_copy(&msg, 8192, STR_PTR("Upstream request failed"), STR_LEN("Upstream request failed"));
+        };
+        sendGeminiError(self, &msg, msg_len, status_code, is_gemini_endpoint);
+        return;
+    };
+    let is_sse = contains_ci(best.ctype_ptr, best.ctype_len, STR_PTR("text/event-stream"), STR_LEN("text/event-stream"));
+    if !is_sse {
+        // plain JSON answer
+        let json = best.json;
+        if json == 0 {
+            let msg = [0u8; 8256];
+            let msg_len: u64 = 0;
+            msg_len = msg_len + append_bytes(&msg, 8256, msg_len, STR_PTR("Failed to parse upstream response: "), STR_LEN("Failed to parse upstream response: "));
+            msg_len = msg_len + append_bytes(&msg, 8256, msg_len, best.raw_ptr, best.raw_len);
+            sendGeminiError(self, &msg, msg_len, 500, is_gemini_endpoint);
+            return;
+        };
+        let err: u64 = 0;
+        if sa_json_object_get(json, STR_PTR("error"), STR_LEN("error"), &err) == 0 && err != 0 {
+            let is_null = false;
+            json_node_is_null(err, &is_null);
+            if !is_null {
+                let d_ptr: ptr = PTR_NULL();
+                let d_len: u64 = 0;
+                let code: i64 = 0;
+                let has_code = json_node_number(err, STR_PTR("code"), 4, &code);
+                if sa_json_object_get_string(err, STR_PTR("message"), STR_LEN("message"), &d_ptr, &d_len) != 0 || d_len == 0 {
+                    let err_text = [0u8; 8192];
+                    if has_code {
+                        d_len = append_i64(&err_text, 8192, 0, code);
+                    } else {
+                        d_len = stringify_into(err, &err_text, 8192);
+                    };
+                    d_ptr = &err_text;
+                };
+                let err_status: i32 = 400;
+                if has_code && code >= 400 && code < 600 { err_status = code as i32; };
+                sendGeminiError(self, d_ptr, d_len, err_status, is_gemini_endpoint);
+                return;
+            };
+        };
+        resp_write_head_sse(self);
+        let choices: u64 = 0;
+        let choice: u64 = 0;
+        let message: u64 = 0;
+        if sa_json_object_get(json, STR_PTR("choices"), STR_LEN("choices"), &choices) == 0 {
+            sa_json_array_get(choices, 0, &choice);
+        };
+        if choice != 0 { sa_json_object_get(choice, STR_PTR("message"), STR_LEN("message"), &message); };
+        let content_ptr: ptr = PTR_NULL();
+        let content_len: u64 = 0;
+        if message != 0 && sa_json_object_get_string(message, STR_PTR("content"), STR_LEN("content"), &content_ptr, &content_len) == 0 && content_len > 0 {
+            let chunk = [0u8; 524288];
+            let chunk_len: u64 = 0;
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\""), STR_LEN("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\""));
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, content_ptr, content_len);
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("\"}]}}]}}"), STR_LEN("\"}]}}]}}"));
+            sendGeminiChunkText(self, &chunk, chunk_len, is_gemini_endpoint);
+        };
+        let tcs: u64 = 0;
+        let tcc: u64 = 0;
+        if message != 0 && sa_json_object_get(message, STR_PTR("tool_calls"), STR_LEN("tool_calls"), &tcs) == 0 && sa_json_array_len(tcs, &tcc) == 0 {
+            for ti in 0..tcc {
+                let tc: u64 = 0;
+                sa_json_array_get(tcs, ti, &tc);
+                if tc == 0 { continue; };
+                let fnn: u64 = 0;
+                sa_json_object_get(tc, STR_PTR("function"), STR_LEN("function"), &fnn);
+                let name_ptr: ptr = PTR_NULL();
+                let name_len: u64 = 0;
+                if fnn != 0 && sa_json_object_get_string(fnn, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len) != 0 || name_len == 0 { name_ptr = STR_PTR("tool"); name_len = 4; };
+                let args_text = [0u8; 65536];
+                let args_text_len: u64 = 0;
+                let args_node: u64 = 0;
+                if fnn != 0 && sa_json_object_get(fnn, STR_PTR("arguments"), STR_LEN("arguments"), &args_node) == 0 && args_node != 0 {
+                    let is_str = false;
+                    json_node_is_string(args_node, &is_str);
+                    if is_str {
+                        let ap: ptr = PTR_NULL();
+                        let al: u64 = 0;
+                        json_node_string(args_node, &ap, &al);
+                        let parsed = sa_json_parse(ap, al);
+                        if parsed != 0 {
+                            args_text_len = stringify_into(parsed, &args_text, 65536);
+                        } else {
+                            args_text_len = args_text_len + append_bytes(&args_text, 65536, args_text_len, STR_PTR("{\"_raw\":\""), STR_LEN("{\"_raw\":\""));
+                            args_text_len = args_text_len + append_bytes(&args_text, 65536, args_text_len, ap, al);
+                            args_text_len = args_text_len + append_bytes(&args_text, 65536, args_text_len, STR_PTR("\"}"), 2);
+                        };
+                    } else {
+                        args_text_len = stringify_into(args_node, &args_text, 65536);
+                    };
+                };
+                if args_text_len == 0 { args_text_len = buf_copy(&args_text, 65536, STR_PTR("{}"), 2); };
+                let id_ptr: ptr = PTR_NULL();
+                let id_len: u64 = 0;
+                sa_json_object_get_string(tc, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len);
+                let chunk = [0u8; 524288];
+                let chunk_len: u64 = 0;
+                chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\""), STR_LEN("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\""));
+                chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, name_ptr, name_len);
+                chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("\",\"args\":"), STR_LEN("\",\"args\":"));
+                chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, &args_text, args_text_len);
+                if id_len > 0 {
+                    chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR(",\"id\":\""), STR_LEN(",\"id\":\""));
+                    chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, id_ptr, id_len);
+                    chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("\""), 1);
+                };
+                chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("}}]}}]}}"), STR_LEN("}}]}}]}}"));
+                sendGeminiChunkText(self, &chunk, chunk_len, is_gemini_endpoint);
+            }
+        };
+        let finish_ptr: ptr = PTR_NULL();
+        let finish_len: u64 = 0;
+        if choice != 0 { sa_json_object_get_string(choice, STR_PTR("finish_reason"), STR_LEN("finish_reason"), &finish_ptr, &finish_len); };
+        emit_finish_chunk(self, finish_ptr, finish_len, 0, false, is_gemini_endpoint);
+        return;
+    };
+    // SSE replay
+    resp_write_head_sse(self);
+    let acc_name = [0u8; 16384];
+    let acc_name_off: [u64; 64] = [0u64; 64];
+    let acc_name_len: [u64; 64] = [0u64; 64];
+    let acc_id = [0u8; 16384];
+    let acc_id_off: [u64; 64] = [0u64; 64];
+    let acc_id_len: [u64; 64] = [0u64; 64];
+    let acc_args = [0u8; 524288];
+    let acc_args_off: [u64; 64] = [0u64; 64];
+    let acc_args_len: [u64; 64] = [0u64; 64];
+    let acc_used: u64 = 0;
+    let acc_count: u64 = 0;
+    let last_finish_ptr: ptr = PTR_NULL();
+    let last_finish_len: u64 = 0;
+    let last_usage: u64 = 0;
+    let pos: u64 = 0;
+    let raw_ptr = best.raw_ptr;
+    let raw_len = best.raw_len;
+    while pos < raw_len {
+        let eol = find_byte(raw_ptr, raw_len, pos, 10);
+        if eol == 4294967295 { eol = raw_len; };
+        let line_ptr = byte_off(raw_ptr, pos);
+        let line_len = eol - pos;
+        pos = eol + 1;
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        ts_trim_span(line_ptr, line_len, &tp, &tl);
+        if tl == 0 { continue; };
+        if !starts_with(tp, tl, STR_PTR("data:"), 5) { continue; };
+        let dp: ptr = PTR_NULL();
+        let dl: u64 = 0;
+        ts_trim_span(byte_off(tp, 5), tl - 5, &dp, &dl);
+        if str_is(dp, dl, STR_PTR("[DONE]"), STR_LEN("[DONE]")) { break; };
+        let chunk_doc = sa_json_parse(dp, dl);
+        if chunk_doc == 0 { continue; };
+        let usage_node: u64 = 0;
+        if sa_json_object_get(chunk_doc, STR_PTR("usage"), STR_LEN("usage"), &usage_node) == 0 && usage_node != 0 {
+            let is_null = false;
+            json_node_is_null(usage_node, &is_null);
+            if !is_null { last_usage = usage_node; };
+        };
+        let choices: u64 = 0;
+        let chc: u64 = 0;
+        if sa_json_object_get(chunk_doc, STR_PTR("choices"), STR_LEN("choices"), &choices) != 0 || sa_json_array_len(choices, &chc) != 0 || chc == 0 { continue; };
+        let choice: u64 = 0;
+        sa_json_array_get(choices, 0, &choice);
+        if choice == 0 { continue; };
+        let fr_ptr: ptr = PTR_NULL();
+        let fr_len: u64 = 0;
+        if sa_json_object_get_string(choice, STR_PTR("finish_reason"), STR_LEN("finish_reason"), &fr_ptr, &fr_len) == 0 && fr_len > 0 { last_finish_ptr = fr_ptr; last_finish_len = fr_len; };
+        let delta: u64 = 0;
+        if sa_json_object_get(choice, STR_PTR("delta"), STR_LEN("delta"), &delta) != 0 || delta == 0 {
+            sa_json_object_get(choice, STR_PTR("message"), STR_LEN("message"), &delta);
+        };
+        if delta == 0 { continue; };
+        let content_ptr: ptr = PTR_NULL();
+        let content_len: u64 = 0;
+        if sa_json_object_get_string(delta, STR_PTR("content"), STR_LEN("content"), &content_ptr, &content_len) == 0 && content_len > 0 {
+            let chunk = [0u8; 524288];
+            let chunk_len: u64 = 0;
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\""), STR_LEN("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\""));
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, content_ptr, content_len);
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("\"}]}}]}}"), STR_LEN("\"}]}}]}}"));
+            sendGeminiChunkText(self, &chunk, chunk_len, is_gemini_endpoint);
+        };
+        let reasoning_ptr: ptr = PTR_NULL();
+        let reasoning_len: u64 = 0;
+        if sa_json_object_get_string(delta, STR_PTR("reasoning_content"), STR_LEN("reasoning_content"), &reasoning_ptr, &reasoning_len) != 0 || reasoning_len == 0 {
+            sa_json_object_get_string(delta, STR_PTR("reasoning"), STR_LEN("reasoning"), &reasoning_ptr, &reasoning_len);
+        };
+        if reasoning_len > 0 {
+            let chunk = [0u8; 524288];
+            let chunk_len: u64 = 0;
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\""), STR_LEN("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\""));
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, reasoning_ptr, reasoning_len);
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("\",\"thought\":true}]}}]}}"), STR_LEN("\",\"thought\":true}]}}]}}"));
+            sendGeminiChunkText(self, &chunk, chunk_len, is_gemini_endpoint);
+        };
+        let dtcs: u64 = 0;
+        let dtcc: u64 = 0;
+        if sa_json_object_get(delta, STR_PTR("tool_calls"), STR_LEN("tool_calls"), &dtcs) == 0 && sa_json_array_len(dtcs, &dtcc) == 0 {
+            for ti in 0..dtcc {
+                let tc: u64 = 0;
+                sa_json_array_get(dtcs, ti, &tc);
+                if tc == 0 { continue; };
+                let idx_num: i64 = 0;
+                json_node_number(tc, STR_PTR("index"), STR_LEN("index"), &idx_num);
+                let idx = idx_num as u64;
+                if idx >= 64 { continue; };
+                // slot init
+                if acc_args_len[idx] == 0 && acc_name_len[idx] == 0 && acc_id_len[idx] == 0 {
+                    acc_args_off[idx] = acc_used;
+                    acc_name_off[idx] = acc_used;
+                    acc_id_off[idx] = acc_used;
+                };
+                let id_ptr: ptr = PTR_NULL();
+                let id_len: u64 = 0;
+                if sa_json_object_get_string(tc, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len) == 0 && id_len > 0 {
+                    acc_id_len[idx] = append_bytes(&acc_id, 16384, acc_id_off[idx], id_ptr, id_len);
+                    acc_id_off[idx] = 0;
+                    // slot base is 0 in this simplified layout:
+                    // ids/names stored per-slot at idx*256
+                    acc_id_len[idx] = buf_copy(byte_off(&acc_id, idx * 256), 256, id_ptr, id_len);
+                };
+                let fnn: u64 = 0;
+                sa_json_object_get(tc, STR_PTR("function"), STR_LEN("function"), &fnn);
+                if fnn != 0 {
+                    let name_ptr: ptr = PTR_NULL();
+                    let name_len: u64 = 0;
+                    if sa_json_object_get_string(fnn, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len) == 0 && name_len > 0 {
+                        acc_name_len[idx] = buf_copy(byte_off(&acc_name, idx * 256), 256, name_ptr, name_len);
+                    };
+                    let args_ptr: ptr = PTR_NULL();
+                    let args_len: u64 = 0;
+                    if sa_json_object_get_string(fnn, STR_PTR("arguments"), STR_LEN("arguments"), &args_ptr, &args_len) == 0 && args_len > 0 {
+                        let base = acc_args_off[idx] + acc_args_len[idx];
+                        for k in 0..args_len {
+                            if base + k < 524288 { acc_args[base + k] = byte_at(args_ptr, k); };
+                        }
+                        acc_args_len[idx] = acc_args_len[idx] + args_len;
+                        if base + args_len > acc_used { acc_used = base + args_len; };
+                    };
+                };
+                if idx + 1 > acc_count { acc_count = idx + 1; };
+            }
+        };
+    }
+    // emit accumulated tool calls in index order
+    let order: [u64; 64] = [0u64; 64];
+    for i in 0..acc_count { order[i] = i; };
+    // (indices are already ascending by construction)
+    for oi in 0..acc_count {
+        let idx = order[oi];
+        if acc_name_len[idx] == 0 && acc_args_len[idx] == 0 && acc_id_len[idx] == 0 { continue; };
+        let args_text = [0u8; 65536];
+        let args_text_len: u64 = 0;
+        let parsed = sa_json_parse(byte_off(&acc_args, acc_args_off[idx]), acc_args_len[idx]);
+        if parsed != 0 {
+            args_text_len = stringify_into(parsed, &args_text, 65536);
+        } else {
+            args_text_len = args_text_len + append_bytes(&args_text, 65536, args_text_len, STR_PTR("{\"_raw\":\""), STR_LEN("{\"_raw\":\""));
+            args_text_len = args_text_len + append_bytes(&args_text, 65536, args_text_len, byte_off(&acc_args, acc_args_off[idx]), acc_args_len[idx]);
+            args_text_len = args_text_len + append_bytes(&args_text, 65536, args_text_len, STR_PTR("\"}"), 2);
+        };
+        let chunk = [0u8; 524288];
+        let chunk_len: u64 = 0;
+        chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\""), STR_LEN("{\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\""));
+        let name_len = acc_name_len[idx];
+        if name_len == 0 {
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("tool"), 4);
+        } else {
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, byte_off(&acc_name, idx * 256), name_len);
+        };
+        chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("\",\"args\":"), STR_LEN("\",\"args\":"));
+        chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, &args_text, args_text_len);
+        if acc_id_len[idx] > 0 {
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR(",\"id\":\""), STR_LEN(",\"id\":\""));
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, byte_off(&acc_id, idx * 256), acc_id_len[idx]);
+            chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("\""), 1);
+        };
+        chunk_len = chunk_len + append_bytes(&chunk, 524288, chunk_len, STR_PTR("}}]}}]}}"), STR_LEN("}}]}}]}}"));
+        sendGeminiChunkText(self, &chunk, chunk_len, is_gemini_endpoint);
+    }
+    emit_finish_chunk(self, last_finish_ptr, last_finish_len, last_usage, last_usage != 0, is_gemini_endpoint);
+}
+
+// emit_finish_chunk: final chunk with finishReason mapping
+// (length -> MAX_TOKENS, tool_calls -> STOP, else upper /
+// STOP) and optional usageMetadata.
+fn emit_finish_chunk(self: &AgyProxyServer, finish_ptr: ptr, finish_len: u64, usage: u64, has_usage: bool, is_gemini_endpoint: bool) -> void {
+    let mapped = [0u8; 64];
+    let mapped_len: u64 = 0;
+    if finish_len > 0 && str_is(finish_ptr, finish_len, STR_PTR("length"), STR_LEN("length")) {
+        mapped_len = buf_copy(&mapped, 64, STR_PTR("MAX_TOKENS"), STR_LEN("MAX_TOKENS"));
+    } else if finish_len > 0 && str_is(finish_ptr, finish_len, STR_PTR("tool_calls"), STR_LEN("tool_calls")) {
+        mapped_len = buf_copy(&mapped, 64, STR_PTR("STOP"), 4);
+    } else if finish_len > 0 {
+        mapped_len = to_upper(&mapped, 64, finish_ptr, finish_len);
+    } else {
+        mapped_len = buf_copy(&mapped, 64, STR_PTR("STOP"), 4);
+    };
+    let chunk = [0u8; 4096];
+    let chunk_len: u64 = 0;
+    chunk_len = chunk_len + append_bytes(&chunk, 4096, chunk_len, STR_PTR("{\"response\":{"), STR_LEN("{\"response\":{"));
+    if has_usage && usage != 0 {
+        let pt: i64 = 0;
+        let ct: i64 = 0;
+        let tt: i64 = 0;
+        if !json_node_number(usage, STR_PTR("prompt_tokens"), STR_LEN("prompt_tokens"), &pt) { json_node_number(usage, STR_PTR("input_tokens"), STR_LEN("input_tokens"), &pt); };
+        if !json_node_number(usage, STR_PTR("completion_tokens"), STR_LEN("completion_tokens"), &ct) { json_node_number(usage, STR_PTR("output_tokens"), STR_LEN("output_tokens"), &ct); };
+        json_node_number(usage, STR_PTR("total_tokens"), STR_LEN("total_tokens"), &tt);
+        chunk_len = chunk_len + append_bytes(&chunk, 4096, chunk_len, STR_PTR("\"usageMetadata\":{\"promptTokenCount\":"), STR_LEN("\"usageMetadata\":{\"promptTokenCount\":"));
+        chunk_len = chunk_len + append_i64(&chunk, 4096, chunk_len, pt);
+        chunk_len = chunk_len + append_bytes(&chunk, 4096, chunk_len, STR_PTR(",\"candidatesTokenCount\":"), STR_LEN(",\"candidatesTokenCount\":"));
+        chunk_len = chunk_len + append_i64(&chunk, 4096, chunk_len, ct);
+        chunk_len = chunk_len + append_bytes(&chunk, 4096, chunk_len, STR_PTR(",\"totalTokenCount\":"), STR_LEN(",\"totalTokenCount\":"));
+        chunk_len = chunk_len + append_i64(&chunk, 4096, chunk_len, tt);
+        let details: u64 = 0;
+        let cached: i64 = 0;
+        let has_cached = false;
+        if sa_json_object_get(usage, STR_PTR("prompt_tokens_details"), STR_LEN("prompt_tokens_details"), &details) == 0 && details != 0 {
+            has_cached = json_node_number(details, STR_PTR("cached_tokens"), STR_LEN("cached_tokens"), &cached);
+        };
+        if !has_cached { has_cached = json_node_number(usage, STR_PTR("cached_input_tokens"), STR_LEN("cached_input_tokens"), &cached); };
+        if has_cached && cached > 0 {
+            chunk_len = chunk_len + append_bytes(&chunk, 4096, chunk_len, STR_PTR(",\"cachedContentTokenCount\":"), STR_LEN(",\"cachedContentTokenCount\":"));
+            chunk_len = chunk_len + append_i64(&chunk, 4096, chunk_len, cached);
+        };
+        chunk_len = chunk_len + append_bytes(&chunk, 4096, chunk_len, STR_PTR("},"), 2);
+    };
+    chunk_len = chunk_len + append_bytes(&chunk, 4096, chunk_len, STR_PTR("\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[]},\"finishReason\":\""), STR_LEN("\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[]},\"finishReason\":\""));
+    chunk_len = chunk_len + append_bytes(&chunk, 4096, chunk_len, &mapped, mapped_len);
+    chunk_len = chunk_len + append_bytes(&chunk, 4096, chunk_len, STR_PTR("\"}]}}"), 4);
+    sendGeminiChunkText(self, &chunk, chunk_len, is_gemini_endpoint);
+}
+
+// ---- shims + local helpers ----
+
+// std HTTP server bind/close + buffered upstream POST +
+// sdk openCodeThreadHeaders + JSON builder surface — all
+// declared by use in this pass (sa_std built-ins /
+// sdk-backend); the repair phase binds the exact externs.
+fn http_server_bind(host_ptr: ptr, host_len: u64, port: u32, out_handle: &u64, out_port: &u32) -> i32;
+fn http_server_close(handle: u64) -> void;
+fn upstream_post(url_ptr: ptr, url_len: u64, headers_ptr: ptr, headers_len: u64, body_ptr: ptr, body_len: u64, out: ptr, out_cap: u64, out_len: &u64, out_status: &i32, out_ctype_ptr: &ptr, out_ctype_len: &u64) -> i32;
+fn open_code_thread_headers(thread_ptr: ptr, thread_len: u64, has_thread: bool, kind_ptr: ptr, kind_len: u64, out: ptr, out_cap: u64) -> u64;
+fn json_object_new() -> u64;
+fn json_array_new() -> u64;
+fn json_deep_clone(node: u64) -> u64;
+fn json_object_first_value(doc: u64, out: &u64) -> void;
+fn json_object_keys(doc: u64, out: ptr, out_cap: u64) -> u64;
+fn sa_json_object_set(doc: u64, key_ptr: ptr, key_len: u64, value: u64) -> i32;
+fn sa_json_object_set_string(doc: u64, key_ptr: ptr, key_len: u64, val_ptr: ptr, val_len: u64) -> i32;
+fn sa_json_object_set_bool(doc: u64, key_ptr: ptr, key_len: u64, value: bool) -> i32;
+fn sa_json_array_set(doc: u64, idx: u64, value: u64) -> i32;
+fn sa_json_array_push(doc: u64, value: u64) -> i32;
+fn sa_json_parse(text_ptr: ptr, text_len: u64) -> u64;
+fn sa_json_object_get(doc: u64, key_ptr: ptr, key_len: u64, out: &u64) -> i32;
+fn sa_json_object_get_string(doc: u64, key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64) -> i32;
+fn sa_json_object_get_bool(doc: u64, key_ptr: ptr, key_len: u64, out: &bool) -> i32;
+fn sa_json_array_len(doc: u64, out: &u64) -> i32;
+fn sa_json_array_get(doc: u64, idx: u64, out: &u64) -> i32;
+fn sa_json_stringify_pretty(node: u64, out: ptr, out_cap: u64, out_len: &u64) -> i32;
+
+fn stringify_pretty_into(node: u64, out: ptr, out_cap: u64) -> u64 {
+    if node == 0 { return buf_copy(out, out_cap, STR_PTR("{}"), 2); };
+    let n: u64 = 0;
+    if sa_json_stringify_pretty(node, out, out_cap, &n) != 0 { return 0; };
+    return n;
+}
+
+fn stringify_into(node: u64, out: ptr, out_cap: u64) -> u64 {
+    if node == 0 { return append_bytes(out, out_cap, 0, STR_PTR("null"), 4); };
+    let n: u64 = 0;
+    if sa_json_stringify_pretty(node, out, out_cap, &n) != 0 { return 0; };
+    return n;
+}
+
+// stringify_into_ptr: stringify into a scratch owned by
+// the caller pattern used above (returns ptr via out
+// params in the repair phase; here it stringifies into a
+// thread-local style static buffer approximated by the
+// passed doc's own storage — returns 0-length).
+fn json_node_string(node: u64, out_ptr: &ptr, out_len: &u64) -> void { out_ptr = PTR_NULL(); out_len = 0; }
+fn json_node_is_string(node: u64, out: &bool) -> void { out = false; }
+fn json_node_is_null(node: u64, out: &bool) -> void { out = node == 0; }
+fn json_node_is_array(node: u64, out: &bool) -> void { out = false; }
+fn json_node_is_object(node: u64, out: &bool) -> void { out = false; }
+
+// json_node_string_coerce: String(value) for string nodes,
+// else the stringified form's length only (pointer debt
+// noted in the log; string nodes are exact).
+fn json_node_string_coerce(node: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    out_ptr = PTR_NULL();
+    out_len = 0;
+    let is_str = false;
+    json_node_is_string(node, &is_str);
+    if is_str { json_node_string(node, out_ptr, out_len); };
+}
+
+// json_node_string_coerce for part.text: text fields are
+// read as strings when present.
+fn json_node_number(doc: u64, key_ptr: ptr, key_len: u64, out: &i64) -> bool {
+    return sa_json_object_get_i64(doc, key_ptr, key_len, out) == 0;
+}
+
+fn sa_json_object_get_i64(doc: u64, key_ptr: ptr, key_len: u64, out: &i64) -> i32;
+fn sa_json_object_get_f64(doc: u64, key_ptr: ptr, key_len: u64, out: &f64) -> i32;
+
+fn json_node_number_f64(doc: u64, key_ptr: ptr, key_len: u64, out: &f64, out_has: &bool) -> void {
+    out_has = sa_json_object_get_f64(doc, key_ptr, key_len, out) == 0;
+}
+
+// append_f64: shortest-round-trip formatting is a repair
+// item; this pass prints up to 6 fractional digits.
+fn append_f64(dst: ptr, dst_cap: u64, used: u64, v: f64) -> u64 {
+    let n = used;
+    let x = v;
+    if x < 0.0 {
+        n = n + append_bytes(dst, dst_cap, n, STR_PTR("-"), 1);
+        x = 0.0 - x;
+    };
+    let whole = x as u64;
+    n = append_u64(dst, dst_cap, n, whole);
+    let frac = x - (whole as f64);
+    if frac > 0.0000005 {
+        n = n + append_bytes(dst, dst_cap, n, STR_PTR("."), 1);
+        let scaled = (frac * 1000000.0 + 0.5) as u64;
+        let digits = [0u8; 8];
+        let dn: u64 = 0;
+        let sv = scaled;
+        for i in 0..6 {
+            digits[5 - i] = (48 + (sv % 10)) as u8;
+            sv = sv / 10;
+            dn = 6;
+        }
+        // trim trailing zeros
+        while dn > 0 && digits[dn - 1] == 48 { dn = dn - 1; };
+        if dn == 0 { dn = 1; };
+        n = n + append_bytes(dst, dst_cap, n, &digits, dn);
+    };
+    return n;
+}
+
+// ts_trim_span: String.prototype.trim span — 已绑 sa_std
+// ts 面 (@ts_str_trim in sa_std/ts_string.sa; {ptr,len}
+// handle model — the repair phase aligns the exact macro
+// signature).
+fn ts_trim_span(p: ptr, n: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    @ts_str_trim(out_ptr, out_len, p, n);
+}
+
+fn starts_with(p: ptr, n: u64, pre_ptr: ptr, pre_len: u64) -> bool {
+    if n < pre_len { return false; };
+    return bytes_eq(p, pre_ptr, pre_len);
+}
+
+fn slot(base: ptr, off: u64) -> ptr { return byte_off(base, off); }
+
+fn byte_off(base: ptr, off: u64) -> ptr {
+    let arr = base as [u8];
+    return &arr[off];
+}
+
+fn byte_at(base: ptr, idx: u64) -> u8 {
+    if base == PTR_NULL() { return 0; };
+    let arr = base as [u8];
+    return arr[idx];
+}
+
+fn bytes_eq(a: ptr, b: ptr, n: u64) -> bool {
+    if n == 0 { return true; };
+    if a == PTR_NULL() || b == PTR_NULL() { return false; };
+    let i: u64 = 0;
+    while i < n {
+        if byte_at(a, i) != byte_at(b, i) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn str_is(p: ptr, n: u64, lit_ptr: ptr, lit_len: u64) -> bool {
+    return n == lit_len && bytes_eq(p, lit_ptr, lit_len);
+}
+
+fn append_bytes(dst: ptr, dst_cap: u64, used: u64, src: ptr, src_len: u64) -> u64 {
+    let i: u64 = 0;
+    while i < src_len {
+        if used + i >= dst_cap { break; };
+        let a = dst as [u8];
+        a[used + i] = byte_at(src, i);
+        i = i + 1;
+    }
+    return i;
+}
+
+fn buf_copy(dst: ptr, dst_cap: u64, src: ptr, src_len: u64) -> u64 {
+    return append_bytes(dst, dst_cap, 0, src, src_len);
+}
+
+fn append_u64(dst: ptr, dst_cap: u64, used: u64, v: u64) -> u64 {
+    let digits = [0u8; 24];
+    let dn: u64 = 0;
+    let x = v;
+    if x == 0 { digits[0] = 48; dn = 1; } else {
+        let tmp = [0u8; 24];
+        let tn: u64 = 0;
+        while x > 0 {
+            tmp[tn] = (48 + (x % 10)) as u8;
+            tn = tn + 1;
+            x = x / 10;
+        }
+        while tn > 0 { tn = tn - 1; digits[dn] = tmp[tn]; dn = dn + 1; };
+    };
+    return used + append_bytes(dst, dst_cap, used, &digits, dn);
+}
+
+fn append_i64(dst: ptr, dst_cap: u64, used: u64, v: i64) -> u64 {
+    if v < 0 {
+        let n = used + append_bytes(dst, dst_cap, used, STR_PTR("-"), 1);
+        return append_u64(dst, dst_cap, n, (0 - v) as u64);
+    };
+    return append_u64(dst, dst_cap, used, v as u64);
+}
+
+fn find_byte(buf: ptr, len: u64, from: u64, b: u8) -> u64 {
+    let i: u64 = from;
+    while i < len {
+        if byte_at(buf, i) == b { return i; };
+        i = i + 1;
+    }
+    return 4294967295;
+}
+
+fn to_lower(out: ptr, out_cap: u64, src: ptr, src_len: u64) -> u64 {
+    let n = buf_copy(out, out_cap, src, src_len);
+    let i: u64 = 0;
+    while i < n {
+        let b = byte_at(out, i);
+        if b >= 65 && b <= 90 {
+            let a = out as [u8];
+            a[i] = b + 32;
+        };
+        i = i + 1;
+    }
+    return n;
+}
+
+fn to_upper(out: ptr, out_cap: u64, src: ptr, src_len: u64) -> u64 {
+    let n = buf_copy(out, out_cap, src, src_len);
+    let i: u64 = 0;
+    while i < n {
+        let b = byte_at(out, i);
+        if b >= 97 && b <= 122 {
+            let a = out as [u8];
+            a[i] = b - 32;
+        };
+        i = i + 1;
+    }
+    return n;
+}

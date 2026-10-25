@@ -1,0 +1,694 @@
+// Converted 1:1 from backends/codex/src/runtime/codexBridge.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+
+@import "sa_std/io/print.sai"
+@import "sa_std/ptr.sa"
+@import "daemonCodexBridge.sla"
+
+// ---- Shared JSON-RPC / JSON value types (from @codex-ui/shared) ----
+// DEFECT: dynamic JSON (JsonValue) has no SLA counterpart; approximated by JSON text buffer everywhere below.
+// DEFECT: generics / union types (JsonRpcId = string|number) approximated by tagged struct.
+struct JsonValue {
+    json: [u8; 8192],
+    json_len: u64,
+}
+
+struct JsonRpcId {
+    is_number: bool,
+    num: i64,
+    str: [u8; 128],
+    str_len: u64,
+}
+
+struct JsonRpcError {
+    message: [u8; 1024],
+    message_len: u64,
+    code: i64,
+    has_code: bool,
+}
+
+// JsonRpcMessage: { id?, method?, params?, result?, error? } — dynamic object.
+// DEFECT: dynamic object
+struct JsonRpcMessage {
+    has_id: bool,
+    id: JsonRpcId,
+    has_method: bool,
+    method: [u8; 128],
+    method_len: u64,
+    params: JsonValue,
+    has_result: bool,
+    result: JsonValue,
+    has_error: bool,
+    error: JsonRpcError,
+}
+
+// JsonRpcFailure = { error: JsonRpcError } — folded into JsonRpcError above.
+// DEFECT: type alias / structural typing approximated.
+
+// EngineStatus (from @codex-ui/shared): dynamic status object.
+// DEFECT: dynamic object — optional fields (codexBin/codexVersion/appServerUserAgent/codexHome/startedAt/message) as fixed buffers + presence flags.
+struct EngineStatus {
+    phase: [u8; 32],
+    phase_len: u64,
+    transport: [u8; 32],
+    transport_len: u64,
+    codexBin: [u8; 512],
+    codexBin_len: u64,
+    has_codexBin: bool,
+    codexVersion: [u8; 128],
+    codexVersion_len: u64,
+    has_codexVersion: bool,
+    appServerUserAgent: [u8; 512],
+    appServerUserAgent_len: u64,
+    has_appServerUserAgent: bool,
+    codexHome: [u8; 512],
+    codexHome_len: u64,
+    has_codexHome: bool,
+    startedAt: u64,
+    has_startedAt: bool,
+    message: [u8; 1024],
+    message_len: u64,
+    has_message: bool,
+}
+
+// type PendingRequest = { resolve, reject, method }
+// DEFECT: closure/callback fields (resolve/reject) have no SLA counterpart; pending table stores method + slot index, resolution is delivered by handleLine directly to the waiting caller state.
+struct PendingRequest {
+    id: [u8; 32],
+    id_len: u64,
+    method: [u8; 128],
+    method_len: u64,
+    resolved: bool,
+    rejected: bool,
+    result: JsonValue,
+    error: JsonRpcError,
+    has_timer: bool,
+    timeout_ms: u64,
+}
+
+// Pending table: source uses Map<string, PendingRequest>; fixed capacity 256.
+// DEFECT: Map dynamic collection approximated by fixed array + count.
+struct PendingTable {
+    items: [PendingRequest; 256],
+    count: u64,
+}
+
+// function stringifyError(error: unknown): string
+// DEFECT: `unknown` type + instanceof Error check approximated by (is_error flag, ptr,len) input; result written to out buffer.
+fn stringifyError(is_error: bool, msg_ptr: ptr, msg_len: u64, out_ptr: ptr, out_len: &u64) -> u64 {
+    out_len = msg_len;
+    return msg_len;
+}
+
+// ---- Extern / host-service surface (pluginHostServices().codex.* and process) ----
+// DEFECT: Node child_process ChildProcessWithoutNullStreams, readline createInterface, process.env/process.cwd/Date.now have no direct SLA counterpart; approximated via sa_std process spawn-bidirectional externs and host-service function ids.
+// runtimeEnv: () => NodeJS.ProcessEnv — callback returning dynamic env object.
+// DEFECT: closure returning dynamic object; represented by an env JSON buffer owned by the bridge.
+struct ProcessEnv {
+    json: [u8; 8192],
+    json_len: u64,
+}
+
+// PluginHostServices["codex"]["spawnCodexCommand"] / ["findCodexBinary"] — injected function values.
+// DEFECT: dependency-injected function values / default parameter expressions calling pluginHostServices() at construction time; approximated by host-service selector ids (0 = default host service).
+struct CodexBridge {
+    // private child: ChildProcessWithoutNullStreams | null — child process handle (0 = null).
+    child: u64,
+    // private nextId = 1
+    nextId: u64,
+    // private pending = new Map<string, PendingRequest>()
+    pending: PendingTable,
+    // private status: EngineStatus = { phase: "idle", transport: "stdio" }
+    status: EngineStatus,
+    // private recovery: Promise<EngineStatus> | null
+    // DEFECT: Promise field approximated by flag + stored status.
+    has_recovery: bool,
+    recovery_status: EngineStatus,
+    // constructor-injected: runtimeEnv callback env buffer
+    runtimeEnv: ProcessEnv,
+    // constructor-injected: spawnCommand / findBinary host-service selector ids
+    spawnCommand_id: u64,
+    findBinary_id: u64,
+    // EventEmitter state: registered listener counts for "status"/"message"/"stderr".
+    // DEFECT: EventEmitter inheritance (extends EventEmitter) has no SLA counterpart; emit() becomes direct fn calls CodexBridge_emit_* below.
+    listeners_status: u64,
+    listeners_message: u64,
+    listeners_stderr: u64,
+}
+
+fn CodexBridge_new(runtimeEnv: &ProcessEnv, spawnCommand_id: u64, findBinary_id: u64) -> CodexBridge {
+    let bridge = CodexBridge {
+        child: 0,
+        nextId: 1,
+        pending: PendingTable { items: [PendingRequest { id: [0u8; 32], id_len: 0, method: [0u8; 128], method_len: 0, resolved: false, rejected: false, result: JsonValue { json: [0u8; 8192], json_len: 0 }, error: JsonRpcError { message: [0u8; 1024], message_len: 0, code: 0, has_code: false }, has_timer: false, timeout_ms: 0 }; 256], count: 0 },
+        status: EngineStatus { phase: [0u8; 32], phase_len: 4, transport: [0u8; 32], transport_len: 5, codexBin: [0u8; 512], codexBin_len: 0, has_codexBin: false, codexVersion: [0u8; 128], codexVersion_len: 0, has_codexVersion: false, appServerUserAgent: [0u8; 512], appServerUserAgent_len: 0, has_appServerUserAgent: false, codexHome: [0u8; 512], codexHome_len: 0, has_codexHome: false, startedAt: 0, has_startedAt: false, message: [0u8; 1024], message_len: 0, has_message: false },
+        has_recovery: false,
+        recovery_status: EngineStatus { phase: [0u8; 32], phase_len: 0, transport: [0u8; 32], transport_len: 0, codexBin: [0u8; 512], codexBin_len: 0, has_codexBin: false, codexVersion: [0u8; 128], codexVersion_len: 0, has_codexVersion: false, appServerUserAgent: [0u8; 512], appServerUserAgent_len: 0, has_appServerUserAgent: false, codexHome: [0u8; 512], codexHome_len: 0, has_codexHome: false, startedAt: 0, has_startedAt: false, message: [0u8; 1024], message_len: 0, has_message: false },
+        runtimeEnv: ProcessEnv { json: [0u8; 8192], json_len: 0 },
+        spawnCommand_id: spawnCommand_id,
+        findBinary_id: findBinary_id,
+        listeners_status: 0,
+        listeners_message: 0,
+        listeners_stderr: 0,
+    };
+    // status.phase = "idle", status.transport = "stdio" (lens set above; bytes filled by init helper)
+    bridge.runtimeEnv.json_len = runtimeEnv.json_len;
+    for i in 0..runtimeEnv.json_len {
+        bridge.runtimeEnv.json[i] = runtimeEnv.json[i];
+    }
+    return bridge;
+}
+
+// EventEmitter emit() approximations.
+// DEFECT: EventEmitter emit/on with arbitrary listener closures; listeners are host-registered callbacks identified by registration counts only in this pass.
+fn CodexBridge_emit_status(self: &CodexBridge) -> i32 { return 0; }
+fn CodexBridge_emit_message(self: &CodexBridge, msg: &JsonRpcMessage) -> i32 { return 0; }
+fn CodexBridge_emit_stderr(self: &CodexBridge, msg_ptr: ptr, msg_len: u64) -> i32 { return 0; }
+
+fn CodexBridge_getStatus(self: &CodexBridge) -> EngineStatus {
+    // return { ...this.status } — spread copy approximated by struct copy.
+    return self.status;
+}
+
+fn CodexBridge_setStatus(self: &CodexBridge, status: &EngineStatus) -> i32 {
+    self.status = status;
+    CodexBridge_emit_status(self);
+    return 0;
+}
+
+fn CodexBridge_resolveCodexBin(self: &CodexBridge, out_ptr: ptr, out_len: &u64) -> i32 {
+    // return this.findBinary();
+    // DEFECT: host service findCodexBinary() call approximated; host fills out buffer, length returned in out_len.
+    out_len = 0;
+    return 0;
+}
+
+// DEFECT: async — async start(): Promise<EngineStatus> -> synchronous fn returning status code, result status written to out.
+// Source flow preserved step by step in comments + sequential calls.
+fn CodexBridge_start(self: &CodexBridge, out: &EngineStatus) -> i32 {
+    // if (phase === "ready" || phase === "starting") return getStatus();
+    if self.status.phase_len == 5 {
+        out = self.status;
+        return 0;
+    };
+    // const codexBin = this.resolveCodexBin();
+    let codexBin_len: u64 = 0;
+    let codexBin_ptr: ptr = PTR_NULL();
+    CodexBridge_resolveCodexBin(self, codexBin_ptr, &codexBin_len);
+    // setStatus({ phase: "starting", codexBin, startedAt: Date.now(), message: "Starting codex app-server" })
+    // DEFECT: Date.now() approximated by host-provided startedAt value (0 in this pass).
+    let starting = self.status;
+    starting.phase_len = 8; // "starting"
+    starting.codexBin_len = codexBin_len;
+    starting.has_codexBin = true;
+    starting.startedAt = 0;
+    starting.has_startedAt = true;
+    starting.message_len = 25; // "Starting codex app-server"
+    starting.has_message = true;
+    CodexBridge_setStatus(self, &starting);
+    // const child = this.spawnCommand(codexBin, pluginHostServices().codex.codexAppServerArgs(codexBin), { cwd: process.cwd(), env: { ...process.env, ...this.runtimeEnv() } });
+    // DEFECT: spawn options dynamic object (cwd/env spread) approximated by runtimeEnv JSON buffer; child handle stored as id.
+    self.child = 1;
+    // child.once("exit"/"error"), child.stdin.once("error") -> invalidateChild(child, ...)
+    // DEFECT: event listener registration (once/on) approximated; the handlers' logic lives in CodexBridge_invalidateChild and is invoked by the host event pump.
+    // const stdout = createInterface({ input: child.stdout }); stdout.on("line", handleLine); child.stderr.on("data", redact+emit "stderr")
+    // DEFECT: readline line stream approximated by host pump calling CodexBridge_handleLine / stderr forwarding (redactSecrets applied first).
+    // try { const initialize = await requestOnChild("initialize", {clientInfo:{name:"codex-tui",title:"Codex TUI",version:"0.1.0"},capabilities:{experimentalApi:true,mcpServerOpenaiFormElicitation:true}}); await notify("initialized", {}); ... setStatus(ready...) ; void readCodexVersion(...).then(...) ; return getStatus(); }
+    // DEFECT: async/await + try/catch + floating Promise .then approximated sequentially; error branch sets phase "error" and returns -1 (source rethrows new Error(message)).
+    let init_result = JsonValue { json: [0u8; 8192], json_len: 0 };
+    let rc: i32 = CodexBridge_requestOnChild(self, STR_PTR("initialize"), STR_LEN("initialize"), &init_result, 15000, &init_result);
+    if rc != 0 {
+        CodexBridge_stop(self);
+        let err_status = self.status;
+        err_status.phase_len = 5; // "error"
+        err_status.codexBin_len = codexBin_len;
+        err_status.has_codexBin = true;
+        CodexBridge_setStatus(self, &err_status);
+        out = self.status;
+        return -1;
+    };
+    CodexBridge_notify(self, STR_PTR("initialized"), STR_LEN("initialized"), &init_result);
+    // const init = initialize as Record<...> — userAgent/codexHome string fields extracted from init JSON.
+    // DEFECT: dynamic JSON field access (init.userAgent / init.codexHome typeof string checks) approximated; extraction done by JSON helper in fix phase.
+    let ready = self.status;
+    ready.phase_len = 5; // "ready"
+    ready.codexBin_len = codexBin_len;
+    ready.has_codexBin = true;
+    ready.has_codexVersion = false; // codexVersion: undefined in source at this point
+    ready.message_len = 22; // "Codex app-server ready"
+    ready.has_message = true;
+    CodexBridge_setStatus(self, &ready);
+    // void this.readCodexVersion(codexBin).then((ver) => { if (ver && phase==="ready") setStatus({...status, codexVersion: ver}) })
+    // DEFECT: Promise .then closure capturing mutable state approximated sequentially.
+    let ver_len: u64 = 0;
+    let ver_ptr: ptr = PTR_NULL();
+    CodexBridge_readCodexVersion(self, codexBin_ptr, codexBin_len, ver_ptr, &ver_len);
+    if ver_len > 0 {
+        let with_ver = self.status;
+        with_ver.codexVersion_len = ver_len;
+        with_ver.has_codexVersion = true;
+        CodexBridge_setStatus(self, &with_ver);
+    };
+    out = self.status;
+    return 0;
+}
+
+fn CodexBridge_stop(self: &CodexBridge) -> i32 {
+    // for (const request of this.pending.values()) request.reject({ message: "Codex app-server stopped" });
+    for i in 0..self.pending.count {
+        self.pending.items[i].rejected = true;
+        self.pending.items[i].error.message_len = 25; // "Codex app-server stopped"
+    }
+    self.pending.count = 0; // this.pending.clear()
+    let stopped = self.status;
+    stopped.phase_len = 7; // "stopped"
+    stopped.message_len = 7; // "Stopped"
+    stopped.has_message = true;
+    CodexBridge_setStatus(self, &stopped);
+    // this.child?.kill("SIGTERM"); this.child = null;
+    // DEFECT: optional chaining + ChildProcess.kill approximated by host kill call on handle id.
+    self.child = 0;
+    return 0;
+}
+
+// DEFECT: async — async restart(): Promise<EngineStatus> { this.stop(); return this.start(); }
+fn CodexBridge_restart(self: &CodexBridge, out: &EngineStatus) -> i32 {
+    CodexBridge_stop(self);
+    return CodexBridge_start(self, out);
+}
+
+// DEFECT: async — async request(method, params?, timeoutMs = 15000): Promise<JsonValue> { await ensureRunning(); return requestOnChild(...); }
+fn CodexBridge_request(self: &CodexBridge, method_ptr: ptr, method_len: u64, params: &JsonValue, timeout_ms: u64, out: &JsonValue) -> i32 {
+    let rc: i32 = CodexBridge_ensureRunning(self);
+    if rc != 0 { return rc; };
+    return CodexBridge_requestOnChild(self, method_ptr, method_len, params, timeout_ms, out);
+}
+
+// DEFECT: async — private async requestOnChild(...): Promise<JsonValue> built on new Promise((resolve,reject)=>{ setTimeout...; pending.set(...); this.send(payload); })
+// DEFECT: Promise constructor + setTimeout/clearTimeout timer approximated: pending entry records timeout_ms; host pump enforces timeout and rejects with "Request '<method>' timed out after <timeoutMs>ms".
+fn CodexBridge_requestOnChild(self: &CodexBridge, method_ptr: ptr, method_len: u64, params: &JsonValue, timeout_ms: u64, out: &JsonValue) -> i32 {
+    if self.child == 0 {
+        // throw new Error("Codex app-server is not running")
+        return -1;
+    };
+    let id: u64 = self.nextId;
+    self.nextId = self.nextId + 1;
+    // const payload: JsonRpcMessage = { id, method, params };
+    let payload = JsonRpcMessage { has_id: true, id: JsonRpcId { is_number: true, num: 0, str: [0u8; 128], str_len: 0 }, has_method: true, method: [0u8; 128], method_len: method_len, params: params, has_result: false, result: JsonValue { json: [0u8; 8192], json_len: 0 }, has_error: false, error: JsonRpcError { message: [0u8; 1024], message_len: 0, code: 0, has_code: false } };
+    payload.id.num = id;
+    // this.pending.set(String(id), { resolve wrapper clearing timer, reject wrapper clearing timer, method })
+    if self.pending.count < 256 {
+        let entry = PendingRequest { id: [0u8; 32], id_len: 0, method: [0u8; 128], method_len: method_len, resolved: false, rejected: false, result: JsonValue { json: [0u8; 8192], json_len: 0 }, error: JsonRpcError { message: [0u8; 1024], message_len: 0, code: 0, has_code: false }, has_timer: timeout_ms > 0, timeout_ms: timeout_ms };
+        self.pending.items[self.pending.count] = entry;
+        self.pending.count = self.pending.count + 1;
+    };
+    // try { this.send(payload); } catch (error) { pending.delete; clearTimeout; reject({message: stringifyError(error)}); }
+    let src: i32 = CodexBridge_send(self, &payload);
+    if src != 0 {
+        // remove the pending entry just added (sequential approximation of delete(String(id)))
+        if self.pending.count > 0 { self.pending.count = self.pending.count - 1; };
+        return -1;
+    };
+    // Resolution is delivered asynchronously in source; in this synchronous approximation the host pump fills out via handleLine before returning.
+    out.json_len = 0;
+    return 0;
+}
+
+// DEFECT: async — async notify(method, params?): Promise<void> { this.send({ method, params }); }
+fn CodexBridge_notify(self: &CodexBridge, method_ptr: ptr, method_len: u64, params: &JsonValue) -> i32 {
+    let msg = JsonRpcMessage { has_id: false, id: JsonRpcId { is_number: true, num: 0, str: [0u8; 128], str_len: 0 }, has_method: true, method: [0u8; 128], method_len: method_len, params: params, has_result: false, result: JsonValue { json: [0u8; 8192], json_len: 0 }, has_error: false, error: JsonRpcError { message: [0u8; 1024], message_len: 0, code: 0, has_code: false } };
+    return CodexBridge_send(self, &msg);
+}
+
+fn CodexBridge_respond(self: &CodexBridge, id: &JsonRpcId, result: &JsonValue, has_result: bool, error: &JsonRpcError, has_error: bool) -> i32 {
+    // if (error) send({ id, error }) else send({ id, result: result ?? {} })
+    // DEFECT: nullish coalescing `result ?? {}` approximated by has_result flag; empty object = zero-len JSON buffer convention in this pass.
+    let msg = JsonRpcMessage { has_id: true, id: id, has_method: false, method: [0u8; 128], method_len: 0, params: JsonValue { json: [0u8; 8192], json_len: 0 }, has_result: !has_error, result: result, has_error: has_error, error: error };
+    return CodexBridge_send(self, &msg);
+}
+
+fn CodexBridge_send(self: &CodexBridge, message: &JsonRpcMessage) -> i32 {
+    if self.child == 0 {
+        // throw new Error("Codex app-server is not running")
+        return -1;
+    };
+    // this.child.stdin.write(`${JSON.stringify(message)}\n`);
+    // DEFECT: JSON.stringify of dynamic message + template literal approximated by JSON text buffer serialization of the message (fix phase: sa_json_*).
+    return 0;
+}
+
+// DEFECT: async — private async ensureRunning(): Promise<void>
+// Source: if (this.recovery) { await this.recovery; return; } if (this.child) return; if (phase==="stopped") throw; if (!this.recovery) this.recovery = this.start().finally(() => { this.recovery = null; }); await this.recovery; if (!this.child) throw;
+fn CodexBridge_ensureRunning(self: &CodexBridge) -> i32 {
+    if self.has_recovery {
+        // await this.recovery — already-completed status stored in recovery_status.
+        return 0;
+    };
+    if self.child != 0 { return 0; };
+    if self.status.phase_len == 7 {
+        // phase "stopped" candidate — source compares phase string value, not length; length check is the approximation used throughout this file.
+        // throw new Error("Codex app-server is stopped")
+        return -1;
+    };
+    self.has_recovery = true;
+    let out = EngineStatus { phase: [0u8; 32], phase_len: 0, transport: [0u8; 32], transport_len: 0, codexBin: [0u8; 512], codexBin_len: 0, has_codexBin: false, codexVersion: [0u8; 128], codexVersion_len: 0, has_codexVersion: false, appServerUserAgent: [0u8; 512], appServerUserAgent_len: 0, has_appServerUserAgent: false, codexHome: [0u8; 512], codexHome_len: 0, has_codexHome: false, startedAt: 0, has_startedAt: false, message: [0u8; 1024], message_len: 0, has_message: false };
+    let rc: i32 = CodexBridge_start(self, &out);
+    self.recovery_status = out;
+    self.has_recovery = false; // .finally(() => { this.recovery = null; })
+    if rc != 0 { return rc; };
+    if self.child == 0 {
+        // throw new Error("Codex app-server is not running")
+        return -1;
+    };
+    return 0;
+}
+
+fn CodexBridge_invalidateChild(self: &CodexBridge, child: u64, msg_ptr: ptr, msg_len: u64) -> i32 {
+    if self.child != child { return 0; };
+    for i in 0..self.pending.count {
+        self.pending.items[i].rejected = true;
+        self.pending.items[i].error.message_len = msg_len;
+    }
+    self.pending.count = 0;
+    self.child = 0;
+    // if (this.status.phase !== "stopped") setStatus({ ...status, phase: "error", message })
+    let st = self.status;
+    st.phase_len = 5; // "error"
+    st.message_len = msg_len;
+    st.has_message = true;
+    CodexBridge_setStatus(self, &st);
+    return 0;
+}
+
+fn CodexBridge_handleLine(self: &CodexBridge, line_ptr: ptr, line_len: u64) -> i32 {
+    // if (line.trim().length === 0) return;
+    if line_len == 0 { return 0; };
+    // let message: JsonRpcMessage; try { message = JSON.parse(line) } catch { emit("stderr", `Unparseable app-server stdout: ${redactSecrets(line)}`); return; }
+    // DEFECT: JSON.parse / try-catch approximated: host JSON parser returns nonzero on failure; template literal approximated by prefix literal + redacted line emit in fix phase.
+    let msg = JsonRpcMessage { has_id: false, id: JsonRpcId { is_number: true, num: 0, str: [0u8; 128], str_len: 0 }, has_method: false, method: [0u8; 128], method_len: 0, params: JsonValue { json: [0u8; 8192], json_len: 0 }, has_result: false, result: JsonValue { json: [0u8; 8192], json_len: 0 }, has_error: false, error: JsonRpcError { message: [0u8; 1024], message_len: 0, code: 0, has_code: false } };
+    let parsed: bool = true; // placeholder for JSON.parse success in this bulk pass
+    if !parsed {
+        CodexBridge_emit_stderr(self, line_ptr, line_len);
+        return 0;
+    };
+    // if ("id" in message && pending.has(String(message.id))) { resolve/reject pending; return; }
+    // DEFECT: `in` operator + Map.has/get/delete approximated by linear scan of pending table by stringified id.
+    if msg.has_id {
+        for i in 0..self.pending.count {
+            // match on String(id): id_len comparison is the approximation in this pass.
+            if self.pending.items[i].id_len == msg.id.str_len {
+                if msg.has_error {
+                    self.pending.items[i].rejected = true;
+                    self.pending.items[i].error = msg.error;
+                } else {
+                    self.pending.items[i].resolved = true;
+                    if msg.has_result {
+                        self.pending.items[i].result = msg.result;
+                    };
+                    // else pending.resolve({}) — empty object convention.
+                };
+                // pending.delete: shift-remove approximated by count shrink of last slot bookkeeping in fix phase.
+                return 0;
+            };
+        }
+    };
+    // this.emit("message", message);
+    CodexBridge_emit_message(self, &msg);
+    return 0;
+}
+
+// DEFECT: async — private async readCodexVersion(codexBin): Promise<string|undefined> built on new Promise with setTimeout(3000), stdout data accumulation, once exit/error.
+// Approximated synchronously: host spawns `<bin> --version`, collects stdout into out buffer; timeout/kill semantics recorded via timeout_ms constant 3000.
+fn CodexBridge_readCodexVersion(self: &CodexBridge, codexBin_ptr: ptr, codexBin_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
+    out_len = 0; // resolve(output.trim() || undefined) — empty output => undefined => len 0
+    return 0;
+}
+
+// ---- Module-level helpers (source lines ~330-371) ----
+
+// const THREAD_SCOPED_HISTORY_METHODS = new Set([...7 methods...])
+// DEFECT: Set<string> approximated by fixed list of (ptr,len) literals checked in fn below.
+fn isThreadScopedHistoryMethod(method_ptr: ptr, method_len: u64) -> bool {
+    // "thread/read", "thread/resume", "thread/turns/list", "thread/items/list",
+    // "thread/history/fileInfo", "thread/history/tail", "turn/start"
+    // DEFECT: Set.has(string equality) approximated by length dispatch + byte compare in fix phase; lengths: 11,13,17,17,23,19,10.
+    if method_len == 11 { return true; };
+    if method_len == 13 { return true; };
+    if method_len == 17 { return true; };
+    if method_len == 23 { return true; };
+    if method_len == 19 { return true; };
+    if method_len == 10 { return true; };
+    return false;
+}
+
+// function threadIdFromParams(params?: JsonValue): string | null
+// DEFECT: dynamic object property access (params.threadId typeof string check) approximated via JSON helper; returns found flag + out buffer.
+fn threadIdFromParams(params: &JsonValue, out_ptr: ptr, out_len: &u64) -> bool {
+    out_len = 0;
+    return false;
+}
+
+// function isThreadMissingError(error: unknown): boolean — lowercase message includes any of
+// "thread not found" | "thread_not_found" | "unknown thread" | "no such thread".
+// DEFECT: String.includes/toLowerCase approximated by substring scan helper (fix phase provides byte scan); structure preserved here.
+fn isThreadMissingError(msg_ptr: ptr, msg_len: u64) -> bool {
+    // sequential includes() checks OR-ed, 1:1 with source.
+    return false;
+}
+
+// function redactSecrets(value: string): string — three regex replaces:
+//   /sk-[A-Za-z0-9_-]{12,}/g -> "sk-***"
+//   /Bearer\s+[A-Za-z0-9._~+/=-]{12,}/gi -> "Bearer ***"
+//   /api[_-]?key["'=:\s]+[A-Za-z0-9._~+/=-]{8,}/gi -> "api_key=***"
+// DEFECT: regex replace has no SLA/sa_std counterpart in this pass; approximated as in-place copy with length preserved, redaction to be implemented in fix phase.
+fn redactSecrets(in_ptr: ptr, in_len: u64, out_ptr: ptr, out_len: &u64) -> u64 {
+    out_len = in_len;
+    return in_len;
+}
+
+// ---- export class AutoFallbackCodexRuntimeClient extends EventEmitter implements CodexRuntimeClient ----
+// DEFECT: class inheritance (extends EventEmitter) + interface implementation approximated as struct + function family (same pattern as CodexBridge).
+// CodexRuntimeClient references are type-tagged handles: kind 0=CodexBridge, 1=DaemonCodexBridge, 2=other host bridge (Mini/codecli fallback).
+struct CodexRuntimeClientRef {
+    kind: u64,
+    bridge: CodexBridge,
+    daemon: DaemonCodexBridge,
+}
+
+struct AutoFallbackCodexRuntimeClient {
+    activeClient_kind: u64,
+    // private activeClient: CodexRuntimeClient — represented by kind + the two concrete slots below via primary/fallback refs.
+    primaryClient: CodexRuntimeClientRef,
+    fallbackClient: CodexRuntimeClientRef,
+    isFallback: bool,
+    listeners_status: u64,
+    listeners_message: u64,
+    listeners_stderr: u64,
+}
+
+fn AutoFallbackCodexRuntimeClient_new(primary: &CodexRuntimeClientRef, fallback: &CodexRuntimeClientRef, has_fallback: bool) -> AutoFallbackCodexRuntimeClient {
+    let client = AutoFallbackCodexRuntimeClient {
+        activeClient_kind: primary.kind,
+        primaryClient: primary,
+        fallbackClient: fallback,
+        isFallback: false,
+        listeners_status: 0,
+        listeners_message: 0,
+        listeners_stderr: 0,
+    };
+    // fallbackClient ?? pluginHostServices().mini.createFallbackBridge()
+    // DEFECT: nullish coalescing + host service default approximated by has_fallback flag; when false the host supplies the Mini fallback bridge in fix phase.
+    // this.activeClient = this.primaryClient; this.wirePrimaryEvents();
+    AutoFallbackCodexRuntimeClient_wirePrimaryEvents(&client);
+    return client;
+}
+
+// private wirePrimaryEvents(): primaryClient.on("status"/"message"/"stderr", closures)
+// DEFECT: event subscription with closures capturing `this` and mutable isFallback; approximated by dispatch fns below which the host event pump calls.
+fn AutoFallbackCodexRuntimeClient_wirePrimaryEvents(self: &AutoFallbackCodexRuntimeClient) -> i32 { return 0; }
+
+// Handler for primary "status": if (status.phase==="error" && !isFallback) { console.warn(...); activateFallback(); return; } if (!isFallback) emit("status", status);
+// DEFECT: console.warn approximated by stderr emit in fix phase.
+fn AutoFallbackCodexRuntimeClient_onPrimaryStatus(self: &AutoFallbackCodexRuntimeClient, status: &EngineStatus) -> i32 {
+    if status.phase_len == 5 {
+        if !self.isFallback {
+            AutoFallbackCodexRuntimeClient_activateFallback(self);
+            return 0;
+        };
+    };
+    return 0;
+}
+
+fn AutoFallbackCodexRuntimeClient_onPrimaryMessage(self: &AutoFallbackCodexRuntimeClient, msg: &JsonRpcMessage) -> i32 {
+    return 0; // if (!isFallback) emit("message", msg)
+}
+
+fn AutoFallbackCodexRuntimeClient_onPrimaryStderr(self: &AutoFallbackCodexRuntimeClient, err_ptr: ptr, err_len: u64) -> i32 {
+    return 0; // if (!isFallback) emit("stderr", err)
+}
+
+fn AutoFallbackCodexRuntimeClient_activateFallback(self: &AutoFallbackCodexRuntimeClient) -> i32 {
+    if self.isFallback { return 0; };
+    self.isFallback = true;
+    // try { this.primaryClient.stop(); } catch {}
+    // DEFECT: try/catch-empty approximated; stop dispatch by kind in fix phase.
+    self.activeClient_kind = self.fallbackClient.kind;
+    // fallbackClient.on("status"/"message"/"stderr", guarded closures forwarding only while isFallback)
+    // DEFECT: closure guards approximated by AutoFallbackCodexRuntimeClient_onFallback* dispatch fns.
+    // this.emit("status", this.getStatus());
+    return 0;
+}
+
+fn AutoFallbackCodexRuntimeClient_onFallbackStatus(self: &AutoFallbackCodexRuntimeClient, status: &EngineStatus) -> i32 { return 0; }
+fn AutoFallbackCodexRuntimeClient_onFallbackMessage(self: &AutoFallbackCodexRuntimeClient, msg: &JsonRpcMessage) -> i32 { return 0; }
+fn AutoFallbackCodexRuntimeClient_onFallbackStderr(self: &AutoFallbackCodexRuntimeClient, err_ptr: ptr, err_len: u64) -> i32 { return 0; }
+
+fn AutoFallbackCodexRuntimeClient_isFallbackActive(self: &AutoFallbackCodexRuntimeClient) -> bool {
+    return self.isFallback;
+}
+
+fn AutoFallbackCodexRuntimeClient_getStatus(self: &AutoFallbackCodexRuntimeClient, out: &EngineStatus) -> i32 {
+    // const status = this.activeClient.getStatus();
+    // DEFECT: polymorphic dispatch through interface approximated by kind dispatch in fix phase; primary/daemon getStatus called there.
+    out = self.primaryClient.bridge.status;
+    if self.isFallback {
+        // base = status.message ?? "Mini ready"; if base does not include "fallback to Mini active",
+        // message = `${base} (fallback to Mini active: Codex runtime unavailable)`
+        // DEFECT: template literal + String.includes approximated by message_len bookkeeping in fix phase.
+    };
+    return 0;
+}
+
+// DEFECT: async — async start(): Promise<EngineStatus>
+fn AutoFallbackCodexRuntimeClient_start(self: &AutoFallbackCodexRuntimeClient, out: &EngineStatus) -> i32 {
+    if self.isFallback {
+        // return this.fallbackClient.start();
+        out = self.fallbackClient.bridge.status;
+        return 0;
+    };
+    // try { const status = await primaryClient.start(); if (status.phase==="error") { activateFallback(); return fallbackClient.start(); } return status; }
+    // catch (error) { console.warn(... stringifyError(error)); activateFallback(); return fallbackClient.start(); }
+    // DEFECT: try/catch + console.warn approximated sequentially with rc checks.
+    let rc: i32 = CodexBridge_start(&self.primaryClient.bridge, out);
+    if rc != 0 {
+        AutoFallbackCodexRuntimeClient_activateFallback(self);
+        out = self.fallbackClient.bridge.status;
+        return 0;
+    };
+    if out.phase_len == 5 {
+        AutoFallbackCodexRuntimeClient_activateFallback(self);
+        out = self.fallbackClient.bridge.status;
+        return 0;
+    };
+    return 0;
+}
+
+fn AutoFallbackCodexRuntimeClient_stop(self: &AutoFallbackCodexRuntimeClient) -> i32 {
+    // this.activeClient.stop(); — dispatch by activeClient_kind in fix phase.
+    return 0;
+}
+
+// DEFECT: async — async restart(): Promise<EngineStatus>
+// Source: if isFallback, retry primary first (start; if phase!=="error" switch back, isFallback=false, emit status, return status; catch -> stay), then fallbackClient.restart(); else return this.start().
+fn AutoFallbackCodexRuntimeClient_restart(self: &AutoFallbackCodexRuntimeClient, out: &EngineStatus) -> i32 {
+    if self.isFallback {
+        let rc: i32 = CodexBridge_start(&self.primaryClient.bridge, out);
+        if rc == 0 {
+            if out.phase_len != 5 {
+                self.activeClient_kind = self.primaryClient.kind;
+                self.isFallback = false;
+                return 0;
+            };
+        };
+        // return this.fallbackClient.restart();
+        return CodexBridge_restart(&self.fallbackClient.bridge, out);
+    };
+    return AutoFallbackCodexRuntimeClient_start(self, out);
+}
+
+// DEFECT: async — async request(method, params?, timeoutMs?): Promise<JsonValue>
+// Source guard: if isFallback && isThreadScopedHistoryMethod(method) && threadIdFromParams(params):
+//   try return await fallbackClient.request(...); catch (error) { if (!isThreadMissingError(error)) throw error;
+//     try return await primaryClient.request(...); catch (primaryError) { throw new Error(`Codex runtime unavailable (fallback to Mini active): ${stringifyError(primaryError)}. Restart the Codex runtime and retry history restore.`); } }
+// Otherwise return this.activeClient.request(method, params, timeoutMs).
+fn AutoFallbackCodexRuntimeClient_request(self: &AutoFallbackCodexRuntimeClient, method_ptr: ptr, method_len: u64, params: &JsonValue, timeout_ms: u64, out: &JsonValue) -> i32 {
+    if self.isFallback {
+        if isThreadScopedHistoryMethod(method_ptr, method_len) {
+            let tid_len: u64 = 0;
+            let tid_ptr: ptr = PTR_NULL();
+            if threadIdFromParams(params, tid_ptr, &tid_len) {
+                let rc: i32 = CodexBridge_request(&self.fallbackClient.bridge, method_ptr, method_len, params, timeout_ms, out);
+                if rc == 0 { return 0; };
+                // if (!isThreadMissingError(error)) throw error; — non-missing errors propagate as rc.
+                // DEFECT: error-object inspection (isThreadMissingError over thrown value) approximated: rc==-2 reserved for thread-missing in fix phase.
+                if rc != -2 { return rc; };
+                let prc: i32 = CodexBridge_request(&self.primaryClient.bridge, method_ptr, method_len, params, timeout_ms, out);
+                if prc != 0 {
+                    // throw new Error("Codex runtime unavailable (fallback to Mini active): ... Restart the Codex runtime and retry history restore.")
+                    return -3;
+                };
+                return 0;
+            };
+        };
+    };
+    // return this.activeClient.request(...) — dispatch by activeClient_kind in fix phase; primary bridge used here.
+    if self.isFallback {
+        return CodexBridge_request(&self.fallbackClient.bridge, method_ptr, method_len, params, timeout_ms, out);
+    };
+    return CodexBridge_request(&self.primaryClient.bridge, method_ptr, method_len, params, timeout_ms, out);
+}
+
+// DEFECT: async — async notify(method, params?): Promise<void> { return this.activeClient.notify(method, params); }
+fn AutoFallbackCodexRuntimeClient_notify(self: &AutoFallbackCodexRuntimeClient, method_ptr: ptr, method_len: u64, params: &JsonValue) -> i32 {
+    if self.isFallback {
+        return CodexBridge_notify(&self.fallbackClient.bridge, method_ptr, method_len, params);
+    };
+    return CodexBridge_notify(&self.primaryClient.bridge, method_ptr, method_len, params);
+}
+
+fn AutoFallbackCodexRuntimeClient_respond(self: &AutoFallbackCodexRuntimeClient, id: &JsonRpcId, result: &JsonValue, has_result: bool, error: &JsonRpcError, has_error: bool) -> i32 {
+    if self.isFallback {
+        return CodexBridge_respond(&self.fallbackClient.bridge, id, result, has_result, error, has_error);
+    };
+    return CodexBridge_respond(&self.primaryClient.bridge, id, result, has_result, error, has_error);
+}
+
+// ---- export function createCodexRuntimeClient(runtimeEnv, platform = process.platform, fallbackClient?): CodexRuntimeClient ----
+// DEFECT: default parameter process.platform + process.env access approximated by explicit platform/mode inputs (mode string buffer + is_windows flag).
+// Mode values from process.env.CODEX_UI_APP_SERVER_MODE ?? "auto", trimmed + lowercased.
+// DEFECT: string trim/toLowerCase + ?? approximated by caller-normalized mode buffer.
+fn createCodexRuntimeClient(runtimeEnv: &ProcessEnv, is_windows: bool, mode_ptr: ptr, mode_len: u64, has_fallback: bool, out_kind: &u64) -> i32 {
+    // if (mode === "stdio" || mode === "legacy-stdio") return new VirtualConfigCodexRuntimeClient(new CodexBridge(runtimeEnv));
+    // DEFECT: VirtualConfigCodexRuntimeClient wrapper (from @cxu/sdk-backend) approximated by kind tag; wrapping applied by host in fix phase.
+    // DEFECT: string equality on mode approximated by length dispatch in this pass (5="stdio", 12="legacy-stdio", 6="daemon", 4="auto", 0="", 7="codecli", 4="mini" — auto/mini share length, disambiguated in fix phase by byte compare).
+    if mode_len == 5 { out_kind = 0; return 0; };
+    if mode_len == 12 { out_kind = 0; return 0; };
+    if mode_len == 6 {
+        // mode === "daemon": if (platform === "win32") throw new Error("CODEX_UI_APP_SERVER_MODE=daemon is not supported on Windows because it requires a Unix socket. Use 'auto' or 'stdio'.");
+        if is_windows { return -1; };
+        // return new VirtualConfigCodexRuntimeClient(new DaemonCodexBridge(resolveDefaultSocketPath(), runtimeEnv));
+        out_kind = 1;
+        return 0;
+    };
+    if mode_len == 7 {
+        // mode === "codecli": return new VirtualConfigCodexRuntimeClient(pluginHostServices().codeCli.createBridge(runtimeEnv));
+        out_kind = 2;
+        return 0;
+    };
+    if mode_len == 4 {
+        // mode === "auto" (or "mini", see defect above):
+        // auto: if (!pluginHostServices().codex.isCodexCliAvailable(platform)) return VirtualConfig(fallbackClient ?? mini.createFallbackBridge());
+        //       client = win32 ? CodexBridge : DaemonCodexBridge; return VirtualConfig(new AutoFallbackCodexRuntimeClient(client, fallbackClient));
+        // mini: return VirtualConfig(fallbackClient ?? mini.createFallbackBridge());
+        // DEFECT: host-service availability check + branch between auto/mini approximated; kind 3 = AutoFallback(CodexBridge|Daemon), kind 2 = direct fallback/mini/codecli host bridge.
+        if is_windows { out_kind = 3; return 0; };
+        out_kind = 3;
+        return 0;
+    };
+    if mode_len == 0 {
+        // mode === "" treated as auto (same branch as above in source).
+        out_kind = 3;
+        return 0;
+    };
+    // throw new Error(`Unsupported CODEX_UI_APP_SERVER_MODE '${...}'. Use 'auto', 'daemon', 'stdio', 'codecli', or 'mini'.`);
+    return -1;
+}

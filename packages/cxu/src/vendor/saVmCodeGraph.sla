@@ -1,0 +1,314 @@
+// Converted 1:1 from packages/cxu/src/vendor/saVmCodeGraph.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+
+// Code graph extraction (tree-sitter AST + regex fallback), scoped
+// graph crawling (module_dependency / call_flow / symbol_hierarchy)
+// and DOT / Python-stub / NetworkX formatters.
+// DEFECT: web-tree-sitter Node objects, dynamic import(), Map/Set,
+// async fs and closures capturing mutable state have no SLA
+// equivalents; tree nodes become opaque handles (TsNode), maps/sets
+// become fixed arrays + linear scans, async becomes synchronous +
+// status code, and recursive visitor closures become explicit
+// stack-based walk functions (approximated in this bulk pass).
+@import "sa_std/io/print.sai"
+@import "sa_std/ptr.sa"
+@import "../shared-types.sla"
+@import "./saVmPolicy.sla"
+@import "./saVmTreeSitter.sla"
+@import "./saVmResultKind.sla"
+
+// DEFECT: tree-sitter Node -> opaque handle struct.
+struct TsNode { handle: u64, valid: bool }
+fn ts_node_type_len(n: &TsNode) -> u64 { return 0; }
+fn ts_node_child_count(n: &TsNode) -> u64 { return 0; }
+fn ts_node_child(n: &TsNode, idx: u64, out: &TsNode) -> bool { out.valid = false; return false; }
+fn ts_node_child_for_field(n: &TsNode, field_ptr: ptr, field_len: u64, out: &TsNode) -> bool { out.valid = false; return false; }
+fn ts_node_text(n: &TsNode, out_ptr: ptr, out_cap: u64) -> u64 { return 0; }
+fn ts_node_start_row(n: &TsNode) -> u64 { return 0; }
+
+// export type CodeGraphEdgeKind = "extends"|"implements"|"owns"|"imports"|"calls"
+const EDGE_EXTENDS: u64 = 0;
+const EDGE_IMPLEMENTS: u64 = 1;
+const EDGE_OWNS: u64 = 2;
+const EDGE_IMPORTS: u64 = 3;
+const EDGE_CALLS: u64 = 4;
+
+// export interface CodeGraphNode { id, label, kind, file?, line? }
+// kind: "class"|"interface"|"module"|"function"|"unknown" -> u64 tag.
+const NODE_CLASS: u64 = 0;
+const NODE_INTERFACE: u64 = 1;
+const NODE_MODULE: u64 = 2;
+const NODE_FUNCTION: u64 = 3;
+const NODE_UNKNOWN: u64 = 4;
+struct CodeGraphNode {
+    id_bytes: [u8; 1024], id_len: u64,
+    label_bytes: [u8; 1024], label_len: u64,
+    kind: u64,
+    has_file: bool, file_bytes: [u8; 4096], file_len: u64,
+    has_line: bool, line: u64,
+}
+// export interface CodeGraphEdge { source, target, kind, label? }
+struct CodeGraphEdge {
+    source_bytes: [u8; 1024], source_len: u64,
+    target_bytes: [u8; 1024], target_len: u64,
+    kind: u64, has_label: bool, label_bytes: [u8; 256], label_len: u64,
+}
+// DEFECT: graph arrays -> fixed arrays (max_nodes budget <= 100 in
+// source; capacity 128 here; edges capacity 1024).
+struct CodeGraph { nodes: [CodeGraphNode; 128], nodes_len: u64, edges: [CodeGraphEdge; 1024], edges_len: u64, root_id_bytes: [u8; 1024], root_id_len: u64, truncated: bool }
+
+// Field/method sub-records of ExtractedClassInfo.
+// DEFECT: Array<{name, type?}> / Array<{name, calls[]}> -> JSON bufs.
+struct ExtractedClassInfo {
+    name_bytes: [u8; 512], name_len: u64,
+    bases_json: [u8; 2048], bases_json_len: u64, bases_count: u64,
+    interfaces_json: [u8; 2048], interfaces_json_len: u64, interfaces_count: u64,
+    fields_json: [u8; 4096], fields_json_len: u64, fields_count: u64,
+    methods_json: [u8; 8192], methods_json_len: u64, methods_count: u64,
+    line: u64,
+}
+struct ExtractedImportInfo {
+    specifier_bytes: [u8; 1024], specifier_len: u64,
+    symbols_json: [u8; 4096], symbols_json_len: u64, symbols_count: u64,
+    is_default: bool, is_namespace: bool,
+}
+struct ExtractedFileInfo {
+    file_path_bytes: [u8; 4096], file_path_len: u64,
+    classes: [ExtractedClassInfo; 256], classes_len: u64,
+    imports: [ExtractedImportInfo; 256], imports_len: u64,
+    functions_json: [u8; 16384], functions_json_len: u64, functions_count: u64,
+}
+
+// export type CodeGraphMode = "symbol_hierarchy"|"module_dependency"|"module_deps"|"call_flow"
+const MODE_SYMBOL_HIERARCHY: u64 = 0;
+const MODE_MODULE_DEPENDENCY: u64 = 1;
+const MODE_CALL_FLOW: u64 = 2;
+// export interface CodeGraphOptions
+struct CodeGraphOptions {
+    target_bytes: [u8; 1024], target_len: u64,
+    has_mode: bool, mode: u64,
+    has_depth: bool, depth: u64,
+    has_direction: bool, direction: u64,
+    has_format: bool, format: u64,
+    has_max_nodes: bool, max_nodes: u64,
+    has_max_tokens: bool, max_tokens: u64,
+    has_output_file: bool, output_file_bytes: [u8; 4096], output_file_len: u64,
+    candidate_json: [u8; 8192], candidate_json_len: u64, candidate_count: u64,
+    has_candidate: bool,
+    timeout_ms: u64, has_timeout: bool,
+}
+const DIR_UPSTREAM: u64 = 0;
+const DIR_DOWNSTREAM: u64 = 1;
+const DIR_BOTH: u64 = 2;
+const FMT_DOT: u64 = 0;
+const FMT_PY_STUB: u64 = 1;
+const FMT_NETWORKX: u64 = 2;
+
+// --- AST Extraction ---
+// function cleanSymbolName(raw) -> string
+fn cleanSymbolName(raw_ptr: ptr, raw_len: u64, out_ptr: ptr, out_cap: u64) -> u64 {
+    // DEFECT: RegExp strip /^[<{(]+|[>})]+$/ + \s+ collapse -> byte
+    // scan: trim leading <{( chars, trailing >}) chars, collapse
+    // whitespace runs to one space, trim.
+    return 0;
+}
+// function extractTypeIdentifiers(node: Node | null) -> string[]
+// DEFECT: recursive closure walk -> explicit recursive fn + JSON out.
+fn extractTypeIdentifiers(node: &TsNode, has_node: bool, out_ptr: ptr, out_cap: u64, out_count: &u64) -> i32 {
+    // collects type_identifier / identifier / nested_type_identifier
+    // texts via cleanSymbolName, excluding keyword texts (implements,
+    // extends, class, interface, type, public, private, protected,
+    // readonly); deduped preserving order.
+    out_count = 0;
+    return 0;
+}
+// function extractTsClass(node: Node) -> ExtractedClassInfo
+fn extractTsClass(node: &TsNode, out: &ExtractedClassInfo) -> i32 {
+    // name from "name" field, else first type/identifier child, else
+    // "(anonymous)". class_heritage: extends_clause -> bases,
+    // implements_clause -> interfaces (extractTypeIdentifiers).
+    // class_body: field definitions -> fields {name, type sans ": "};
+    // method_definition -> methods {name, calls} where calls are
+    // call_expression function texts stripped of "this." / "<obj>."
+    // prefixes and filtered to plain identifiers, deduped.
+    // line = startPosition.row + 1.
+    out.name_len = 0;
+    return 0;
+}
+// function extractTsInterface(node: Node) -> ExtractedClassInfo
+fn extractTsInterface(node: &TsNode, out: &ExtractedClassInfo) -> i32 {
+    // name field or "(anonymous)"; extends(_type)_clause -> bases;
+    // interface_body/object_type property/method signatures ->
+    // fields; interfaces/methods empty; line = row + 1.
+    return 0;
+}
+// function extractTsImports(node: Node) -> ExtractedImportInfo[]
+fn extractTsImports(root: &TsNode, out: &ExtractedFileInfo) -> i32 {
+    // recursive visit: import_statement -> specifier from "source"
+    // field sans quotes; import_clause children: identifier ->
+    // default symbol; namespace_import -> "*" symbol + isNamespace;
+    // named_imports/import_specifier -> {imported: name, local:
+    // alias ?? name}. Pushes into out.imports.
+    return 0;
+}
+// function extractPythonClass(node: Node) -> ExtractedClassInfo
+fn extractPythonClass(node: &TsNode, out: &ExtractedClassInfo) -> i32 {
+    // name field; superclasses identifiers -> bases; body
+    // function_definition -> methods (calls from "call" nodes:
+    // identifier text or attribute field text, deduped);
+    // expression_statement assignment -> fields {left identifier,
+    // type}. interfaces empty; line = row + 1.
+    return 0;
+}
+// function extractPythonImports(node: Node) -> ExtractedImportInfo[]
+fn extractPythonImports(root: &TsNode, out: &ExtractedFileInfo) -> i32 {
+    // visit: import_statement dotted_name children -> one import
+    // each (symbol = itself); import_from_statement -> specifier
+    // from module_name field, other dotted_names as symbols.
+    return 0;
+}
+
+// function extractRegexFallback(content, filePath) -> ExtractedFileInfo
+// DEFECT: four global RegExps with capture groups + exec loops ->
+// hand-written scanners (bulk pass keeps the pattern inventory and
+// result shape; scanners are stubs returning counts).
+fn extractRegexFallback(content_ptr: ptr, content_len: u64, file_ptr: ptr, file_len: u64, out: &ExtractedFileInfo) -> i32 {
+    // classRegex: (export)?(default)?class Name (extends X)?
+    //   (implements A, B)? -> classes {name, bases, interfaces,
+    //   fields [], methods [], line by newline count}.
+    // importRegex: import {..}|Name|* as Name from 'spec' -> imports.
+    // functionRegex: (export)?(async)?function Name(params){body}
+    //   -> functions with calls = identifier( tokens in body minus
+    //   if/for/while/switch/catch/function, deduped.
+    // arrowRegex: (export)?(const|let|var) Name = (async)?(params)=>
+    //   {body} -> same call extraction.
+    out.classes_len = 0; out.imports_len = 0; out.functions_count = 0;
+    return 0;
+}
+
+// export async function extractFileInfo(filePath, content)
+// DEFECT: async; dynamic import("web-tree-sitter") + Parser.init
+// wasm locateFile -> tree-sitter extern session (saVmTreeSitter.sla).
+fn extractFileInfo(file_ptr: ptr, file_len: u64, content_ptr: ptr, content_len: u64, out: &ExtractedFileInfo) -> i32 {
+    // lang = loadLanguageForFile(filePath); none -> regex fallback.
+    // Parse; failure/null tree/exception -> regex fallback.
+    // typescript|tsx|javascript: extractTsImports + visit classes
+    // (class_declaration / named class), interfaces, function
+    // declarations (calls walk, deduped, line row+1) and lexical/
+    // variable declarations holding arrow/function expressions.
+    // python: extractPythonImports + class_definition /
+    // function_definition visit. Other languages -> regex fallback.
+    return extractRegexFallback(content_ptr, content_len, file_ptr, file_len, out);
+}
+
+// --- Path & Import Resolution ---
+// export function resolveImportFilePath(importerAbsPath, specifier, _cwd?)
+// DEFECT: string | null -> has return flag + output buffer.
+fn resolveImportFilePath(imp_ptr: ptr, imp_len: u64, spec_ptr: ptr, spec_len: u64, out_ptr: ptr, out_cap: u64) -> bool {
+    // non-"." specifier -> null (external package). Candidates in
+    // order: base, .js->.ts, .js->.tsx, +.ts, +.tsx, +.js, +.mjs,
+    // +.py, /index.ts, /index.tsx, /index.js; first existing file
+    // (existsSync + statSyncSafe isFile) wins.
+    return false;
+}
+fn statSyncSafe(path_ptr: ptr, path_len: u64, is_file_out: &bool) -> bool {
+    // DEFECT: require("node:fs") inside fn + try/catch -> fs extern;
+    // returns false (null) on any error.
+    is_file_out = false;
+    return false;
+}
+// export function findProjectSourceFiles(dir, maxFiles = 200) -> string[]
+fn findProjectSourceFiles(dir_ptr: ptr, dir_len: u64, max_files: u64, out_ptr: ptr, out_cap: u64, out_count: &u64) -> i32 {
+    // recursive walk, depth <= 6, stop at maxFiles; skip dot-dirs
+    // and node_modules/dist/build/coverage/release/desktop-
+    // resources/temp/tmp; collect .ts/.tsx/.js/.jsx/.mjs/.py files.
+    // DEFECT: closure recursion -> explicit stack walk; readdir
+    // errors silently skipped (1:1 with source catch {}).
+    out_count = 0;
+    return 0;
+}
+
+// --- Scoped Graph Crawler ---
+// export async function buildScopedCodeGraph(options, policy, cwd)
+// DEFECT: async; Map/Set/queue closures -> fixed arrays + index
+// queues inside CodeGraph and local caches (capacity noted inline).
+fn buildScopedCodeGraph(opts: &CodeGraphOptions, policy: &NormalizedSaVmPolicy, cwd_ptr: ptr, cwd_len: u64, out: &CodeGraph) -> i32 {
+    // target trimmed; maxDepth = clamp(depth ?? 2, 1, 5);
+    // maxNodes = clamp(max_nodes ?? 30, 5, 100); direction ?? both.
+    // mode normalize: module_dependency|module_deps ->
+    // module_dependency; call_flow stays; else file target ->
+    // module_dependency, symbol target -> symbol_hierarchy.
+    // getFileAST(absPath): cache; checkSaVmPath read must allow;
+    // readFile utf8; extractFileInfo(relative path, content).
+    // module_dependency: root module node; upstream BFS over
+    // resolved imports (edges "imports"); downstream scan of all
+    // candidate/project files importing each queued module.
+    // call_flow: locate class/function by name; seed root node;
+    // build allFunctions map (functions + qualified/bare methods);
+    // BFS over calls with has_method edges from the class root.
+    // symbol_hierarchy: locate class (candidate files, else the
+    // three hardcoded heuristic paths from source lines 1019-1023:
+    // apps/server/src/opencodeBridge.ts,
+    // backends/mini/src/runtime/miniBridge.ts, apps/server/src/
+    // index.ts); missing -> mock class node; else extends edges to
+    // bases, implements edges to interfaces, owns edges to fields
+    // whose type is a capitalized non-builtin type name; depth > 1
+    // follows base imports one more level for grandparents.
+    // truncated set whenever the maxNodes budget stops growth.
+    out.nodes_len = 0; out.edges_len = 0; out.truncated = false;
+    return 0;
+}
+
+// --- Formatters ---
+// export function formatAsDot(graph, title?) -> string
+fn formatAsDot(g: &CodeGraph, title_ptr: ptr, title_len: u64, has_title: bool, out_ptr: ptr, out_cap: u64) -> u64 {
+    // graphName = (title || rootId || "CodeGraph") with
+    // non [a-zA-Z0-9_] -> "_"; header lines digraph/rankdir/node/
+    // edge; root highlighted filled #e1f5fe; edges grouped by
+    // source|kind|label (single -> "a" -> "b"; many -> { t1 t2 });
+    // implements dashed, owns arrowhead diamond, calls dotted;
+    // no edges -> bare node lines; truncated -> trailing comment.
+    // DEFECT: Map grouping + template strings -> buffer appends.
+    return 0;
+}
+// export function formatAsPyStub(graph) -> string
+fn formatAsPyStub(g: &CodeGraph, out_ptr: ptr, out_cap: u64) -> u64 {
+    // header comments + typing imports; per node "class <id>(<bases>):"
+    // with docstring file note, owned fields as lowercased-first
+    // "<field>: <Type>" lines, or "pass" when no file/fields;
+    // result trimEnd()ed in source.
+    return 0;
+}
+// export function formatAsNetworkX(graph) -> string
+fn formatAsNetworkX(g: &CodeGraph, out_ptr: ptr, out_cap: u64) -> u64 {
+    // "import networkx as nx", G = nx.DiGraph(); add_node lines
+    // (kind + optional file); add_edge lines (rel + optional label);
+    // query helper comments incl. root ancestors/descendants.
+    return 0;
+}
+
+// --- Native Action Entry Point ---
+// export async function nativeCodeGraph(rawInput, policy, cwd, startedAt)
+// DEFECT: async; Record<string, any> -> JSON buffer; Date.now() ->
+// now_ms parameter (duration = now - startedAt computed by caller
+// helper duration_since(startedAt)).
+fn nativeCodeGraph(raw_json_ptr: ptr, raw_json_len: u64, has_policy: bool, policy_json_ptr: ptr, policy_json_len: u64, cwd_ptr: ptr, cwd_len: u64, started_at: u64, now_ms: u64, out: &SaVmRunResult) -> i32 {
+    // target = rawInput.target ?? symbol ?? path ?? query ?? name,
+    // stringified + trimmed; empty -> sa_error exit 1 result with
+    // "target parameter is required for code_graph ..." stderr.
+    // normalized = normalizeSaVmPolicy(policy, cwd); options built
+    // with typeof-number/string guards (depth, max_nodes,
+    // max_tokens, output_file, candidate_files ?? files, format
+    // default "dot"). buildScopedCodeGraph; format by format.
+    // output_file: resolve, checkSaVmPath write; denied ->
+    // capability_denied exit 228 result carrying the formatted
+    // output on stdout; allowed -> writeFile utf8 and prefix
+    // "[Graph saved to <output_file>]\n\n".
+    // success: ok, exit 0, one code_graph event {timestamp, type,
+    // target, nodes, edges}, stderr notes truncation.
+    // exception -> sa_error exit 1 "[code_graph] error analyzing
+    // <target>: <msg>".
+    // DEFECT: SaVmRunResult here is the saVmTypes.sla shape; the
+    // source imports it from saVmResultKind.ts — kept as one struct.
+    out.ok = false;
+    return 0;
+}

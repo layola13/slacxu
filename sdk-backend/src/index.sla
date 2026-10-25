@@ -1,0 +1,248 @@
+// Converted 1:1 from sdk-backend/src/index.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// @cxu/sdk-backend — the server-side plugin contract.
+//
+// An independent project (own repo, own version). This SDK is the ONLY
+// contract between a plugin's server side and the server host: plugins
+// never import host internals, the host never imports plugin internals.
+// The frontend has its own separate SDK (@cxu/sdk-frontend); the
+// two agree only on the `plugin.json` manifest file format below.
+//
+// A backend id is an opaque string to the host. An id the registry does
+// not know is simply "not installed" — never a reason to fall back to
+// another backend.
+
+@import "sa_std/ptr.sa"
+
+// DEFECT: TS `as const` string tuple + (typeof T)[number] union ->
+// flat newline-joined table + tag comment. WellKnownPluginId is
+// one of: mini, codex, claude, agy, grok, pi, opencode,
+// opencode-v2, muse.
+let WELL_KNOWN_PLUGIN_IDS_FLAT = "mini\ncodex\nclaude\nagy\ngrok\npi\nopencode\nopencode-v2\nmuse";
+let WELL_KNOWN_PLUGIN_IDS_COUNT: u64 = 9;
+
+// Coarse feature flags a plugin declares; the web SDK mirrors them.
+struct PluginCapabilities {
+    history: bool,
+    compaction: bool,
+    slashCommandForwarding: bool,
+    skills: bool,
+    mcp: bool,
+    fileParts: bool,
+    permissionRoundTrips: bool,
+}
+
+fn no_capabilities(out: &PluginCapabilities) -> void {
+    out.history = false;
+    out.compaction = false;
+    out.slashCommandForwarding = false;
+    out.skills = false;
+    out.mcp = false;
+    out.fileParts = false;
+    out.permissionRoundTrips = false;
+}
+
+// The `plugin.json` manifest schema (shared file format of both SDKs).
+struct PluginManifest {
+    // Plugin id, e.g. "opencode-v2" or "web-shell". Opaque to the hosts.
+    id: [u8; 128],
+    id_len: u64,
+    // Plugin kind: "backend" | "service" | "framework" | "feature".
+    kind: [u8; 32],
+    kind_len: u64,
+    // Plugin version (semver), independent of every other project.
+    version: [u8; 64],
+    version_len: u64,
+    displayName: [u8; 256],
+    displayName_len: u64,
+    // Which entry points this plugin ships. Either side may be absent.
+    sides_server: bool,
+    sides_web: bool,
+    // Only "mini" is true: installed and enabled on a fresh install.
+    defaultInstalled: bool,
+    capabilities: PluginCapabilities,
+    // Optional web presentation hints (single source: plugin.json).
+    has_presentation: bool,
+    presentation_label: [u8; 128],
+    presentation_label_len: u64,
+    presentation_icon: [u8; 128],
+    presentation_icon_len: u64,
+    has_presentation_labelKey: bool,
+    presentation_labelKey: [u8; 128],
+    presentation_labelKey_len: u64,
+}
+
+// Registry of INSTALLED server plugins. Available-but-not-installed
+// plugins are not in here: they get no engine and no history scope.
+// A fresh install registers exactly the defaultInstalled plugins.
+// DEFECT: TS class with a private Map<string, ServerPlugin> ->
+// struct with a fixed table (cap 64, registration order kept) of
+// ServerPlugin handles (u64 into the host's plugin table, since
+// ServerPlugin itself is a contract struct in server.sla).
+// DEFECT: register() throws on duplicate -> status code 5.
+struct ServerPluginRegistry {
+    ids: [u8; 8192],
+    id_off: [u64; 64],
+    id_len: [u64; 64],
+    plugins: [u64; 64],
+    count: u64,
+    arena_len: u64,
+}
+
+fn registry_index_of(reg: &ServerPluginRegistry, id_ptr: ptr, id_len: u64) -> u64 {
+    for i in 0..reg.count {
+        if reg.id_len[i] == id_len {
+            let same = true;
+            for j in 0..id_len {
+                let a = reg.ids[reg.id_off[i] + j];
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, id_ptr, j);
+                if a != b { same = false; break; };
+            }
+            if same { return i; };
+        };
+    }
+    return 4294967295;
+}
+
+fn serverPluginRegistry_register(reg: &ServerPluginRegistry, manifest_id_ptr: ptr, manifest_id_len: u64, plugin: u64) -> i32 {
+    if registry_index_of(reg, manifest_id_ptr, manifest_id_len) != 4294967295 { return 5; };
+    if reg.count >= 64 { return 5; };
+    let off = reg.arena_len;
+    for j in 0..manifest_id_len {
+        if reg.arena_len < 8192 {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, manifest_id_ptr, j);
+            reg.ids[reg.arena_len] = b;
+            reg.arena_len = reg.arena_len + 1;
+        };
+    }
+    reg.id_off[reg.count] = off;
+    reg.id_len[reg.count] = manifest_id_len;
+    reg.plugins[reg.count] = plugin;
+    reg.count = reg.count + 1;
+    return 0;
+}
+
+fn serverPluginRegistry_unregister(reg: &ServerPluginRegistry, id_ptr: ptr, id_len: u64) -> bool {
+    let idx = registry_index_of(reg, id_ptr, id_len);
+    if idx == 4294967295 { return false; };
+    // DEFECT: removal compacts the handle table but leaves the id
+    // arena bytes orphaned (Map.delete semantics approximated).
+    let i = idx;
+    while i + 1 < reg.count {
+        reg.id_off[i] = reg.id_off[i + 1];
+        reg.id_len[i] = reg.id_len[i + 1];
+        reg.plugins[i] = reg.plugins[i + 1];
+        i = i + 1;
+    }
+    reg.count = reg.count - 1;
+    return true;
+}
+
+// The installed plugin for an id, or undefined — never a substitute.
+// DEFECT: undefined -> bool + out handle.
+fn serverPluginRegistry_get(reg: &ServerPluginRegistry, id_ptr: ptr, id_len: u64, out: &u64) -> bool {
+    let idx = registry_index_of(reg, id_ptr, id_len);
+    if idx == 4294967295 { return false; };
+    out = reg.plugins[idx];
+    return true;
+}
+
+fn serverPluginRegistry_has(reg: &ServerPluginRegistry, id_ptr: ptr, id_len: u64) -> bool {
+    return registry_index_of(reg, id_ptr, id_len) != 4294967295;
+}
+
+// ids(): string[] -- writes newline-joined ids into out.
+// DEFECT: string[] -> flat buffer + count via reg.count.
+fn serverPluginRegistry_ids(reg: &ServerPluginRegistry, out_bytes: &[u8; 8192], out_len: &u64) -> void {
+    out_len = 0;
+    for i in 0..reg.count {
+        if i > 0 {
+            if out_len < 8192 {
+                out_bytes[out_len] = 10;
+                out_len = out_len + 1;
+            };
+        };
+        for j in 0..reg.id_len[i] {
+            if out_len < 8192 {
+                out_bytes[out_len] = reg.ids[reg.id_off[i] + j];
+                out_len = out_len + 1;
+            };
+        }
+    }
+}
+
+// list(): ServerPlugin[] in registration order (handles).
+fn serverPluginRegistry_list(reg: &ServerPluginRegistry, out: &[u64; 64], out_count: &u64) -> void {
+    out_count = reg.count;
+    for i in 0..reg.count {
+        out[i] = reg.plugins[i];
+    }
+}
+
+// defaultPlugin(): first plugin whose manifest.defaultInstalled
+// is true. DEFECT: needs the manifest of each handle; the caller
+// supplies the flags table parallel to registration order.
+fn serverPluginRegistry_defaultPlugin(reg: &ServerPluginRegistry, defaultInstalled_flags: &[bool; 64], out: &u64) -> bool {
+    for i in 0..reg.count {
+        if defaultInstalled_flags[i] {
+            out = reg.plugins[i];
+            return true;
+        };
+    }
+    return false;
+}
+
+// Re-export forwarding (barrel). Each TS export line maps to the
+// module that defines it; SLA has no re-export mechanism, so the
+// imports below stand in for them (DEFECT: barrel forwarding).
+// export type { CliDiscoverySpec, EngineHandle, EngineStatus, PluginInstallation, RpcContext, ServerHost, ServerPlugin } from "./server.ts"
+@import "server.sla"
+// export type { RelayConfigPlugin, RelayStation, ServiceHost, ServicePlugin } from "./service.ts"
+@import "service.sla"
+// export * from "./runtimeClient.ts"
+@import "runtimeClient.sla"
+// export { pageThreadHistory } from "./threadHistoryPaging.ts"
+@import "threadHistoryPaging.sla"
+// export { setPluginHostServices, tryPluginHostServices, pluginHostServices, type CliSelectionKind, type PluginHostServices } from "./hostServices.ts"
+@import "hostServices.sla"
+// export type { NotePriorityLevel, SaVmActionType, SaVmFsCapability, SaVmNetCapability, SaVmRunInput, SaVmRunResult } + { SaVmCapabilityDeniedError, SaVmInputError } from "./saVmTypes.ts"
+@import "saVmTypes.sla"
+// export { isSystemWebSearchPermissionRequest } from "./systemWebSearch.ts"
+@import "systemWebSearch.sla"
+// export { loadRegressionCases, resolveRegressionCasesDir, type RegressionCase, type RegressionCaseFilter } from "./regressionCases.ts"
+@import "regressionCases.sla"
+// export { codexUiDataDir } from "./dataDir.ts"
+@import "dataDir.sla"
+// export { ClaudeSkillInventory, expandClaudeSkillInput, skillGroupsJson, types } from "./claudeSkillInventory.ts"
+@import "claudeSkillInventory.sla"
+// export { VirtualCodexConfigStore, VirtualConfigCodexRuntimeClient, prepareVirtualCodexConfig, resolveCodexUserConfigPath, resolveVirtualCodexConfigPath, syncModelProvidersToUserConfig } from "./codexVirtualConfig.ts"
+@import "codexVirtualConfig.sla"
+// export { OPENCODE_* , session fns, type OpenCodeBackendKind } from "./openCodeSessionProtocol.ts"
+@import "openCodeSessionProtocol.sla"
+// export { getSaVmGlobalDataDir, getSaVmProjectDataDir, resolveSaVmMcpScriptPath, resolveSaVmMcpSourceCandidates, SA_VM_MCP_SCRIPT_NAME } from "./saVmPaths.ts"
+@import "saVmPaths.sla"
+// export { isBunRuntime, isNodeRuntime } from "./runtimeDetect.ts"
+@import "runtimeDetect.sla"
+// export { openNodeRuntimeDatabase, openRuntimeDatabase, type RuntimeDatabase } from "./runtimeDatabase.ts"
+@import "runtimeDatabase.sla"
+// export * from "./saVmWorkspaceSkill.ts"
+@import "saVmWorkspaceSkill.sla"
+// export * from "./imagePersistence.ts"
+@import "imagePersistence.sla"
+// export { STORM_STALLED_AFTER_ATTEMPTS, STORM_STALLED_AFTER_MS } from "./streamRetryThresholds.ts"
+@import "streamRetryThresholds.sla"
+// export * from "./goalContinuation.ts"
+@import "goalContinuation.sla"
+// export * from "./codexFallbackInstructions.ts"
+@import "codexFallbackInstructions.sla"
+// export { normalizeMemoryScope, resolveGlobalMemoryFilePath, resolveWorkspaceMemoryFilePath, type MemoryScope } from "./memoryFilePaths.ts"
+@import "memoryFilePaths.sla"
+// export type { RemoteThreadRoute } from "./remoteThreadRoute.ts"
+@import "remoteThreadRoute.sla"
+// export { CODEX_ULTRA_MODEL_CATALOG_FILE } from "./modelCatalog.ts"
+@import "modelCatalog.sla"
+// export { resolveCliSpawn, resolveWindowsComSpec, resolveWindowsPowerShell, spawnCli, spawnCliSync } from "./cliSpawn.ts"
+@import "cliSpawn.sla"
+// export { createBridgeEventLogger, type BridgeEventLogger } from "./bridgeEventLog.ts"
+@import "bridgeEventLog.sla"

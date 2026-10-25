@@ -1,0 +1,243 @@
+// Converted 1:1 from backends/pi/src/runtime/piRuntimeAdapter.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+
+@import "sa_std/io/print.sai"
+@import "piRpcProcessManager.sla"
+@import "piTurnProjector.sla"
+@import "piRpcProtocol.sla"
+
+// DEFECT: EventEmitter base class — emit("notification"|"stderr"|"exit"|"error")
+// becomes callback slots on the adapter, noted per call site.
+
+// export const PI_ABORT_ACK_TIMEOUT_MS = 2_000;
+// Pi RPC does not include a turn id on lifecycle events. After an abort ACK,
+// the old agent may still emit its terminal event; wait briefly for that event
+// before allowing a new prompt, otherwise it can settle the new mutable ctx.
+// export const PI_ABORT_SETTLE_TIMEOUT_MS = 2_000;
+// (values recorded here; SLA const syntax applied in the repair phase)
+
+struct PiRuntimeConfig {
+    thread_id: [128]u8,
+    thread_id_len: u64,
+    cwd: [1024]u8,
+    cwd_len: u64,
+    session_id: [256]u8, // sessionId?: string
+    session_id_len: u64,
+    has_session_id: bool,
+    model: [1024]u8, // model?: string
+    model_len: u64,
+    has_model: bool,
+    has_relay_config: bool,
+    relay_config: PiRelayConfig,
+    // envOverrides?: Record<string, string> — DEFECT: dynamic object, JSON text.
+    env_overrides_json: [8192]u8,
+    env_overrides_json_len: u64,
+    has_env_overrides: bool,
+    session_dir: [1024]u8, // sessionDir?: string
+    session_dir_len: u64,
+    has_session_dir: bool,
+}
+
+// PiRuntimeAdapter manages the communication between Ultra's thread model
+// and an underlying Pi RPC process.
+// DEFECT: the settlementWaiter is a { resolve, promise } pair — a manually
+// resolved Promise; approximated by a flag the message handler sets.
+struct PiRuntimeAdapter {
+    process: PiRpcProcessManager, // PiRpcProcessManager | null via has_process
+    has_process: bool,
+    ctx: PiProjectorContext, // PiProjectorContext | null via has_ctx
+    has_ctx: bool,
+    config: PiRuntimeConfig,
+    settlement_waiter_active: bool, // settlementWaiter !== null
+}
+
+fn pi_runtime_adapter_new(cfg: &PiRuntimeConfig, out: &PiRuntimeAdapter) -> i32 {
+    out.config = cfg;
+    out.has_process = false;
+    out.has_ctx = false;
+    out.settlement_waiter_active = false;
+    return 0;
+}
+
+// updateConfig(updates: Partial<PiRuntimeConfig>): Object.assign(this.config, updates)
+// DEFECT: Partial<> + Object.assign shallow merge; approximated by copying the
+// fields the caller marked present (flags on the updates struct).
+fn pi_runtime_adapter_update_config(adapter: &PiRuntimeAdapter, updates: &PiRuntimeConfig) -> i32 {
+    if updates.has_session_id {
+        adapter.config.session_id_len = updates.session_id_len;
+        adapter.config.has_session_id = true;
+    };
+    if updates.has_model {
+        adapter.config.model_len = updates.model_len;
+        adapter.config.has_model = true;
+    };
+    if updates.has_relay_config {
+        adapter.config.relay_config = updates.relay_config;
+        adapter.config.has_relay_config = true;
+    };
+    adapter.config.cwd_len = updates.cwd_len;
+    // DEFECT: byte payloads copied alongside lengths in the repair phase.
+    return 0;
+}
+
+// get threadId(): this.config.threadId — length accessor.
+fn pi_runtime_adapter_thread_id(adapter: &PiRuntimeAdapter) -> u64 {
+    return adapter.config.thread_id_len;
+}
+
+// get sessionId(): this.ctx?.sessionId ?? this.config.sessionId ?? this.config.threadId
+// DEFECT: nullish chain approximated by flag checks; returns which source won
+// (0 = ctx, 1 = config.sessionId, 2 = config.threadId) and the length via out_len.
+fn pi_runtime_adapter_session_id(adapter: &PiRuntimeAdapter, out_len: &u64) -> u64 {
+    if adapter.has_ctx && adapter.ctx.has_session_id {
+        out_len = adapter.ctx.session_id_len;
+        return 0;
+    };
+    if adapter.config.has_session_id {
+        out_len = adapter.config.session_id_len;
+        return 1;
+    };
+    out_len = adapter.config.thread_id_len;
+    return 2;
+}
+
+// get isRunning(): this.process !== null && this.process.isRunning()
+fn pi_runtime_adapter_is_running(adapter: &PiRuntimeAdapter) -> bool {
+    return adapter.has_process && pi_rpc_process_manager_is_running(&adapter.process);
+}
+
+// get isTurnActive(): this.process !== null && this.process.isTurnActive
+fn pi_runtime_adapter_is_turn_active(adapter: &PiRuntimeAdapter) -> bool {
+    return adapter.has_process && pi_rpc_process_manager_is_turn_active(&adapter.process);
+}
+
+// start(): starts the persistent Pi RPC process if not already running.
+// Registers the proc handlers (source order):
+//   proc.on("message"): ignore when this.process !== proc (stale flush);
+//     agent_settled resolves + clears the settlement waiter; when ctx exists,
+//     projectPiMessage -> toPiNotification -> emit("notification") per event.
+//   proc.on("stderr"): emit("stderr", text).
+//   proc.on("exit"): when ctx running, forceTerminatePi(ctx, "failed",
+//     `Pi process exited unexpectedly with code=${code}, signal=${signal}`)
+//     projected out; process = null; emit("exit", { code, signal }).
+//   proc.on("error"): same force-terminate with err.message; emit("error", err).
+//   proc.on("timeout"): force-terminate with `Pi timeout (${type}): ${details}`.
+// DEFECT: closures capturing `proc` identity + EventEmitter registration have
+// no counterpart; handlers become the pi_runtime_adapter_on_* entry points
+// below, dispatched by the process manager with an identity token.
+fn pi_runtime_adapter_start(adapter: &PiRuntimeAdapter) -> i32 {
+    if adapter.has_process && pi_rpc_process_manager_is_running(&adapter.process) { return 0; };
+    // const procConfig: PiProcessConfig = { threadId, workspaceCwd: cwd, model,
+    //   sessionDir, relayConfig, envOverrides } (from this.config)
+    // const proc = new PiRpcProcessManager(procConfig); this.process = proc;
+    // ... handler registrations ...
+    // proc.start();
+    let rc = pi_rpc_process_manager_start(&adapter.process);
+    if rc == 0 { adapter.has_process = true; };
+    return rc;
+}
+
+// proc "message" handler body (see start() notes).
+// DEFECT: projected notifications are emitted one by one; here they are
+// accumulated into `events` and handed to the bridge's notification sink.
+fn pi_runtime_adapter_on_message(adapter: &PiRuntimeAdapter, msg: &PiRpcIncomingMessage, events: &PiProjectedEvents) -> i32 {
+    // if (msg.type === "agent_settled") { settlementWaiter?.resolve(); settlementWaiter = null; }
+    // DEFECT: type check on raw JSON deferred; the waiter flag is cleared by the
+    // caller when it has identified agent_settled.
+    if !adapter.has_ctx { events.len = 0; return 0; };
+    return project_pi_message(msg, &adapter.ctx, events);
+    // for (const p of projected) { const notif = toPiNotification(p); if (notif) emit(...); }
+}
+
+// proc "exit"/"error"/"timeout" handler bodies: when ctx.status === "running",
+// forceTerminatePi fallback events are projected to notifications (see start()).
+fn pi_runtime_adapter_on_process_failure(adapter: &PiRuntimeAdapter, err_ptr: ptr, err_len: u64, events: &PiProjectedEvents) -> i32 {
+    events.len = 0;
+    if adapter.has_ctx && adapter.ctx.status == 0 {
+        return force_terminate_pi(&adapter.ctx, 2, err_ptr, err_len, true, events);
+    };
+    return 0;
+}
+
+// async executeTurn(prompt, turnId): Promise<void>
+// DEFECT: async — synchronous here; the prompt response is awaited via the
+// process manager's pending-command mechanism in the source.
+fn pi_runtime_adapter_execute_turn(adapter: &PiRuntimeAdapter, prompt_ptr: ptr, prompt_len: u64, turn_id_ptr: ptr, turn_id_len: u64) -> i32 {
+    pi_runtime_adapter_start(adapter);
+    // const turnCtx = createPiProjectorContext(this.config.threadId, turnId);
+    // turnCtx.hasStartedTurn = true; turnCtx.sessionId = this.sessionId; this.ctx = turnCtx;
+    create_pi_projector_context(adapter.config.thread_id, adapter.config.thread_id_len, turn_id_ptr, turn_id_len, &adapter.ctx);
+    adapter.ctx.has_started_turn = true;
+    adapter.has_ctx = true;
+    // const resp = await this.process!.sendCommand({ type: "prompt",
+    //   message: prompt, streamingBehavior: "steer" });
+    // DEFECT: non-null assertion this.process! has no counterpart.
+    let cmd = PiRpcCommand { type_bytes: [0u8; 32], type_len: 6, has_id: false, id: [0u8; 128], id_len: 0, message: [0u8; 8192], message_len: prompt_len, has_images: false, images_json: [0u8; 4096], images_json_len: 0, streaming_behavior: [0u8; 16], streaming_behavior_len: 5, parent_session: [0u8; 256], parent_session_len: 0, provider: [0u8; 128], provider_len: 0, model_id: [0u8; 128], model_id_len: 0, level: [0u8; 32], level_len: 0, mode: [0u8; 16], mode_len: 0, custom_instructions: [0u8; 4096], custom_instructions_len: 0, enabled: false, raw_json: [0u8; 16384], raw_json_len: 0 };
+    // type_bytes = "prompt", streaming_behavior = "steer" (bytes set in repair phase)
+    let rc = pi_rpc_process_manager_send_command(&adapter.process, &cmd, 0, false);
+    // if (resp.success === false) { forceTerminatePi(turnCtx, "failed",
+    //   resp.error || "Failed to initiate prompt turn") -> notifications }
+    // DEFECT: response success inspection deferred with sendCommand completion.
+    return rc;
+}
+
+// async steer(message): only when the process is running.
+// DEFECT: async — synchronous here.
+fn pi_runtime_adapter_steer(adapter: &PiRuntimeAdapter, msg_ptr: ptr, msg_len: u64) -> i32 {
+    if adapter.has_process && pi_rpc_process_manager_is_running(&adapter.process) {
+        let cmd = PiRpcCommand { type_bytes: [0u8; 32], type_len: 5, has_id: false, id: [0u8; 128], id_len: 0, message: [0u8; 8192], message_len: msg_len, has_images: false, images_json: [0u8; 4096], images_json_len: 0, streaming_behavior: [0u8; 16], streaming_behavior_len: 0, parent_session: [0u8; 256], parent_session_len: 0, provider: [0u8; 128], provider_len: 0, model_id: [0u8; 128], model_id_len: 0, level: [0u8; 32], level_len: 0, mode: [0u8; 16], mode_len: 0, custom_instructions: [0u8; 4096], custom_instructions_len: 0, enabled: false, raw_json: [0u8; 16384], raw_json_len: 0 };
+        // type_bytes = "steer"
+        return pi_rpc_process_manager_send_command(&adapter.process, &cmd, 0, false);
+    };
+    return 0;
+}
+
+// async interrupt(): force-terminate ctx as "interrupted" first, then send
+// { type: "abort" } with PI_ABORT_ACK_TIMEOUT_MS and race the settlement
+// waiter against PI_ABORT_SETTLE_TIMEOUT_MS; afterwards the process is never
+// reused (process = null; process.stop(1000)) — also on ack failure (catch).
+// DEFECT: async + Promise.race + setTimeout approximated sequentially: the
+// settle wait becomes a bounded poll in the repair phase.
+fn pi_runtime_adapter_interrupt(adapter: &PiRuntimeAdapter) -> i32 {
+    if adapter.has_ctx && adapter.ctx.status == 0 {
+        let events = PiProjectedEvents { items: [128]PiProjectedEvent, len: 0 };
+        // DEFECT: PiProjectedEvents value construction elided; fallback events
+        // are emitted as notifications by the caller path.
+        force_terminate_pi(&adapter.ctx, 3, STR_PTR(""), 0, false, &events);
+    };
+    if adapter.has_process && pi_rpc_process_manager_is_running(&adapter.process) {
+        adapter.settlement_waiter_active = true;
+        let cmd = PiRpcCommand { type_bytes: [0u8; 32], type_len: 5, has_id: false, id: [0u8; 128], id_len: 0, message: [0u8; 8192], message_len: 0, has_images: false, images_json: [0u8; 4096], images_json_len: 0, streaming_behavior: [0u8; 16], streaming_behavior_len: 0, parent_session: [0u8; 256], parent_session_len: 0, provider: [0u8; 128], provider_len: 0, model_id: [0u8; 128], model_id_len: 0, level: [0u8; 32], level_len: 0, mode: [0u8; 16], mode_len: 0, custom_instructions: [0u8; 4096], custom_instructions_len: 0, enabled: false, raw_json: [0u8; 16384], raw_json_len: 0 };
+        // type_bytes = "abort"; ack timeout = PI_ABORT_ACK_TIMEOUT_MS (2000)
+        let rc = pi_rpc_process_manager_send_command(&adapter.process, &cmd, 2000, true);
+        // await Promise.race([settledPromise, timeout(PI_ABORT_SETTLE_TIMEOUT_MS)])
+        adapter.settlement_waiter_active = false;
+        adapter.has_process = false; // if (this.process === process) this.process = null;
+        pi_rpc_process_manager_stop(&adapter.process, 1000);
+        return rc;
+    };
+    return 0;
+}
+
+// async getMessages(): Promise<PiRpcSessionMessage[]>
+// Sends { type: "get_messages" }; returns resp.messages when success &&
+// Array.isArray(resp.messages); [] when not running or on error (try/catch).
+// DEFECT: async + dynamic response shape; count written via out_count.
+fn pi_runtime_adapter_get_messages(adapter: &PiRuntimeAdapter, out_count: &u64) -> i32 {
+    out_count = 0;
+    if !adapter.has_process || !pi_rpc_process_manager_is_running(&adapter.process) { return 0; };
+    let cmd = PiRpcCommand { type_bytes: [0u8; 32], type_len: 12, has_id: false, id: [0u8; 128], id_len: 0, message: [0u8; 8192], message_len: 0, has_images: false, images_json: [0u8; 4096], images_json_len: 0, streaming_behavior: [0u8; 16], streaming_behavior_len: 0, parent_session: [0u8; 256], parent_session_len: 0, provider: [0u8; 128], provider_len: 0, model_id: [0u8; 128], model_id_len: 0, level: [0u8; 32], level_len: 0, mode: [0u8; 16], mode_len: 0, custom_instructions: [0u8; 4096], custom_instructions_len: 0, enabled: false, raw_json: [0u8; 16384], raw_json_len: 0 };
+    // type_bytes = "get_messages"
+    // DEFECT: (resp as any).messages extraction deferred to the sa_json layer.
+    return pi_rpc_process_manager_send_command(&adapter.process, &cmd, 0, false);
+}
+
+// stop(timeoutMs = 3000)
+fn pi_runtime_adapter_stop(adapter: &PiRuntimeAdapter, timeout_ms: u64) -> i32 {
+    adapter.settlement_waiter_active = false;
+    if adapter.has_process {
+        pi_rpc_process_manager_stop(&adapter.process, timeout_ms);
+        adapter.has_process = false;
+    };
+    adapter.has_ctx = false;
+    return 0;
+}

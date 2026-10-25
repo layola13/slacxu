@@ -1,0 +1,702 @@
+// Converted 1:1 from backends/muse/src/runtime/museCompatibleTurnProjector.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// Muse exec --json 瀑布流投影器。
+//
+// 背景：MuseBridge 原来只解析 `run.output.delta` 纯文本，
+// thinking / todolist / subagent / mcp / skill 全部丢失。
+// 本投影器参考 mini/opencode 的做法，把 muse exec --json stdout 的
+// `tool.result`（`correlation_facts.tool_name` 带工具名，verified 2026-10-13：
+// stdout 只有 result、没有 started）、`tool_batch.effect.*`（session log 形状，
+// 保留兼容）、`write_todos` 输出、`subagent_*` / `read_skill` / `mcp__*` /
+// reasoning 文本统一投影成 Codex Ultra 前端已能渲染的 item 类型：
+// - reasoning -> type=reasoning + item/reasoning/textDelta
+// - agent 文本 -> type=agentMessage + item/agentMessage/delta
+// - write_todos/todowrite -> type=plan（turn/plan/updated 同形）
+// - subagent_spawn/status -> type=collabAgentToolCall
+// - mcp__/skill/read_skill -> type=toolCall（保留原名，瀑布流按 toolCall 渲染）
+// - 普通工具 -> type=toolCall
+//
+// 防御性设计：muse 不同 provider/版本的 record 字段名可能漂移，
+// 所有提取函数都做多键兼容，解析失败时回退为普通 toolCall 行，
+// 绝不吞掉工具调用。
+//
+// Source import: types JsonRpcNotification, JsonValue from "@codex-ui/shared".
+@import "sa_std/io/print.sai"
+
+// export type MuseProjectedEvent — a discriminated union:
+//   { kind: "turn/started", threadId, turnId }
+//   { kind: "turn/completed", threadId, turnId }
+//   { kind: "turn/failed", threadId, turnId, error? }
+//   { kind: "item/agentMessage/delta", threadId, turnId, itemId, delta }
+//   { kind: "item/reasoning/textDelta", threadId, turnId, itemId, delta }
+//   { kind: "item/started", threadId, turnId, item: Record<string, JsonValue> }
+//   { kind: "item/completed", threadId, turnId, item: Record<string, JsonValue> }
+//   { kind: "turn/plan/updated", threadId, turnId,
+//     plan: Array<{ step: string; status: string }>, planItem: Record<...> }
+// DEFECT: discriminated union type — events are JSON text buffers
+// with a "kind" string field; kind constants are compared by bytes.
+struct MuseProjectedEvent {
+    kind_ptr: ptr,
+    kind_len: u64,
+    json_ptr: ptr,
+    json_len: u64,
+}
+
+// Event list accumulator: functions below append to a caller-owned
+// JSON array buffer + count (the source's MuseProjectedEvent[]).
+struct MuseProjectedEventList {
+    json_ptr: ptr,
+    json_len: u64,
+    count: u64,
+}
+
+// export interface MuseProjectorContext — the mutable projector
+// state. String accumulators are (ptr, len) into context-owned
+// buffers; the six Map/Set collections are host-side maps keyed by
+// string buffers, held as opaque u64 handles.
+struct MuseProjectorContext {
+    threadId_ptr: ptr,
+    threadId_len: u64,
+    turnId_ptr: ptr,
+    turnId_len: u64,
+    status: u64, // 0 = running, 1 = completed, 2 = failed
+    hasStartedTurn: bool,
+    assistantIndex: u64,
+    assistantItemId_ptr: ptr,
+    assistantItemId_len: u64,
+    assistantStarted: bool,
+    assistantDone: bool,
+    assistantText_ptr: ptr,
+    assistantText_len: u64,
+    reasoningItemId_ptr: ptr,
+    reasoningItemId_len: u64,
+    reasoningStarted: bool,
+    reasoningDone: bool,
+    reasoningText_ptr: ptr,
+    reasoningText_len: u64,
+    // activeTools: Map<string, Record<string, JsonValue>>
+    activeTools: u64,
+    // pendingPlanCandidates: Set<string>
+    pendingPlanCandidates: u64,
+    // tool_output_ref → 工具名：部分 tool.result 缺 correlation_facts，
+    // 靠输出引用文件名里的 `<tool>-stdout` 片段按 call_id 回填。
+    toolNameByCallId: u64,
+    // subagent.control 记录的 subagent_id → 模型侧 tool call_id。
+    subagentCallBySubagentId: u64,
+    // subagent_id → 子会话 id（subagent.control.child_session_bound/start_attested）。
+    subagentChildBySubagentId: u64,
+    // subagent_id → {objective, role, taskName}（resume_context_recorded）。
+    subagentMetaBySubagentId: u64,
+    // workflow_run_id → 模型侧 tool call_id（workflow_run_launched.call_id）。
+    workflowCallByRunId: u64,
+    planStarted: bool,
+    lastPlanJson_ptr: ptr,
+    lastPlanJson_len: u64,
+    // True when replaying a subagent session log offline (no stdout stream).
+    // Child logs carry committed reasoning/assistant text instead of deltas,
+    // and the log's terminal record must close the turn.
+    offline: bool,
+    has_offline: bool,
+}
+
+// museAssistantItemId(turnId, index = 0): `muse-msg-${turnId}-${index}`
+// DEFECT: template literal + default parameter — byte assembly;
+// caller passes index explicitly (0 for the default).
+fn museAssistantItemId(turnId_ptr: ptr, turnId_len: u64, index: u64, out_ptr: &ptr, out_len: &u64) -> void {
+}
+
+fn createMuseProjectorContext(threadId_ptr: ptr, threadId_len: u64, turnId_ptr: ptr, turnId_len: u64, out: &MuseProjectorContext) -> void {
+    out.threadId_ptr = threadId_ptr;
+    out.threadId_len = threadId_len;
+    out.turnId_ptr = turnId_ptr;
+    out.turnId_len = turnId_len;
+    out.status = 0;
+    out.hasStartedTurn = false;
+    out.assistantIndex = 0;
+    museAssistantItemId(turnId_ptr, turnId_len, 0, &out.assistantItemId_ptr, &out.assistantItemId_len);
+    out.assistantStarted = false;
+    out.assistantDone = false;
+    out.assistantText_len = 0;
+    // reasoningItemId = `muse-thought-${turnId}-0`
+    out.reasoningStarted = false;
+    out.reasoningDone = false;
+    out.reasoningText_len = 0;
+    out.planStarted = false;
+    out.lastPlanJson_len = 0;
+    out.offline = false;
+    out.has_offline = false;
+}
+
+fn nowSec() -> u64 {
+    // Math.floor(Date.now() / 1000)
+    return sa_std_time_now_ms() / 1000;
+}
+
+// 输出截断与 mini 对齐（miniBridge toolItem output.slice(0, 2000)）：
+// 事件/历史落盘只保留前 2000 字符，防止大工具输出撑爆内存与事件流。
+// DEFECT: JS string slice counts UTF-16 code units — byte slice here
+// (may split a multi-byte character at the boundary).
+fn sliceOutputText(text_ptr: ptr, text_len: u64, out_len: &u64) -> void {
+    out_len = text_len;
+    if out_len > 2000 { out_len = 2000; };
+}
+
+fn ensureTurnStarted(ctx: &MuseProjectorContext, events: &MuseProjectedEventList) -> void {
+    if ctx.hasStartedTurn { return; };
+    ctx.hasStartedTurn = true;
+    // push { kind: "turn/started", threadId, turnId }
+    events.count = events.count + 1;
+}
+
+// asRecord(value): Record<string, unknown> — {} for non-objects.
+// Represented as a sa_json doc id; 0 stands for the empty object.
+// DEFECT: dynamic object — see museHistoryProjection.sla.
+fn asRecord(doc: u64, key_ptr: ptr, key_len: u64) -> u64 {
+    return sa_json_get_object(doc, key_ptr, key_len);
+}
+
+fn asText(doc: u64, key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    // typeof value === "string" && value.trim() ? value : undefined
+    return sa_json_get_string_nonempty(doc, key_ptr, key_len, out_ptr, out_len);
+}
+
+// pushAssistantDelta: empty delta -> no-op; ensureTurnStarted; a
+// done assistant segment is reset and advanced (assistantIndex += 1,
+// new assistantItemId); completeActiveReasoning first; when not
+// started, push item/started with item {type: "agentMessage",
+// id: assistantItemId, threadId, turnId, role: "assistant",
+// status: "inProgress", text: "", content: [], startedAt: nowSec()};
+// append delta to assistantText; push item/agentMessage/delta.
+fn pushAssistantDelta(ctx: &MuseProjectorContext, events: &MuseProjectedEventList, delta_ptr: ptr, delta_len: u64) -> void {
+}
+
+// pushReasoningDelta: mirror of pushAssistantDelta for the reasoning
+// segment (item {type: "reasoning", id: reasoningItemId, title:
+// "Thinking", text: "", status: "inProgress", startedAt: nowSec(),
+// firstTokenAt: nowSec()}), then item/reasoning/textDelta.
+fn pushReasoningDelta(ctx: &MuseProjectorContext, events: &MuseProjectedEventList, delta_ptr: ptr, delta_len: u64) -> void {
+}
+
+// completeActiveReasoning: when reasoningStarted && !reasoningDone,
+// mark done and push item/completed with the full reasoning item
+// (status "completed", text = reasoningText).
+fn completeActiveReasoning(ctx: &MuseProjectorContext, events: &MuseProjectedEventList) -> void {
+}
+
+// completeActiveAssistant: when assistantStarted && !assistantDone,
+// mark done and push item/completed with {type: "agentMessage",
+// id, threadId, turnId, role: "assistant", status: "completed",
+// text: assistantText, content: [{type: "text", text: assistantText}]}.
+fn completeActiveAssistant(ctx: &MuseProjectorContext, events: &MuseProjectedEventList) -> void {
+}
+
+// ---------------------------------------------------------------------------
+// 工具名分类（对齐 mini/opencode 适配口径）
+// ---------------------------------------------------------------------------
+
+// normToolName: name.trim().toLowerCase().replace(/[_-]+/g, "")
+// DEFECT: RegExp replace — explicit byte loop (drop "_" and "-",
+// ASCII-lowercase) into the caller's buffer.
+fn normToolName(name_ptr: ptr, name_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+}
+
+fn isMusePlanToolName(toolName_ptr: ptr, toolName_len: u64) -> bool {
+    // normalized in {writetodos, todowrite, settodo, sessiontodo, todos}
+    return false;
+}
+
+fn isMuseSubagentToolName(toolName_ptr: ptr, toolName_len: u64) -> bool {
+    // normalized in {subagentspawn, subagentstatus, subagentsendmessage,
+    // subagentwait, subagentreadresult, subagentcancel, task, subagent, workflow}
+    return false;
+}
+
+// 只有 spawn/workflow 在瀑布流里是一张子 agent 卡片；wait/read_result 等
+// 是普通工具行（否则每轮 wait 都会多出一个 agent 图标）。
+fn isMuseAgentCardToolName(toolName_ptr: ptr, toolName_len: u64) -> bool {
+    // normalized in {subagentspawn, task, subagent, workflow}
+    return false;
+}
+
+fn isMuseSubagentControlToolName(toolName_ptr: ptr, toolName_len: u64) -> bool {
+    // normalized in {subagentwait, subagentreadresult, subagentstatus,
+    // subagentcancel, subagentsendmessage}
+    return false;
+}
+
+fn isMuseSkillToolName(toolName_ptr: ptr, toolName_len: u64) -> bool {
+    // normalized === readskill || === skill || startsWith("skill")
+    return false;
+}
+
+fn isMuseMcpToolName(toolName_ptr: ptr, toolName_len: u64) -> bool {
+    // lower starts with "mcp__" | "mcp-" | "mcp:" or includes "__"
+    return false;
+}
+
+// type PlanStep = { step: string; status: string } — kept as JSON
+// records inside JSON array buffers, like the other dynamic shapes.
+
+fn normalizePlanStatus(value_ptr: ptr, value_len: u64, has_value: bool, out_ptr: &ptr, out_len: &u64) -> void {
+    // value.replace(/[_-]+/g, "").toLowerCase(): completed|complete|done
+    // -> "completed"; inprogress|running|started -> "in_progress";
+    // anything else -> "pending".
+    out_ptr = STR_PTR("pending");
+    out_len = STR_LEN("pending");
+}
+
+// planStepsFromValue(value): PlanStep[] | null — non-array -> null;
+// string entries -> {step: trimmed, status: "pending"}; record
+// entries take step from content ?? subject ?? step ?? title ??
+// task ?? text (first non-empty), status via normalizePlanStatus;
+// empty result -> null. Output is a JSON array buffer.
+fn planStepsFromValue(value_doc: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    return false;
+}
+
+// extractPlanSteps(input, output?): tries planStepsFromValue(input),
+// then input's todos ?? tasks ?? plan ?? steps ?? items; then the
+// output: a string output is JSON.parse'd (failure -> no plan) and
+// checked directly and via the same keys; an object output likewise.
+fn extractPlanSteps(input_doc: u64, output_ptr: ptr, output_len: u64, has_output: bool, output_is_string: bool, out_ptr: &ptr, out_len: &u64) -> bool {
+    return false;
+}
+
+// musePlanItemId(turnId): `muse-plan-${turnId}`
+fn musePlanItemId(turnId_ptr: ptr, turnId_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+}
+
+// buildPlanItem(threadId, turnId, steps): {type: "plan",
+// id: musePlanItemId(turnId), threadId, turnId, plan: steps,
+// text: steps mapped to "- [x] <step>" (completed) /
+// "- [ ] <step> _(in progress)_" (in_progress) / "- [ ] <step>",
+// joined with "\n", status: any in_progress -> "inProgress", else
+// all completed (and non-empty) -> "completed", else "pending",
+// startedAt: nowSec()}.
+fn buildPlanItem(threadId_ptr: ptr, threadId_len: u64, turnId_ptr: ptr, turnId_len: u64, steps_ptr: ptr, steps_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+}
+
+// pushPlanUpdate: json = JSON.stringify(steps); dedupes when
+// planStarted && lastPlanJson === json; otherwise records it and
+// pushes item/started (the plan item) + turn/plan/updated.
+fn pushPlanUpdate(ctx: &MuseProjectorContext, events: &MuseProjectedEventList, steps_ptr: ptr, steps_len: u64) -> void {
+}
+
+// truncatePrompt: text.length > 2000 ? text.slice(0, 2000) + "…" : text
+fn truncatePrompt(text_ptr: ptr, text_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+}
+
+// workflow 的入参是 `{name, script}`，真正的子任务提示写在脚本
+// `host.agent({ input: "..." })` 里（实测 Muse 1.4.11）。没有 script 时
+// 再退回 objective/prompt/task 等常规键。
+// Order: prompt ?? objective ?? task ?? input (direct text); else
+// from script: match /host\.agent\(\s*\{([\s\S]*?)\}\s*\)/ then
+// /\binput\s*:\s*("..."|'...'|`...`)/ inside the block, unescaping
+// \n and \" in the captured literal; result truncatePrompt'd.
+// DEFECT: RegExp extraction over the script text — approximated by
+// byte scans for "host.agent(" and the `input` key; escape handling
+// limited to \n and \" as in the source.
+fn extractWorkflowPrompt(rec_doc: u64, out_ptr: &ptr, out_len: &u64) -> void {
+}
+
+// subagentChildIdFrom(rec, previous, callId): subagent_id ??
+// childSessionId ?? childSessionID ?? sessionId ?? sessionID ??
+// child_session_id; else previous.receiverThreadIds[0] when a
+// non-empty string array; else callId itself.
+fn subagentChildIdFrom(rec_doc: u64, previous_ptr: ptr, previous_len: u64, has_previous: bool, callId_ptr: ptr, callId_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+}
+
+// buildSubagentItem(threadId, turnId, callId, toolName, input,
+// status, output?, previous?): the collabAgentToolCall item —
+// agentRole from role ?? agent ?? subagent_type ?? agentType ??
+// agentRole ?? toolName; description (agentName) from task_name ??
+// name ?? title ?? description ?? label ?? ""; prompt =
+// truncatePrompt(extractWorkflowPrompt(rec) || description || "");
+// childId via subagentChildIdFrom; agentStatus maps inProgress ->
+// running / failed -> failed / else completed; outputText =
+// sliceOutputText(string output trimmed, or JSON.stringify of an
+// object output); receiverThreadIds = previous list with childId
+// appended when absent; agentsStates = {[childId]: {status:
+// agentStatus, message: description || previous state message ||
+// "<agentRole> <agentStatus>"}}; startedAt = previous.startedAt ??
+// nowSec(); output included only when non-empty.
+// DEFECT: object spread + computed keys ({[childId]: ...}) — item
+// assembled as a JSON text buffer.
+fn buildSubagentItem(threadId_ptr: ptr, threadId_len: u64, turnId_ptr: ptr, turnId_len: u64, callId_ptr: ptr, callId_len: u64, toolName_ptr: ptr, toolName_len: u64, input_doc: u64, status_ptr: ptr, status_len: u64, output_ptr: ptr, output_len: u64, has_output: bool, previous_ptr: ptr, previous_len: u64, has_previous: bool, out_ptr: &ptr, out_len: &u64) -> void {
+}
+
+// 已 started 的行再次收到富信息（args/子会话/结果）时发一次更新事件。
+// kind = item.status is "inProgress"/"in_progress" ? item/started : item/completed.
+fn emitItemUpdate(ctx: &MuseProjectorContext, events: &MuseProjectedEventList, item_ptr: ptr, item_len: u64) -> void {
+    events.count = events.count + 1;
+}
+
+// toToolItem(threadId, turnId, callId, toolName, input, status, output?):
+// the toolCall item. Input restoration order (source comments):
+// muse stdout 的 tool.result 不带 input（input 只存在于模型侧），瀑布流的
+// 参数详情行（对标 mini）靠 input.path/command 渲染；还原顺序：
+// 1) MCP 信封 JSON（action + 白名单参数，sa-vm 通道渲染 vm-<action>）；
+// 2) exec 信封 JSON（command/description/output，bash 类工具）；
+// 3) 结果首行反引号路径（read 类工具）；还原不出就留空——绝不编造命令。
+// Implementation in the source: trailer = parseMuseSaVmTrailer(
+// outputText) (sa-vm 动作尾行优先，同时从输出中剥离); cleanText =
+// trailer?.stripped ?? outputText; envelope =
+// parseMuseExecEnvelope(cleanText); mcpInput = !envelope ?
+// parseMuseMcpEnvelope(cleanText) : null; innerOutput =
+// envelope?.output ?? cleanText; when isEmptyInput(input): args =
+// trailer?.input ?? mcpInput ?? (envelope?.command ? {description?,
+// command} : (innerOutput ? inferMuseToolInput(toolName,
+// innerOutput) : null)); else args = input. Item = {type:
+// "toolCall", id: callId, threadId, turnId, name/tool/toolName:
+// toolName, input: args, arguments: args, status, startedAt:
+// nowSec()}; output/text = sliceOutputText(innerOutput) when
+// defined; mcp = true for MCP names; skill = true for skill names.
+fn toToolItem(threadId_ptr: ptr, threadId_len: u64, turnId_ptr: ptr, turnId_len: u64, callId_ptr: ptr, callId_len: u64, toolName_ptr: ptr, toolName_len: u64, input_doc: u64, status_ptr: ptr, status_len: u64, output_ptr: ptr, output_len: u64, has_output: bool, out_ptr: &ptr, out_len: &u64) -> void {
+}
+
+fn isEmptyInput(input_doc: u64) -> bool {
+    // undefined/null -> true; string -> trim length 0; plain object
+    // -> no keys; anything else -> false.
+    return true;
+}
+
+// 从 tool_output_ref 的输出引用里抠出 call_id → 工具名。
+// 实测两种形状（verified 2026-10-13）：
+// - id: "monitor-stdout-<task>-call_<id>"
+// - path/uri: ".../<task>/call_<id>-<tool>-stdout.txt"
+// Candidates: ref.id, ref.path, ref.uri, ref.output_ref (strings).
+// Patterns: /(call_[A-Za-z0-9]+)-([A-Za-z0-9_]+)-(stdout|stderr|output|result)\b/
+// then /^([A-Za-z0-9_]+)-(stdout|stderr|output|result)-.+-(call_[A-Za-z0-9]+)$/.
+// DEFECT: RegExp — approximated by token scans splitting on "-"
+// and checking the stdout/stderr/output/result markers.
+fn parseToolOutputRef(payload_doc: u64, out_callId: &ptr, out_callId_len: &u64, out_toolName: &ptr, out_toolName_len: &u64) -> bool {
+    return false;
+}
+
+// "tool unavailable: unknown tool `X`" 这类失败文本里抠出被调工具名。
+// Pattern: /unknown tool\s*[`'"]?([A-Za-z0-9_.-]{1,120})[`'"]?/i with
+// surrounding quotes stripped; returns status 0 + name or 1.
+// DEFECT: RegExp — byte scan for the "unknown tool" prefix
+// (case-insensitive) plus the token character set.
+fn parseUnknownToolName(outputText_ptr: ptr, outputText_len: u64, out_ptr: &ptr, out_len: &u64) -> i32 {
+    return 1;
+}
+
+fn isFailureOutputText(outputText_ptr: ptr, outputText_len: u64) -> bool {
+    // /^\s*(tool unavailable|unknown tool|error:|failed:|failure:)/i
+    return false;
+}
+
+// muse exec 类工具的结果是 JSON 信封（verified 2026-10-13，真机抓包）：
+// {"chunk_id":"exec-1-1","command":"git log ...","description":"... Chore",
+//  "exit_code":0,"terminal_status":"completed","output":"...","truncated":false}
+// 拆出 command/description 做 input（瀑布流详情行直接渲染命令，对标 mini），
+// output/text 只留真正的输出。
+// Returns null unless the trimmed text starts with "{" and parses
+// to an object with a command or an output field.
+fn parseMuseExecEnvelope(outputText_ptr: ptr, outputText_len: u64, out_command: &ptr, out_command_len: &u64, out_description: &ptr, out_description_len: &u64, out_output: &ptr, out_output_len: &u64, out_exitCode: &u64, has_exitCode: &bool) -> bool {
+    return false;
+}
+
+// muse MCP 结果是另一种 JSON 信封（verified 2026-10-13，真机抓包）：
+// {"status":"ok","action":"git_status","repo":"...","branch":"...","counts":{...}}
+// 拆出 action + 白名单参数做 input，瀑布流 sa-vm 通道直接渲染
+// `vm-<action>` + 参数详情（对标 mini/opencode 行）。白名单只取调用形参，
+// 结果数据留在 output/text 里，不污染 args。
+// MCP_INPUT_KEYS — 与 scripts/sa-vm-mcp.mjs 的 inputSchema.properties
+// 全量对齐（2026-10-13）：白名单缺 key 会导致瀑布流工具详情行丢参数
+// （如 read_lines 的 start_line/end_line，前端 ChatRow 靠它们渲染
+// `path:start-end`）。只取调用形参标量，结果数据留在 output/text。
+// 兼容键（command/url/destination/language/description）保留。
+// The set (verbatim from the source): "action", "path", "file",
+// "dir", "type", "depth", "max_entries", "max_files", "max_errors",
+// "detail", "check_references", "force", "content", "patch",
+// "old_text", "new_text", "start_line", "end_line", "lines",
+// "max_tokens", "numbered", "pattern", "query", "is_regex",
+// "queries", "max_file_bytes", "max_matches", "max_results", "page",
+// "page_size", "count_cap", "exact_total", "symbol", "old_name",
+// "new_name", "source", "target", "statement", "component_name",
+// "profile", "subcommand", "exe", "args", "head_lines",
+// "tail_lines", "env", "key", "fact", "level", "all", "from", "to",
+// "cwd", "threadId", "question", "options", "checks", "questions",
+// "goal", "thoughts", "context", "items", "criterion", "task",
+// "phases", "plan", "constraints", "user_request", "actual_work",
+// "evidence", "error_summary", "hypotheses", "proposed_fix", "code",
+// "diff", "target_component", "mode", "direction", "format",
+// "output_file", "candidate_files", "files", "staged", "stat_only",
+// "pathspec", "diff_context", "parallel", "concurrency", "command",
+// "url", "destination", "language", "description".
+fn MCP_INPUT_KEYS_contains(key_ptr: ptr, key_len: u64) -> bool {
+    return false;
+}
+
+// 纯标量或字符串数组才进 input：大对象（env/options/parallel 等）只留存在性，
+// 防止巨型 JSON 撑爆瀑布流行与落盘。
+// mcpInputValue: string/number/boolean kept; for keys files|queries|args
+// a string array is kept; otherwise undefined (dropped).
+fn mcpInputValue_kept(key_ptr: ptr, key_len: u64, value_doc: u64, value_key_ptr: ptr, value_key_len: u64) -> bool {
+    return false;
+}
+
+// sa-vm MCP 动作尾行（scripts/sa-vm-mcp.mjs 在 MUSE_SA_VM_ENVELOPE=1 时追加）：
+// 输出末尾的 `\n[sa-vm-action {"action":"read_lines","path":...}]`。
+// read_lines 类工具结果是人类文本、无 action 字段，stdout 又无模型侧 input，
+// 只有这行能还原调用参数。返回 {input, stripped}，调用方把 stripped 作为
+// 真正输出（尾行不进 output/text、不污染前端）。
+// Pattern: /\n\[sa-vm-action (\{.*\})\]\s*$/s; the parsed record
+// must carry a non-empty string action; input = {action} plus the
+// whitelisted scalar keys via mcpInputValue; stripped = the text
+// before the match, trimEnd'd.
+// DEFECT: RegExp with dotAll — approximated by a suffix scan for
+// the last "\n[sa-vm-action " marker and a trailing "]".
+fn parseMuseSaVmTrailer(outputText_ptr: ptr, outputText_len: u64, out_input_ptr: &ptr, out_input_len: &u64, out_stripped_ptr: &ptr, out_stripped_len: &u64) -> bool {
+    return false;
+}
+
+// parseMuseMcpEnvelope: trimmed text must start with "{" and parse
+// to an object with a non-empty string action; returns {action}
+// plus whitelisted scalar keys, or null.
+fn parseMuseMcpEnvelope(outputText_ptr: ptr, outputText_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    return false;
+}
+
+// 从 muse 工具结果首行保守还原参数（只取反引号/引号包裹的路径 token，
+// 必须无空格、含 / 或带扩展名、长度 < 300；bash 输出等还原不出的不碰）。
+// First line: /[`"']([^`"']{1,300})[`"']/ token kept as {path} when
+// it has no whitespace and contains "/" or matches
+// /\.[A-Za-z0-9]{1,8}$/; for skill tools, /skill\s*[:"']?\s*
+// ([A-Za-z0-9._-]{1,80})/i on the first line yields {skill}.
+// DEFECT: RegExp (both patterns) — byte scans instead.
+fn inferMuseToolInput(toolName_ptr: ptr, toolName_len: u64, outputText_ptr: ptr, outputText_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    return false;
+}
+
+// 从任意 record 结构中抠出 tool 名 / callId / input / output / 文本。
+// Field fallback chains preserved from the source:
+// toolName: payload.tool_name ?? record.tool_name ??
+//   facts.tool_name ?? payload.toolName ?? record.toolName ??
+//   payload.tool ?? record.tool ?? payload.name ?? record.name
+//   (facts = payload.correlation_facts ?? record.correlation_facts;
+//   record = payload.record ?? payload)
+// callId: payload.call_id ?? record.call_id ?? payload.callId ??
+//   record.callId ?? payload.callID ?? record.callID ?? payload.id
+//   ?? record.effect_id
+// input: payload.input ?? record.input ?? record.args ??
+//   payload.args ?? record.arguments
+// output: payload.output ?? record.output ?? payload.result ??
+//   record.result ?? payload.text ?? record.text
+// text / reasoning (+ thinking aliases) / todos (payload.todos ??
+//   record.todos ?? record.tasks ?? input.todos ?? input.tasks)
+// Results are sa_json doc handles / string buffers via out params.
+// DEFECT: dynamic JSON traversal — sa_json key lookups in the
+// exact source order.
+fn pickToolFields(payload_doc: u64, out_toolName: &ptr, out_toolName_len: &u64, has_toolName: &bool, out_callId: &ptr, out_callId_len: &u64, has_callId: &bool) -> void {
+}
+
+// Muse 模型侧入参在 stdout 里不存在，只在 session log 的
+// `assistant_tool_calls_committed.tool_calls[].args` 里（JSON 字符串）。
+// 投影它可以把原生工具（subagent_spawn / workflow / bash / read_file）的
+// 真实参数补回已开始的工具行，而不是只能靠结果文本反推。
+// Per call: name (name ?? tool_name) and callId (call_id ?? callId
+// ?? id) required; args parsed from a JSON string (non-JSON args
+// ignored) or taken as an object; empty input skipped. Then:
+// - agent-card names: rebuild the subagent item merging the
+//   previous active item (prev spread wins for state fields, tool/
+//   name/input/arguments/prompt/agentName/agentRole refreshed);
+//   for "workflow" the card input is reduced to {name?, prompt?,
+//   scriptChars?} so multi-KB scripts never enter the waterfall.
+// - plan names: extractPlanSteps(input) -> pushPlanUpdate.
+// - otherwise: toToolItem with the previous status/output, stored
+//   and re-emitted via emitItemUpdate.
+fn projectToolCallsCommitted(ctx: &MuseProjectorContext, event_doc: u64, events: &MuseProjectedEventList) -> void {
+}
+
+// callIdFromWorkflowRunId: /model-tool-(.+)$/ -> `call-${group}`.
+// DEFECT: RegExp — suffix scan for the "model-tool-" prefix.
+fn callIdFromWorkflowRunId(runId_ptr: ptr, runId_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    return false;
+}
+
+// parseJsonObjectText: trims, takes the span from the first "{" to
+// the last "}", JSON.parse's it, returns the object or null.
+fn parseJsonObjectText(text_ptr: ptr, text_len: u64, out_doc: &u64) -> bool {
+    out_doc = 0;
+    return false;
+}
+
+// mapMuseChildStatus(status, terminal): terminal failed|cancelled|
+// error -> "failed", terminal completed -> "completed"; else status
+// completed|terminal -> "completed", failed|error|cancelled ->
+// "failed"; otherwise "running".
+fn mapMuseChildStatus(status_ptr: ptr, status_len: u64, has_status: bool, terminal_ptr: ptr, terminal_len: u64, has_terminal: bool, out_ptr: &ptr, out_len: &u64) -> void {
+    out_ptr = STR_PTR("running");
+    out_len = STR_LEN("running");
+}
+
+// workflowChildrenState(item): item.children filtered to objects,
+// or [].
+fn workflowChildrenState(item_ptr: ptr, item_len: u64, out_count: &u64) -> void {
+    out_count = 0;
+}
+
+// projectWorkflowLaunched: runId = event.workflow_run_id; callId =
+// event.call_id ?? callIdFromWorkflowRunId(runId); both recorded in
+// workflowCallByRunId. The workflow item (previous active item or a
+// fresh buildSubagentItem with {name: entryId}) is updated with
+// {name/tool: "workflow", status: "inProgress", agentStatus:
+// "running", agentName/entryId: entryId (entry_id ?? name ??
+// "workflow"), workflowRunId, scriptId, scriptPath, childLimit}
+// and re-emitted via emitItemUpdate.
+fn projectWorkflowLaunched(ctx: &MuseProjectorContext, event_doc: u64, events: &MuseProjectedEventList) -> void {
+}
+
+// projectWorkflowChild: callId resolved via workflowCallByRunId /
+// runId derivation; childId = event.child_id required. sessionId =
+// event.session_stream.id ?? child_session_id ?? childId; status
+// via mapMuseChildStatus. The child row {id, sessionId, label,
+// status, attempt (event or previous or 1), durationMs, resultRef}
+// replaces the same-id row in the parent item's children; the
+// parent stays "inProgress" with agentStatus completed only when
+// every child is non-running; receiverThreadIds / agentThreadId /
+// agentsStates are rebuilt from the children.
+fn projectWorkflowChild(ctx: &MuseProjectorContext, event_doc: u64, events: &MuseProjectedEventList) -> void {
+}
+
+// projectWorkflowReconciled: callId = event.call_id required.
+// message = parseJsonObjectText(event.message); child rows from
+// event.product_projection.child_rows; summary from
+// message.final_summary.summary ?? .text; failed when the summary
+// status matches /fail|error/i or message.latest_failure exists.
+// Children are closed (failed/completed, per-row summary merged);
+// the item gets status/agentStatus from failed, agentsStates with
+// row summaries, output/finalSummary = sliceOutputText(summary)
+// when present, background = message.deferred_to_background === true.
+fn projectWorkflowReconciled(ctx: &MuseProjectorContext, event_doc: u64, events: &MuseProjectedEventList) -> void {
+}
+
+// 原生 subagent_spawn / subagent_wait 控制面（Muse 1.4.11 顶层 payload）：
+// spawn_accepted / resume_context_recorded / child_session_bound /
+// start_attested / status_updated / runtime_observed / result_ready。
+// kind = payloadType after "subagent.control."; rec = payload.record;
+// subagentId = rec.subagent_id ?? rec.subagentId (required).
+// - resume_context_recorded | spawn_accepted: store meta
+//   {objective, role, taskName} (new values win per field); no events.
+// - child_session_bound: store child session id; no events.
+// - start_attested: callId = rec.dispatched_via_tool_call_id ??
+//   cached; child = rec.subagent_session_id ?? rec.subagentSessionId
+//   ?? cached; when both known and the spawn item exists, patch it
+//   with {subagentId, childSessionId, receiverThreadIds: [child],
+//   agentThreadId/agentId: child, agentStatus: "running",
+//   agentsStates: {[child]: {status: "running", message: agentName}}}
+//   and emitItemUpdate.
+// - status_updated: control = (rec.control_status ?? "running")
+//   lowercased; item status failed when control is failed|cancelled
+//   else inProgress (agentStatus failed|running); agentsStates for
+//   the child when known.
+// - result_ready: summary = rec.summary ?? rec.text ?? ""; failed =
+//   Boolean(rec.error_kind); item closed with prompt from meta
+//   objective and agentName from meta taskName/role fallbacks;
+//   child receiver/agentsStates and output = sliceOutputText(summary).
+fn projectSubagentControl(ctx: &MuseProjectorContext, payloadType_ptr: ptr, payloadType_len: u64, payload_doc: u64, events: &MuseProjectedEventList) -> void {
+}
+
+// 投影单条 muse exec JSONL 记录。纯函数，只读写 ctx。
+// 已确认的 payload_type：
+// - run.output.delta {text} -> agent 文本流
+// - run.terminal.completed/failed {text} -> 交由 runtime 收尾（此处顺手闭合 items）
+// - tool_batch.effect.started/terminal {record:{tool_name,call_id,...}} -> 工具行
+// 其余未知 payload 按通用规则尝试提取（绝不抛错）。
+// Branch order preserved from the source (line -> events buffer):
+// 0. Parse: blank / non-"{" / unparseable -> no events; ctx.status
+//    !== running -> no events.
+// 1. payloadType "runtime.session": inner = payload.event; on
+//    inner.kind: assistant_tool_calls_committed ->
+//    projectToolCallsCommitted; workflow_run_launched /
+//    workflow_child_lifecycle / workflow_launch_reconciled -> the
+//    workflow projectors. Only when ctx.offline: reasoning_committed
+//    | thinking_committed -> pushReasoningDelta + complete;
+//    assistant_message_committed | assistant_text_committed |
+//    agent_message_committed | message_committed -> pushAssistantDelta
+//    + complete; workflow_child_result_submitted -> assistant text
+//    from payload/text; tool_result_batch_committed -> per result,
+//    toToolItem completed with the previous item's name/input;
+//    terminal -> ctx.status from /fail|error|cancel/i.
+// 2. "assistant_tool_calls_committed" (top level) ->
+//    projectToolCallsCommitted(payload). "subagent.control.*" ->
+//    projectSubagentControl.
+// 3. "run.output.delta" -> pushAssistantDelta(payload.text).
+// 4. "run.reasoning.delta" | "run.thinking.delta" |
+//    "run.output.reasoning.delta" -> pushReasoningDelta(text ??
+//    reasoning ?? thinking ?? delta).
+// 5. "tool.result" | "tool_result": ensureTurnStarted + complete
+//    reasoning/assistant; pickToolFields; the name falls back to
+//    toolNameByCallId, then parseUnknownToolName(output), then
+//    "tool" (部分 tool.result 缺 correlation_facts); failed from
+//    correlation_facts.outcome /fail|error/ or isFailureOutputText.
+//    Plan names -> pushPlanUpdate (pendingPlanCandidates.delete).
+//    Subagent-control names -> plain started+completed tool rows,
+//    plus parsed subagent_id/child backfill onto the spawn card.
+//    Agent-card names -> buildSubagentItem merge (workflow fields
+//    entryId/scriptPath/workflowRunId; spawn fields subagentId/
+//    agentName from agent_path); workflow/spawn results are only
+//    launch receipts: keepLive keeps them inProgress (output kept),
+//    completed only on failure; wait-like results also backfill the
+//    spawn card. Other tools: previous input wins when the result
+//    input is empty; started+completed pair via toToolItem.
+// 6. "task.lifecycle.tool_output_ref" | "tool_output_ref":
+//    parseToolOutputRef -> toolNameByCallId.set (输出引用先行，
+//    比 tool.result 先到，供缺名 result 回填).
+// 7. tool_batch.effect.started | tool.effect.started | tool.started
+//    | tool_call.started: complete reasoning/assistant; plan names
+//    -> pushPlanUpdate or pendingPlanCandidates.add; agent-card
+//    names -> buildSubagentItem (previous kept); else toToolItem
+//    inProgress with previous-input fallback; item/started.
+// 8. tool_batch.effect.terminal | tool.effect.terminal |
+//    tool.completed | tool_call.completed: failed from outcome.kind
+//    / record error presence; name falls back to the active item's
+//    tool/toolName/name; plan names -> pushPlanUpdate when steps
+//    exist (else fall through to a plain row so the call stays
+//    visible); agent-card names -> merged item, workflow/spawn/task
+//    stay inProgress while live; else toToolItem completed.
+// 9. "session.todoListChanged" | "todo.updated" |
+//    "session.todolist.changed": planStepsFromValue(payload.todos
+//    ?? payload.items ?? record.todos ?? record.items) ->
+//    ensureTurnStarted + pushPlanUpdate.
+// 10. Generic fallback for empty/tool/subagent/skill/mcp payload
+//     types: reasoning text -> reasoning delta; todos -> plan
+//     update; toolName -> tool/agent-card row (terminal when the
+//     payload type matches /terminal|completed|failed|error/i);
+//     other non-"run." text -> assistant delta.
+// 11. "run.terminal.completed" | "run.terminal.failed" |
+//     "run.terminal.cancelled": payload.text becomes assistant text
+//     when none accumulated; complete reasoning/assistant; close
+//     every inProgress tool as completed; pending plan candidates
+//     are flushed as started+completed write_todos rows and cleared.
+// DEFECT: JSON.parse per line + switch over dynamic fields —
+// sa_json_parse + key lookups; the per-branch logic above is kept
+// as ordered helper calls in this fn's body during the fix phase.
+fn projectMuseJsonlRecord(line_ptr: ptr, line_len: u64, ctx: &MuseProjectorContext, events: &MuseProjectedEventList) -> void {
+    events.count = 0;
+}
+
+// 收尾：turn 结束时关闭所有 open 行（供 runtime 在 completed/failed 时调用）。
+// No-op when ctx.status !== running; sets ctx.status; completes
+// reasoning/assistant; closes inProgress tools with the turn status;
+// flushes pending plan candidates as write_todos started+completed
+// rows; clears candidates; finally pushes turn/completed or
+// turn/failed.
+fn finalizeMuseProjection(ctx: &MuseProjectorContext, status: u64, events: &MuseProjectedEventList) -> void {
+}
+
+// 投影事件 -> 前端 JSON-RPC notification（沿用现有瀑布流方法名，零前端改动）。
+// Mapping preserved from the source (params assembled per kind):
+// - turn/started:    {threadId, turnId, turn: {id: turnId, threadId, status: "running"}}
+// - turn/completed:  {threadId, turnId, turn: {..., status: "completed"}}
+// - turn/failed:     {threadId, turnId, turn: {..., status: "failed"}, error?}
+// - item/agentMessage/delta:   {threadId, turnId, itemId, delta}
+// - item/reasoning/textDelta:  {threadId, turnId, itemId, delta}
+// - item/started | item/completed: {threadId, turnId, item}
+// - turn/plan/updated: {threadId, turnId, plan, item: planItem}
+// Output is the notification as a JSON text buffer.
+fn toMuseNotification(event_ptr: ptr, event_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+}

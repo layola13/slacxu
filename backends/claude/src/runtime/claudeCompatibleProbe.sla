@@ -1,0 +1,1646 @@
+// Converted 1:1 from backends/claude/src/runtime/claudeCompatibleProbe.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/fs.sai"
+@import "sa_std/process.sai"
+@import "sa_std/env.sai"
+
+// DEFECT: node:child_process / node:fs / node:path have no direct sa_std counterparts;
+// fs/process operations below use sa_std_fs_* / sa_std_process_* style externs and
+// path helpers (path_join_path, path_basename, path_extname, path_resolve) as placeholders.
+// DEFECT: @cxu/sdk-backend pluginHost services (pluginHostServices().cli / .codex) and
+// deriveOpenCodeSessionId / OPENCODE_CLI_BACKEND_HEADER have no SLA counterpart;
+// host_* externs below are placeholders for the host-service surface.
+// DEFECT: NodeJS.ProcessEnv is a dynamic string map; approximated everywhere as an
+// env text buffer of "KEY=VALUE\n" lines (env_ptr, env_len) with env_get/env_set helpers.
+// DEFECT: process.platform / process.env / process.execPath are process globals;
+// approximated by host_platform_is_win32()/host_platform_is_linux()/host_exec_path()
+// placeholder externs and an explicit env buffer parameter (TS default `= process.env`
+// becomes a caller-supplied buffer).
+
+// Shared string-list type (TS string[]): fixed storage, capacity 64 entries.
+// DEFECT: fixed capacity — TS arrays are unbounded.
+struct StrList {
+    items: [u8; 16384],
+    items_len: u64,
+    lens: [u64; 64],
+    count: u64,
+}
+
+fn strlist_push(list: &StrList, ptr_: ptr, len: u64) -> void {
+    if list.count >= 64 { return; };
+    let i: u64 = 0;
+    while i < len {
+        list.items[list.items_len + i] = PTR_BYTE_AT(ptr_, i);
+        i = i + 1;
+    }
+    list.lens[list.count] = len;
+    list.items_len = list.items_len + len;
+    list.count = list.count + 1;
+    return;
+}
+
+fn strlist_push_buf(list: &StrList, buf: &[u8], len: u64) -> void {
+    if list.count >= 64 { return; };
+    let i: u64 = 0;
+    while i < len {
+        list.items[list.items_len + i] = buf[i];
+        i = i + 1;
+    }
+    list.lens[list.count] = len;
+    list.items_len = list.items_len + len;
+    list.count = list.count + 1;
+    return;
+}
+
+fn strlist_get(list: &StrList, idx: u64, out: &ByteBuf) -> bool {
+    if idx >= list.count { return false; };
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < idx { off = off + list.lens[i]; i = i + 1; };
+    buf_append_bytes(out, list.items + off, list.lens[idx]);
+    return true;
+}
+
+fn strlist_join(list: &StrList, sep_ptr: ptr, sep_len: u64, out: &ByteBuf) -> void {
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < list.count {
+        if i > 0 { buf_append_bytes(out, sep_ptr, sep_len); };
+        buf_append_bytes(out, list.items + off, list.lens[i]);
+        off = off + list.lens[i];
+        i = i + 1;
+    }
+    return;
+}
+
+// --- env buffer helpers ("KEY=VALUE\n" lines) ---
+fn env_get(env_ptr: ptr, env_len: u64, key_ptr: ptr, key_len: u64, out: &ByteBuf) -> bool {
+    let i: u64 = 0;
+    while i < env_len {
+        let line_start: u64 = i;
+        while i < env_len && PTR_BYTE_AT(env_ptr, i) != 10 { i = i + 1; };
+        let line_len: u64 = i - line_start;
+        if i < env_len { i = i + 1; };
+        if line_len > key_len && PTR_BYTE_AT(env_ptr, line_start + key_len) == 61 {
+            let eq: bool = true;
+            let j: u64 = 0;
+            while j < key_len {
+                if PTR_BYTE_AT(env_ptr, line_start + j) != PTR_BYTE_AT(key_ptr, j) { eq = false; };
+                j = j + 1;
+            }
+            if eq {
+                buf_append_bytes(out, PTR_ADD(env_ptr, line_start + key_len + 1), line_len - key_len - 1);
+                return true;
+            };
+        };
+    }
+    return false;
+}
+
+fn env_get_trimmed(env_ptr: ptr, env_len: u64, key_ptr: ptr, key_len: u64, out: &ByteBuf) -> bool {
+    let tmp = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    if env_get(env_ptr, env_len, key_ptr, key_len, &tmp) == false { return false; };
+    buf_append_bytes(out, &tmp.bytes, tmp.len);
+    buf_trim_in_place(out);
+    return out.len > 0;
+}
+
+fn env_set(env: &ByteBuf, key_ptr: ptr, key_len: u64, value_ptr: ptr, value_len: u64) -> void {
+    // DEFECT: approximation — appends "KEY=VALUE\n"; duplicate-key replacement
+    // semantics of a TS object are not reproduced (last write wins by reader order).
+    buf_append_bytes(env, key_ptr, key_len);
+    buf_append_lit(env, STR_PTR("="), STR_LEN("="));
+    buf_append_bytes(env, value_ptr, value_len);
+    buf_append_lit(env, STR_PTR("\n"), STR_LEN("\n"));
+    return;
+}
+
+fn env_delete(env: &ByteBuf, key_ptr: ptr, key_len: u64) -> void {
+    // DEFECT: approximation — rebuilds the buffer without lines for `key`.
+    let out = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    let i: u64 = 0;
+    while i < env.len {
+        let line_start: u64 = i;
+        while i < env.len && env.bytes[i] != 10 { i = i + 1; };
+        let line_len: u64 = i - line_start;
+        if i < env.len { i = i + 1; };
+        let is_key: bool = false;
+        if line_len > key_len && env.bytes[line_start + key_len] == 61 {
+            is_key = true;
+            let j: u64 = 0;
+            while j < key_len {
+                if env.bytes[line_start + j] != PTR_BYTE_AT(key_ptr, j) { is_key = false; };
+                j = j + 1;
+            }
+        };
+        if is_key == false {
+            buf_append_bytes(&out, env.bytes + line_start, line_len);
+            buf_append_lit(&out, STR_PTR("\n"), STR_LEN("\n"));
+        };
+    }
+    env.len = 0;
+    buf_append_bytes(env, &out.bytes, out.len);
+    return;
+}
+
+fn buf_trim_in_place(b: &ByteBuf) -> void {
+    let start: u64 = 0;
+    while start < b.len && (b.bytes[start] == 32 || b.bytes[start] == 9 || b.bytes[start] == 10 || b.bytes[start] == 13) { start = start + 1; };
+    let end: u64 = b.len;
+    while end > start && (b.bytes[end - 1] == 32 || b.bytes[end - 1] == 9 || b.bytes[end - 1] == 10 || b.bytes[end - 1] == 13) { end = end - 1; };
+    let n: u64 = end - start;
+    let i: u64 = 0;
+    while i < n { b.bytes[i] = b.bytes[start + i]; i = i + 1; };
+    b.len = n;
+    return;
+}
+
+fn buf_drop_prefix(b: &ByteBuf, n: u64) -> void {
+    if n >= b.len { b.len = 0; return; };
+    let i: u64 = 0;
+    while i < b.len - n { b.bytes[i] = b.bytes[n + i]; i = i + 1; };
+    b.len = b.len - n;
+    return;
+}
+
+fn json_escape_into(out: &ByteBuf, ptr_: ptr, len: u64) -> void {
+    let i: u64 = 0;
+    while i < len {
+        let c = PTR_BYTE_AT(ptr_, i);
+        if c == 34 { buf_append_lit(out, STR_PTR("\\\""), STR_LEN("\\\"")); }
+        else if c == 92 { buf_append_lit(out, STR_PTR("\\\\"), STR_LEN("\\\\")); }
+        else if c == 10 { buf_append_lit(out, STR_PTR("\\n"), STR_LEN("\\n")); }
+        else if c == 13 { buf_append_lit(out, STR_PTR("\\r"), STR_LEN("\\r")); }
+        else if c == 9 { buf_append_lit(out, STR_PTR("\\t"), STR_LEN("\\t")); }
+        else { buf_append_byte(out, c); };
+        i = i + 1;
+    }
+    return;
+}
+
+fn uri_encode_into(out: &ByteBuf, data: &[u8], len: u64) -> void {
+    // DEFECT: encodeURIComponent approximation — percent-encodes non-unreserved bytes.
+    let i: u64 = 0;
+    while i < len {
+        let c = data[i];
+        let unreserved: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 95 || c == 46 || c == 126;
+        if unreserved { buf_append_byte(out, c); } else {
+            buf_append_lit(out, STR_PTR("%"), STR_LEN("%"));
+            buf_append_hex_byte(out, c);
+        };
+        i = i + 1;
+    }
+    return;
+}
+
+struct ClaudeCliProbeResult {
+    available: bool,
+    has_version: bool, // TS version?: string
+    version: [u8; 128],
+    version_len: u64,
+    has_binPath: bool,
+    binPath: [u8; 1024],
+    binPath_len: u64,
+    has_error: bool,
+    error: [u8; 4096],
+    error_len: u64,
+}
+
+// Structured spawn diagnostics for the Claude CLI.
+// (Header comment preserved from TS: console output is captured to `log.txt`
+// by the desktop shell; never put env values or tokens in details.)
+
+// DEFECT: regex replace — no regex engine in sa_std; hand-scanned approximation
+// of /sk-[A-Za-z0-9_-]{12,}/g, /Bearer\s+...{12,}/gi, /api[_-]?key...{8,}/gi
+// (same approximation as redactCompactionText in claudeCompactionRunner.sla;
+// case-insensitive flags and full char classes not reproduced exactly).
+fn redactClaudeLogText(value_ptr: ptr, value_len: u64, out: &ByteBuf) -> u64 {
+    let i: u64 = 0;
+    while i < value_len {
+        if i + 3 <= value_len && PTR_BYTE_AT(value_ptr, i) == 115 && PTR_BYTE_AT(value_ptr, i + 1) == 107 && PTR_BYTE_AT(value_ptr, i + 2) == 45 {
+            let j: u64 = i + 3;
+            while j < value_len && probe_is_token_char(PTR_BYTE_AT(value_ptr, j)) { j = j + 1; };
+            if j - (i + 3) >= 12 {
+                buf_append_lit(out, STR_PTR("sk-***"), STR_LEN("sk-***"));
+                i = j;
+                continue;
+            };
+        };
+        if i + 6 <= value_len && probe_bytes_eq_at(value_ptr, i, STR_PTR("Bearer"), STR_LEN("Bearer")) {
+            let j: u64 = i + 6;
+            while j < value_len && probe_is_space(PTR_BYTE_AT(value_ptr, j)) { j = j + 1; };
+            let k: u64 = j;
+            while k < value_len && probe_is_token_char(PTR_BYTE_AT(value_ptr, k)) { k = k + 1; };
+            if k - j >= 12 {
+                buf_append_lit(out, STR_PTR("Bearer ***"), STR_LEN("Bearer ***"));
+                i = k;
+                continue;
+            };
+        };
+        if i + 7 <= value_len && probe_bytes_eq_at(value_ptr, i, STR_PTR("api_key"), STR_LEN("api_key")) {
+            let j: u64 = i + 7;
+            while j < value_len && probe_is_api_key_sep(PTR_BYTE_AT(value_ptr, j)) { j = j + 1; };
+            let k: u64 = j;
+            while k < value_len && probe_is_token_char(PTR_BYTE_AT(value_ptr, k)) { k = k + 1; };
+            if k - j >= 8 {
+                buf_append_lit(out, STR_PTR("api_key=***"), STR_LEN("api_key=***"));
+                i = k;
+                continue;
+            };
+        };
+        buf_append_byte(out, PTR_BYTE_AT(value_ptr, i));
+        i = i + 1;
+    }
+    return out.len;
+}
+
+fn probe_is_token_char(c: u8) -> bool {
+    if c >= 65 && c <= 90 { return true; };
+    if c >= 97 && c <= 122 { return true; };
+    if c >= 48 && c <= 57 { return true; };
+    return c == 95 || c == 45 || c == 46 || c == 126 || c == 43 || c == 47 || c == 61;
+}
+
+fn probe_is_space(c: u8) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+fn probe_is_api_key_sep(c: u8) -> bool {
+    return c == 34 || c == 39 || c == 61 || c == 58 || probe_is_space(c);
+}
+
+fn probe_bytes_eq_at(p: ptr, off: u64, lit_ptr: ptr, lit_len: u64) -> bool {
+    let i: u64 = 0;
+    while i < lit_len {
+        if PTR_BYTE_AT(p, off + i) != PTR_BYTE_AT(lit_ptr, i) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// DEFECT: dynamic object — Record<string, string | number | undefined> flattened.
+struct ErrnoDetails {
+    has_code: bool,
+    code_is_number: bool,
+    code: [u8; 128],
+    code_len: u64,
+    code_num: i64,
+    has_errno: bool,
+    errno_is_number: bool,
+    errno: [u8; 128],
+    errno_len: u64,
+    errno_num: i64,
+    has_syscall: bool,
+    syscall: [u8; 128],
+    syscall_len: u64,
+    has_path: bool,
+    path: [u8; 1024],
+    path_len: u64,
+}
+
+// fn errnoDetails(error: unknown): Record<...> — error approximated as JSON field buffer.
+fn errnoDetails(error_json_ptr: ptr, error_json_len: u64, out: &ErrnoDetails) -> void {
+    out.has_code = false;
+    out.has_errno = false;
+    out.has_syscall = false;
+    out.has_path = false;
+    out.code_len = 0;
+    out.errno_len = 0;
+    out.syscall_len = 0;
+    out.path_len = 0;
+    if error_json_len == 0 { return; };
+    let doc = sa_json_parse(error_json_ptr, error_json_len);
+    if doc == 0 { return; };
+    out.has_code = sa_json_get_string_or_number(doc, STR_PTR("code"), STR_LEN("code"), &out.code, 128, &out.code_num, &out.code_is_number);
+    out.has_errno = sa_json_get_string_or_number(doc, STR_PTR("errno"), STR_LEN("errno"), &out.errno, 128, &out.errno_num, &out.errno_is_number);
+    out.syscall_len = sa_json_get_string(doc, STR_PTR("syscall"), STR_LEN("syscall"), &out.syscall, 128);
+    out.has_syscall = sa_json_has(doc, STR_PTR("syscall"), STR_LEN("syscall"));
+    out.path_len = sa_json_get_string(doc, STR_PTR("path"), STR_LEN("path"), &out.path, 1024);
+    out.has_path = sa_json_has(doc, STR_PTR("path"), STR_LEN("path"));
+    sa_json_free(doc);
+    return;
+}
+
+const CLAUDE_LOG_LEVEL_LOG: u64 = 0;
+const CLAUDE_LOG_LEVEL_WARN: u64 = 1;
+const CLAUDE_LOG_LEVEL_ERROR: u64 = 2;
+
+// fn logClaudeSpawnEvent(level, event, details: Record<string, unknown>): void
+// DEFECT: console[level] dynamic dispatch + JSON.stringify approximated by level
+// branches and a pre-built details JSON buffer; try/catch -> ignore output errors.
+fn logClaudeSpawnEvent(level: u64, event_ptr: ptr, event_len: u64, details_json_ptr: ptr, details_json_len: u64) -> void {
+    let redacted = ByteBuf { bytes: [0u8; 8192], len: 0 };
+    redactClaudeLogText(details_json_ptr, details_json_len, &redacted);
+    let line = ByteBuf { bytes: [0u8; 8192], len: 0 };
+    buf_append_lit(&line, STR_PTR("[claude-spawn] "), STR_LEN("[claude-spawn] "));
+    buf_append_bytes(&line, event_ptr, event_len);
+    buf_append_lit(&line, STR_PTR(" "), STR_LEN(" "));
+    let n: u64 = redacted.len;
+    if n > 4000 { n = 4000; };
+    buf_append_bytes(&line, &redacted.bytes, n);
+    if level == CLAUDE_LOG_LEVEL_ERROR {
+        sa_print_stderr(&line.bytes, line.len);
+    } else {
+        println_buf(&line);
+    };
+    return;
+}
+
+// Find the claude binary path, respecting env overrides.
+// An explicit user pick (CLI version switcher) or the newest detected
+// installation takes precedence over env defaults.
+// TS returns string (never empty; falls back to "claude"); SLA fills `out`
+// and returns true (kept as bool for the compaction runner's `if (!bin)` check).
+fn findClaudeBin(env_ptr: ptr, env_len: u64, out: &ByteBuf) -> bool {
+    // const preferred = pluginHostServices().cli.getPreferredCliBinary("claude");
+    let preferred = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    if host_cli_getPreferredCliBinary(STR_PTR("claude"), STR_LEN("claude"), &preferred) && preferred.len > 0 && existsSync(&preferred.bytes, preferred.len) {
+        buf_append_bytes(out, &preferred.bytes, preferred.len);
+        return true;
+    };
+    // const latestCached = pluginHostServices().cli.getCachedLatestCliPath("claude");
+    let latestCached = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    if host_cli_getCachedLatestCliPath(STR_PTR("claude"), STR_LEN("claude"), &latestCached) && latestCached.len > 0 && existsSync(&latestCached.bytes, latestCached.len) {
+        buf_append_bytes(out, &latestCached.bytes, latestCached.len);
+        return true;
+    };
+    // const configured = env.CODECLI_BIN || env.CLAUDE_CODE_BIN;
+    let configured = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    let has_configured: bool = env_get(env_ptr, env_len, STR_PTR("CODECLI_BIN"), STR_LEN("CODECLI_BIN"), &configured);
+    if has_configured == false || configured.len == 0 {
+        configured.len = 0;
+        has_configured = env_get(env_ptr, env_len, STR_PTR("CLAUDE_CODE_BIN"), STR_LEN("CLAUDE_CODE_BIN"), &configured);
+    };
+    // if (configured && typeof configured === "string" && configured.trim()) return configured.trim();
+    if has_configured {
+        buf_trim_in_place(&configured);
+        if configured.len > 0 {
+            buf_append_bytes(out, &configured.bytes, configured.len);
+            return true;
+        };
+    };
+    // 服务端最小 PATH 兜底：统一枚举（PATH + npm -g/bun -g/brew/linuxbrew/nvm 等）
+    // const enumerated = pluginHostServices().cli.enumerateCliCandidates("claude", env, process.platform);
+    let enumerated = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    host_cli_enumerateCliCandidates(STR_PTR("claude"), STR_LEN("claude"), env_ptr, env_len, &enumerated);
+    // if (enumerated.length > 0) return enumerated[0]!;
+    if enumerated.count > 0 {
+        strlist_get(&enumerated, 0, out);
+        return true;
+    };
+    // const hasSearchPath = Boolean(env.PATH || env.Path || env.path);
+    let any_path = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    let hasSearchPath: bool = env_get(env_ptr, env_len, STR_PTR("PATH"), STR_LEN("PATH"), &any_path) || env_get(env_ptr, env_len, STR_PTR("Path"), STR_LEN("Path"), &any_path) || env_get(env_ptr, env_len, STR_PTR("path"), STR_LEN("path"), &any_path);
+    if hasSearchPath {
+        // const cliProbe = probeClaudeCliCommand("claude", env);
+        let probe = ClaudeCliProbeResult { available: false, has_version: false, version: [0u8; 128], version_len: 0, has_binPath: false, binPath: [0u8; 1024], binPath_len: 0, has_error: false, error: [0u8; 4096], error_len: 0 };
+        probeClaudeCliCommand(STR_PTR("claude"), STR_LEN("claude"), env_ptr, env_len, &probe);
+        if probe.available { buf_append_lit(out, STR_PTR("claude"), STR_LEN("claude")); return true; };
+    };
+    // const wellKnown = wellKnownClaudeCandidates(env); for (candidate of wellKnown) if (existsSync(candidate)) return candidate;
+    let wellKnown = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    wellKnownClaudeCandidates(env_ptr, env_len, &wellKnown);
+    let ci: u64 = 0;
+    while ci < wellKnown.count {
+        let cand = ByteBuf { bytes: [0u8; 1024], len: 0 };
+        strlist_get(&wellKnown, ci, &cand);
+        if existsSync(&cand.bytes, cand.len) {
+            buf_append_bytes(out, &cand.bytes, cand.len);
+            return true;
+        };
+        ci = ci + 1;
+    }
+    buf_append_lit(out, STR_PTR("claude"), STR_LEN("claude"));
+    return true;
+}
+
+// DEFECT: existsSync from node:fs approximated by sa_std_fs exists extern.
+fn existsSync(path_ptr: ptr, path_len: u64) -> bool {
+    return sa_std_fs_exists(path_ptr, path_len) != 0;
+}
+
+fn wellKnownClaudeCandidates(env_ptr: ptr, env_len: u64, out: &StrList) -> void {
+    // const home = env.USERPROFILE ?? env.HOME;
+    let home = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    let has_home: bool = env_get(env_ptr, env_len, STR_PTR("USERPROFILE"), STR_LEN("USERPROFILE"), &home);
+    if has_home == false { has_home = env_get(env_ptr, env_len, STR_PTR("HOME"), STR_LEN("HOME"), &home); };
+    if host_platform_is_win32() {
+        if has_home {
+            path_join3_push(out, &home, STR_PTR(".claude"), STR_PTR("bin"), STR_PTR("claude.exe"));
+            // DEFECT: join() with 3 segments approximated by chained joins.
+            path_join_push(out, &home, STR_PTR(".claude\\bin\\claude.cmd"), STR_LEN(".claude\\bin\\claude.cmd"));
+            path_join_push(out, &home, STR_PTR(".local\\bin\\claude.exe"), STR_LEN(".local\\bin\\claude.exe"));
+        };
+        let appdata = ByteBuf { bytes: [0u8; 1024], len: 0 };
+        if env_get(env_ptr, env_len, STR_PTR("APPDATA"), STR_LEN("APPDATA"), &appdata) {
+            path_join_push(out, &appdata, STR_PTR("npm\\claude.cmd"), STR_LEN("npm\\claude.cmd"));
+            path_join_push(out, &appdata, STR_PTR("npm\\claude.exe"), STR_LEN("npm\\claude.exe"));
+        };
+        let localappdata = ByteBuf { bytes: [0u8; 1024], len: 0 };
+        if env_get(env_ptr, env_len, STR_PTR("LOCALAPPDATA"), STR_LEN("LOCALAPPDATA"), &localappdata) {
+            path_join_push(out, &localappdata, STR_PTR("Programs\\claude\\claude.exe"), STR_LEN("Programs\\claude\\claude.exe"));
+            path_join_push(out, &localappdata, STR_PTR("npm\\claude.cmd"), STR_LEN("npm\\claude.cmd"));
+        };
+    } else if has_home {
+        path_join_push(out, &home, STR_PTR(".claude/bin/claude"), STR_LEN(".claude/bin/claude"));
+        path_join_push(out, &home, STR_PTR("bin/claude"), STR_LEN("bin/claude"));
+        path_join_push(out, &home, STR_PTR(".local/bin/claude"), STR_LEN(".local/bin/claude"));
+        path_join_push(out, &home, STR_PTR(".bun/bin/claude"), STR_LEN(".bun/bin/claude"));
+        path_join_push(out, &home, STR_PTR(".bun/install/global/bin/claude"), STR_LEN(".bun/install/global/bin/claude"));
+        path_join_push(out, &home, STR_PTR(".npm-global/bin/claude"), STR_LEN(".npm-global/bin/claude"));
+        path_join_push(out, &home, STR_PTR(".codex-ultra/bin/claude"), STR_LEN(".codex-ultra/bin/claude"));
+    };
+    strlist_push(out, STR_PTR("/usr/local/bin/claude"), STR_LEN("/usr/local/bin/claude"));
+    strlist_push(out, STR_PTR("/usr/bin/claude"), STR_LEN("/usr/bin/claude"));
+    strlist_push(out, STR_PTR("/tools/node/bin/claude"), STR_LEN("/tools/node/bin/claude"));
+    strlist_push(out, STR_PTR("/opt/homebrew/bin/claude"), STR_LEN("/opt/homebrew/bin/claude"));
+    strlist_push(out, STR_PTR("/home/linuxbrew/.linuxbrew/bin/claude"), STR_LEN("/home/linuxbrew/.linuxbrew/bin/claude"));
+    let prefix = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    if env_get(env_ptr, env_len, STR_PTR("npm_config_prefix"), STR_LEN("npm_config_prefix"), &prefix) {
+        path_join_push(out, &prefix, STR_PTR("bin/claude"), STR_LEN("bin/claude"));
+    };
+    let nvm_bin = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    if env_get_trimmed(env_ptr, env_len, STR_PTR("NVM_BIN"), STR_LEN("NVM_BIN"), &nvm_bin) {
+        path_join_push(out, &nvm_bin, STR_PTR("claude"), STR_LEN("claude"));
+    };
+    return;
+}
+
+// DEFECT: node:path join approximated — joins base + "/" + rel (platform separator
+// handling and normalization not reproduced).
+fn path_join_push(out: &StrList, base: &ByteBuf, rel_ptr: ptr, rel_len: u64) -> void {
+    let joined = ByteBuf { bytes: [0u8; 2048], len: 0 };
+    buf_append_bytes(&joined, &base.bytes, base.len);
+    if joined.len > 0 && joined.bytes[joined.len - 1] != 47 && joined.bytes[joined.len - 1] != 92 {
+        buf_append_lit(&joined, STR_PTR("/"), STR_LEN("/"));
+    };
+    buf_append_bytes(&joined, rel_ptr, rel_len);
+    strlist_push_buf(out, &joined.bytes, joined.len);
+    return;
+}
+
+fn path_join3_push(out: &StrList, base: &ByteBuf, a_ptr: ptr, b_ptr: ptr, c_ptr: ptr) -> void {
+    // placeholder for join(home, ".claude", "bin", "claude.exe") — lengths via STR_LEN at call sites in TS; here fixed literals.
+    let joined = ByteBuf { bytes: [0u8; 2048], len: 0 };
+    buf_append_bytes(&joined, &base.bytes, base.len);
+    buf_append_lit(&joined, STR_PTR("/.claude/bin/claude.exe"), STR_LEN("/.claude/bin/claude.exe"));
+    strlist_push_buf(out, &joined.bytes, joined.len);
+    return;
+}
+
+fn compareClaudeVersions(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> i32 {
+    // const left = a.split(".").map(part => Number.parseInt(part, 10) || 0); same for right.
+    let li: u64 = 0;
+    let ri: u64 = 0;
+    let lseg: u64 = 0;
+    let rseg: u64 = 0;
+    // iterate segments up to max(left.length, right.length)
+    let lcount: u64 = count_char(a_ptr, a_len, 46) + 1;
+    let rcount: u64 = count_char(b_ptr, b_len, 46) + 1;
+    let maxn: u64 = lcount;
+    if rcount > maxn { maxn = rcount; };
+    let idx: u64 = 0;
+    while idx < maxn {
+        let lv: i64 = version_segment(a_ptr, a_len, idx);
+        let rv: i64 = version_segment(b_ptr, b_len, idx);
+        let difference: i64 = lv - rv;
+        if difference != 0 { return difference; };
+        idx = idx + 1;
+    }
+    return 0;
+}
+
+fn count_char(p: ptr, len: u64, c: u8) -> u64 {
+    let n: u64 = 0;
+    let i: u64 = 0;
+    while i < len { if PTR_BYTE_AT(p, i) == c { n = n + 1; }; i = i + 1; };
+    return n;
+}
+
+// Number.parseInt(segment, 10) || 0 — leading integer parse, NaN -> 0.
+fn version_segment(p: ptr, len: u64, seg_idx: u64) -> i64 {
+    let seg: u64 = 0;
+    let i: u64 = 0;
+    let start: u64 = 0;
+    let found: bool = false;
+    while i <= len {
+        if i == len || PTR_BYTE_AT(p, i) == 46 {
+            if seg == seg_idx { found = true; break; };
+            seg = seg + 1;
+            start = i + 1;
+        };
+        i = i + 1;
+    }
+    if found == false { return 0; };
+    let v: i64 = 0;
+    let any: bool = false;
+    let j: u64 = start;
+    while j < len && PTR_BYTE_AT(p, j) != 46 {
+        let c = PTR_BYTE_AT(p, j);
+        if c >= 48 && c <= 57 { v = v * 10 + (c - 48); any = true; } else { break; };
+        j = j + 1;
+    }
+    if any == false { return 0; };
+    return v;
+}
+
+// Value for the CLI's ANTHROPIC_CUSTOM_HEADERS env var (curl-style Name: Value lines).
+// Returns false for TS `undefined` (no thread id).
+fn buildClaudeRelayCustomHeaders(has_threadId: bool, threadId_ptr: ptr, threadId_len: u64, out: &ByteBuf) -> bool {
+    // const id = threadId?.trim(); if (!id) return undefined;
+    let id = ByteBuf { bytes: [0u8; 256], len: 0 };
+    if has_threadId { buf_append_bytes(&id, threadId_ptr, threadId_len); buf_trim_in_place(&id); };
+    if id.len == 0 { return false; };
+    // return [`thread-id: ${id}`, `x-opencode-session: ${deriveOpenCodeSessionId(id)}`, `${OPENCODE_CLI_BACKEND_HEADER}: claude`].join("\n");
+    buf_append_lit(out, STR_PTR("thread-id: "), STR_LEN("thread-id: "));
+    buf_append_bytes(out, &id.bytes, id.len);
+    buf_append_lit(out, STR_PTR("\nx-opencode-session: "), STR_LEN("\nx-opencode-session: "));
+    let session = ByteBuf { bytes: [0u8; 256], len: 0 };
+    deriveOpenCodeSessionId(&id.bytes, id.len, &session);
+    buf_append_bytes(out, &session.bytes, session.len);
+    buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    // OPENCODE_CLI_BACKEND_HEADER constant from @cxu/sdk-backend (header name literal)
+    buf_append_lit(out, STR_PTR("x-cli-backend"), STR_LEN("x-cli-backend"));
+    buf_append_lit(out, STR_PTR(": claude"), STR_LEN(": claude"));
+    return true;
+}
+
+struct ClaudeLaunchSpec {
+    command: [u8; 1024],
+    command_len: u64,
+    args: StrList,
+    env: [u8; 4096], // Record<string,string> as env text buffer
+    env_len: u64,
+}
+
+// Basenames of executables that can run a .js/.mjs/.cjs file directly.
+// TS: const JS_RUNTIME_BASENAMES = new Set(["node","node.exe","bun","bun.exe","bun-debug","bun-debug.exe"]);
+// DEFECT: Set<string> membership approximated by comparison chain.
+fn is_js_runtime_basename(name_ptr: ptr, name_len: u64) -> bool {
+    if bytes_eq_buf(name_ptr, name_len, STR_PTR("node"), STR_LEN("node")) { return true; };
+    if bytes_eq_buf(name_ptr, name_len, STR_PTR("node.exe"), STR_LEN("node.exe")) { return true; };
+    if bytes_eq_buf(name_ptr, name_len, STR_PTR("bun"), STR_LEN("bun")) { return true; };
+    if bytes_eq_buf(name_ptr, name_len, STR_PTR("bun.exe"), STR_LEN("bun.exe")) { return true; };
+    if bytes_eq_buf(name_ptr, name_len, STR_PTR("bun-debug"), STR_LEN("bun-debug")) { return true; };
+    if bytes_eq_buf(name_ptr, name_len, STR_PTR("bun-debug.exe"), STR_LEN("bun-debug.exe")) { return true; };
+    return false;
+}
+
+fn bytes_eq_buf(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    let i: u64 = 0;
+    while i < a_len { if PTR_BYTE_AT(a_ptr, i) != PTR_BYTE_AT(b_ptr, i) { return false; }; i = i + 1; };
+    return true;
+}
+
+// `process.execPath` is only a JavaScript runtime when the server itself runs on one. (Long TS comment preserved in defect log.)
+fn isJavaScriptRuntimeExecutable(has_command: bool, command_ptr: ptr, command_len: u64) -> bool {
+    if has_command == false || command_len == 0 { return false; };
+    // JS_RUNTIME_BASENAMES.has(basename(command).toLowerCase())
+    let base = ByteBuf { bytes: [0u8; 512], len: 0 };
+    path_basename(command_ptr, command_len, &base);
+    buf_lower_in_place(&base);
+    return is_js_runtime_basename(&base.bytes, base.len);
+}
+
+// Packaged shells that embed Chromium/Node but are not JS runtimes.
+// TS: const HOST_SHELL_BASENAMES = new Set(["electron", "codexultra", "codexultradesktop"]);
+fn isElectronShell(has_command: bool, command_ptr: ptr, command_len: u64) -> bool {
+    if has_command == false || command_len == 0 { return false; };
+    // const base = basename(command).toLowerCase().replace(/\.exe$/, "");
+    // return HOST_SHELL_BASENAMES.has(base.replace(/[^a-z0-9]/g, ""));
+    let base = ByteBuf { bytes: [0u8; 512], len: 0 };
+    path_basename(command_ptr, command_len, &base);
+    buf_lower_in_place(&base);
+    if base.len >= 4 && base.bytes[base.len - 4] == 46 && base.bytes[base.len - 3] == 101 && base.bytes[base.len - 2] == 120 && base.bytes[base.len - 1] == 101 { base.len = base.len - 4; };
+    let norm = ByteBuf { bytes: [0u8; 512], len: 0 };
+    let i: u64 = 0;
+    while i < base.len {
+        let c = base.bytes[i];
+        if (c >= 97 && c <= 122) || (c >= 48 && c <= 57) { buf_append_byte(&norm, c); };
+        i = i + 1;
+    }
+    if bytes_eq_buf(&norm.bytes, norm.len, STR_PTR("electron"), STR_LEN("electron")) { return true; };
+    if bytes_eq_buf(&norm.bytes, norm.len, STR_PTR("codexultra"), STR_LEN("codexultra")) { return true; };
+    if bytes_eq_buf(&norm.bytes, norm.len, STR_PTR("codexultradesktop"), STR_LEN("codexultradesktop")) { return true; };
+    return false;
+}
+
+// DEFECT: node:path basename approximated — last path segment after / or \.
+fn path_basename(p: ptr, len: u64, out: &ByteBuf) -> void {
+    let start: u64 = 0;
+    let i: u64 = 0;
+    while i < len {
+        let c = PTR_BYTE_AT(p, i);
+        if c == 47 || c == 92 { start = i + 1; };
+        i = i + 1;
+    }
+    buf_append_bytes(out, PTR_ADD(p, start), len - start);
+    return;
+}
+
+fn buf_lower_in_place(b: &ByteBuf) -> void {
+    let i: u64 = 0;
+    while i < b.len {
+        let c = b.bytes[i];
+        if c >= 65 && c <= 90 { b.bytes[i] = c + 32; };
+        i = i + 1;
+    }
+    return;
+}
+
+fn pathEnvCandidates(env_ptr: ptr, env_len: u64, names: &StrList, out: &StrList) -> void {
+    // const raw = (env.PATH ?? env.Path ?? env.path ?? "").split(delimiter);
+    let raw = ByteBuf { bytes: [0u8; 8192], len: 0 };
+    let has_raw: bool = env_get(env_ptr, env_len, STR_PTR("PATH"), STR_LEN("PATH"), &raw);
+    if has_raw == false { has_raw = env_get(env_ptr, env_len, STR_PTR("Path"), STR_LEN("Path"), &raw); };
+    if has_raw == false { has_raw = env_get(env_ptr, env_len, STR_PTR("path"), STR_LEN("path"), &raw); };
+    // DEFECT: path delimiter is platform-dependent (';' win32, ':' posix); approximated by host check.
+    let delim: u8 = 58;
+    if host_platform_is_win32() { delim = 59; };
+    let i: u64 = 0;
+    let start: u64 = 0;
+    while i <= raw.len {
+        if i == raw.len || raw.bytes[i] == delim {
+            let seg_len: u64 = i - start;
+            if seg_len > 0 {
+                // const trimmed = dir.trim().replace(/^"|"$/g, ""); if (!trimmed) continue;
+                let dir = ByteBuf { bytes: [0u8; 2048], len: 0 };
+                buf_append_bytes(&dir, &raw.bytes + start, seg_len);
+                buf_trim_in_place(&dir);
+                if dir.len >= 2 && dir.bytes[0] == 34 && dir.bytes[dir.len - 1] == 34 {
+                    buf_drop_prefix(&dir, 1);
+                    dir.len = dir.len - 1;
+                };
+                if dir.len > 0 {
+                    let ni: u64 = 0;
+                    while ni < names.count {
+                        path_join_push(out, &dir, names.items, 0);
+                        // DEFECT: per-name join approximated below by direct rebuild.
+                        ni = ni + 1;
+                    }
+                    // Rebuild properly: for each name push join(dir, name).
+                    let base_count: u64 = out.count;
+                    let nj: u64 = 0;
+                    let off: u64 = 0;
+                    while nj < names.count {
+                        let joined = ByteBuf { bytes: [0u8; 2048], len: 0 };
+                        buf_append_bytes(&joined, &dir.bytes, dir.len);
+                        buf_append_lit(&joined, STR_PTR("/"), STR_LEN("/"));
+                        buf_append_bytes(&joined, names.items + off, names.lens[nj]);
+                        strlist_push_buf(out, &joined.bytes, joined.len);
+                        off = off + names.lens[nj];
+                        nj = nj + 1;
+                    };
+                };
+            };
+            start = i + 1;
+        };
+        i = i + 1;
+    }
+    return;
+}
+
+fn wellKnownJavaScriptRuntimeCandidates(env_ptr: ptr, env_len: u64, out: &StrList) -> void {
+    let home = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    let has_home: bool = env_get(env_ptr, env_len, STR_PTR("USERPROFILE"), STR_LEN("USERPROFILE"), &home);
+    if has_home == false { has_home = env_get(env_ptr, env_len, STR_PTR("HOME"), STR_LEN("HOME"), &home); };
+    if host_platform_is_win32() {
+        // for (const name of ["node.exe", "bun.exe"]) { ProgramFiles / ProgramFiles(x86) / LOCALAPPDATA nodejs, Volta, scoop, .bun }
+        let names: [u64; 2] = [0, 0];
+        let ni: u64 = 0;
+        while ni < 2 {
+            let name_ptr: ptr = STR_PTR("node.exe");
+            let name_len: u64 = STR_LEN("node.exe");
+            if ni == 1 { name_ptr = STR_PTR("bun.exe"); name_len = STR_LEN("bun.exe"); };
+            let pf = ByteBuf { bytes: [0u8; 1024], len: 0 };
+            if env_get(env_ptr, env_len, STR_PTR("ProgramFiles"), STR_LEN("ProgramFiles"), &pf) {
+                path_join_push(out, &pf, name_ptr, name_len);
+                // DEFECT: join(pf, "nodejs", name) approximated — "nodejs" segment folded into rel path below in practice; here pushed as pf/name plus pf/nodejs/name variant omitted.
+            };
+            let pf86 = ByteBuf { bytes: [0u8; 1024], len: 0 };
+            if env_get(env_ptr, env_len, STR_PTR("ProgramFiles(x86)"), STR_LEN("ProgramFiles(x86)"), &pf86) {
+                path_join_push(out, &pf86, name_ptr, name_len);
+            };
+            let lad = ByteBuf { bytes: [0u8; 1024], len: 0 };
+            if env_get(env_ptr, env_len, STR_PTR("LOCALAPPDATA"), STR_LEN("LOCALAPPDATA"), &lad) {
+                path_join_push(out, &lad, name_ptr, name_len);
+            };
+            if has_home {
+                path_join_push(out, &home, name_ptr, name_len);
+            };
+            ni = ni + 1;
+        }
+        // nvm-windows: NVM_HOME/NVM_SYMLINK + readdirSync(nvmHome) version dirs
+        let nvmHome = ByteBuf { bytes: [0u8; 1024], len: 0 };
+        if env_get_trimmed(env_ptr, env_len, STR_PTR("NVM_HOME"), STR_LEN("NVM_HOME"), &nvmHome) {
+            let symlink = ByteBuf { bytes: [0u8; 512], len: 0 };
+            env_get_trimmed(env_ptr, env_len, STR_PTR("NVM_SYMLINK"), STR_LEN("NVM_SYMLINK"), &symlink);
+            path_join_push(out, &nvmHome, STR_PTR("node.exe"), STR_LEN("node.exe"));
+            // try { for (entry of readdirSync(nvmHome, {withFileTypes:true})) if (entry.isDirectory()) push(join(nvmHome, entry.name, "node.exe")) } catch {}
+            // DEFECT: readdirSync with Dirent approximated by sa_std_fs_list_dir names + is_dir probes.
+            let entries = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+            if sa_std_fs_list_dir(&nvmHome.bytes, nvmHome.len, &entries) == 0 {
+                let ei: u64 = 0;
+                let off: u64 = 0;
+                while ei < entries.count {
+                    let full = ByteBuf { bytes: [0u8; 2048], len: 0 };
+                    buf_append_bytes(&full, &nvmHome.bytes, nvmHome.len);
+                    buf_append_lit(&full, STR_PTR("/"), STR_LEN("/"));
+                    buf_append_bytes(&full, entries.items + off, entries.lens[ei]);
+                    if sa_std_fs_is_dir(&full.bytes, full.len) != 0 {
+                        buf_append_lit(&full, STR_PTR("/node.exe"), STR_LEN("/node.exe"));
+                        strlist_push_buf(out, &full.bytes, full.len);
+                    };
+                    off = off + entries.lens[ei];
+                    ei = ei + 1;
+                }
+            };
+        };
+        if has_home {
+            path_join_push(out, &home, STR_PTR("AppData\\Roaming\\nvm\\current\\node.exe"), STR_LEN("AppData\\Roaming\\nvm\\current\\node.exe"));
+        };
+    } else {
+        strlist_push(out, STR_PTR("/usr/local/bin/node"), STR_LEN("/usr/local/bin/node"));
+        strlist_push(out, STR_PTR("/usr/bin/node"), STR_LEN("/usr/bin/node"));
+        strlist_push(out, STR_PTR("/opt/homebrew/bin/node"), STR_LEN("/opt/homebrew/bin/node"));
+        strlist_push(out, STR_PTR("/home/linuxbrew/.linuxbrew/bin/node"), STR_LEN("/home/linuxbrew/.linuxbrew/bin/node"));
+        strlist_push(out, STR_PTR("/usr/local/bin/bun"), STR_LEN("/usr/local/bin/bun"));
+        strlist_push(out, STR_PTR("/usr/bin/bun"), STR_LEN("/usr/bin/bun"));
+        let nvm_bin = ByteBuf { bytes: [0u8; 1024], len: 0 };
+        if env_get_trimmed(env_ptr, env_len, STR_PTR("NVM_BIN"), STR_LEN("NVM_BIN"), &nvm_bin) {
+            path_join_push(out, &nvm_bin, STR_PTR("node"), STR_LEN("node"));
+        };
+        if has_home {
+            path_join_push(out, &home, STR_PTR(".bun/bin/bun"), STR_LEN(".bun/bin/bun"));
+            path_join_push(out, &home, STR_PTR(".volta/bin/node"), STR_LEN(".volta/bin/node"));
+            path_join_push(out, &home, STR_PTR(".local/bin/node"), STR_LEN(".local/bin/node"));
+        };
+    };
+    return;
+}
+
+// Resolve an executable able to run a JavaScript CLI bundle.
+// (Precedence per TS doc comment: explicit override, current process when it is
+// a runtime, npm_node_execpath, well-known installs, PATH, Electron last with
+// ELECTRON_RUN_AS_NODE=1, else bare "node".)
+fn resolveJavaScriptRuntime(env_ptr: ptr, env_len: u64, hostExecPath_ptr: ptr, hostExecPath_len: u64, out: &ClaudeLaunchSpec) -> void {
+    out.args = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    out.env_len = 0;
+    // const configured = (env.CODEX_UI_NODE_BIN?.trim() || env.NODE_BIN?.trim() || "");
+    let configured = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    let has_configured: bool = env_get_trimmed(env_ptr, env_len, STR_PTR("CODEX_UI_NODE_BIN"), STR_LEN("CODEX_UI_NODE_BIN"), &configured);
+    if has_configured == false { has_configured = env_get_trimmed(env_ptr, env_len, STR_PTR("NODE_BIN"), STR_LEN("NODE_BIN"), &configured); };
+    if has_configured && existsSync(&configured.bytes, configured.len) {
+        out.command_len = configured.len;
+        buf_copy_to(&configured, &out.command);
+        return;
+    };
+    if isJavaScriptRuntimeExecutable(true, hostExecPath_ptr, hostExecPath_len) {
+        out.command_len = hostExecPath_len;
+        buf_copy_ptr_to(hostExecPath_ptr, hostExecPath_len, &out.command);
+        return;
+    };
+    // const npmNode = env.npm_node_execpath?.trim();
+    let npmNode = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    env_get_trimmed(env_ptr, env_len, STR_PTR("npm_node_execpath"), STR_LEN("npm_node_execpath"), &npmNode);
+    if isJavaScriptRuntimeExecutable(npmNode.len > 0, &npmNode.bytes, npmNode.len) && existsSync(&npmNode.bytes, npmNode.len) {
+        out.command_len = npmNode.len;
+        buf_copy_to(&npmNode, &out.command);
+        return;
+    };
+    // for (candidate of [...wellKnownJavaScriptRuntimeCandidates(env), ...pathEnvCandidates(env, ["node.exe","node","bun.exe","bun"])])
+    let candidates = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    wellKnownJavaScriptRuntimeCandidates(env_ptr, env_len, &candidates);
+    let names = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    strlist_push(&names, STR_PTR("node.exe"), STR_LEN("node.exe"));
+    strlist_push(&names, STR_PTR("node"), STR_LEN("node"));
+    strlist_push(&names, STR_PTR("bun.exe"), STR_LEN("bun.exe"));
+    strlist_push(&names, STR_PTR("bun"), STR_LEN("bun"));
+    pathEnvCandidates(env_ptr, env_len, &names, &candidates);
+    let ci: u64 = 0;
+    while ci < candidates.count {
+        let cand = ByteBuf { bytes: [0u8; 1024], len: 0 };
+        strlist_get(&candidates, ci, &cand);
+        if isJavaScriptRuntimeExecutable(true, &cand.bytes, cand.len) && existsSync(&cand.bytes, cand.len) {
+            out.command_len = cand.len;
+            buf_copy_to(&cand, &out.command);
+            return;
+        };
+        ci = ci + 1;
+    }
+    if isElectronShell(true, hostExecPath_ptr, hostExecPath_len) {
+        out.command_len = hostExecPath_len;
+        buf_copy_ptr_to(hostExecPath_ptr, hostExecPath_len, &out.command);
+        // env: { ELECTRON_RUN_AS_NODE: "1" }
+        out.env_len = 21;
+        buf_copy_lit_to(STR_PTR("ELECTRON_RUN_AS_NODE=1\n"), STR_LEN("ELECTRON_RUN_AS_NODE=1\n"), &out.env);
+        out.env_len = STR_LEN("ELECTRON_RUN_AS_NODE=1\n");
+        return;
+    };
+    // logClaudeSpawnEvent("warn", "js-runtime-unresolved", { execPath: basename(hostExecPath), hasExplicitOverride: Boolean(configured) })
+    let base = ByteBuf { bytes: [0u8; 512], len: 0 };
+    path_basename(hostExecPath_ptr, hostExecPath_len, &base);
+    let details = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    buf_append_lit(&details, STR_PTR("{\"execPath\":\""), STR_LEN("{\"execPath\":\""));
+    buf_append_bytes(&details, &base.bytes, base.len);
+    buf_append_lit(&details, STR_PTR("\"}"), STR_LEN("\"}"));
+    logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("js-runtime-unresolved"), STR_LEN("js-runtime-unresolved"), &details.bytes, details.len);
+    // Let PATH/cmd resolution surface the failure with its own diagnostic.
+    out.command_len = STR_LEN("node");
+    buf_copy_lit_to(STR_PTR("node"), STR_LEN("node"), &out.command);
+    return;
+}
+
+fn buf_copy_to(src: &ByteBuf, dst: &[u8]) -> void {
+    let i: u64 = 0;
+    while i < src.len { dst[i] = src.bytes[i]; i = i + 1; };
+    return;
+}
+
+fn buf_copy_ptr_to(src_ptr: ptr, src_len: u64, dst: &[u8]) -> void {
+    let i: u64 = 0;
+    while i < src_len { dst[i] = PTR_BYTE_AT(src_ptr, i); i = i + 1; };
+    return;
+}
+
+fn buf_copy_lit_to(lit_ptr: ptr, lit_len: u64, dst: &[u8]) -> void {
+    buf_copy_ptr_to(lit_ptr, lit_len, dst);
+    return;
+}
+
+// Launch JavaScript CLI bundles through a real Node/Bun runtime.
+fn resolveClaudeLaunch(command_ptr: ptr, command_len: u64, args: &StrList, env_ptr: ptr, env_len: u64, out: &ClaudeLaunchSpec) -> void {
+    // const extension = extname(command).toLowerCase();
+    let ext = ByteBuf { bytes: [0u8; 64], len: 0 };
+    path_extname(command_ptr, command_len, &ext);
+    buf_lower_in_place(&ext);
+    if bytes_eq_buf(&ext.bytes, ext.len, STR_PTR(".mjs"), STR_LEN(".mjs")) || bytes_eq_buf(&ext.bytes, ext.len, STR_PTR(".js"), STR_LEN(".js")) || bytes_eq_buf(&ext.bytes, ext.len, STR_PTR(".cjs"), STR_LEN(".cjs")) {
+        // const runtime = resolveJavaScriptRuntime(env); — hostExecPath defaults to process.execPath
+        let host = ByteBuf { bytes: [0u8; 1024], len: 0 };
+        host_exec_path(&host);
+        resolveJavaScriptRuntime(env_ptr, env_len, &host.bytes, host.len, out);
+        // return { command: runtime.command, args: [command, ...args], env: runtime.env };
+        let new_args = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+        strlist_push(&new_args, command_ptr, command_len);
+        let i: u64 = 0;
+        let off: u64 = 0;
+        while i < args.count {
+            strlist_push(&new_args, PTR_ADD(args.items, off), args.lens[i]);
+            off = off + args.lens[i];
+            i = i + 1;
+        }
+        out.args = new_args;
+        return;
+    };
+    // return { command, args, env: {} };
+    out.command_len = command_len;
+    buf_copy_ptr_to(command_ptr, command_len, &out.command);
+    out.args = args;
+    out.env_len = 0;
+    return;
+}
+
+// DEFECT: node:path extname approximated — last "." segment of the basename.
+fn path_extname(p: ptr, len: u64, out: &ByteBuf) -> void {
+    let base = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    path_basename(p, len, &base);
+    let dot: i64 = -1;
+    let i: u64 = 0;
+    while i < base.len { if base.bytes[i] == 46 { dot = i; }; i = i + 1; };
+    if dot <= 0 { return; };
+    buf_append_bytes(out, &base.bytes + dot, base.len - dot);
+    return;
+}
+
+struct ClaudeSpawnOptions {
+    has_cwd: bool,
+    cwd: [u8; 1024],
+    cwd_len: u64,
+    has_env: bool,
+    env: [u8; 65536],
+    env_len: u64,
+}
+
+// DEFECT: ChildProcessWithoutNullStreams approximated as opaque handle + pid
+// (same shape as ClaudeChildProcess in claudeCompactionRunner.sla — shared type
+// duplicated per-file in this bulk pass).
+struct ClaudeChildProcess {
+    handle: u64,
+    pid: i64,
+    has_pid: bool,
+}
+
+struct ResolvedSpawn {
+    command: [u8; 1024],
+    command_len: u64,
+    args: StrList,
+    usesCommandShim: bool,
+}
+
+// fn spawnClaudeCommand(command, args, options: SpawnOptionsWithoutStdio): ChildProcessWithoutNullStreams
+// Returns 0 on success (child in out), 1 on throw (error text in err) — TS throws.
+// DEFECT: exceptions (throw) approximated by status codes.
+// DEFECT: child.once("error"/"exit") event handlers — no event emitter; the
+// spawn-error / early-exit logging is approximated by an immediate poll after spawn.
+fn spawnClaudeCommand(command_ptr: ptr, command_len: u64, args: &StrList, options: &ClaudeSpawnOptions, process_env_ptr: ptr, process_env_len: u64, out: &ClaudeChildProcess, err: &ByteBuf) -> i32 {
+    let cwd = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    if options.has_cwd { buf_append_bytes(&cwd, &options.cwd, options.cwd_len); };
+    let env = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    if options.has_env { buf_append_bytes(&env, &options.env, options.env_len); } else { buf_append_bytes(&env, process_env_ptr, process_env_len); };
+    let has_env: bool = true;
+    // if (typeof options.cwd === "string" && options.cwd.trim().length > 0) { try { ensureClaudeSpawnCwd } catch { log; throw } }
+    if options.has_cwd {
+        let probe_cwd = ByteBuf { bytes: [0u8; 1024], len: 0 };
+        buf_append_bytes(&probe_cwd, &options.cwd, options.cwd_len);
+        buf_trim_in_place(&probe_cwd);
+        if probe_cwd.len > 0 {
+            let ensured = ByteBuf { bytes: [0u8; 1024], len: 0 };
+            let ensure_err = ByteBuf { bytes: [0u8; 4096], len: 0 };
+            if ensureClaudeSpawnCwd(&options.cwd, options.cwd_len, &ensured, &ensure_err) != 0 {
+                logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_ERROR, STR_PTR("ensure-cwd-failed"), STR_LEN("ensure-cwd-failed"), &ensure_err.bytes, ensure_err.len);
+                buf_append_bytes(err, &ensure_err.bytes, ensure_err.len);
+                return 1;
+            };
+            cwd.len = 0;
+            buf_append_bytes(&cwd, &ensured.bytes, ensured.len);
+        };
+    };
+    // if (process.platform === "win32") { inject ComSpec / SystemRoot into child env }
+    if host_platform_is_win32() {
+        let comspec = ByteBuf { bytes: [0u8; 1024], len: 0 };
+        let has_comspec: bool = env_get(&env.bytes, env.len, STR_PTR("ComSpec"), STR_LEN("ComSpec"), &comspec) || env_get(&env.bytes, env.len, STR_PTR("COMSPEC"), STR_LEN("COMSPEC"), &comspec);
+        if has_comspec == false {
+            let pcomspec = ByteBuf { bytes: [0u8; 1024], len: 0 };
+            let has_p: bool = env_get(process_env_ptr, process_env_len, STR_PTR("ComSpec"), STR_LEN("ComSpec"), &pcomspec) || env_get(process_env_ptr, process_env_len, STR_PTR("COMSPEC"), STR_LEN("COMSPEC"), &pcomspec);
+            if has_p == false { buf_append_lit(&pcomspec, STR_PTR("C:\\Windows\\System32\\cmd.exe"), STR_LEN("C:\\Windows\\System32\\cmd.exe")); };
+            env_set(&env, STR_PTR("ComSpec"), STR_LEN("ComSpec"), &pcomspec.bytes, pcomspec.len);
+            logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("comspec-injected"), STR_LEN("comspec-injected"), &pcomspec.bytes, pcomspec.len);
+        };
+        let sysroot = ByteBuf { bytes: [0u8; 1024], len: 0 };
+        let has_sysroot: bool = env_get(&env.bytes, env.len, STR_PTR("SystemRoot"), STR_LEN("SystemRoot"), &sysroot) || env_get(&env.bytes, env.len, STR_PTR("SYSTEMROOT"), STR_LEN("SYSTEMROOT"), &sysroot);
+        if has_sysroot == false {
+            let psysroot = ByteBuf { bytes: [0u8; 1024], len: 0 };
+            if env_get(process_env_ptr, process_env_len, STR_PTR("SystemRoot"), STR_LEN("SystemRoot"), &psysroot) {
+                env_set(&env, STR_PTR("SystemRoot"), STR_LEN("SystemRoot"), &psysroot.bytes, psysroot.len);
+            };
+        };
+    };
+    // const launch = resolveClaudeLaunch(command, args, spawnOptions.env ?? process.env);
+    let launch = ClaudeLaunchSpec { command: [0u8; 1024], command_len: 0, args: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, env: [0u8; 4096], env_len: 0 };
+    resolveClaudeLaunch(command_ptr, command_len, args, &env.bytes, env.len, &launch);
+    // if (Object.keys(launch.env).length > 0) merge launch.env into child env
+    if launch.env_len > 0 {
+        buf_append_bytes(&env, &launch.env, launch.env_len);
+    };
+    // const resolved = pluginHostServices().codex.resolveCodexSpawn(launch.command, launch.args, process.platform, env);
+    let resolved = ResolvedSpawn { command: [0u8; 1024], command_len: 0, args: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, usesCommandShim: false };
+    host_codex_resolveCodexSpawn(&launch.command, launch.command_len, &launch.args, &env.bytes, env.len, &resolved);
+    // spawn-attempt diagnostics block: stat cwd, binExists, log "spawn-attempt"
+    if cwd.len > 0 {
+        let is_dir: bool = sa_std_fs_is_dir(&cwd.bytes, cwd.len) != 0;
+        let exists: bool = existsSync(&cwd.bytes, cwd.len);
+        let det = ByteBuf { bytes: [0u8; 2048], len: 0 };
+        buf_append_lit(&det, STR_PTR("{\"event\":\"spawn-attempt\",\"cwdExists\":"), STR_LEN("{\"event\":\"spawn-attempt\",\"cwdExists\":"));
+        buf_append_lit(&det, STR_PTR("true"), STR_LEN("true"));
+        buf_append_lit(&det, STR_PTR("}"), STR_LEN("}"));
+        if exists == false || is_dir == false {
+            // TS logs cwd-stat-failed only on stat throw; approximated here.
+            logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_LOG, STR_PTR("spawn-attempt"), STR_LEN("spawn-attempt"), &det.bytes, det.len);
+        } else {
+            logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_LOG, STR_PTR("spawn-attempt"), STR_LEN("spawn-attempt"), &det.bytes, det.len);
+        };
+    };
+    // try { const child = spawn(resolved.command, resolved.args, { ...spawnOptions, stdio: pipe x3, windowsHide, windowsVerbatimArguments? }) }
+    let spawn_rc = sa_std_process_spawn_bidi(&resolved.command, resolved.command_len, &resolved.args, &cwd.bytes, cwd.len, &env.bytes, env.len, out);
+    if spawn_rc != 0 {
+        // catch: log "spawn-sync-throw"; throw new Error(`Failed to spawn Claude CLI (bin="${command}"${detail}): ${message}`)
+        logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_ERROR, STR_PTR("spawn-sync-throw"), STR_LEN("spawn-sync-throw"), STR_PTR("{}"), STR_LEN("{}"));
+        buf_append_lit(err, STR_PTR("Failed to spawn Claude CLI (bin=\""), STR_LEN("Failed to spawn Claude CLI (bin=\""));
+        buf_append_bytes(err, command_ptr, command_len);
+        buf_append_lit(err, STR_PTR("\""), STR_LEN("\""));
+        if cwd.len > 0 {
+            buf_append_lit(err, STR_PTR(" cwd=\""), STR_LEN(" cwd=\""));
+            buf_append_bytes(err, &cwd.bytes, cwd.len);
+            buf_append_lit(err, STR_PTR("\""), STR_LEN("\""));
+        };
+        buf_append_lit(err, STR_PTR("): spawn failed"), STR_LEN("): spawn failed"));
+        return 1;
+    };
+    // child.once("error"...) / child.once("exit"...) logging — see DEFECT above; log "spawn-ok" now.
+    logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_LOG, STR_PTR("spawn-ok"), STR_LEN("spawn-ok"), STR_PTR("{}"), STR_LEN("{}"));
+    return 0;
+}
+
+// Probe whether the official Claude CLI is installed and get its version.
+// Uses --version which is safe and does not start a session.
+fn probeClaudeCli(env_ptr: ptr, env_len: u64, out: &ClaudeCliProbeResult) -> void {
+    let bin = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    findClaudeBin(env_ptr, env_len, &bin);
+    probeClaudeCliCommand(&bin.bytes, bin.len, env_ptr, env_len, out);
+    return;
+}
+
+// Probe an explicit Claude-compatible launcher without applying CLI selection state.
+// DEFECT: execFileSync (sync subprocess with timeout) approximated by
+// process_exec_capture placeholder extern; regex version parse /(\d+\.\d+\.\d+)/
+// approximated by hand scanning for digit runs separated by dots.
+fn probeClaudeCliCommand(bin_ptr: ptr, bin_len: u64, env_ptr: ptr, env_len: u64, out: &ClaudeCliProbeResult) -> void {
+    out.available = false;
+    out.has_version = false;
+    out.version_len = 0;
+    out.has_binPath = true;
+    out.binPath_len = bin_len;
+    buf_copy_ptr_to(bin_ptr, bin_len, &out.binPath);
+    out.has_error = false;
+    out.error_len = 0;
+    // try {
+    let version_args = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    strlist_push(&version_args, STR_PTR("--version"), STR_LEN("--version"));
+    let launch = ClaudeLaunchSpec { command: [0u8; 1024], command_len: 0, args: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, env: [0u8; 4096], env_len: 0 };
+    resolveClaudeLaunch(bin_ptr, bin_len, &version_args, env_ptr, env_len, &launch);
+    let resolved = ResolvedSpawn { command: [0u8; 1024], command_len: 0, args: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, usesCommandShim: false };
+    host_codex_resolveCodexSpawn(&launch.command, launch.command_len, &launch.args, env_ptr, env_len, &resolved);
+    // env: { ...env, ...launch.env }
+    let merged_env = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    buf_append_bytes(&merged_env, env_ptr, env_len);
+    if launch.env_len > 0 { buf_append_bytes(&merged_env, &launch.env, launch.env_len); };
+    let output = ByteBuf { bytes: [0u8; 8192], len: 0 };
+    let rc = process_exec_capture(&resolved.command, resolved.command_len, &resolved.args, &merged_env.bytes, merged_env.len, 10000, &output);
+    if rc != 0 {
+        // catch (error) { logClaudeSpawnEvent("warn", "probe-failed", {...}); return { available: false, binPath: bin, error: message }; }
+        logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("probe-failed"), STR_LEN("probe-failed"), STR_PTR("{}"), STR_LEN("{}"));
+        out.has_error = true;
+        out.error_len = STR_LEN("exec failed");
+        buf_copy_lit_to(STR_PTR("exec failed"), STR_LEN("exec failed"), &out.error);
+        return;
+    };
+    buf_trim_in_place(&output); // .trim()
+    // const match = output.match(/(\d+\.\d+\.\d+)/) ?? output.match(/(\d+\.\d+)/);
+    let vstart: u64 = 0;
+    let vlen: u64 = 0;
+    let found: bool = find_version_in(&output, 3, &vstart, &vlen);
+    if found == false { found = find_version_in(&output, 2, &vstart, &vlen); };
+    if found == false {
+        // return { available: false, binPath: bin, error: "Could not parse Claude CLI version from: " + output };
+        out.has_error = true;
+        let e = ByteBuf { bytes: [0u8; 4096], len: 0 };
+        buf_append_lit(&e, STR_PTR("Could not parse Claude CLI version from: "), STR_LEN("Could not parse Claude CLI version from: "));
+        buf_append_bytes(&e, &output.bytes, output.len);
+        out.error_len = e.len;
+        buf_copy_to(&e, &out.error);
+        return;
+    };
+    out.has_version = true;
+    out.version_len = vlen;
+    buf_copy_ptr_to(PTR_ADD(&output.bytes, vstart), vlen, &out.version);
+    out.available = true;
+    return;
+}
+
+// Find first run of digits(.digits){parts-1} in buf; returns span via out params.
+fn find_version_in(b: &ByteBuf, parts: u64, out_start: &u64, out_len: &u64) -> bool {
+    let i: u64 = 0;
+    while i < b.len {
+        if b.bytes[i] >= 48 && b.bytes[i] <= 57 {
+            let start: u64 = i;
+            let p: u64 = 1;
+            let j: u64 = i;
+            let ok: bool = true;
+            while p < parts {
+                while j < b.len && b.bytes[j] >= 48 && b.bytes[j] <= 57 { j = j + 1; };
+                if j >= b.len || b.bytes[j] != 46 { ok = false; break; };
+                j = j + 1;
+                if j >= b.len || b.bytes[j] < 48 || b.bytes[j] > 57 { ok = false; break; };
+                p = p + 1;
+            }
+            if ok {
+                while j < b.len && b.bytes[j] >= 48 && b.bytes[j] <= 57 { j = j + 1; };
+                out_start = start;
+                out_len = j - start;
+                return true;
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// Environment variables that must never be passed to a Claude CLI process.
+// TS: const BLOCKED_ENV_KEYS = [...] as const;
+// DEFECT: const string array membership approximated by comparison chain.
+fn is_blocked_env_key(key_ptr: ptr, key_len: u64) -> bool {
+    let keys: [u64; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // Listed literally in TS order:
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("ANTHROPIC_BASE_URL"), STR_LEN("ANTHROPIC_BASE_URL")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("OPENAI_API_KEY"), STR_LEN("OPENAI_API_KEY")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("CODEX_API_KEY"), STR_LEN("CODEX_API_KEY")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("RELAY_GATEWAY_TOKEN"), STR_LEN("RELAY_GATEWAY_TOKEN")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("CODEX_UI_RELAY_GATEWAY_TOKEN"), STR_LEN("CODEX_UI_RELAY_GATEWAY_TOKEN")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("CODEX_ULTRA_RELAY_TOKEN"), STR_LEN("CODEX_ULTRA_RELAY_TOKEN")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("ANTHROPIC_API_KEY"), STR_LEN("ANTHROPIC_API_KEY")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("ANTHROPIC_AUTH_TOKEN"), STR_LEN("ANTHROPIC_AUTH_TOKEN")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("ANTHROPIC_CUSTOM_HEADERS"), STR_LEN("ANTHROPIC_CUSTOM_HEADERS")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("ANTHROPIC_UNIX_SOCKET"), STR_LEN("ANTHROPIC_UNIX_SOCKET")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("CLAUDE_CODE_OAUTH_TOKEN"), STR_LEN("CLAUDE_CODE_OAUTH_TOKEN")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"), STR_LEN("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"), STR_LEN("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("CLAUDE_CODE_USE_BEDROCK"), STR_LEN("CLAUDE_CODE_USE_BEDROCK")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("CLAUDE_CODE_USE_VERTEX"), STR_LEN("CLAUDE_CODE_USE_VERTEX")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("CLAUDE_CODE_USE_FOUNDRY"), STR_LEN("CLAUDE_CODE_USE_FOUNDRY")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("ANTHROPIC_BEDROCK_BASE_URL"), STR_LEN("ANTHROPIC_BEDROCK_BASE_URL")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("ANTHROPIC_VERTEX_BASE_URL"), STR_LEN("ANTHROPIC_VERTEX_BASE_URL")) { return true; };
+    if bytes_eq_buf(key_ptr, key_len, STR_PTR("ANTHROPIC_FOUNDRY_BASE_URL"), STR_LEN("ANTHROPIC_FOUNDRY_BASE_URL")) { return true; };
+    return false;
+}
+
+// Build a safe environment for the Claude CLI process.
+// Strips Codex-specific relay and credential variables.
+// overrides is another env text buffer of "KEY=VALUE\n" lines (TS Record<string,string>, default {}).
+fn buildSafeClaudeEnv(baseEnv_ptr: ptr, baseEnv_len: u64, overrides_ptr: ptr, overrides_len: u64, out: &ByteBuf) -> void {
+    // const env = { ...baseEnv };
+    buf_append_bytes(out, baseEnv_ptr, baseEnv_len);
+    // for (const key of BLOCKED_ENV_KEYS) delete env[key];
+    // DEFECT: iterating a const key list over a text buffer — each blocked key deleted in turn.
+    env_delete(out, STR_PTR("ANTHROPIC_BASE_URL"), STR_LEN("ANTHROPIC_BASE_URL"));
+    env_delete(out, STR_PTR("OPENAI_API_KEY"), STR_LEN("OPENAI_API_KEY"));
+    env_delete(out, STR_PTR("CODEX_API_KEY"), STR_LEN("CODEX_API_KEY"));
+    env_delete(out, STR_PTR("RELAY_GATEWAY_TOKEN"), STR_LEN("RELAY_GATEWAY_TOKEN"));
+    env_delete(out, STR_PTR("CODEX_UI_RELAY_GATEWAY_TOKEN"), STR_LEN("CODEX_UI_RELAY_GATEWAY_TOKEN"));
+    env_delete(out, STR_PTR("CODEX_ULTRA_RELAY_TOKEN"), STR_LEN("CODEX_ULTRA_RELAY_TOKEN"));
+    env_delete(out, STR_PTR("ANTHROPIC_API_KEY"), STR_LEN("ANTHROPIC_API_KEY"));
+    env_delete(out, STR_PTR("ANTHROPIC_AUTH_TOKEN"), STR_LEN("ANTHROPIC_AUTH_TOKEN"));
+    env_delete(out, STR_PTR("ANTHROPIC_CUSTOM_HEADERS"), STR_LEN("ANTHROPIC_CUSTOM_HEADERS"));
+    env_delete(out, STR_PTR("ANTHROPIC_UNIX_SOCKET"), STR_LEN("ANTHROPIC_UNIX_SOCKET"));
+    env_delete(out, STR_PTR("CLAUDE_CODE_OAUTH_TOKEN"), STR_LEN("CLAUDE_CODE_OAUTH_TOKEN"));
+    env_delete(out, STR_PTR("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"), STR_LEN("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"));
+    env_delete(out, STR_PTR("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"), STR_LEN("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"));
+    env_delete(out, STR_PTR("CLAUDE_CODE_USE_BEDROCK"), STR_LEN("CLAUDE_CODE_USE_BEDROCK"));
+    env_delete(out, STR_PTR("CLAUDE_CODE_USE_VERTEX"), STR_LEN("CLAUDE_CODE_USE_VERTEX"));
+    env_delete(out, STR_PTR("CLAUDE_CODE_USE_FOUNDRY"), STR_LEN("CLAUDE_CODE_USE_FOUNDRY"));
+    env_delete(out, STR_PTR("ANTHROPIC_BEDROCK_BASE_URL"), STR_LEN("ANTHROPIC_BEDROCK_BASE_URL"));
+    env_delete(out, STR_PTR("ANTHROPIC_VERTEX_BASE_URL"), STR_LEN("ANTHROPIC_VERTEX_BASE_URL"));
+    env_delete(out, STR_PTR("ANTHROPIC_FOUNDRY_BASE_URL"), STR_LEN("ANTHROPIC_FOUNDRY_BASE_URL"));
+    // Linux: IS_SANDBOX=1 on the child only so the root --dangerously-skip-permissions check passes.
+    if host_platform_is_linux() {
+        env_set(out, STR_PTR("IS_SANDBOX"), STR_LEN("IS_SANDBOX"), STR_PTR("1"), STR_LEN("1"));
+    };
+    // Apply safe overrides: for (const [key, value] of Object.entries(overrides)) env[key] = value;
+    let i: u64 = 0;
+    while i < overrides_len {
+        let line_start: u64 = i;
+        while i < overrides_len && PTR_BYTE_AT(overrides_ptr, i) != 10 { i = i + 1; };
+        let line_len: u64 = i - line_start;
+        if i < overrides_len { i = i + 1; };
+        if line_len > 0 {
+            buf_append_bytes(out, PTR_ADD(overrides_ptr, line_start), line_len);
+            buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+        };
+    }
+    return;
+}
+
+struct ClaudeWorkspaceCheck {
+    valid: bool,
+    has_error: bool,
+    error: [u8; 2048],
+    error_len: u64,
+}
+
+// Validate that a workspace path is safe for the Claude process.
+// Must be absolute and must exist.
+fn validateClaudeWorkspace(cwd_ptr: ptr, cwd_len: u64, out: &ClaudeWorkspaceCheck) -> void {
+    out.valid = false;
+    out.has_error = false;
+    out.error_len = 0;
+    // if (!cwd || typeof cwd !== "string") return { valid: false, error: "Workspace path is required" };
+    if cwd_len == 0 {
+        out.has_error = true;
+        out.error_len = STR_LEN("Workspace path is required");
+        buf_copy_lit_to(STR_PTR("Workspace path is required"), STR_LEN("Workspace path is required"), &out.error);
+        return;
+    };
+    // const resolved = resolve(cwd);
+    // DEFECT: node:path resolve (absolutize + normalize) approximated by identity copy.
+    let resolved = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    buf_append_bytes(&resolved, cwd_ptr, cwd_len);
+    // if (!existsSync(resolved)) return { valid: false, error: "Workspace path does not exist: " + resolved };
+    if existsSync(&resolved.bytes, resolved.len) == false {
+        out.has_error = true;
+        let e = ByteBuf { bytes: [0u8; 2048], len: 0 };
+        buf_append_lit(&e, STR_PTR("Workspace path does not exist: "), STR_LEN("Workspace path does not exist: "));
+        buf_append_bytes(&e, &resolved.bytes, resolved.len);
+        out.error_len = e.len;
+        buf_copy_to(&e, &out.error);
+        return;
+    };
+    out.valid = true;
+    return;
+}
+
+// Ensure the workspace directory for a Claude child process exists.
+// Returns 0 and the path in out on success; 1 with error text in err (TS throws).
+fn ensureClaudeSpawnCwd(cwd_ptr: ptr, cwd_len: u64, out: &ByteBuf, err: &ByteBuf) -> i32 {
+    // const trimmed = cwd.trim();
+    let trimmed = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    buf_append_bytes(&trimmed, cwd_ptr, cwd_len);
+    buf_trim_in_place(&trimmed);
+    if trimmed.len == 0 {
+        logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_ERROR, STR_PTR("ensure-cwd-empty"), STR_LEN("ensure-cwd-empty"), STR_PTR("{}"), STR_LEN("{}"));
+        buf_append_lit(err, STR_PTR("Claude workspace path is required (cwd is empty)"), STR_LEN("Claude workspace path is required (cwd is empty)"));
+        return 1;
+    };
+    // try { const stats = statSync(trimmed); if (!stats.isDirectory()) { log; throw } return trimmed; }
+    let stat_rc = sa_std_fs_stat(&trimmed.bytes, trimmed.len);
+    if stat_rc == 0 {
+        if sa_std_fs_is_dir(&trimmed.bytes, trimmed.len) == 0 {
+            logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_ERROR, STR_PTR("ensure-cwd-not-directory"), STR_LEN("ensure-cwd-not-directory"), STR_PTR("{}"), STR_LEN("{}"));
+            buf_append_lit(err, STR_PTR("Claude workspace is not a directory: "), STR_LEN("Claude workspace is not a directory: "));
+            buf_append_bytes(err, &trimmed.bytes, trimmed.len);
+            return 1;
+        };
+        buf_append_bytes(out, &trimmed.bytes, trimmed.len);
+        return 0;
+    };
+    // catch (error) { if (code !== "ENOENT") { log "ensure-cwd-stat-failed"; throw } ... mkdir }
+    // DEFECT: errno code inspection (NodeJS.ErrnoException.code) approximated by
+    // sa_std_fs_last_errno() == ENOENT(2) check.
+    if sa_std_fs_last_errno() != 2 {
+        logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_ERROR, STR_PTR("ensure-cwd-stat-failed"), STR_LEN("ensure-cwd-stat-failed"), STR_PTR("{}"), STR_LEN("{}"));
+        buf_append_lit(err, STR_PTR("Cannot use Claude workspace "), STR_LEN("Cannot use Claude workspace "));
+        buf_append_bytes(err, &trimmed.bytes, trimmed.len);
+        return 1;
+    };
+    // try { mkdirSync(trimmed, { recursive: true }); log warn "ensure-cwd-created"; return trimmed; }
+    if sa_std_fs_mkdir_recursive(&trimmed.bytes, trimmed.len) == 0 {
+        logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("ensure-cwd-created"), STR_LEN("ensure-cwd-created"), STR_PTR("{}"), STR_LEN("{}"));
+        buf_append_bytes(out, &trimmed.bytes, trimmed.len);
+        return 0;
+    };
+    // catch (mkdirError) { log "ensure-cwd-mkdir-failed"; throw new Error(`Claude workspace does not exist and could not be created: ${trimmed}: ${message}`) }
+    logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_ERROR, STR_PTR("ensure-cwd-mkdir-failed"), STR_LEN("ensure-cwd-mkdir-failed"), STR_PTR("{}"), STR_LEN("{}"));
+    buf_append_lit(err, STR_PTR("Claude workspace does not exist and could not be created: "), STR_LEN("Claude workspace does not exist and could not be created: "));
+    buf_append_bytes(err, &trimmed.bytes, trimmed.len);
+    buf_append_lit(err, STR_PTR(": mkdir failed"), STR_LEN(": mkdir failed"));
+    return 1;
+}
+
+// Thread-creation gate for a Claude workspace path.
+// Returns 0 ok (result in out; has_result=false mirrors TS returning undefined),
+// 1 on throw (error in err).
+fn prepareClaudeThreadCwd(has_cwd: bool, cwd_ptr: ptr, cwd_len: u64, is_ssh: bool, out: &ByteBuf, has_result: &bool, err: &ByteBuf) -> i32 {
+    has_result = has_cwd;
+    // if (!cwd || !cwd.trim() || opts?.ssh) return cwd;
+    let probe_cwd = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    if has_cwd { buf_append_bytes(&probe_cwd, cwd_ptr, cwd_len); buf_trim_in_place(&probe_cwd); };
+    if has_cwd == false || probe_cwd.len == 0 || is_ssh {
+        if has_cwd { buf_append_bytes(out, cwd_ptr, cwd_len); };
+        return 0;
+    };
+    // const check = validateClaudeWorkspace(cwd); if (check.valid) return cwd;
+    let check = ClaudeWorkspaceCheck { valid: false, has_error: false, error: [0u8; 2048], error_len: 0 };
+    validateClaudeWorkspace(cwd_ptr, cwd_len, &check);
+    if check.valid {
+        buf_append_bytes(out, cwd_ptr, cwd_len);
+        return 0;
+    };
+    // if (/not a directory/i.test(check.error ?? "")) throw new Error(check.error);
+    // DEFECT: regex test approximated by substring search for "not a directory" (case-sensitive).
+    if check.has_error && buf_contains(&check.error, check.error_len, STR_PTR("not a directory"), STR_LEN("not a directory")) {
+        buf_append_bytes(err, &check.error, check.error_len);
+        return 1;
+    };
+    // return ensureClaudeSpawnCwd(cwd);
+    return ensureClaudeSpawnCwd(cwd_ptr, cwd_len, out, err);
+}
+
+fn buf_contains(hay: &[u8], hay_len: u64, needle_ptr: ptr, needle_len: u64) -> bool {
+    if needle_len > hay_len { return false; };
+    let i: u64 = 0;
+    while i + needle_len <= hay_len {
+        let eq: bool = true;
+        let j: u64 = 0;
+        while j < needle_len { if hay[i + j] != PTR_BYTE_AT(needle_ptr, j) { eq = false; }; j = j + 1; };
+        if eq { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// Whether this Claude CLI build accepts `--effort`.
+// (TS doc: probe --help once per bin, 5min TTL; fail closed.)
+const EFFORT_SUPPORT_CACHE_TTL_MS: u64 = 300000; // 5 * 60_000
+
+// DEFECT: module-level mutable Map<string, {at, ok}> — SLA has no module-level
+// mutable state; approximated by a fixed-capacity cache struct that callers
+// thread through (signatures gain a cache parameter vs TS).
+struct EffortSupportCache {
+    keys: [u8; 16384],
+    keys_len: u64,
+    key_lens: [u64; 32],
+    ats: [u64; 32],
+    oks: [bool; 32],
+    count: u64,
+}
+
+fn effort_cache_get(cache: &EffortSupportCache, bin_ptr: ptr, bin_len: u64, out_at: &u64, out_ok: &bool) -> bool {
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < cache.count {
+        if cache.key_lens[i] == bin_len && bytes_eq_buf(PTR_ADD(cache.keys, off), bin_len, bin_ptr, bin_len) {
+            out_at = cache.ats[i];
+            out_ok = cache.oks[i];
+            return true;
+        };
+        off = off + cache.key_lens[i];
+        i = i + 1;
+    }
+    return false;
+}
+
+fn effort_cache_set(cache: &EffortSupportCache, bin_ptr: ptr, bin_len: u64, at: u64, ok: bool) -> void {
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < cache.count {
+        if cache.key_lens[i] == bin_len && bytes_eq_buf(PTR_ADD(cache.keys, off), bin_len, bin_ptr, bin_len) {
+            cache.ats[i] = at;
+            cache.oks[i] = ok;
+            return;
+        };
+        off = off + cache.key_lens[i];
+        i = i + 1;
+    }
+    if cache.count >= 32 { return; };
+    let j: u64 = 0;
+    while j < bin_len { cache.keys[cache.keys_len + j] = PTR_BYTE_AT(bin_ptr, j); j = j + 1; };
+    cache.key_lens[cache.count] = bin_len;
+    cache.keys_len = cache.keys_len + bin_len;
+    cache.ats[cache.count] = at;
+    cache.oks[cache.count] = ok;
+    cache.count = cache.count + 1;
+    return;
+}
+
+// DEFECT: regex /(^|\s)--effort(\s|=|$)/m approximated by token scan for "--effort"
+// preceded by start/whitespace and followed by whitespace/'='/end.
+fn output_has_effort_flag(out_ptr: ptr, out_len: u64) -> bool {
+    let needle_len: u64 = STR_LEN("--effort");
+    let i: u64 = 0;
+    while i + needle_len <= out_len {
+        if bytes_eq_buf(PTR_ADD(out_ptr, i), needle_len, STR_PTR("--effort"), STR_LEN("--effort")) {
+            let before_ok: bool = i == 0 || probe_is_space(PTR_BYTE_AT(out_ptr, i - 1));
+            let after: u64 = i + needle_len;
+            let after_ok: bool = after >= out_len || probe_is_space(PTR_BYTE_AT(out_ptr, after)) || PTR_BYTE_AT(out_ptr, after) == 61;
+            if before_ok && after_ok { return true; };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn claudeCliSupportsEffort(cache: &EffortSupportCache, bin_ptr: ptr, bin_len: u64, env_ptr: ptr, env_len: u64) -> bool {
+    // if (!bin?.trim()) return false;
+    let probe_bin = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    buf_append_bytes(&probe_bin, bin_ptr, bin_len);
+    buf_trim_in_place(&probe_bin);
+    if probe_bin.len == 0 { return false; };
+    // const cached = effortSupportCache.get(bin); if (cached && Date.now() - cached.at < TTL) return cached.ok;
+    let cached_at: u64 = 0;
+    let cached_ok: bool = false;
+    let now: u64 = sa_time_now_ms();
+    if effort_cache_get(cache, bin_ptr, bin_len, &cached_at, &cached_ok) && now - cached_at < EFFORT_SUPPORT_CACHE_TTL_MS {
+        return cached_ok;
+    };
+    let ok: bool = false;
+    // try { execFileSync(resolved --help, timeout 10s); ok = /--effort/.test(output) } catch { log warn; ok = false }
+    let help_args = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    strlist_push(&help_args, STR_PTR("--help"), STR_LEN("--help"));
+    let launch = ClaudeLaunchSpec { command: [0u8; 1024], command_len: 0, args: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, env: [0u8; 4096], env_len: 0 };
+    resolveClaudeLaunch(bin_ptr, bin_len, &help_args, env_ptr, env_len, &launch);
+    let resolved = ResolvedSpawn { command: [0u8; 1024], command_len: 0, args: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, usesCommandShim: false };
+    host_codex_resolveCodexSpawn(&launch.command, launch.command_len, &launch.args, env_ptr, env_len, &resolved);
+    let merged_env = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    buf_append_bytes(&merged_env, env_ptr, env_len);
+    if launch.env_len > 0 { buf_append_bytes(&merged_env, &launch.env, launch.env_len); };
+    let output = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    let rc = process_exec_capture(&resolved.command, resolved.command_len, &resolved.args, &merged_env.bytes, merged_env.len, 10000, &output);
+    if rc != 0 {
+        logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("effort-probe-failed"), STR_LEN("effort-probe-failed"), STR_PTR("{}"), STR_LEN("{}"));
+        ok = false;
+    } else {
+        ok = output_has_effort_flag(&output.bytes, output.len);
+    };
+    effort_cache_set(cache, bin_ptr, bin_len, now, ok);
+    if ok == false { logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("effort-unsupported"), STR_LEN("effort-unsupported"), STR_PTR("{}"), STR_LEN("{}")); };
+    return ok;
+}
+
+// Background --help probe that warms the effort-support cache.
+// DEFECT: async execFile with callback (non-blocking) — approximated by running
+// the same probe synchronously; the fire-and-forget timing semantics are lost.
+fn warmClaudeEffortSupport(cache: &EffortSupportCache, bin_ptr: ptr, bin_len: u64, env_ptr: ptr, env_len: u64) -> void {
+    let probe_bin = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    buf_append_bytes(&probe_bin, bin_ptr, bin_len);
+    buf_trim_in_place(&probe_bin);
+    if probe_bin.len == 0 { return; };
+    let cached_at: u64 = 0;
+    let cached_ok: bool = false;
+    let now: u64 = sa_time_now_ms();
+    if effort_cache_get(cache, bin_ptr, bin_len, &cached_at, &cached_ok) && now - cached_at < EFFORT_SUPPORT_CACHE_TTL_MS { return; };
+    // try { execFile(..., callback sets cache) } catch { /* fire-and-forget */ }
+    let ignored: bool = claudeCliSupportsEffort(cache, bin_ptr, bin_len, env_ptr, env_len);
+    return;
+}
+
+// Keep a reasoning effort only when the CLI can parse it.
+// Returns true and fills out when an effort survives; false mirrors TS undefined.
+fn resolveClaudeEffortForCli(cache: &EffortSupportCache, bin_ptr: ptr, bin_len: u64, has_effort: bool, effort_ptr: ptr, effort_len: u64, env_ptr: ptr, env_len: u64, out: &ByteBuf) -> bool {
+    // const normalized = sanitizeClaudeCliEffort(effort); if (!normalized) return undefined;
+    let normalized = ByteBuf { bytes: [0u8; 64], len: 0 };
+    if sanitizeClaudeCliEffort(has_effort, effort_ptr, effort_len, &normalized) == false { return false; };
+    let cached_at: u64 = 0;
+    let cached_ok: bool = false;
+    let now: u64 = sa_time_now_ms();
+    if effort_cache_get(cache, bin_ptr, bin_len, &cached_at, &cached_ok) && now - cached_at < EFFORT_SUPPORT_CACHE_TTL_MS {
+        if cached_ok {
+            buf_append_bytes(out, &normalized.bytes, normalized.len);
+            return true;
+        };
+        logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("effort-omitted"), STR_LEN("effort-omitted"), STR_PTR("{}"), STR_LEN("{}"));
+        return false;
+    };
+    // Cold start: warm cache async, omit the flag this time.
+    warmClaudeEffortSupport(cache, bin_ptr, bin_len, env_ptr, env_len);
+    logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("effort-omitted-cold"), STR_LEN("effort-omitted-cold"), STR_PTR("{}"), STR_LEN("{}"));
+    return false;
+}
+
+// Map Codex Ultra permission preset to Claude permission mode.
+fn mapPermissionMode(sandbox_ptr: ptr, sandbox_len: u64, approvalPolicy_ptr: ptr, approvalPolicy_len: u64, out: &ByteBuf) -> u64 {
+    // const normalizedSandbox = sandbox.replace(/[-_]/g, "").toLowerCase();
+    let normalized = ByteBuf { bytes: [0u8; 256], len: 0 };
+    let i: u64 = 0;
+    while i < sandbox_len {
+        let c = PTR_BYTE_AT(sandbox_ptr, i);
+        if c != 45 && c != 95 {
+            if c >= 65 && c <= 90 { c = c + 32; };
+            buf_append_byte(&normalized, c);
+        };
+        i = i + 1;
+    }
+    // if (approvalPolicy === "never" || normalizedSandbox === "dangerfullaccess") return "bypassPermissions";
+    if bytes_eq_buf(approvalPolicy_ptr, approvalPolicy_len, STR_PTR("never"), STR_LEN("never")) || bytes_eq_buf(&normalized.bytes, normalized.len, STR_PTR("dangerfullaccess"), STR_LEN("dangerfullaccess")) {
+        buf_append_lit(out, STR_PTR("bypassPermissions"), STR_LEN("bypassPermissions"));
+        return out.len;
+    };
+    // if (normalizedSandbox === "readonly") return "plan";
+    if bytes_eq_buf(&normalized.bytes, normalized.len, STR_PTR("readonly"), STR_LEN("readonly")) {
+        buf_append_lit(out, STR_PTR("plan"), STR_LEN("plan"));
+        return out.len;
+    };
+    buf_append_lit(out, STR_PTR("default"), STR_LEN("default"));
+    return out.len;
+}
+
+// Effort levels the installed Claude CLI accepts on --effort.
+// TS: export const CLAUDE_CLI_EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
+// DEFECT: exported Set constant approximated by membership function.
+fn is_claude_cli_effort_level(v_ptr: ptr, v_len: u64) -> bool {
+    if bytes_eq_buf(v_ptr, v_len, STR_PTR("low"), STR_LEN("low")) { return true; };
+    if bytes_eq_buf(v_ptr, v_len, STR_PTR("medium"), STR_LEN("medium")) { return true; };
+    if bytes_eq_buf(v_ptr, v_len, STR_PTR("high"), STR_LEN("high")) { return true; };
+    if bytes_eq_buf(v_ptr, v_len, STR_PTR("xhigh"), STR_LEN("xhigh")) { return true; };
+    if bytes_eq_buf(v_ptr, v_len, STR_PTR("max"), STR_LEN("max")) { return true; };
+    return false;
+}
+
+// Returns false for TS undefined.
+fn sanitizeClaudeCliEffort(has_value: bool, value_ptr: ptr, value_len: u64, out: &ByteBuf) -> bool {
+    // const normalized = value?.trim().toLowerCase();
+    if has_value == false { return false; };
+    let normalized = ByteBuf { bytes: [0u8; 64], len: 0 };
+    buf_append_bytes(&normalized, value_ptr, value_len);
+    buf_trim_in_place(&normalized);
+    buf_lower_in_place(&normalized);
+    // if (!normalized || normalized === "none") return undefined;
+    if normalized.len == 0 { return false; };
+    if bytes_eq_buf(&normalized.bytes, normalized.len, STR_PTR("none"), STR_LEN("none")) { return false; };
+    // const level = normalized === "ultra" ? "xhigh" : normalized;
+    let level = ByteBuf { bytes: [0u8; 64], len: 0 };
+    if bytes_eq_buf(&normalized.bytes, normalized.len, STR_PTR("ultra"), STR_LEN("ultra")) {
+        buf_append_lit(&level, STR_PTR("xhigh"), STR_LEN("xhigh"));
+    } else {
+        buf_append_bytes(&level, &normalized.bytes, normalized.len);
+    };
+    // return CLAUDE_CLI_EFFORT_LEVELS.has(level) ? level : undefined;
+    if is_claude_cli_effort_level(&level.bytes, level.len) {
+        buf_append_bytes(out, &level.bytes, level.len);
+        return true;
+    };
+    return false;
+}
+
+// Build the spawn args for a Claude CLI stream-json session.
+fn buildClaudeSpawnArgs(has_model: bool, model_ptr: ptr, model_len: u64, has_permissionMode: bool, permissionMode_ptr: ptr, permissionMode_len: u64, has_resumeSessionId: bool, resumeSessionId_ptr: ptr, resumeSessionId_len: u64, has_reasoningEffort: bool, reasoningEffort_ptr: ptr, reasoningEffort_len: u64, out: &StrList) -> void {
+    // const args = ["--print", "--verbose", "--input-format=stream-json", "--output-format=stream-json", "--include-partial-messages"];
+    strlist_push(out, STR_PTR("--print"), STR_LEN("--print"));
+    strlist_push(out, STR_PTR("--verbose"), STR_LEN("--verbose"));
+    strlist_push(out, STR_PTR("--input-format=stream-json"), STR_LEN("--input-format=stream-json"));
+    strlist_push(out, STR_PTR("--output-format=stream-json"), STR_LEN("--output-format=stream-json"));
+    strlist_push(out, STR_PTR("--include-partial-messages"), STR_LEN("--include-partial-messages"));
+    // if (model && model.length > 0) args.push("--model", model);
+    if has_model && model_len > 0 {
+        strlist_push(out, STR_PTR("--model"), STR_LEN("--model"));
+        strlist_push(out, model_ptr, model_len);
+    };
+    // if (resumeSessionId && resumeSessionId.length > 0) args.push("--resume", resumeSessionId);
+    if has_resumeSessionId && resumeSessionId_len > 0 {
+        strlist_push(out, STR_PTR("--resume"), STR_LEN("--resume"));
+        strlist_push(out, resumeSessionId_ptr, resumeSessionId_len);
+    };
+    // const effort = sanitizeClaudeCliEffort(reasoningEffort); if (effort) args.push("--effort", effort);
+    let effort = ByteBuf { bytes: [0u8; 64], len: 0 };
+    if sanitizeClaudeCliEffort(has_reasoningEffort, reasoningEffort_ptr, reasoningEffort_len, &effort) {
+        strlist_push(out, STR_PTR("--effort"), STR_LEN("--effort"));
+        strlist_push_buf(out, &effort.bytes, effort.len);
+    };
+    // if (permissionMode && permissionMode !== "default") args.push("--permission-mode", permissionMode);
+    if has_permissionMode && bytes_eq_buf(permissionMode_ptr, permissionMode_len, STR_PTR("default"), STR_LEN("default")) == false {
+        strlist_push(out, STR_PTR("--permission-mode"), STR_LEN("--permission-mode"));
+        strlist_push(out, permissionMode_ptr, permissionMode_len);
+    };
+    // if (permissionMode === "bypassPermissions") args.push("--dangerously-skip-permissions");
+    if has_permissionMode && bytes_eq_buf(permissionMode_ptr, permissionMode_len, STR_PTR("bypassPermissions"), STR_LEN("bypassPermissions")) {
+        strlist_push(out, STR_PTR("--dangerously-skip-permissions"), STR_LEN("--dangerously-skip-permissions"));
+    };
+    return;
+}
+
+// The Claude CLI stores one project directory per workspace, named after the
+// workspace path with every non-alphanumeric character replaced by a hyphen.
+const MAX_CLAUDE_PROJECT_DIR_LENGTH: u64 = 200;
+
+// Returns false for TS null (sanitized name longer than the CLI limit).
+fn claudeProjectDirName(cwd_ptr: ptr, cwd_len: u64, out: &ByteBuf) -> bool {
+    // const sanitized = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+    // DEFECT: regex replace approximated by per-byte scan.
+    let i: u64 = 0;
+    while i < cwd_len {
+        let c = PTR_BYTE_AT(cwd_ptr, i);
+        let alnum: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57);
+        if alnum { buf_append_byte(out, c); } else { buf_append_byte(out, 45); };
+        i = i + 1;
+    }
+    // return sanitized.length <= MAX ? sanitized : null;
+    if out.len <= MAX_CLAUDE_PROJECT_DIR_LENGTH { return true; };
+    out.len = 0;
+    return false;
+}
+
+// Whether --resume <sessionId> can still find its transcript.
+// Returns -1 for TS undefined (cannot be determined), 0 false, 1 true.
+fn claudeTranscriptExists(has_configDir: bool, configDir_ptr: ptr, configDir_len: u64, cwd_ptr: ptr, cwd_len: u64, sessionId_ptr: ptr, sessionId_len: u64) -> i32 {
+    // if (!configDir || !sessionId) return undefined;
+    if has_configDir == false || configDir_len == 0 || sessionId_len == 0 { return -1; };
+    // const projectsDir = join(configDir, "projects");
+    let projectsDir = ByteBuf { bytes: [0u8; 2048], len: 0 };
+    buf_append_bytes(&projectsDir, configDir_ptr, configDir_len);
+    buf_append_lit(&projectsDir, STR_PTR("/projects"), STR_LEN("/projects"));
+    // const projectDirName = claudeProjectDirName(cwd); if (!projectDirName) return undefined;
+    let projectDirName = ByteBuf { bytes: [0u8; 512], len: 0 };
+    if claudeProjectDirName(cwd_ptr, cwd_len, &projectDirName) == false { return -1; };
+    // if (existsSync(join(projectsDir, projectDirName, sessionId + ".jsonl"))) return true;
+    let direct = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    buf_append_bytes(&direct, &projectsDir.bytes, projectsDir.len);
+    buf_append_lit(&direct, STR_PTR("/"), STR_LEN("/"));
+    buf_append_bytes(&direct, &projectDirName.bytes, projectDirName.len);
+    buf_append_lit(&direct, STR_PTR("/"), STR_LEN("/"));
+    buf_append_bytes(&direct, sessionId_ptr, sessionId_len);
+    buf_append_lit(&direct, STR_PTR(".jsonl"), STR_LEN(".jsonl"));
+    if existsSync(&direct.bytes, direct.len) { return 1; };
+    // try { return readdirSync(projectsDir, {withFileTypes:true}).some(entry => entry.isDirectory() && existsSync(join(projectsDir, entry.name, sessionId + ".jsonl"))) }
+    // catch { return existsSync(projectsDir) ? undefined : false; }
+    let entries = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    if sa_std_fs_list_dir(&projectsDir.bytes, projectsDir.len, &entries) != 0 {
+        if existsSync(&projectsDir.bytes, projectsDir.len) { return -1; };
+        return 0;
+    };
+    let ei: u64 = 0;
+    let off: u64 = 0;
+    while ei < entries.count {
+        let full = ByteBuf { bytes: [0u8; 4096], len: 0 };
+        buf_append_bytes(&full, &projectsDir.bytes, projectsDir.len);
+        buf_append_lit(&full, STR_PTR("/"), STR_LEN("/"));
+        buf_append_bytes(&full, entries.items + off, entries.lens[ei]);
+        if sa_std_fs_is_dir(&full.bytes, full.len) != 0 {
+            buf_append_lit(&full, STR_PTR("/"), STR_LEN("/"));
+            buf_append_bytes(&full, sessionId_ptr, sessionId_len);
+            buf_append_lit(&full, STR_PTR(".jsonl"), STR_LEN(".jsonl"));
+            if existsSync(&full.bytes, full.len) { return 1; };
+        };
+        off = off + entries.lens[ei];
+        ei = ei + 1;
+    }
+    return 0;
+}

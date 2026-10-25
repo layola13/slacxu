@@ -1,0 +1,187 @@
+// Converted 1:1 from backends/cline/src/runtime/clineProviders.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// Provider + MCP settings files inside the cline data dir — the
+// same files `cline auth` and the hub runtime read (verified
+// against cline 3.0.73):
+//  - <dataDir>/settings/providers.json — BYOK provider entries
+//    keyed by id, each {settings:{provider, apiKey, baseUrl,
+//    model}, tokenSource}.
+//  - <dataDir>/settings/cline_mcp_settings.json — MCP servers
+//    for sessions.
+//
+// DEFECT: dynamic JSON objects (Record<string, unknown>,
+// index signatures) — the providers file is carried as a parsed
+// sa_json doc handle plus its raw text; field-level access goes
+// through sa_json_object_get. JSON mutation (object set) is not
+// in the verified std surface — calls are marked DEFECT inline.
+// DEFECT: node:path join — '/' byte-concat approximation.
+// DEFECT: node:fs sync APIs (existsSync/readFileSync/
+// writeFileSync/mkdirSync) map to sa_std fs externs; mkdir has no
+// verified std counterpart yet (calls marked DEFECT).
+
+// clineProvidersPath(dataDir): join(dataDir, "settings", "providers.json")
+fn clineProvidersPath(dataDir_ptr: ptr, dataDir_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    out_len = join3(out, out_cap, dataDir_ptr, dataDir_len, STR_PTR("settings"), STR_LEN("settings"), STR_PTR("providers.json"), STR_LEN("providers.json"));
+}
+
+// clineMcpSettingsPath(dataDir): join(dataDir, "settings", "cline_mcp_settings.json")
+fn clineMcpSettingsPath(dataDir_ptr: ptr, dataDir_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    out_len = join3(out, out_cap, dataDir_ptr, dataDir_len, STR_PTR("settings"), STR_LEN("settings"), STR_PTR("cline_mcp_settings.json"), STR_LEN("cline_mcp_settings.json"));
+}
+
+// interface ClineProvidersFile {
+//   version: number; lastUsedProvider?: string;
+//   modes: Record<string, unknown>;
+//   providers: Record<string, unknown>; [key: string]: unknown }
+// DEFECT: dynamic object — doc handle + raw text stand in for the
+// typed shape; version is lifted out because the source reads it.
+struct ClineProvidersFile {
+    doc: u64,
+    version: u64,
+    raw: [u8; 16384],
+    raw_len: u64,
+}
+
+// readProvidersFile(path): parse the file; on missing/malformed
+// input return the default { version: 1, modes: {}, providers: {} }
+// (the spread `...parsed` merge keeps the doc itself authoritative).
+// DEFECT: try/catch folded into status checks.
+fn readProvidersFile(path_ptr: ptr, path_len: u64, out: &ClineProvidersFile) -> void {
+    out.version = 1;
+    out.doc = 0;
+    out.raw_len = 0;
+    let total: u64 = 0;
+    if sa_std_fs_len(path_ptr, path_len, &total) == 0 && total <= 16384 {
+        let fh: u64 = 0;
+        if sa_std_fs_open_read(path_ptr, path_len, &fh) == 0 {
+            let read_n: u64 = 0;
+            let rst = sa_std_fs_file_read(fh, &out.raw, 16384, &read_n);
+            sa_fs_file_close(fh);
+            if rst == 0 {
+                out.raw_len = read_n;
+                let doc = sa_json_parse(&out.raw, out.raw_len);
+                if doc != 0 {
+                    out.doc = doc;
+                    let v: u64 = 0;
+                    if sa_json_object_get_i64(doc, STR_PTR("version"), STR_LEN("version"), &v) == 0 {
+                        out.version = v;
+                    };
+                    return;
+                };
+            };
+        };
+    };
+    // Default shape.
+    let dflt = "{\"version\":1,\"modes\":{},\"providers\":{}}";
+    let dp: ptr = STR_PTR(dflt);
+    let dl = STR_LEN(dflt);
+    for i in 0..dl {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, dp, i);
+        out.raw[i] = b;
+    }
+    out.raw_len = dl;
+    out.doc = sa_json_parse(&out.raw, out.raw_len);
+}
+
+// writeClineRelayProvider(dataDir, entryId, entry): register (or
+// refresh) a relay station as an OpenAI-compatible provider entry.
+// The hub resolves session providers against cline's BUILT-IN
+// provider ids (an unknown id fails the run), so callers pass the
+// built-in slot id ("openai-compatible") and this writer rewrites
+// that single entry per station — singleton semantics like
+// auggie's process-wide redirector. The data dir is the app's
+// isolated cline dir, never the user's own ~/.cline. The apiKey
+// is whatever the caller passes — for CXU relay stations a
+// placeholder, because the loopback relay gateway resolves the
+// real upstream keys server-side.
+// DEFECT: new Date().toISOString() — no verified std ISO clock;
+// updatedAt is written empty in this pass.
+// DEFECT: JSON.stringify(file, null, 2) pretty printing — the
+// stringify extern's indent support is unverified; output shape
+// may differ cosmetically from the TS file.
+fn writeClineRelayProvider(dataDir_ptr: ptr, dataDir_len: u64, entryId_ptr: ptr, entryId_len: u64, baseUrl_ptr: ptr, baseUrl_len: u64, apiKey_ptr: ptr, apiKey_len: u64, model_ptr: ptr, model_len: u64) -> void {
+    let path = [0u8; 1024];
+    let path_len: u64 = 0;
+    clineProvidersPath(dataDir_ptr, dataDir_len, &path, 1024, &path_len);
+    // mkdirSync(join(dataDir, "settings"), { recursive: true })
+    // DEFECT: mkdir — no verified std extern in this pass.
+    let file = ClineProvidersFile { doc: 0, version: 1, raw: [0u8; 16384], raw_len: 0 };
+    readProvidersFile(&path, path_len, &file);
+    // file.providers[entryId] = { settings: { provider:
+    // "openai-compatible", apiKey, baseUrl, model }, updatedAt,
+    // tokenSource: "manual" }
+    // DEFECT: dynamic object mutation — requires a JSON object
+    // set operation on the parsed doc (providers node), then
+    // stringify + write. Entry JSON text is assembled here for
+    // the repair phase:
+    let entry = [0u8; 4096];
+    let entry_len: u64 = 0;
+    entry_len = entry_len + buf_put(&entry, 4096, entry_len, STR_PTR("{\"settings\":{\"provider\":\"openai-compatible\",\"apiKey\":\""), STR_LEN("{\"settings\":{\"provider\":\"openai-compatible\",\"apiKey\":\""));
+    entry_len = entry_len + buf_put(&entry, 4096, entry_len, apiKey_ptr, apiKey_len);
+    entry_len = entry_len + buf_put(&entry, 4096, entry_len, STR_PTR("\",\"baseUrl\":\""), STR_LEN("\",\"baseUrl\":\""));
+    entry_len = entry_len + buf_put(&entry, 4096, entry_len, baseUrl_ptr, baseUrl_len);
+    entry_len = entry_len + buf_put(&entry, 4096, entry_len, STR_PTR("\",\"model\":\""), STR_LEN("\",\"model\":\""));
+    entry_len = entry_len + buf_put(&entry, 4096, entry_len, model_ptr, model_len);
+    // DEFECT: JSON string escaping of the interpolated values is
+    // not applied in this pass (TS relies on JSON.stringify).
+    entry_len = entry_len + buf_put(&entry, 4096, entry_len, STR_PTR("\"},\"updatedAt\":\"\",\"tokenSource\":\"manual\"}"), STR_LEN("\"},\"updatedAt\":\"\",\"tokenSource\":\"manual\"}"));
+    // DEFECT: providers[entryId] = <entry> + stringify + write —
+    // pending the JSON mutation surface (see defect log).
+    if file.doc != 0 {
+        let sh: u64 = 0;
+        if sa_json_stringify(file.doc, &sh) == 0 {
+            let sp: ptr = sa_json_buffer_data(sh);
+            let sl = sa_json_buffer_len(sh);
+            sa_fs_write_file(&path, path_len, sp, sl);
+        };
+    };
+}
+
+// ensureClineMcpSettingsFile(dataDir): ensure the MCP settings
+// file exists so the host has a stable path to upsert the
+// platform servers (sa-vm / jev) into. Never overwrites an
+// existing file. Returns the path (written to out).
+// DEFECT: try/catch + console.error — errors are swallowed to a
+// stderr print approximation; the path is returned regardless,
+// exactly like the source.
+fn ensureClineMcpSettingsFile(dataDir_ptr: ptr, dataDir_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    clineMcpSettingsPath(dataDir_ptr, dataDir_len, out, out_cap, out_len);
+    // mkdirSync(join(dataDir, "settings"), { recursive: true })
+    // DEFECT: mkdir — see header.
+    let total: u64 = 0;
+    if sa_std_fs_len(out, out_len, &total) != 0 {
+        let seed = "{\n  \"mcpServers\": {}\n}\n";
+        sa_fs_write_file(out, out_len, STR_PTR(seed), STR_LEN(seed));
+    };
+}
+
+// ---- local helpers ----
+
+fn join3(out: ptr, cap: u64, a: ptr, a_len: u64, b: ptr, b_len: u64, c: ptr, c_len: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + buf_put_raw(out, cap, n, a, a_len);
+    if n < cap { PTR_BYTE_SET(out, n, 47); n = n + 1; };
+    n = n + buf_put_raw(out, cap, n, b, b_len);
+    if n < cap { PTR_BYTE_SET(out, n, 47); n = n + 1; };
+    n = n + buf_put_raw(out, cap, n, c, c_len);
+    return n;
+}
+
+fn buf_put_raw(out: ptr, cap: u64, at: u64, src: ptr, n: u64) -> u64 {
+    let w: u64 = 0;
+    for i in 0..n {
+        if at + w < cap {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, src, i);
+            PTR_BYTE_SET(out, at + w, b);
+            w = w + 1;
+        };
+    }
+    return w;
+}
+
+// buf_put for array-backed buffers (entry assembly above).
+fn buf_put(buf: ptr, cap: u64, at: u64, src: ptr, n: u64) -> u64 {
+    return buf_put_raw(buf, cap, at, src, n);
+}

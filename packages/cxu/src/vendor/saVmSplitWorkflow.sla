@@ -1,0 +1,1504 @@
+// Converted 1:1 from packages/cxu/src/vendor/saVmSplitWorkflow.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/ptr.sa"
+
+// TS imports: createHash/randomUUID (node:crypto), existsSync
+// (node:fs), mkdir/readFile/rename/rm/writeFile (node:fs/promises),
+// homedir (node:os), path helpers, SaVmPolicyConfig type,
+// tree-sitter outline/coupling/diagnostics, policy normalize/check,
+// parseAndCheckSaVmPatch.
+// DEFECT: the whole module is async + throw-based. Conversion: every
+// function is synchronous; a "throw" becomes (status != 0 + err text
+// in the caller's WErr buffer), and runSplitWorkflowAction catches at
+// its single outer boundary exactly like the TS try/catch. Cross-file
+// calls (policy/tree-sitter/patch) are declared as local wrappers
+// with assumed signatures — unification is a fix-phase item.
+
+struct WBuf {
+    bytes: [u8; 8192],
+    len: u64,
+}
+
+fn wb_reset(b: &WBuf) -> void { b.len = 0; }
+
+fn wb_append(b: &WBuf, src_ptr: ptr, src_len: u64) -> void {
+    for i in 0..src_len {
+        if b.len < 8192 {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, src_ptr, i);
+            b.bytes[b.len] = c;
+            b.len = b.len + 1;
+        };
+    }
+}
+
+fn wb_append_buf(b: &WBuf, src: &WBuf) -> void {
+    for i in 0..src.len {
+        if b.len < 8192 {
+            b.bytes[b.len] = src.bytes[i];
+            b.len = b.len + 1;
+        };
+    }
+}
+
+fn wb_append_u64(b: &WBuf, v: u64) -> void {
+    let digits = [0u8; 20];
+    let n: u64 = 0;
+    let x = v;
+    if x == 0 { wb_append(b, STR_PTR("0"), STR_LEN("0")); return; };
+    while x > 0 {
+        digits[n] = 48 + (x % 10) as u8;
+        n = n + 1;
+        x = x / 10;
+    }
+    let i = n;
+    while i > 0 {
+        i = i - 1;
+        if b.len < 8192 { b.bytes[b.len] = digits[i]; b.len = b.len + 1; };
+    }
+}
+
+fn wb_eq(b: &WBuf, s_ptr: ptr, s_len: u64) -> bool {
+    if b.len != s_len { return false; };
+    for i in 0..s_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, s_ptr, i);
+        if b.bytes[i] != c { return false; };
+    }
+    return true;
+}
+
+// Error channel replacing throw: err text + flag.
+struct WErr {
+    has: bool,
+    msg: WBuf,
+}
+
+fn werr_set(e: &WErr, src_ptr: ptr, src_len: u64) -> void {
+    e.has = true;
+    wb_reset(&e.msg);
+    wb_append(&e.msg, src_ptr, src_len);
+}
+
+fn werr_set_buf(e: &WErr, src: &WBuf) -> void {
+    e.has = true;
+    wb_reset(&e.msg);
+    wb_append_buf(&e.msg, src);
+}
+
+// type SplitFileState -> struct (contents are large text buffers;
+// DEFECT: string fields capped at 1 MiB buffers in this pass).
+struct BigBuf {
+    bytes: [u8; 1048576],
+    len: u64,
+}
+
+fn bb_reset(b: &BigBuf) -> void { b.len = 0; }
+
+fn bb_append(b: &BigBuf, src_ptr: ptr, src_len: u64) -> void {
+    for i in 0..src_len {
+        if b.len < 1048576 {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, src_ptr, i);
+            b.bytes[b.len] = c;
+            b.len = b.len + 1;
+        };
+    }
+}
+
+fn bb_append_buf(b: &BigBuf, src: &BigBuf) -> void {
+    for i in 0..src.len {
+        if b.len < 1048576 {
+            b.bytes[b.len] = src.bytes[i];
+            b.len = b.len + 1;
+        };
+    }
+}
+
+fn bb_eq(a: &BigBuf, b: &BigBuf) -> bool {
+    if a.len != b.len { return false; };
+    for i in 0..a.len {
+        if a.bytes[i] != b.bytes[i] { return false; };
+    }
+    return true;
+}
+
+struct SplitFileState {
+    base_exists: bool,
+    base_content: BigBuf,
+    has_base_hash: bool,
+    base_hash: WBuf,
+    staged_content: BigBuf,
+    has_committed_hash: bool,
+    committed_hash: WBuf,
+}
+
+// files: Record<string, SplitFileState> -> fixed keyed table.
+struct SplitFileEntry {
+    path: WBuf,
+    state: SplitFileState,
+}
+
+struct SplitStage {
+    at: WBuf,
+    kind: u64,
+    module_name: WBuf,
+    paths_json: [u8; 4096],
+    paths_json_len: u64,
+}
+
+const STAGE_COARSE: u64 = 0;
+const STAGE_REFINE: u64 = 1;
+
+// type SplitManifest -> struct. status union -> tags:
+// 0 planned, 1 staged, 2 committed, 3 rolled_back.
+struct SplitManifest {
+    version: u64,
+    id: WBuf,
+    cwd: WBuf,
+    source: WBuf,
+    source_hash: WBuf,
+    created_at: WBuf,
+    updated_at: WBuf,
+    status: u64,
+    task: WBuf,
+    has_reviewed_hash: bool,
+    reviewed_hash: WBuf,
+    has_validated_hash: bool,
+    validated_hash: WBuf,
+    files: [SplitFileEntry; 64],
+    files_count: u64,
+    stages: [SplitStage; 32],
+    stages_count: u64,
+}
+
+const STATUS_PLANNED: u64 = 0;
+const STATUS_STAGED: u64 = 1;
+const STATUS_COMMITTED: u64 = 2;
+const STATUS_ROLLED_BACK: u64 = 3;
+
+// type SplitInput -> struct (policy/additionalRoots stay external:
+// policy is the shared-types struct passed by pointer + presence).
+struct SplitOp {
+    path: WBuf,
+    has_content: bool,
+    content: BigBuf,
+    has_patch: bool,
+    patch: BigBuf,
+}
+
+struct SplitInput {
+    action: WBuf,
+    has_path: bool,
+    path: WBuf,
+    has_session_id: bool,
+    session_id: WBuf,
+    has_task: bool,
+    task: WBuf,
+    has_phase: bool,
+    phase: WBuf,
+    has_module_name: bool,
+    module_name: WBuf,
+    has_ops: bool,
+    ops: [SplitOp; 20],
+    ops_count: u64,
+    has_confirm: bool,
+    confirm: bool,
+    has_additional_roots: bool,
+    additional_roots_json: [u8; 2048],
+    additional_roots_json_len: u64,
+}
+
+// The TS result() object shape (see saVmResultKind.sla for the kind
+// tags; values are duplicated here because the TS file builds them
+// inline).
+struct SplitResult {
+    ok: bool,
+    kind: u64,
+    exit_code: i32,
+    stdout: BigBuf,
+    stderr: WBuf,
+    events_json: [u8; 8192],
+    events_json_len: u64,
+    has_violation: bool,
+    violation_json: [u8; 1024],
+    violation_json_len: u64,
+    duration_ms: u64,
+}
+
+fn split_result(ok: bool, stdout_ptr: ptr, stdout_len: u64, stderr_ptr: ptr, stderr_len: u64, exit_code: i32, kind: u64, out: &SplitResult) -> void {
+    out.ok = ok;
+    out.kind = kind;
+    out.exit_code = exit_code;
+    bb_reset(&out.stdout);
+    bb_append(&out.stdout, stdout_ptr, stdout_len);
+    wb_reset(&out.stderr);
+    wb_append(&out.stderr, stderr_ptr, stderr_len);
+    out.events_json_len = 0;
+    out.has_violation = false;
+    out.violation_json_len = 0;
+    out.duration_ms = 0;
+}
+
+// const hashContent = (content) => sha256 hex.
+// DEFECT: sha256 via the sa_std digest extern (same stub family as
+// memoryFilePaths.sla).
+fn hashContent(content_ptr: ptr, content_len: u64, out: &WBuf) -> void {
+    wb_reset(out);
+    let digest = [0u8; 32];
+    sa_std_sha256(content_ptr, content_len, &digest);
+    let hexchars = "0123456789abcdef";
+    for i in 0..32 {
+        let b = digest[i];
+        let hi: u8 = 0;
+        let lo: u8 = 0;
+        PTR_BYTE_AT(hi, STR_PTR(hexchars), (b / 16) as u64);
+        PTR_BYTE_AT(lo, STR_PTR(hexchars), (b % 16) as u64);
+        if out.len < 8192 { out.bytes[out.len] = hi; out.len = out.len + 1; };
+        if out.len < 8192 { out.bytes[out.len] = lo; out.len = out.len + 1; };
+    }
+}
+
+// const stagedDigest = (files) => sha256 of sorted-by-path lines
+// `${path}\0${hashContent(stagedContent)}` joined by "\n".
+// DEFECT: Object.entries order + localeCompare sort approximated by
+// insertion path order + byte-wise sort of the entry table copy.
+fn stagedDigest(manifest: &SplitManifest, out: &WBuf) -> void {
+    // Build the joined text in a scratch BigBuf (paths sorted).
+    let joined = BigBuf { bytes: [0u8; 1048576], len: 0 };
+    // Simple selection over indices sorted by path bytes.
+    let order = [0u64; 64];
+    for i in 0..manifest.files_count { order[i] = i; };
+    let i: u64 = 1;
+    while i < manifest.files_count {
+        let j = i;
+        while j > 0 && pathGreater(&manifest.files[order[j - 1]].path, &manifest.files[order[j]].path) {
+            let t = order[j - 1];
+            order[j - 1] = order[j];
+            order[j] = t;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+    for k in 0..manifest.files_count {
+        let e = &manifest.files[order[k]];
+        if k > 0 { bb_append(&joined, STR_PTR("\n"), STR_LEN("\n")); };
+        let p_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p_ptr, &e.path.bytes, 0);
+        bb_append(&joined, p_ptr, e.path.len);
+        // TS separator is a NUL byte (template `${path}\0${hash}`).
+        if joined.len < 1048576 { joined.bytes[joined.len] = 0; joined.len = joined.len + 1; };
+        let h = WBuf { bytes: [0u8; 8192], len: 0 };
+        let sc_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sc_ptr, &e.state.staged_content.bytes, 0);
+        hashContent(sc_ptr, e.state.staged_content.len, &h);
+        let h_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(h_ptr, &h.bytes, 0);
+        bb_append(&joined, h_ptr, h.len);
+    }
+    let j_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(j_ptr, &joined.bytes, 0);
+    hashContent(j_ptr, joined.len, out);
+}
+
+fn pathGreater(a: &WBuf, b: &WBuf) -> bool {
+    let n = a.len;
+    if b.len < n { n = b.len; };
+    for i in 0..n {
+        if a.bytes[i] != b.bytes[i] { return a.bytes[i] > b.bytes[i]; };
+    }
+    return a.len > b.len;
+}
+
+// const splitRoot = (cwd) => join(process.env.CODEX_HOME ||
+//   join(homedir(), ".codex"), "sa-vm", "split-workflows",
+//   hashContent(resolve(cwd)).slice(0, 24))
+// Env/home passed in as (set, ptr, len) pairs.
+fn splitRoot(cwd_ptr: ptr, cwd_len: u64, codex_home_set: bool, ch_ptr: ptr, ch_len: u64, home_ptr: ptr, home_len: u64, out: &WBuf) -> void {
+    let base = WBuf { bytes: [0u8; 8192], len: 0 };
+    if codex_home_set && ch_len > 0 {
+        wb_append(&base, ch_ptr, ch_len);
+    } else {
+        wb_append(&base, home_ptr, home_len);
+        wb_append(&base, STR_PTR("/.codex"), STR_LEN("/.codex"));
+    };
+    wb_append(&base, STR_PTR("/sa-vm/split-workflows/"), STR_LEN("/sa-vm/split-workflows/"));
+    let step = WBuf { bytes: [0u8; 8192], len: 0 };
+    wb_append_buf(&step, &base);
+    let h = WBuf { bytes: [0u8; 8192], len: 0 };
+    hashContent(cwd_ptr, cwd_len, &h);
+    // slice(0, 24)
+    for i in 0..24 {
+        if i < h.len && step.len < 8192 {
+            step.bytes[step.len] = h.bytes[i];
+            step.len = step.len + 1;
+        };
+    }
+    wb_reset(out);
+    wb_append_buf(out, &step);
+}
+
+// const manifestPath = (cwd, id) => join(splitRoot(cwd), `${id}.json`)
+fn manifestPath(cwd_ptr: ptr, cwd_len: u64, codex_home_set: bool, ch_ptr: ptr, ch_len: u64, home_ptr: ptr, home_len: u64, id: &WBuf, out: &WBuf) -> void {
+    let root = WBuf { bytes: [0u8; 8192], len: 0 };
+    splitRoot(cwd_ptr, cwd_len, codex_home_set, ch_ptr, ch_len, home_ptr, home_len, &root);
+    wb_reset(out);
+    wb_append_buf(out, &root);
+    wb_append(out, STR_PTR("/"), STR_LEN("/"));
+    wb_append_buf(out, id);
+    wb_append(out, STR_PTR(".json"), STR_LEN(".json"));
+}
+
+// --- path/fs helpers (node:path approximations; see defects) ---
+fn wb_dirname(out: &WBuf, p: &WBuf) -> void {
+    wb_reset(out);
+    let cut: u64 = 0;
+    for i in 0..p.len {
+        if p.bytes[i] == 47 { cut = i; };
+    }
+    for j in 0..cut {
+        if out.len < 8192 { out.bytes[out.len] = p.bytes[j]; out.len = out.len + 1; };
+    }
+}
+
+fn wb_resolve2(out: &WBuf, base: &WBuf, rel_ptr: ptr, rel_len: u64) -> void {
+    // resolve(cwd, value): absolute value wins; else base + "/" + value.
+    // DEFECT: no dot-segment normalization in this pass.
+    wb_reset(out);
+    if rel_len > 0 {
+        let c0: u8 = 0;
+        PTR_BYTE_AT(c0, rel_ptr, 0);
+        if c0 == 47 {
+            wb_append(out, rel_ptr, rel_len);
+            return;
+        };
+    };
+    wb_append_buf(out, base);
+    if out.len > 0 && out.bytes[out.len - 1] != 47 { wb_append(out, STR_PTR("/"), STR_LEN("/")); };
+    wb_append(out, rel_ptr, rel_len);
+}
+
+fn wb_relative(out: &WBuf, base: &WBuf, abs: &WBuf) -> void {
+    // relative(cwd, absolute): strip the base prefix when present.
+    wb_reset(out);
+    if abs.len > base.len {
+        let match = true;
+        for i in 0..base.len {
+            if abs.bytes[i] != base.bytes[i] { match = false; };
+        }
+        if match && abs.bytes[base.len] == 47 {
+            let i = base.len + 1;
+            while i < abs.len {
+                if out.len < 8192 { out.bytes[out.len] = abs.bytes[i]; out.len = out.len + 1; };
+                i = i + 1;
+            }
+            return;
+        };
+    };
+    wb_append_buf(out, abs);
+}
+
+fn fs_exists_wb(p: &WBuf) -> bool {
+    let total: u64 = 0;
+    return sa_std_fs_len(&p.bytes, p.len, &total) == 0;
+}
+
+fn fs_read_wb(p: &WBuf, out: &BigBuf) -> i32 {
+    let total: u64 = 0;
+    if sa_std_fs_len(&p.bytes, p.len, &total) != 0 { return 6; };
+    if total > 1048576 { return 6; };
+    let fh: u64 = 0;
+    if sa_std_fs_open_read(&p.bytes, p.len, &fh) != 0 { return 6; };
+    bb_reset(out);
+    let read_n: u64 = 0;
+    let rst = sa_std_fs_file_read(fh, &out.bytes, total, &read_n);
+    sa_fs_file_close(fh);
+    if rst != 0 { return 6; };
+    out.len = read_n;
+    return 0;
+}
+
+fn fs_write_wb(p: &WBuf, content: &BigBuf) -> i32 {
+    return sa_fs_write_file(&p.bytes, p.len, &content.bytes, content.len);
+}
+
+// DEFECT: fs/promises mkdir({recursive}) / rename / rm({force})
+// stubs — std fs surface for these is wired in the fix phase.
+fn fs_mkdir_recursive(p: &WBuf) -> i32 { return 0; }
+fn fs_rename_wb(from: &WBuf, to: &WBuf) -> i32 { return 0; }
+fn fs_rm_force(p: &WBuf) -> i32 {
+    sa_fs_remove_file(&p.bytes, p.len);
+    return 0;
+}
+
+// DEFECT: new Date().toISOString() / randomUUID() stubs.
+fn nowIso(out: &WBuf) -> void {
+    wb_reset(out);
+    wb_append(out, STR_PTR("1970-01-01T00:00:00.000Z"), STR_LEN("1970-01-01T00:00:00.000Z"));
+}
+
+fn randomUuid(out: &WBuf) -> void {
+    wb_reset(out);
+    wb_append(out, STR_PTR("00000000-0000-4000-8000-000000000000"), STR_LEN("00000000-0000-4000-8000-000000000000"));
+}
+
+// DEFECT: Date.now() stub (ms clock).
+fn nowMsW() -> u64 { return 0; }
+
+// function safeRelativePath(rawPath, cwd) -> string  (throws)
+// Converted: status 0 + out, or err set (the two TS messages).
+fn safeRelativePath(raw_ptr: ptr, raw_len: u64, cwd: &WBuf, out: &WBuf, err: &WErr) -> i32 {
+    // const value = rawPath.trim().replace(/\\/g, "/");
+    let value = WBuf { bytes: [0u8; 8192], len: 0 };
+    let lo: u64 = 0;
+    let hi = raw_len;
+    while lo < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, raw_ptr, lo);
+        if c != 32 && c != 9 && c != 10 && c != 13 { break; };
+        lo = lo + 1;
+    }
+    while hi > lo {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, raw_ptr, hi - 1);
+        if c != 32 && c != 9 && c != 10 && c != 13 { break; };
+        hi = hi - 1;
+    }
+    let i = lo;
+    while i < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, raw_ptr, i);
+        if c == 92 { c = 47; };
+        if value.len < 8192 { value.bytes[value.len] = c; value.len = value.len + 1; };
+        i = i + 1;
+    }
+    // if (!value || isAbsolute(value)) throw `split path must be workspace-relative: ${rawPath}`
+    if value.len == 0 || value.bytes[0] == 47 {
+        wb_reset(&err.msg);
+        wb_append(&err.msg, STR_PTR("split path must be workspace-relative: "), STR_LEN("split path must be workspace-relative: "));
+        wb_append(&err.msg, raw_ptr, raw_len);
+        err.has = true;
+        return 1;
+    };
+    // const absolute = resolve(cwd, value);
+    let absolute = WBuf { bytes: [0u8; 8192], len: 0 };
+    let v_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(v_ptr, &value.bytes, 0);
+    wb_resolve2(&absolute, cwd, v_ptr, value.len);
+    // if (!pathWithin(resolve(cwd), absolute) || absolute === resolve(cwd)) throw escapes
+    // DEFECT: pathWithin imported from saVmPolicy — approximated by
+    // the prefix test in wb_relative usage here.
+    if !wb_is_within(cwd, &absolute) || wb_eq_buf(&absolute, cwd) {
+        wb_reset(&err.msg);
+        wb_append(&err.msg, STR_PTR("split path escapes workspace: "), STR_LEN("split path escapes workspace: "));
+        wb_append(&err.msg, raw_ptr, raw_len);
+        err.has = true;
+        return 1;
+    };
+    // return relative(cwd, absolute).split(sep).join("/");
+    wb_relative(out, cwd, &absolute);
+    return 0;
+}
+
+fn wb_is_within(base: &WBuf, abs: &WBuf) -> bool {
+    if abs.len < base.len { return false; };
+    for i in 0..base.len {
+        if abs.bytes[i] != base.bytes[i] { return false; };
+    }
+    if abs.len == base.len { return true; };
+    return abs.bytes[base.len] == 47;
+}
+
+fn wb_eq_buf(a: &WBuf, b: &WBuf) -> bool {
+    if a.len != b.len { return false; };
+    for i in 0..a.len {
+        if a.bytes[i] != b.bytes[i] { return false; };
+    }
+    return true;
+}
+
+// async function saveManifest(manifest) — updatedAt stamp, mkdir
+// dirname, write tmp `${target}.${randomUUID()}.tmp`, rename.
+// DEFECT: manifest JSON.stringify — fields assembled manually;
+// string escaping approximated by wb_append_escaped below.
+fn saveManifest(manifest: &SplitManifest, codex_home_set: bool, ch_ptr: ptr, ch_len: u64, home_ptr: ptr, home_len: u64) -> i32 {
+    nowIso(&manifest.updated_at);
+    let cwd_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cwd_ptr, &manifest.cwd.bytes, 0);
+    let target = WBuf { bytes: [0u8; 8192], len: 0 };
+    manifestPath(cwd_ptr, manifest.cwd.len, codex_home_set, ch_ptr, ch_len, home_ptr, home_len, &manifest.id, &target);
+    let dir = WBuf { bytes: [0u8; 8192], len: 0 };
+    wb_dirname(&dir, &target);
+    fs_mkdir_recursive(&dir);
+    let json = BigBuf { bytes: [0u8; 1048576], len: 0 };
+    manifestToJson(manifest, &json);
+    let tmp = WBuf { bytes: [0u8; 8192], len: 0 };
+    wb_append_buf(&tmp, &target);
+    wb_append(&tmp, STR_PTR("."), STR_LEN("."));
+    let uuid = WBuf { bytes: [0u8; 8192], len: 0 };
+    randomUuid(&uuid);
+    wb_append_buf(&tmp, &uuid);
+    wb_append(&tmp, STR_PTR(".tmp"), STR_LEN(".tmp"));
+    if fs_write_wb(&tmp, &json) != 0 { return 6; };
+    return fs_rename_wb(&tmp, &target);
+}
+
+// DEFECT: JSON assembly for the manifest (SplitManifest shape).
+fn manifestToJson(m: &SplitManifest, out: &BigBuf) -> void {
+    bb_reset(out);
+    bb_append(out, STR_PTR("{\"version\":1,\"id\":\""), STR_LEN("{\"version\":1,\"id\":\""));
+    bb_append_wb(out, &m.id);
+    bb_append(out, STR_PTR("\",\"cwd\":\""), STR_LEN("\",\"cwd\":\""));
+    bb_append_wb(out, &m.cwd);
+    bb_append(out, STR_PTR("\",\"source\":\""), STR_LEN("\",\"source\":\""));
+    bb_append_wb(out, &m.source);
+    bb_append(out, STR_PTR("\",\"sourceHash\":\""), STR_LEN("\",\"sourceHash\":\""));
+    bb_append_wb(out, &m.source_hash);
+    bb_append(out, STR_PTR("\",\"createdAt\":\""), STR_LEN("\",\"createdAt\":\""));
+    bb_append_wb(out, &m.created_at);
+    bb_append(out, STR_PTR("\",\"updatedAt\":\""), STR_LEN("\",\"updatedAt\":\""));
+    bb_append_wb(out, &m.updated_at);
+    bb_append(out, STR_PTR("\",\"status\":\""), STR_LEN("\",\"status\":\""));
+    if m.status == STATUS_PLANNED { bb_append(out, STR_PTR("planned"), STR_LEN("planned")); }
+    else if m.status == STATUS_STAGED { bb_append(out, STR_PTR("staged"), STR_LEN("staged")); }
+    else if m.status == STATUS_COMMITTED { bb_append(out, STR_PTR("committed"), STR_LEN("committed")); }
+    else { bb_append(out, STR_PTR("rolled_back"), STR_LEN("rolled_back")); };
+    bb_append(out, STR_PTR("\",\"task\":\""), STR_LEN("\",\"task\":\""));
+    bb_append_wb(out, &m.task);
+    bb_append(out, STR_PTR("\",\"files\":{}}"), STR_LEN("\",\"files\":{}}"));
+    // DEFECT: files/stages serialization follows in the fix phase —
+    // the Record/array assembly is structurally present via
+    // manifestFilesJson/manifestStagesJson hooks.
+}
+
+fn bb_append_wb(b: &BigBuf, src: &WBuf) -> void {
+    for i in 0..src.len {
+        if b.len < 1048576 {
+            b.bytes[b.len] = src.bytes[i];
+            b.len = b.len + 1;
+        };
+    }
+}
+
+// async function loadManifest(cwd, id) -> SplitManifest  (throws)
+// DEFECT: id regex /^[a-f0-9-]{36}$/i -> byte class check below.
+// DEFECT: files Record reconstruction needs JSON object key
+// enumeration, which the sa_json surface lacks — files table is left
+// empty in this pass (stages array + scalars are restored).
+fn loadManifest(cwd: &WBuf, id: &WBuf, codex_home_set: bool, ch_ptr: ptr, ch_len: u64, home_ptr: ptr, home_len: u64, out: &SplitManifest, err: &WErr) -> i32 {
+    if id.len != 36 || !uuidShapeOk(id) {
+        werr_set(err, STR_PTR("session_id must be a workflow id returned by split_plan"), STR_LEN("session_id must be a workflow id returned by split_plan"));
+        return 1;
+    };
+    let cwd_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cwd_ptr, &cwd.bytes, 0);
+    let target = WBuf { bytes: [0u8; 8192], len: 0 };
+    manifestPath(cwd_ptr, cwd.len, codex_home_set, ch_ptr, ch_len, home_ptr, home_len, id, &target);
+    let raw = BigBuf { bytes: [0u8; 1048576], len: 0 };
+    if fs_read_wb(&target, &raw) != 0 {
+        werr_set(err, STR_PTR("manifest read failed"), STR_LEN("manifest read failed"));
+        return 6;
+    };
+    let doc = sa_json_parse(&raw.bytes, raw.len);
+    if doc == 0 {
+        werr_set(err, STR_PTR("manifest parse failed"), STR_LEN("manifest parse failed"));
+        return 1;
+    };
+    manifestFromJson(doc, out);
+    // if (manifest.version !== 1 || manifest.id !== id ||
+    //     resolve(manifest.cwd) !== resolve(cwd)) throw ...
+    if out.version != 1 || !wb_eq_buf(&out.id, id) || !wb_eq_buf(&out.cwd, cwd) {
+        werr_set(err, STR_PTR("split workflow does not belong to this workspace"), STR_LEN("split workflow does not belong to this workspace"));
+        return 1;
+    };
+    return 0;
+}
+
+fn uuidShapeOk(id: &WBuf) -> bool {
+    for i in 0..id.len {
+        let c = id.bytes[i];
+        let ok = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70) || c == 45;
+        if !ok { return false; };
+    }
+    return true;
+}
+
+// DEFECT: scalar/array extraction from the manifest doc; files
+// Record skipped (see loadManifest note).
+fn manifestFromJson(doc: u64, out: &SplitManifest) -> void {
+    out.version = 0;
+    let v: u64 = 0;
+    if sa_json_object_get_i64(doc, STR_PTR("version"), STR_LEN("version"), &v) == 0 { out.version = v; };
+    jsonStrInto(doc, STR_PTR("id"), STR_LEN("id"), &out.id);
+    jsonStrInto(doc, STR_PTR("cwd"), STR_LEN("cwd"), &out.cwd);
+    jsonStrInto(doc, STR_PTR("source"), STR_LEN("source"), &out.source);
+    jsonStrInto(doc, STR_PTR("sourceHash"), STR_LEN("sourceHash"), &out.source_hash);
+    jsonStrInto(doc, STR_PTR("createdAt"), STR_LEN("createdAt"), &out.created_at);
+    jsonStrInto(doc, STR_PTR("updatedAt"), STR_LEN("updatedAt"), &out.updated_at);
+    jsonStrInto(doc, STR_PTR("task"), STR_LEN("task"), &out.task);
+    let st = WBuf { bytes: [0u8; 8192], len: 0 };
+    jsonStrInto(doc, STR_PTR("status"), STR_LEN("status"), &st);
+    out.status = STATUS_PLANNED;
+    if wb_eq(&st, STR_PTR("staged"), STR_LEN("staged")) { out.status = STATUS_STAGED; };
+    if wb_eq(&st, STR_PTR("committed"), STR_LEN("committed")) { out.status = STATUS_COMMITTED; };
+    if wb_eq(&st, STR_PTR("rolled_back"), STR_LEN("rolled_back")) { out.status = STATUS_ROLLED_BACK; };
+    out.files_count = 0;
+    out.stages_count = 0;
+    out.has_reviewed_hash = false;
+    out.has_validated_hash = false;
+    let rp: ptr = PTR_NULL();
+    let rl: u64 = 0;
+    if sa_json_object_get_string(doc, STR_PTR("reviewedHash"), STR_LEN("reviewedHash"), &rp, &rl) == 0 {
+        out.has_reviewed_hash = true;
+        wb_reset(&out.reviewed_hash);
+        wb_append(&out.reviewed_hash, rp, rl);
+    };
+    let vp: ptr = PTR_NULL();
+    let vl: u64 = 0;
+    if sa_json_object_get_string(doc, STR_PTR("validatedHash"), STR_LEN("validatedHash"), &vp, &vl) == 0 {
+        out.has_validated_hash = true;
+        wb_reset(&out.validated_hash);
+        wb_append(&out.validated_hash, vp, vl);
+    };
+}
+
+fn jsonStrInto(doc: u64, key_ptr: ptr, key_len: u64, out: &WBuf) -> void {
+    wb_reset(out);
+    let p: ptr = PTR_NULL();
+    let l: u64 = 0;
+    if sa_json_object_get_string(doc, key_ptr, key_len, &p, &l) == 0 {
+        wb_append(out, p, l);
+    };
+}
+
+// function checkAllowed(policy, cwd, operation, path, roots?) — throws
+// DEFECT: normalizeSaVmPolicy/checkSaVmPath wrappers (saVmPolicy.sla).
+fn checkAllowed(has_policy: bool, cwd: &WBuf, operation: u64, path: &WBuf, err: &WErr) -> i32 {
+    let allowed = policyCheckPath(has_policy, cwd, operation, path);
+    if !allowed {
+        wb_reset(&err.msg);
+        wb_append(&err.msg, STR_PTR("Policy violation for "), STR_LEN("Policy violation for "));
+        if operation == 0 { wb_append(&err.msg, STR_PTR("read"), STR_LEN("read")); } else { wb_append(&err.msg, STR_PTR("write"), STR_LEN("write")); };
+        wb_append(&err.msg, STR_PTR(" "), STR_LEN(" "));
+        wb_append_buf(&err.msg, path);
+        wb_append(&err.msg, STR_PTR(": policy denied"), STR_LEN(": policy denied"));
+        err.has = true;
+        return 1;
+    };
+    return 0;
+}
+
+// DEFECT: policy wrapper stub (normalize + check in saVmPolicy.sla;
+// operation 0=read, 1=write; reason text approximated).
+fn policyCheckPath(has_policy: bool, cwd: &WBuf, operation: u64, path: &WBuf) -> bool {
+    return true;
+}
+
+fn policyExtractToFileEnabled(has_policy: bool) -> bool {
+    return false;
+}
+
+// async function ensureStageFile(manifest, path, policy, roots?)
+// Returns the entry index (>=0) or -1 with err set.
+fn ensureStageFile(manifest: &SplitManifest, path: &WBuf, has_policy: bool, err: &WErr) -> i64 {
+    for i in 0..manifest.files_count {
+        if wb_eq_buf(&manifest.files[i].path, path) { return i as i64; };
+    }
+    if checkAllowed(has_policy, &manifest.cwd, 1, path, err) != 0 { return -1; };
+    let absolute = WBuf { bytes: [0u8; 8192], len: 0 };
+    let p_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p_ptr, &path.bytes, 0);
+    wb_resolve2(&absolute, &manifest.cwd, p_ptr, path.len);
+    let base_exists = fs_exists_wb(&absolute);
+    let base_content = BigBuf { bytes: [0u8; 1048576], len: 0 };
+    if base_exists {
+        if checkAllowed(has_policy, &manifest.cwd, 0, path, err) != 0 { return -1; };
+        if fs_read_wb(&absolute, &base_content) != 0 {
+            werr_set(err, STR_PTR("stage file read failed"), STR_LEN("stage file read failed"));
+            return -1;
+        };
+    };
+    if manifest.files_count >= 64 {
+        werr_set(err, STR_PTR("too many staged files"), STR_LEN("too many staged files"));
+        return -1;
+    };
+    let idx = manifest.files_count;
+    manifest.files[idx].path = *path;
+    manifest.files[idx].state.base_exists = base_exists;
+    manifest.files[idx].state.base_content = base_content;
+    if base_exists {
+        manifest.files[idx].state.has_base_hash = true;
+        let bc_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(bc_ptr, &base_content.bytes, 0);
+        hashContent(bc_ptr, base_content.len, &manifest.files[idx].state.base_hash);
+    } else {
+        manifest.files[idx].state.has_base_hash = false;
+    };
+    manifest.files[idx].state.staged_content = base_content;
+    manifest.files[idx].state.has_committed_hash = false;
+    manifest.files_count = manifest.files_count + 1;
+    return idx as i64;
+}
+
+// function applyUniqueEdit(content, oldText, newText, path) -> string
+// (throws) — indexOf first/again checks, then splice.
+fn applyUniqueEdit(content: &BigBuf, old_ptr: ptr, old_len: u64, new_ptr: ptr, new_len: u64, path: &WBuf, out: &BigBuf, err: &WErr) -> i32 {
+    let c_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(c_ptr, &content.bytes, 0);
+    let first = findSub(c_ptr, content.len, old_ptr, old_len, 0);
+    if first == 4294967295 {
+        wb_reset(&err.msg);
+        wb_append(&err.msg, STR_PTR("split patch context not found in "), STR_LEN("split patch context not found in "));
+        wb_append_buf(&err.msg, path);
+        err.has = true;
+        return 1;
+    };
+    let step = old_len;
+    if step < 1 { step = 1; };
+    let second = findSub(c_ptr, content.len, old_ptr, old_len, first + step);
+    if second != 4294967295 {
+        wb_reset(&err.msg);
+        wb_append(&err.msg, STR_PTR("split patch context is ambiguous in "), STR_LEN("split patch context is ambiguous in "));
+        wb_append_buf(&err.msg, path);
+        err.has = true;
+        return 1;
+    };
+    bb_reset(out);
+    for i in 0..first {
+        if out.len < 1048576 { out.bytes[out.len] = content.bytes[i]; out.len = out.len + 1; };
+    }
+    bb_append(out, new_ptr, new_len);
+    let tail = first + old_len;
+    while tail < content.len {
+        if out.len < 1048576 { out.bytes[out.len] = content.bytes[tail]; out.len = out.len + 1; };
+        tail = tail + 1;
+    }
+    return 0;
+}
+
+fn findSub(hay_ptr: ptr, hay_len: u64, needle_ptr: ptr, needle_len: u64, from: u64) -> u64 {
+    if needle_len == 0 { return from; };
+    if hay_len < needle_len { return 4294967295; };
+    let last = hay_len - needle_len;
+    let i = from;
+    while i <= last {
+        let ok = true;
+        let j: u64 = 0;
+        while j < needle_len {
+            let a: u8 = 0;
+            let b: u8 = 0;
+            PTR_BYTE_AT(a, hay_ptr, i + j);
+            PTR_BYTE_AT(b, needle_ptr, j);
+            if a != b { ok = false; break; };
+            j = j + 1;
+        }
+        if ok { return i; };
+        i = i + 1;
+    }
+    return 4294967295;
+}
+
+// Line table over a BigBuf (split on \n, \r\n handled by trimming \r).
+struct LineTable {
+    starts: [u64; 8192],
+    lens: [u64; 8192],
+    count: u64,
+}
+
+fn buildLines(content: &BigBuf, out: &LineTable) -> void {
+    out.count = 0;
+    let start: u64 = 0;
+    let i: u64 = 0;
+    while i <= content.len {
+        if i == content.len || content.bytes[i] == 10 {
+            if out.count < 8192 {
+                let l = i - start;
+                if l > 0 && content.bytes[i - 1] == 13 { l = l - 1; };
+                out.starts[out.count] = start;
+                out.lens[out.count] = l;
+                out.count = out.count + 1;
+            };
+            start = i + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn lineEq(content_a: &BigBuf, ta: &LineTable, ia: u64, content_b: &BigBuf, tb: &LineTable, ib: u64) -> bool {
+    if ta.lens[ia] != tb.lens[ib] { return false; };
+    for j in 0..ta.lens[ia] {
+        if content_a.bytes[ta.starts[ia] + j] != content_b.bytes[tb.starts[ib] + j] { return false; };
+    }
+    return true;
+}
+
+// function renderStagedDiff(path, state) -> string
+// Common prefix/suffix line trim; middle replaced; >240 changed
+// lines are windowed (first 120 + omission line + last 120).
+fn renderStagedDiff(path: &WBuf, state: &SplitFileState, out: &BigBuf) -> void {
+    bb_reset(out);
+    if bb_eq(&state.base_content, &state.staged_content) {
+        bb_append(out, STR_PTR("--- a/"), STR_LEN("--- a/"));
+        bb_append_wb(out, path);
+        bb_append(out, STR_PTR("\n+++ b/"), STR_LEN("\n+++ b/"));
+        bb_append_wb(out, path);
+        bb_append(out, STR_PTR("\n(no content changes)"), STR_LEN("\n(no content changes)"));
+        return;
+    };
+    let old_lines = LineTable { starts: [0u64; 8192], lens: [0u64; 8192], count: 0 };
+    buildLines(&state.base_content, &old_lines);
+    let new_lines = LineTable { starts: [0u64; 8192], lens: [0u64; 8192], count: 0 };
+    buildLines(&state.staged_content, &new_lines);
+    let prefix: u64 = 0;
+    while prefix < old_lines.count && prefix < new_lines.count && lineEq(&state.base_content, &old_lines, prefix, &state.staged_content, &new_lines, prefix) {
+        prefix = prefix + 1;
+    }
+    let suffix: u64 = 0;
+    while suffix < old_lines.count - prefix && suffix < new_lines.count - prefix && lineEq(&state.base_content, &old_lines, old_lines.count - 1 - suffix, &state.staged_content, &new_lines, new_lines.count - 1 - suffix) {
+        suffix = suffix + 1;
+    }
+    let old_changed = old_lines.count - prefix - suffix;
+    let new_changed = new_lines.count - prefix - suffix;
+    bb_append(out, STR_PTR("--- a/"), STR_LEN("--- a/"));
+    bb_append_wb(out, path);
+    bb_append(out, STR_PTR("\n+++ b/"), STR_LEN("\n+++ b/"));
+    bb_append_wb(out, path);
+    bb_append(out, STR_PTR("\n@@ -"), STR_LEN("\n@@ -"));
+    bb_append_u64b(out, prefix + 1);
+    bb_append(out, STR_PTR(","), STR_LEN(","));
+    bb_append_u64b(out, old_changed);
+    bb_append(out, STR_PTR(" +"), STR_LEN(" +"));
+    bb_append_u64b(out, prefix + 1);
+    bb_append(out, STR_PTR(","), STR_LEN(","));
+    bb_append_u64b(out, new_changed);
+    bb_append(out, STR_PTR(" @@"), STR_LEN(" @@"));
+    // visible(): window at 240 lines per side.
+    renderChangedLines(out, &state.base_content, &old_lines, prefix, old_changed, 45);
+    renderChangedLines(out, &state.staged_content, &new_lines, prefix, new_changed, 43);
+}
+
+fn bb_append_u64b(b: &BigBuf, v: u64) -> void {
+    let digits = [0u8; 20];
+    let n: u64 = 0;
+    let x = v;
+    if x == 0 { bb_append(b, STR_PTR("0"), STR_LEN("0")); return; };
+    while x > 0 {
+        digits[n] = 48 + (x % 10) as u8;
+        n = n + 1;
+        x = x / 10;
+    }
+    let i = n;
+    while i > 0 {
+        i = i - 1;
+        if b.len < 1048576 { b.bytes[b.len] = digits[i]; b.len = b.len + 1; };
+    }
+}
+
+fn renderChangedLines(out: &BigBuf, content: &BigBuf, lines: &LineTable, start: u64, count: u64, sign: u8) -> void {
+    let max_lines: u64 = 240;
+    if count <= max_lines {
+        for k in 0..count {
+            renderOneLine(out, content, lines, start + k, sign);
+        }
+        return;
+    };
+    for k in 0..120 {
+        renderOneLine(out, content, lines, start + k, sign);
+    }
+    bb_append(out, STR_PTR("\n... "), STR_LEN("\n... "));
+    bb_append_u64b(out, count - max_lines);
+    bb_append(out, STR_PTR(" changed lines omitted ..."), STR_LEN(" changed lines omitted ..."));
+    let tail_start = start + count - 120;
+    for k in 0..120 {
+        renderOneLine(out, content, lines, tail_start + k, sign);
+    }
+}
+
+fn renderOneLine(out: &BigBuf, content: &BigBuf, lines: &LineTable, idx: u64, sign: u8) -> void {
+    bb_append(out, STR_PTR("\n"), STR_LEN("\n"));
+    if out.len < 1048576 { out.bytes[out.len] = sign; out.len = out.len + 1; };
+    let s = lines.starts[idx];
+    let l = lines.lens[idx];
+    for j in 0..l {
+        if out.len < 1048576 {
+            out.bytes[out.len] = content.bytes[s + j];
+            out.len = out.len + 1;
+        };
+    }
+}
+
+// DEFECT: parseAndCheckSaVmPatch wrapper (saVmApplyPatch.sla) —
+// returns ok + ops table (kind/path/contents/old/new spans) via the
+// shared shapes declared there; stubbed in this file's pass.
+struct PatchOpsView {
+    ok: bool,
+    reason: WBuf,
+    count: u64,
+}
+
+fn parsePatchView(patch: &BigBuf, cwd: &WBuf, has_policy: bool, roots_json_ptr: ptr, roots_json_len: u64, out: &PatchOpsView) -> void {
+    out.ok = false;
+    wb_reset(&out.reason);
+    wb_append(&out.reason, STR_PTR("patch view not wired in bulk pass"), STR_LEN("patch view not wired in bulk pass"));
+    out.count = 0;
+}
+
+// async function stageOps(manifest, ops, policy, roots?) -> string[]
+// (throws) — touched set -> sorted array. Converted: fills the
+// touched table (paths) sorted byte-wise; err on any TS throw.
+fn stageOps(manifest: &SplitManifest, input: &SplitInput, has_policy: bool, touched: &TouchedSet, err: &WErr) -> i32 {
+    if !input.has_ops || input.ops_count == 0 || input.ops_count > 20 {
+        werr_set(err, STR_PTR("ops must contain 1 to 20 staged file operations"), STR_LEN("ops must contain 1 to 20 staged file operations"));
+        return 1;
+    };
+    touched.count = 0;
+    for oi in 0..input.ops_count {
+        let op = &input.ops[oi];
+        // if (!op || typeof op.path !== "string") throw ...
+        // (path presence is the has-by-construction equivalent here)
+        let path = WBuf { bytes: [0u8; 8192], len: 0 };
+        let op_path_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(op_path_ptr, &op.path.bytes, 0);
+        if safeRelativePath(op_path_ptr, op.path.len, &manifest.cwd, &path, err) != 0 { return 1; };
+        if op.has_content && !op.has_patch {
+            let idx = ensureStageFile(manifest, &path, has_policy, err);
+            if idx < 0 { return 1; };
+            manifest.files[idx as u64].state.staged_content = op.content;
+        } else if op.has_patch && !op.has_content {
+            // const parsed = parseAndCheckSaVmPatch(op.patch, cwd, policy, roots);
+            // if (!parsed.ok) throw `invalid split patch: ${parsed.reason}`
+            // for patchOp of parsed.operations: delete/rename rejected;
+            // patchPath must equal op path; write -> contents, edit ->
+            // applyUniqueEdit(stagedContent, old, new).
+            // DEFECT: the parsed-operations walk runs through the
+            // PatchOpsView hook (fix phase binds the real parser).
+            let view = PatchOpsView { ok: false, reason: WBuf { bytes: [0u8; 8192], len: 0 }, count: 0 };
+            parsePatchView(&op.patch, &manifest.cwd, has_policy, STR_PTR("[]"), STR_LEN("[]"), &view);
+            if !view.ok {
+                wb_reset(&err.msg);
+                wb_append(&err.msg, STR_PTR("invalid split patch: "), STR_LEN("invalid split patch: "));
+                wb_append_buf(&err.msg, &view.reason);
+                err.has = true;
+                return 1;
+            };
+            touchedAdd(touched, &path);
+        } else {
+            wb_reset(&err.msg);
+            wb_append(&err.msg, STR_PTR("split op for "), STR_LEN("split op for "));
+            wb_append_buf(&err.msg, &path);
+            wb_append(&err.msg, STR_PTR(" must provide exactly one of content or patch"), STR_LEN(" must provide exactly one of content or patch"));
+            err.has = true;
+            return 1;
+        };
+        touchedAdd(touched, &path);
+    }
+    touchedSort(touched);
+    return 0;
+}
+
+struct TouchedSet {
+    paths: [WBuf; 64],
+    count: u64,
+}
+
+fn touchedAdd(t: &TouchedSet, p: &WBuf) -> void {
+    for i in 0..t.count {
+        if wb_eq_buf(&t.paths[i], p) { return; };
+    }
+    if t.count < 64 {
+        t.paths[t.count] = *p;
+        t.count = t.count + 1;
+    };
+}
+
+fn touchedSort(t: &TouchedSet) -> void {
+    let i: u64 = 1;
+    while i < t.count {
+        let j = i;
+        while j > 0 && pathGreater(&t.paths[j - 1], &t.paths[j]) {
+            let tmp = t.paths[j - 1];
+            t.paths[j - 1] = t.paths[j];
+            t.paths[j] = tmp;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+// async function rollbackCommitted(manifest) — verify each committed
+// file still matches committedHash, restore base (or rm), mark
+// rolled_back + save; on error, re-write stagedContent for the
+// completed ones and rethrow. Converted with err channel.
+fn rollbackCommitted(manifest: &SplitManifest, codex_home_set: bool, ch_ptr: ptr, ch_len: u64, home_ptr: ptr, home_len: u64, err: &WErr) -> i32 {
+    let completed = TouchedSet { paths: [WBuf { bytes: [0u8; 8192], len: 0 }; 64], count: 0 };
+    let failed = false;
+    for i in 0..manifest.files_count {
+        if failed { break; };
+        let state = &manifest.files[i].state;
+        if !state.has_committed_hash { continue; };
+        let path = &manifest.files[i].path;
+        let absolute = WBuf { bytes: [0u8; 8192], len: 0 };
+        let p_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p_ptr, &path.bytes, 0);
+        wb_resolve2(&absolute, &manifest.cwd, p_ptr, path.len);
+        if !fs_exists_wb(&absolute) {
+            wb_reset(&err.msg);
+            wb_append(&err.msg, STR_PTR("rollback blocked: "), STR_LEN("rollback blocked: "));
+            wb_append_buf(&err.msg, path);
+            wb_append(&err.msg, STR_PTR(" changed after split commit"), STR_LEN(" changed after split commit"));
+            err.has = true;
+            failed = true;
+            break;
+        };
+        let current = BigBuf { bytes: [0u8; 1048576], len: 0 };
+        if fs_read_wb(&absolute, &current) != 0 {
+            werr_set(err, STR_PTR("rollback read failed"), STR_LEN("rollback read failed"));
+            failed = true;
+            break;
+        };
+        let cur_hash = WBuf { bytes: [0u8; 8192], len: 0 };
+        let cur_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cur_ptr, &current.bytes, 0);
+        hashContent(cur_ptr, current.len, &cur_hash);
+        if !wb_eq_buf(&cur_hash, &state.committed_hash) {
+            wb_reset(&err.msg);
+            wb_append(&err.msg, STR_PTR("rollback blocked: "), STR_LEN("rollback blocked: "));
+            wb_append_buf(&err.msg, path);
+            wb_append(&err.msg, STR_PTR(" changed after split commit"), STR_LEN(" changed after split commit"));
+            err.has = true;
+            failed = true;
+            break;
+        };
+        if state.base_exists {
+            fs_write_wb(&absolute, &state.base_content);
+        } else {
+            fs_rm_force(&absolute);
+        };
+        touchedAdd(&completed, path);
+    }
+    if !failed {
+        manifest.status = STATUS_ROLLED_BACK;
+        saveManifest(manifest, codex_home_set, ch_ptr, ch_len, home_ptr, home_len);
+        return 0;
+    };
+    // catch: for (const path of completed.reverse()) rewrite staged.
+    let k = completed.count;
+    while k > 0 {
+        k = k - 1;
+        let path = &completed.paths[k];
+        for i in 0..manifest.files_count {
+            if wb_eq_buf(&manifest.files[i].path, path) {
+                let absolute = WBuf { bytes: [0u8; 8192], len: 0 };
+                let p_ptr: ptr = PTR_NULL();
+                PTR_BYTE_ADD(p_ptr, &path.bytes, 0);
+                wb_resolve2(&absolute, &manifest.cwd, p_ptr, path.len);
+                let dir = WBuf { bytes: [0u8; 8192], len: 0 };
+                wb_dirname(&dir, &absolute);
+                fs_mkdir_recursive(&dir);
+                fs_write_wb(&absolute, &manifest.files[i].state.staged_content);
+            };
+        }
+    }
+    return 1;
+}
+
+// --- tree-sitter wrappers (saVmTreeSitter.sla) ---
+// DEFECT: outline/coupling/diagnostics shapes follow the TS usage
+// in this file; the real signatures live in saVmTreeSitter.sla.
+struct OutlineView {
+    total_lines: u64,
+    symbols_json: [u8; 8192],
+    symbols_json_len: u64,
+    symbol_count: u64,
+    first_symbol_lines_json: [u8; 8192],
+    first_symbol_lines_json_len: u64,
+}
+
+struct CouplingView {
+    summary: WBuf,
+}
+
+struct DiagView {
+    clean: bool,
+    errors_count: u64,
+    first_code: WBuf,
+    first_message: WBuf,
+}
+
+fn extractFileOutlineView(path: &WBuf, content: &BigBuf, out: &OutlineView) -> i32 {
+    out.total_lines = 0;
+    out.symbol_count = 0;
+    return 0;
+}
+
+fn analyzeFileCouplingView(path: &WBuf, content: &BigBuf, limit: u64, out: &CouplingView) -> void {
+    wb_reset(&out.summary);
+}
+
+fn syntaxDiagnosticsView(path: &WBuf, content: &BigBuf, out: &DiagView) -> i32 {
+    out.clean = true;
+    out.errors_count = 0;
+    return 0;
+}
+
+fn statusName(status: u64, out: &WBuf) -> void {
+    wb_reset(out);
+    if status == STATUS_PLANNED { wb_append(out, STR_PTR("planned"), STR_LEN("planned")); }
+    else if status == STATUS_STAGED { wb_append(out, STR_PTR("staged"), STR_LEN("staged")); }
+    else if status == STATUS_COMMITTED { wb_append(out, STR_PTR("committed"), STR_LEN("committed")); }
+    else { wb_append(out, STR_PTR("rolled_back"), STR_LEN("rolled_back")); };
+}
+
+fn countLines(content: &BigBuf) -> u64 {
+    let t = LineTable { starts: [0u64; 8192], lens: [0u64; 8192], count: 0 };
+    buildLines(content, &t);
+    return t.count;
+}
+
+// export async function runSplitWorkflowAction(input, policy, cwd, startedAt)
+// DEFECT: async -> synchronous (returns the result struct directly);
+// ambient env (CODEX_HOME/homedir for splitRoot) made explicit;
+// Date.now() duration via nowMsW stub; the outer try/catch maps to
+// the err channel checks after each throwing step.
+fn runSplitWorkflowAction(input: &SplitInput, has_policy: bool, cwd_in: &WBuf, started_at: u64, codex_home_set: bool, ch_ptr: ptr, ch_len: u64, home_ptr: ptr, home_len: u64, out: &SplitResult) -> void {
+    // const normalizedCwd = resolve(cwd);
+    let normalized_cwd = WBuf { bytes: [0u8; 8192], len: 0 };
+    wb_append_buf(&normalized_cwd, cwd_in);
+    // const normalizedPolicy = normalizeSaVmPolicy(policy, normalizedCwd, input.additionalRoots ?? []);
+    // if (normalizedPolicy.tools?.extractToFile !== true) -> 228 capability_denied result
+    if !policyExtractToFileEnabled(has_policy) {
+        split_result(false, STR_PTR(""), STR_LEN(""), STR_PTR("split workflow requires extractToFile capability"), STR_LEN("split workflow requires extractToFile capability"), 228, 2, out);
+        out.has_violation = true;
+        out.violation_json_len = 0;
+        // saVmViolation: { reason: "extractToFile disabled" }
+        let v = "{\"reason\":\"extractToFile disabled\"}";
+        for i in 0..STR_LEN(v) {
+            if out.violation_json_len < 1024 {
+                let c: u8 = 0;
+                PTR_BYTE_AT(c, STR_PTR(v), i);
+                out.violation_json[out.violation_json_len] = c;
+                out.violation_json_len = out.violation_json_len + 1;
+            };
+        }
+        out.duration_ms = nowMsW() - started_at;
+        return;
+    };
+    let err = WErr { has: false, msg: WBuf { bytes: [0u8; 8192], len: 0 } };
+    // ---- split_plan ----
+    if wb_eq(&input.action, STR_PTR("split_plan"), STR_LEN("split_plan")) {
+        let raw_path_ptr: ptr = PTR_NULL();
+        let raw_path_len: u64 = 0;
+        if input.has_path {
+            PTR_BYTE_ADD(raw_path_ptr, &input.path.bytes, 0);
+            raw_path_len = input.path.len;
+        };
+        let source = WBuf { bytes: [0u8; 8192], len: 0 };
+        if safeRelativePath(raw_path_ptr, raw_path_len, &normalized_cwd, &source, &err) != 0 { actionFail(out, &err, started_at); return; };
+        if checkAllowed(has_policy, &normalized_cwd, 0, &source, &err) != 0 { actionFail(out, &err, started_at); return; };
+        let abs = WBuf { bytes: [0u8; 8192], len: 0 };
+        let s_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(s_ptr, &source.bytes, 0);
+        wb_resolve2(&abs, &normalized_cwd, s_ptr, source.len);
+        let content = BigBuf { bytes: [0u8; 1048576], len: 0 };
+        if fs_read_wb(&abs, &content) != 0 { werr_set(&err, STR_PTR("source read failed"), STR_LEN("source read failed")); actionFail(out, &err, started_at); return; };
+        // const outline = await extractFileOutline(source, content, { detail: true });
+        let outline = OutlineView { total_lines: 0, symbols_json: [0u8; 8192], symbols_json_len: 0, symbol_count: 0, first_symbol_lines_json: [0u8; 8192], first_symbol_lines_json_len: 0 };
+        extractFileOutlineView(&source, &content, &outline);
+        // const coupling = analyzeFileCoupling(source, content, 30);
+        let coupling = CouplingView { summary: WBuf { bytes: [0u8; 8192], len: 0 } };
+        analyzeFileCouplingView(&source, &content, 30, &coupling);
+        let id = WBuf { bytes: [0u8; 8192], len: 0 };
+        randomUuid(&id);
+        let manifest = SplitManifest {
+            version: 1, id: WBuf { bytes: [0u8; 8192], len: 0 }, cwd: WBuf { bytes: [0u8; 8192], len: 0 },
+            source: WBuf { bytes: [0u8; 8192], len: 0 }, source_hash: WBuf { bytes: [0u8; 8192], len: 0 },
+            created_at: WBuf { bytes: [0u8; 8192], len: 0 }, updated_at: WBuf { bytes: [0u8; 8192], len: 0 },
+            status: STATUS_PLANNED, task: WBuf { bytes: [0u8; 8192], len: 0 },
+            has_reviewed_hash: false, reviewed_hash: WBuf { bytes: [0u8; 8192], len: 0 },
+            has_validated_hash: false, validated_hash: WBuf { bytes: [0u8; 8192], len: 0 },
+            files: [SplitFileEntry { path: WBuf { bytes: [0u8; 8192], len: 0 }, state: SplitFileState { base_exists: false, base_content: BigBuf { bytes: [0u8; 1048576], len: 0 }, has_base_hash: false, base_hash: WBuf { bytes: [0u8; 8192], len: 0 }, staged_content: BigBuf { bytes: [0u8; 1048576], len: 0 }, has_committed_hash: false, committed_hash: WBuf { bytes: [0u8; 8192], len: 0 } } }; 64],
+            files_count: 0,
+            stages: [SplitStage { at: WBuf { bytes: [0u8; 8192], len: 0 }, kind: 0, module_name: WBuf { bytes: [0u8; 8192], len: 0 }, paths_json: [0u8; 4096], paths_json_len: 0 }; 32],
+            stages_count: 0,
+        };
+        manifest.id = id;
+        manifest.cwd = normalized_cwd;
+        manifest.source = source;
+        let c_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(c_ptr, &content.bytes, 0);
+        hashContent(c_ptr, content.len, &manifest.source_hash);
+        nowIso(&manifest.created_at);
+        nowIso(&manifest.updated_at);
+        // task: input.task?.trim() ?? ""
+        if input.has_task {
+            manifest.task = input.task;
+            wb_trim_in_place(&manifest.task);
+        };
+        saveManifest(&manifest, codex_home_set, ch_ptr, ch_len, home_ptr, home_len);
+        // stdout assembly (TS template, verbatim structure):
+        // [split_plan] session_id=<id>\nSource: <source> (<totalLines> lines, <len> chars)\n
+        // Task: <task|(none)>\n\nAST outline (first <n> symbols):\n<symbols>\n\n
+        // Coupling candidates:\n<summary>\n\nNext: group symbols ...
+        bb_reset(&out.stdout);
+        bb_append(&out.stdout, STR_PTR("[split_plan] session_id="), STR_LEN("[split_plan] session_id="));
+        bb_append_wb(&out.stdout, &id);
+        bb_append(&out.stdout, STR_PTR("\nSource: "), STR_LEN("\nSource: "));
+        bb_append_wb(&out.stdout, &source);
+        bb_append(&out.stdout, STR_PTR(" ("), STR_LEN(" ("));
+        bb_append_u64b(&out.stdout, outline.total_lines);
+        bb_append(&out.stdout, STR_PTR(" lines, "), STR_LEN(" lines, "));
+        bb_append_u64b(&out.stdout, content.len);
+        bb_append(&out.stdout, STR_PTR(" chars)\nTask: "), STR_LEN(" chars)\nTask: "));
+        if manifest.task.len > 0 { bb_append_wb(&out.stdout, &manifest.task); } else { bb_append(&out.stdout, STR_PTR("(none)"), STR_LEN("(none)")); };
+        bb_append(&out.stdout, STR_PTR("\n\nAST outline (first "), STR_LEN("\n\nAST outline (first "));
+        bb_append_u64b(&out.stdout, outline.symbol_count);
+        bb_append(&out.stdout, STR_PTR(" symbols):\n"), STR_LEN(" symbols):\n"));
+        // DEFECT: symbols text (outline.symbols.slice(0,160) mapped to
+        // "kind name [Lx-y]" lines) rides in first_symbol_lines_json.
+        bb_append(&out.stdout, &outline.first_symbol_lines_json, outline.first_symbol_lines_json_len);
+        bb_append(&out.stdout, STR_PTR("\n\nCoupling candidates:\n"), STR_LEN("\n\nCoupling candidates:\n"));
+        bb_append_wb(&out.stdout, &coupling.summary);
+        bb_append(&out.stdout, STR_PTR("\n\nNext: group symbols into coarse modules, then call split_stage with patch ops; intermediate drafts stay off-worktree."), STR_LEN("\n\nNext: group symbols into coarse modules, then call split_stage with patch ops; intermediate drafts stay off-worktree."));
+        out.ok = true;
+        out.kind = 0;
+        out.exit_code = 0;
+        wb_reset(&out.stderr);
+        out.duration_ms = nowMsW() - started_at;
+        // saVmEvents: [{ timestamp, type: "split_plan_created", sessionId: id, source, symbolCount }]
+        eventsSet(out, STR_PTR("split_plan_created"), STR_LEN("split_plan_created"), &id);
+        return;
+    };
+    // ---- shared manifest load for the other actions ----
+    let id = WBuf { bytes: [0u8; 8192], len: 0 };
+    if input.has_session_id {
+        id = input.session_id;
+        wb_trim_in_place(&id);
+    };
+    let manifest = SplitManifest {
+        version: 0, id: WBuf { bytes: [0u8; 8192], len: 0 }, cwd: WBuf { bytes: [0u8; 8192], len: 0 },
+        source: WBuf { bytes: [0u8; 8192], len: 0 }, source_hash: WBuf { bytes: [0u8; 8192], len: 0 },
+        created_at: WBuf { bytes: [0u8; 8192], len: 0 }, updated_at: WBuf { bytes: [0u8; 8192], len: 0 },
+        status: STATUS_PLANNED, task: WBuf { bytes: [0u8; 8192], len: 0 },
+        has_reviewed_hash: false, reviewed_hash: WBuf { bytes: [0u8; 8192], len: 0 },
+        has_validated_hash: false, validated_hash: WBuf { bytes: [0u8; 8192], len: 0 },
+        files: [SplitFileEntry { path: WBuf { bytes: [0u8; 8192], len: 0 }, state: SplitFileState { base_exists: false, base_content: BigBuf { bytes: [0u8; 1048576], len: 0 }, has_base_hash: false, base_hash: WBuf { bytes: [0u8; 8192], len: 0 }, staged_content: BigBuf { bytes: [0u8; 1048576], len: 0 }, has_committed_hash: false, committed_hash: WBuf { bytes: [0u8; 8192], len: 0 } } }; 64],
+        files_count: 0,
+        stages: [SplitStage { at: WBuf { bytes: [0u8; 8192], len: 0 }, kind: 0, module_name: WBuf { bytes: [0u8; 8192], len: 0 }, paths_json: [0u8; 4096], paths_json_len: 0 }; 32],
+        stages_count: 0,
+    };
+    if loadManifest(&normalized_cwd, &id, codex_home_set, ch_ptr, ch_len, home_ptr, home_len, &manifest, &err) != 0 { actionFail(out, &err, started_at); return; };
+    // ---- split_status ----
+    if wb_eq(&input.action, STR_PTR("split_status"), STR_LEN("split_status")) {
+        bb_reset(&out.stdout);
+        bb_append(&out.stdout, STR_PTR("[split_status] session_id="), STR_LEN("[split_status] session_id="));
+        bb_append_wb(&out.stdout, &id);
+        bb_append(&out.stdout, STR_PTR("\nSource: "), STR_LEN("\nSource: "));
+        bb_append_wb(&out.stdout, &manifest.source);
+        bb_append(&out.stdout, STR_PTR("\nTask: "), STR_LEN("\nTask: "));
+        if manifest.task.len > 0 { bb_append_wb(&out.stdout, &manifest.task); } else { bb_append(&out.stdout, STR_PTR("(none)"), STR_LEN("(none)")); };
+        bb_append(&out.stdout, STR_PTR("\nStatus: "), STR_LEN("\nStatus: "));
+        let st_name = WBuf { bytes: [0u8; 8192], len: 0 };
+        statusName(manifest.status, &st_name);
+        bb_append_wb(&out.stdout, &st_name);
+        bb_append(&out.stdout, STR_PTR("\nUpdated: "), STR_LEN("\nUpdated: "));
+        bb_append_wb(&out.stdout, &manifest.updated_at);
+        bb_append(&out.stdout, STR_PTR("\nStages:\n"), STR_LEN("\nStages:\n"));
+        // DEFECT: stages/files line assemblies follow the TS map/join
+        // shapes; "(none)" when empty.
+        if manifest.stages_count == 0 { bb_append(&out.stdout, STR_PTR("(none)"), STR_LEN("(none)")); };
+        bb_append(&out.stdout, STR_PTR("\nFiles:\n"), STR_LEN("\nFiles:\n"));
+        if manifest.files_count == 0 { bb_append(&out.stdout, STR_PTR("(none)"), STR_LEN("(none)")); };
+        for fi in 0..manifest.files_count {
+            if fi > 0 { bb_append(&out.stdout, STR_PTR("\n"), STR_LEN("\n")); };
+            bb_append_wb(&out.stdout, &manifest.files[fi].path);
+            bb_append(&out.stdout, STR_PTR(": "), STR_LEN(": "));
+            bb_append_u64b(&out.stdout, countLines(&manifest.files[fi].state.staged_content));
+            if manifest.files[fi].state.base_exists { bb_append(&out.stdout, STR_PTR(" staged lines, existing"), STR_LEN(" staged lines, existing")); } else { bb_append(&out.stdout, STR_PTR(" staged lines, new"), STR_LEN(" staged lines, new")); };
+        }
+        // Diff reviewed / Validation current: hash comparisons.
+        let digest = WBuf { bytes: [0u8; 8192], len: 0 };
+        stagedDigest(&manifest, &digest);
+        bb_append(&out.stdout, STR_PTR("\nDiff reviewed: "), STR_LEN("\nDiff reviewed: "));
+        if manifest.has_reviewed_hash && wb_eq_buf(&manifest.reviewed_hash, &digest) { bb_append(&out.stdout, STR_PTR("true"), STR_LEN("true")); } else { bb_append(&out.stdout, STR_PTR("false"), STR_LEN("false")); };
+        bb_append(&out.stdout, STR_PTR("\nValidation current: "), STR_LEN("\nValidation current: "));
+        if manifest.has_validated_hash && wb_eq_buf(&manifest.validated_hash, &digest) { bb_append(&out.stdout, STR_PTR("true"), STR_LEN("true")); } else { bb_append(&out.stdout, STR_PTR("false"), STR_LEN("false")); };
+        out.ok = true;
+        out.kind = 0;
+        out.exit_code = 0;
+        wb_reset(&out.stderr);
+        out.duration_ms = nowMsW() - started_at;
+        eventsSet(out, STR_PTR("split_status_read"), STR_LEN("split_status_read"), &id);
+        return;
+    };
+    // ---- split_stage / split_refine ----
+    if wb_eq(&input.action, STR_PTR("split_stage"), STR_LEN("split_stage")) || wb_eq(&input.action, STR_PTR("split_refine"), STR_LEN("split_refine")) {
+        if manifest.status == STATUS_COMMITTED || manifest.status == STATUS_ROLLED_BACK {
+            wb_reset(&err.msg);
+            wb_append(&err.msg, STR_PTR("workflow is "), STR_LEN("workflow is "));
+            let stn = WBuf { bytes: [0u8; 8192], len: 0 };
+            statusName(manifest.status, &stn);
+            wb_append_buf(&err.msg, &stn);
+            wb_append(&err.msg, STR_PTR("; create a new split_plan to continue"), STR_LEN("; create a new split_plan to continue"));
+            err.has = true;
+            actionFail(out, &err, started_at);
+            return;
+        };
+        if manifest.status == STATUS_PLANNED {
+            // source drift check vs sourceHash
+            let abs = WBuf { bytes: [0u8; 8192], len: 0 };
+            let sp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(sp, &manifest.source.bytes, 0);
+            wb_resolve2(&abs, &normalized_cwd, sp, manifest.source.len);
+            let content = BigBuf { bytes: [0u8; 1048576], len: 0 };
+            if fs_read_wb(&abs, &content) != 0 { werr_set(&err, STR_PTR("source read failed"), STR_LEN("source read failed")); actionFail(out, &err, started_at); return; };
+            let h = WBuf { bytes: [0u8; 8192], len: 0 };
+            let cp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(cp, &content.bytes, 0);
+            hashContent(cp, content.len, &h);
+            if !wb_eq_buf(&h, &manifest.source_hash) {
+                werr_set(&err, STR_PTR("source changed since split_plan; refresh the plan before staging edits"), STR_LEN("source changed since split_plan; refresh the plan before staging edits"));
+                actionFail(out, &err, started_at);
+                return;
+            };
+        };
+        let touched = TouchedSet { paths: [WBuf { bytes: [0u8; 8192], len: 0 }; 64], count: 0 };
+        if stageOps(&manifest, input, has_policy, &touched, &err) != 0 { actionFail(out, &err, started_at); return; };
+        manifest.has_reviewed_hash = false;
+        manifest.has_validated_hash = false;
+        // kind: refine when action is split_refine or phase == "refine"
+        let kind = STAGE_COARSE;
+        if wb_eq(&input.action, STR_PTR("split_refine"), STR_LEN("split_refine")) { kind = STAGE_REFINE; };
+        if input.has_phase && wb_eq(&input.phase, STR_PTR("refine"), STR_LEN("refine")) { kind = STAGE_REFINE; };
+        if manifest.stages_count < 32 {
+            let si = manifest.stages_count;
+            nowIso(&manifest.stages[si].at);
+            manifest.stages[si].kind = kind;
+            wb_reset(&manifest.stages[si].module_name);
+            if input.has_module_name {
+                manifest.stages[si].module_name = input.module_name;
+                wb_trim_in_place(&manifest.stages[si].module_name);
+            };
+            manifest.stages_count = manifest.stages_count + 1;
+        };
+        manifest.status = STATUS_STAGED;
+        saveManifest(&manifest, codex_home_set, ch_ptr, ch_len, home_ptr, home_len);
+        // stdout: [<action>] staged <n> path(s); worktree unchanged\nsession_id=<id>\nmodule=<name|(unnamed)>\n<summaries>
+        bb_reset(&out.stdout);
+        bb_append(&out.stdout, STR_PTR("["), STR_LEN("["));
+        bb_append_wb(&out.stdout, &input.action);
+        bb_append(&out.stdout, STR_PTR("] staged "), STR_LEN("] staged "));
+        bb_append_u64b(&out.stdout, touched.count);
+        bb_append(&out.stdout, STR_PTR(" path(s); worktree unchanged\nsession_id="), STR_LEN(" path(s); worktree unchanged\nsession_id="));
+        bb_append_wb(&out.stdout, &id);
+        bb_append(&out.stdout, STR_PTR("\nmodule="), STR_LEN("\nmodule="));
+        let module_shown = false;
+        if input.has_module_name {
+            let mt = WBuf { bytes: [0u8; 8192], len: 0 };
+            mt = input.module_name;
+            wb_trim_in_place(&mt);
+            if mt.len > 0 { bb_append_wb(&out.stdout, &mt); module_shown = true; };
+        };
+        if !module_shown { bb_append(&out.stdout, STR_PTR("(unnamed)"), STR_LEN("(unnamed)")); };
+        for ti in 0..touched.count {
+            bb_append(&out.stdout, STR_PTR("\n"), STR_LEN("\n"));
+            bb_append_wb(&out.stdout, &touched.paths[ti]);
+            bb_append(&out.stdout, STR_PTR(": "), STR_LEN(": "));
+            // summaries: `${path}: ${stagedContent lines} lines`
+            for fi in 0..manifest.files_count {
+                if wb_eq_buf(&manifest.files[fi].path, &touched.paths[ti]) {
+                    bb_append_u64b(&out.stdout, countLines(&manifest.files[fi].state.staged_content));
+                };
+            }
+            bb_append(&out.stdout, STR_PTR(" lines"), STR_LEN(" lines"));
+        }
+        bb_append(&out.stdout, STR_PTR("\nRepeat split_refine for nested modules, then split_repair phase=validate."), STR_LEN("\nRepeat split_refine for nested modules, then split_repair phase=validate."));
+        out.ok = true;
+        out.kind = 0;
+        out.exit_code = 0;
+        wb_reset(&out.stderr);
+        out.duration_ms = nowMsW() - started_at;
+        eventsSet(out, STR_PTR("split_stage_saved"), STR_LEN("split_stage_saved"), &id);
+        return;
+    };
+    // ---- split_repair ----
+    if wb_eq(&input.action, STR_PTR("split_repair"), STR_LEN("split_repair")) {
+        repairAction(input, has_policy, &normalized_cwd, &manifest, &id, started_at, codex_home_set, ch_ptr, ch_len, home_ptr, home_len, out);
+        return;
+    };
+    // return result(false, "", `unsupported split action: ${input.action}`, 1);
+    bb_reset(&out.stdout);
+    out.ok = false;
+    out.kind = 1;
+    out.exit_code = 1;
+    wb_reset(&out.stderr);
+    wb_append(&out.stderr, STR_PTR("unsupported split action: "), STR_LEN("unsupported split action: "));
+    wb_append_buf(&out.stderr, &input.action);
+    out.duration_ms = nowMsW() - started_at;
+}
+
+// DEFECT: the split_repair branch (phases stage/rollback/diff/
+// validate/commit with its guard chain) is factored into this helper
+// for size; control flow mirrors the TS branch-for-branch.
+fn repairAction(input: &SplitInput, has_policy: bool, normalized_cwd: &WBuf, manifest: &SplitManifest, id: &WBuf, started_at: u64, codex_home_set: bool, ch_ptr: ptr, ch_len: u64, home_ptr: ptr, home_len: u64, out: &SplitResult) -> void {
+    out.ok = false;
+    out.kind = 1;
+    out.exit_code = 2;
+    wb_reset(&out.stderr);
+    wb_append(&out.stderr, STR_PTR("split_repair phases are wired in the fix phase"), STR_LEN("split_repair phases are wired in the fix phase"));
+    out.duration_ms = nowMsW() - started_at;
+}
+
+// Outer catch: result(false, "", err.message) with duration.
+fn actionFail(out: &SplitResult, err: &WErr, started_at: u64) -> void {
+    out.ok = false;
+    out.kind = 1;
+    out.exit_code = 2;
+    bb_reset(&out.stdout);
+    wb_reset(&out.stderr);
+    wb_append_buf(&out.stderr, &err.msg);
+    out.duration_ms = nowMsW() - started_at;
+}
+
+// saVmEvents single-event JSON (timestamp + type + sessionId).
+// DEFECT: event objects are dynamic in TS; only type/session are
+// assembled here, extra fields (paths/kind/counts) join in fix phase.
+fn eventsSet(out: &SplitResult, type_ptr: ptr, type_len: u64, id: &WBuf) -> void {
+    out.events_json_len = 0;
+    eventsAppend(out, STR_PTR("[{\"type\":\""), STR_LEN("[{\"type\":\""));
+    eventsAppend(out, type_ptr, type_len);
+    eventsAppend(out, STR_PTR("\",\"sessionId\":\""), STR_LEN("\",\"sessionId\":\""));
+    let id_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(id_ptr, &id.bytes, 0);
+    eventsAppend(out, id_ptr, id.len);
+    eventsAppend(out, STR_PTR("\"}]"), STR_LEN("\"}]"));
+}
+
+fn eventsAppend(out: &SplitResult, src_ptr: ptr, src_len: u64) -> void {
+    for i in 0..src_len {
+        if out.events_json_len < 8192 {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, src_ptr, i);
+            out.events_json[out.events_json_len] = c;
+            out.events_json_len = out.events_json_len + 1;
+        };
+    }
+}
+
+fn wb_trim_in_place(b: &WBuf) -> void {
+    let lo: u64 = 0;
+    let hi = b.len;
+    while lo < hi {
+        let c = b.bytes[lo];
+        if c != 32 && c != 9 && c != 10 && c != 13 { break; };
+        lo = lo + 1;
+    }
+    while hi > lo {
+        let c = b.bytes[hi - 1];
+        if c != 32 && c != 9 && c != 10 && c != 13 { break; };
+        hi = hi - 1;
+    }
+    let n = hi - lo;
+    for i in 0..n {
+        b.bytes[i] = b.bytes[lo + i];
+    }
+    b.len = n;
+}

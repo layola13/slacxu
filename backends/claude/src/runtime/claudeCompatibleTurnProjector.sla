@@ -1,0 +1,1300 @@
+// Converted 1:1 from backends/claude/src/runtime/claudeCompatibleTurnProjector.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/json.sai"
+@import "claudeCompatibleProtocol.sla"
+
+// DEFECT: @codex-ui/shared JsonValue/JsonRpcNotification are dynamic JSON;
+// notifications and item payloads are JSON text buffers here.
+// DEFECT: ProjectedEvent is a discriminated union of 11 object shapes in TS;
+// approximated as one struct with kind tag + all variant fields + has_* flags.
+// DEFECT: TurnState uses Set<string> and Map<string, *> — approximated by
+// StrList-as-set and StrMap (parallel key/value StrLists) with linear lookup.
+// DEFECT: sa_std JSON surface has no nested-object/array accessors; the
+// sa_json_* probes used below for message content blocks and stream_event
+// fields are placeholders for that missing surface.
+
+// String map (TS Map<string, string>): parallel key/value lists.
+struct StrMap {
+    keys: StrList,
+    vals: StrList,
+}
+
+fn strmap_has(m: &StrMap, key_ptr: ptr, key_len: u64) -> bool {
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < m.keys.count {
+        if m.keys.lens[i] == key_len && bytes_eq_buf(PTR_ADD(m.keys.items, off), key_len, key_ptr, key_len) { return true; };
+        off = off + m.keys.lens[i];
+        i = i + 1;
+    }
+    return false;
+}
+
+fn strmap_get(m: &StrMap, key_ptr: ptr, key_len: u64, out: &ByteBuf) -> bool {
+    let koff: u64 = 0;
+    let voff: u64 = 0;
+    let i: u64 = 0;
+    while i < m.keys.count {
+        if m.keys.lens[i] == key_len && bytes_eq_buf(PTR_ADD(m.keys.items, koff), key_len, key_ptr, key_len) {
+            buf_append_bytes(out, PTR_ADD(m.vals.items, voff), m.vals.lens[i]);
+            return true;
+        };
+        koff = koff + m.keys.lens[i];
+        voff = voff + m.vals.lens[i];
+        i = i + 1;
+    }
+    return false;
+}
+
+fn strmap_set(m: &StrMap, key_ptr: ptr, key_len: u64, val_ptr: ptr, val_len: u64) -> void {
+    let koff: u64 = 0;
+    let voff: u64 = 0;
+    let i: u64 = 0;
+    while i < m.keys.count {
+        if m.keys.lens[i] == key_len && bytes_eq_buf(PTR_ADD(m.keys.items, koff), key_len, key_ptr, key_len) {
+            // DEFECT: value replacement in packed storage approximated by append-only
+            // shadow entry — later sets append a new pair and get() scans from the end.
+            // (Implemented via strmap_set_latest below at call sites that need replace.)
+            strlist_push(&m.keys, key_ptr, key_len);
+            strlist_push(&m.vals, val_ptr, val_len);
+            return;
+        };
+        koff = koff + m.keys.lens[i];
+        voff = voff + m.vals.lens[i];
+        i = i + 1;
+    }
+    strlist_push(&m.keys, key_ptr, key_len);
+    strlist_push(&m.vals, val_ptr, val_len);
+    return;
+}
+
+// get() honoring latest-write-wins under the append-only approximation.
+fn strmap_get_latest(m: &StrMap, key_ptr: ptr, key_len: u64, out: &ByteBuf) -> bool {
+    let idx: i64 = m.keys.count - 1;
+    while idx >= 0 {
+        let koff: u64 = 0;
+        let voff: u64 = 0;
+        let i: u64 = 0;
+        while i < idx { koff = koff + m.keys.lens[i]; voff = voff + m.vals.lens[i]; i = i + 1; };
+        if m.keys.lens[idx] == key_len && bytes_eq_buf(PTR_ADD(m.keys.items, koff), key_len, key_ptr, key_len) {
+            buf_append_bytes(out, PTR_ADD(m.vals.items, voff), m.vals.lens[idx]);
+            return true;
+        };
+        idx = idx - 1;
+    }
+    return false;
+}
+
+fn strset_has(set: &StrList, key_ptr: ptr, key_len: u64) -> bool {
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < set.count {
+        if set.lens[i] == key_len && bytes_eq_buf(PTR_ADD(set.items, off), key_len, key_ptr, key_len) { return true; };
+        off = off + set.lens[i];
+        i = i + 1;
+    }
+    return false;
+}
+
+fn strset_add(set: &StrList, key_ptr: ptr, key_len: u64) -> void {
+    if strset_has(set, key_ptr, key_len) == false { strlist_push(set, key_ptr, key_len); };
+    return;
+}
+
+// Normalized events emitted by the projector.
+// These match the Codex Ultra notification method names so the existing
+// waterfall UI can render them without changes.
+struct ProjectedEvent {
+    kind: [u8; 64], // "thread/started" | "turn/started" | "turn/completed" | "turn/failed" | "turn/interrupted" | "item/agentMessage/delta" | "item/reasoning/textDelta" | "item/started" | "item/completed" | "item/permissionRequest" | "system/init"
+    kind_len: u64,
+    threadId: [u8; 128],
+    threadId_len: u64,
+    turnId: [u8; 128],
+    turnId_len: u64,
+    externalSessionId: [u8; 128],
+    externalSessionId_len: u64,
+    has_model: bool,
+    model: [u8; 256],
+    model_len: u64,
+    has_cwd: bool,
+    cwd: [u8; 1024],
+    cwd_len: u64,
+    has_error: bool,
+    error: [u8; 4096],
+    error_len: u64,
+    itemId: [u8; 512],
+    itemId_len: u64,
+    delta: [u8; 262144],
+    delta_len: u64,
+    item_json: [u8; 262144], // item: Record<string, JsonValue> as JSON text
+    item_json_len: u64,
+    requestId: [u8; 256],
+    requestId_len: u64,
+    toolName: [u8; 256],
+    toolName_len: u64,
+    input_json: [u8; 262144], // input: unknown as JSON text
+    input_json_len: u64,
+    has_toolUseId: bool,
+    toolUseId: [u8; 128],
+    toolUseId_len: u64,
+    has_version: bool,
+    version: [u8; 64],
+    version_len: u64,
+    has_permissionMode: bool,
+    permissionMode: [u8; 64],
+    permissionMode_len: u64,
+    json: [u8; 262144], // unused mirror of other structs' raw-json field
+    json_len: u64,
+}
+
+fn projected_event_new(kind_ptr: ptr, kind_len: u64, threadId_ptr: ptr, threadId_len: u64, turnId_ptr: ptr, turnId_len: u64, out: &ProjectedEvent) -> void {
+    out.kind_len = kind_len;
+    buf_copy_ptr_to(kind_ptr, kind_len, &out.kind);
+    out.threadId_len = threadId_len;
+    buf_copy_ptr_to(threadId_ptr, threadId_len, &out.threadId);
+    out.turnId_len = turnId_len;
+    buf_copy_ptr_to(turnId_ptr, turnId_len, &out.turnId);
+    out.externalSessionId_len = 0;
+    out.has_model = false;
+    out.model_len = 0;
+    out.has_cwd = false;
+    out.cwd_len = 0;
+    out.has_error = false;
+    out.error_len = 0;
+    out.itemId_len = 0;
+    out.delta_len = 0;
+    out.item_json_len = 0;
+    out.requestId_len = 0;
+    out.toolName_len = 0;
+    out.input_json_len = 0;
+    out.has_toolUseId = false;
+    out.toolUseId_len = 0;
+    out.has_version = false;
+    out.version_len = 0;
+    out.has_permissionMode = false;
+    out.permissionMode_len = 0;
+    out.json_len = 0;
+    return;
+}
+
+// State machine for a single Claude turn.
+// Ensures exactly one terminal event is emitted per turn.
+const TURN_STATUS_RUNNING: u64 = 0;
+const TURN_STATUS_COMPLETED: u64 = 1;
+const TURN_STATUS_FAILED: u64 = 2;
+const TURN_STATUS_INTERRUPTED: u64 = 3;
+
+// TS streamToolBlocks value: { id: string; name: string; argumentsJson: string; initialInput: JsonValue }
+struct StreamToolBlock {
+    occupied: bool,
+    id: [u8; 128],
+    id_len: u64,
+    name: [u8; 256],
+    name_len: u64,
+    argumentsJson: [u8; 262144],
+    argumentsJson_len: u64,
+    initialInput_json: [u8; 262144],
+    initialInput_json_len: u64,
+}
+
+struct TurnState {
+    turnId: [u8; 128],
+    turnId_len: u64,
+    threadId: [u8; 128],
+    threadId_len: u64,
+    status: u64, // TURN_STATUS_*
+    assistantItemIds: StrList, // Set<string>
+    assistantTextBlocks: StrList, // string[]
+    has_streamMessageId: bool,
+    streamMessageId: [u8; 128],
+    streamMessageId_len: u64,
+    streamedAssistantItems: StrMap, // Map<string, string>
+    streamedReasoningItems: StrMap, // Map<string, string>
+    toolItems_keys: StrList, // Map<string, Record<string, JsonValue>> keys
+    toolItems_json: StrList, // ... values as item JSON text
+    streamToolBlocks: [StreamToolBlock; 64], // Map<number, StreamToolBlock> by block index
+}
+
+struct ProjectorContext {
+    threadId: [u8; 128],
+    threadId_len: u64,
+    turnId: [u8; 128],
+    turnId_len: u64,
+    sessionToThread: StrMap, // Map<string, string>: external session_id -> internal threadId
+    turn_status: u64, // mirror of turn.status for the runtime's isTurnActive check
+    turn: TurnState,
+}
+
+fn toolItems_get(ctx: &ProjectorContext, id_ptr: ptr, id_len: u64, out: &ByteBuf) -> bool {
+    let koff: u64 = 0;
+    let voff: u64 = 0;
+    let i: u64 = 0;
+    while i < ctx.turn.toolItems_keys.count {
+        if ctx.turn.toolItems_keys.lens[i] == id_len && bytes_eq_buf(PTR_ADD(ctx.turn.toolItems_keys.items, koff), id_len, id_ptr, id_len) {
+            buf_append_bytes(out, PTR_ADD(ctx.turn.toolItems_json.items, voff), ctx.turn.toolItems_json.lens[i]);
+            return true;
+        };
+        koff = koff + ctx.turn.toolItems_keys.lens[i];
+        voff = voff + ctx.turn.toolItems_json.lens[i];
+        i = i + 1;
+    }
+    return false;
+}
+
+fn toolItems_set(ctx: &ProjectorContext, id_ptr: ptr, id_len: u64, item_json_ptr: ptr, item_json_len: u64) -> void {
+    // Append-only with latest-wins reads via toolItems_get_latest at read sites that need it.
+    strlist_push(&ctx.turn.toolItems_keys, id_ptr, id_len);
+    strlist_push(&ctx.turn.toolItems_json, item_json_ptr, item_json_len);
+    return;
+}
+
+fn toolItems_get_latest(ctx: &ProjectorContext, id_ptr: ptr, id_len: u64, out: &ByteBuf) -> bool {
+    let idx: i64 = ctx.turn.toolItems_keys.count - 1;
+    while idx >= 0 {
+        let koff: u64 = 0;
+        let voff: u64 = 0;
+        let i: u64 = 0;
+        while i < idx { koff = koff + ctx.turn.toolItems_keys.lens[i]; voff = voff + ctx.turn.toolItems_json.lens[i]; i = i + 1; };
+        if ctx.turn.toolItems_keys.lens[idx] == id_len && bytes_eq_buf(PTR_ADD(ctx.turn.toolItems_keys.items, koff), id_len, id_ptr, id_len) {
+            buf_append_bytes(out, PTR_ADD(ctx.turn.toolItems_json.items, voff), ctx.turn.toolItems_json.lens[idx]);
+            return true;
+        };
+        idx = idx - 1;
+    }
+    return false;
+}
+
+// Create a fresh projector context for a new turn.
+fn createProjectorContext(threadId_ptr: ptr, threadId_len: u64, turnId_ptr: ptr, turnId_len: u64, out: &ProjectorContext) -> void {
+    out.threadId_len = threadId_len;
+    buf_copy_ptr_to(threadId_ptr, threadId_len, &out.threadId);
+    out.turnId_len = turnId_len;
+    buf_copy_ptr_to(turnId_ptr, turnId_len, &out.turnId);
+    out.sessionToThread = StrMap { keys: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, vals: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 } };
+    out.turn_status = TURN_STATUS_RUNNING;
+    let t = &out.turn;
+    t.turnId_len = turnId_len;
+    buf_copy_ptr_to(turnId_ptr, turnId_len, &t.turnId);
+    t.threadId_len = threadId_len;
+    buf_copy_ptr_to(threadId_ptr, threadId_len, &t.threadId);
+    t.status = TURN_STATUS_RUNNING;
+    t.assistantItemIds = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    t.assistantTextBlocks = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    t.has_streamMessageId = false;
+    t.streamMessageId_len = 0;
+    t.streamedAssistantItems = StrMap { keys: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, vals: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 } };
+    t.streamedReasoningItems = StrMap { keys: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, vals: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 } };
+    t.toolItems_keys = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    t.toolItems_json = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    let bi: u64 = 0;
+    while bi < 64 { t.streamToolBlocks[bi].occupied = false; t.streamToolBlocks[bi].argumentsJson_len = 0; t.streamToolBlocks[bi].initialInput_json_len = 0; bi = bi + 1; };
+    return;
+}
+
+// DEFECT: regex replace /\r\n/g -> "\n" approximated by byte scan; .trim() by buf trim.
+fn normalizeAssistantText(value_ptr: ptr, value_len: u64, out: &ByteBuf) -> void {
+    let i: u64 = 0;
+    while i < value_len {
+        let c = PTR_BYTE_AT(value_ptr, i);
+        if c == 13 && i + 1 < value_len && PTR_BYTE_AT(value_ptr, i + 1) == 10 {
+            buf_append_byte(out, 10);
+            i = i + 2;
+        } else {
+            buf_append_byte(out, c);
+            i = i + 1;
+        };
+    }
+    buf_trim_in_place(out);
+    return;
+}
+
+fn assistantResultAlreadyProjected(blocks: &StrList, result_ptr: ptr, result_len: u64) -> bool {
+    // const normalizedBlocks = blocks.map(normalizeAssistantText).filter(Boolean);
+    // return normalizedBlocks.includes(result)
+    //   || normalizeAssistantText(normalizedBlocks.join("\n")) === result
+    //   || normalizeAssistantText(normalizedBlocks.join("")) === result;
+    let joined_nl = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    let joined_raw = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    let off: u64 = 0;
+    let kept: u64 = 0;
+    let i: u64 = 0;
+    while i < blocks.count {
+        let nb = ByteBuf { bytes: [0u8; 262144], len: 0 };
+        normalizeAssistantText(PTR_ADD(blocks.items, off), blocks.lens[i], &nb);
+        off = off + blocks.lens[i];
+        if nb.len > 0 {
+            // includes(result): normalized block equals result
+            if nb.len == result_len && bytes_eq_buf(&nb.bytes, nb.len, result_ptr, result_len) { return true; };
+            if kept > 0 { buf_append_lit(&joined_nl, STR_PTR("\n"), STR_LEN("\n")); };
+            buf_append_bytes(&joined_nl, &nb.bytes, nb.len);
+            buf_append_bytes(&joined_raw, &nb.bytes, nb.len);
+            kept = kept + 1;
+        };
+        i = i + 1;
+    }
+    let jn = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    normalizeAssistantText(&joined_nl.bytes, joined_nl.len, &jn);
+    if jn.len == result_len && bytes_eq_buf(&jn.bytes, jn.len, result_ptr, result_len) { return true; };
+    let jr = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    normalizeAssistantText(&joined_raw.bytes, joined_raw.len, &jr);
+    if jr.len == result_len && bytes_eq_buf(&jr.bytes, jr.len, result_ptr, result_len) { return true; };
+    return false;
+}
+
+fn reconcileStreamedItem(items: &StrMap, incoming_ptr: ptr, incoming_len: u64) -> bool {
+    // const normalizedIncoming = normalizeAssistantText(incoming); if (!normalizedIncoming) return false;
+    let ni = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    normalizeAssistantText(incoming_ptr, incoming_len, &ni);
+    if ni.len == 0 { return false; };
+    // for (const [itemId, current] of items) { ... if longer, items.set(itemId, incoming); return true; }
+    let koff: u64 = 0;
+    let voff: u64 = 0;
+    let i: u64 = 0;
+    while i < items.keys.count {
+        let cur = ByteBuf { bytes: [0u8; 262144], len: 0 };
+        buf_append_bytes(&cur, PTR_ADD(items.vals.items, voff), items.vals.lens[i]);
+        let nc = ByteBuf { bytes: [0u8; 262144], len: 0 };
+        normalizeAssistantText(&cur.bytes, cur.len, &nc);
+        let relevant: bool = true;
+        if nc.len == 0 { relevant = false; };
+        if relevant && buf_contains(&nc.bytes, nc.len, &ni.bytes, ni.len) == false && buf_contains(&ni.bytes, ni.len, &nc.bytes, nc.len) == false { relevant = false; };
+        if relevant {
+            if ni.len > nc.len {
+                strmap_set(items, PTR_ADD(items.keys.items, koff), items.keys.lens[i], incoming_ptr, incoming_len);
+            };
+            return true;
+        };
+        koff = koff + items.keys.lens[i];
+        voff = voff + items.vals.lens[i];
+        i = i + 1;
+    }
+    return false;
+}
+
+// fn streamedToolArguments(block): JsonValue — output as JSON text.
+// DEFECT: JSON.parse try/catch — parse failure returns the raw source *string*
+// as a JsonValue; here a failed parse is JSON-encoded as a string literal.
+fn streamedToolArguments(block: &StreamToolBlock, out: &ByteBuf) -> void {
+    // const source = block.argumentsJson.trim(); if (!source) return block.initialInput;
+    let src = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    buf_append_bytes(&src, &block.argumentsJson, block.argumentsJson_len);
+    buf_trim_in_place(&src);
+    if src.len == 0 {
+        buf_append_bytes(out, &block.initialInput_json, block.initialInput_json_len);
+        return;
+    };
+    // try { return JSON.parse(source) } catch { return source }
+    let doc = sa_json_parse(&src.bytes, src.len);
+    if doc != 0 {
+        sa_json_free(doc);
+        buf_append_bytes(out, &src.bytes, src.len);
+        return;
+    };
+    buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+    json_escape_into(out, &src.bytes, src.len);
+    buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+    return;
+}
+
+// Convert a projected event into a JSON-RPC notification that the
+// existing Codex Ultra frontend expects.
+// DEFECT: TS builds a params Record and returns { method, params }; SLA writes
+// the full notification JSON text: {"method": "...", "params": {...}}.
+fn toNotification(event: &ProjectedEvent, out: &ByteBuf) -> void {
+    let kind = &event.kind;
+    let kl: u64 = event.kind_len;
+    buf_append_lit(out, STR_PTR("{\"method\":\""), STR_LEN("{\"method\":\""));
+    // method name: for item/permissionRequest the method is "item/tool/requestPermission"
+    let is_perm: bool = bytes_eq_buf(kind, kl, STR_PTR("item/permissionRequest"), STR_LEN("item/permissionRequest"));
+    if is_perm {
+        buf_append_lit(out, STR_PTR("item/tool/requestPermission"), STR_LEN("item/tool/requestPermission"));
+    } else {
+        buf_append_bytes(out, kind, kl);
+    };
+    buf_append_lit(out, STR_PTR("\",\"params\":{"), STR_LEN("\",\"params\":{"));
+    // params.threadId / params.turnId common to most kinds
+    let is_thread_started: bool = bytes_eq_buf(kind, kl, STR_PTR("thread/started"), STR_LEN("thread/started"));
+    let is_system_init: bool = bytes_eq_buf(kind, kl, STR_PTR("system/init"), STR_LEN("system/init"));
+    buf_append_lit(out, STR_PTR("\"threadId\":\""), STR_LEN("\"threadId\":\""));
+    json_escape_into(out, &event.threadId, event.threadId_len);
+    buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+    if is_thread_started || is_system_init {
+        buf_append_lit(out, STR_PTR(",\"externalSessionId\":\""), STR_LEN(",\"externalSessionId\":\""));
+        json_escape_into(out, &event.externalSessionId, event.externalSessionId_len);
+        buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+    };
+    if is_system_init {
+        // if (event.version) params.claudeCodeVersion = event.version; model/cwd/permissionMode likewise
+        if event.has_version { json_param_string(out, STR_PTR("claudeCodeVersion"), STR_LEN("claudeCodeVersion"), &event.version, event.version_len); };
+        if event.has_model { json_param_string(out, STR_PTR("model"), STR_LEN("model"), &event.model, event.model_len); };
+        if event.has_cwd { json_param_string(out, STR_PTR("cwd"), STR_LEN("cwd"), &event.cwd, event.cwd_len); };
+        if event.has_permissionMode { json_param_string(out, STR_PTR("permissionMode"), STR_LEN("permissionMode"), &event.permissionMode, event.permissionMode_len); };
+        buf_append_lit(out, STR_PTR("}}"), STR_LEN("}}"));
+        return;
+    };
+    if is_thread_started {
+        if event.has_model { json_param_string(out, STR_PTR("model"), STR_LEN("model"), &event.model, event.model_len); };
+        if event.has_cwd { json_param_string(out, STR_PTR("cwd"), STR_LEN("cwd"), &event.cwd, event.cwd_len); };
+        buf_append_lit(out, STR_PTR("}}"), STR_LEN("}}"));
+        return;
+    };
+    // all remaining kinds carry turnId
+    buf_append_lit(out, STR_PTR(",\"turnId\":\""), STR_LEN(",\"turnId\":\""));
+    json_escape_into(out, &event.turnId, event.turnId_len);
+    buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+    if bytes_eq_buf(kind, kl, STR_PTR("turn/started"), STR_LEN("turn/started")) || bytes_eq_buf(kind, kl, STR_PTR("turn/completed"), STR_LEN("turn/completed")) || bytes_eq_buf(kind, kl, STR_PTR("turn/failed"), STR_LEN("turn/failed")) || bytes_eq_buf(kind, kl, STR_PTR("turn/interrupted"), STR_LEN("turn/interrupted")) {
+        // params.turn = { id: turnId, threadId, status }
+        let status_ptr: ptr = STR_PTR("running");
+        let status_len: u64 = STR_LEN("running");
+        if bytes_eq_buf(kind, kl, STR_PTR("turn/completed"), STR_LEN("turn/completed")) { status_ptr = STR_PTR("completed"); status_len = STR_LEN("completed"); };
+        if bytes_eq_buf(kind, kl, STR_PTR("turn/failed"), STR_LEN("turn/failed")) { status_ptr = STR_PTR("failed"); status_len = STR_LEN("failed"); };
+        if bytes_eq_buf(kind, kl, STR_PTR("turn/interrupted"), STR_LEN("turn/interrupted")) { status_ptr = STR_PTR("interrupted"); status_len = STR_LEN("interrupted"); };
+        buf_append_lit(out, STR_PTR(",\"turn\":{\"id\":\""), STR_LEN(",\"turn\":{\"id\":\""));
+        json_escape_into(out, &event.turnId, event.turnId_len);
+        buf_append_lit(out, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        json_escape_into(out, &event.threadId, event.threadId_len);
+        buf_append_lit(out, STR_PTR("\",\"status\":\""), STR_LEN("\",\"status\":\""));
+        buf_append_bytes(out, status_ptr, status_len);
+        buf_append_lit(out, STR_PTR("\"}"), STR_LEN("\"}"));
+        // turn/failed: if (event.error) params.error = event.error;
+        if bytes_eq_buf(kind, kl, STR_PTR("turn/failed"), STR_LEN("turn/failed")) && event.has_error {
+            json_param_string(out, STR_PTR("error"), STR_LEN("error"), &event.error, event.error_len);
+        };
+        buf_append_lit(out, STR_PTR("}}"), STR_LEN("}}"));
+        return;
+    };
+    if bytes_eq_buf(kind, kl, STR_PTR("item/agentMessage/delta"), STR_LEN("item/agentMessage/delta")) || bytes_eq_buf(kind, kl, STR_PTR("item/reasoning/textDelta"), STR_LEN("item/reasoning/textDelta")) {
+        // params.itemId / params.delta
+        json_param_string(out, STR_PTR("itemId"), STR_LEN("itemId"), &event.itemId, event.itemId_len);
+        json_param_string(out, STR_PTR("delta"), STR_LEN("delta"), &event.delta, event.delta_len);
+        buf_append_lit(out, STR_PTR("}}"), STR_LEN("}}"));
+        return;
+    };
+    if bytes_eq_buf(kind, kl, STR_PTR("item/started"), STR_LEN("item/started")) || bytes_eq_buf(kind, kl, STR_PTR("item/completed"), STR_LEN("item/completed")) {
+        // params.item = event.item (raw JSON)
+        buf_append_lit(out, STR_PTR(",\"item\":"), STR_LEN(",\"item\":"));
+        if event.item_json_len > 0 { buf_append_bytes(out, &event.item_json, event.item_json_len); } else { buf_append_lit(out, STR_PTR("{}"), STR_LEN("{}")); };
+        buf_append_lit(out, STR_PTR("}}"), STR_LEN("}}"));
+        return;
+    };
+    if is_perm {
+        // params.id = requestId; params.toolName; params.input; if (toolUseId) params.toolUseId
+        json_param_string(out, STR_PTR("id"), STR_LEN("id"), &event.requestId, event.requestId_len);
+        json_param_string(out, STR_PTR("toolName"), STR_LEN("toolName"), &event.toolName, event.toolName_len);
+        buf_append_lit(out, STR_PTR(",\"input\":"), STR_LEN(",\"input\":"));
+        if event.input_json_len > 0 { buf_append_bytes(out, &event.input_json, event.input_json_len); } else { buf_append_lit(out, STR_PTR("{}"), STR_LEN("{}")); };
+        if event.has_toolUseId { json_param_string(out, STR_PTR("toolUseId"), STR_LEN("toolUseId"), &event.toolUseId, event.toolUseId_len); };
+        buf_append_lit(out, STR_PTR("}}"), STR_LEN("}}"));
+        return;
+    };
+    buf_append_lit(out, STR_PTR("}}"), STR_LEN("}}"));
+    return;
+}
+
+fn json_param_string(out: &ByteBuf, key_ptr: ptr, key_len: u64, val: &[u8], val_len: u64) -> void {
+    buf_append_lit(out, STR_PTR(",\""), STR_LEN(",\""));
+    buf_append_bytes(out, key_ptr, key_len);
+    buf_append_lit(out, STR_PTR("\":\""), STR_LEN("\":\""));
+    json_escape_into(out, val, val_len);
+    buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+    return;
+}
+
+// Resolve the threadId for a message, using the session-to-thread map
+// and falling back to the context's threadId for single-thread bridges.
+fn resolveThread(ctx: &ProjectorContext, has_sessionId: bool, sessionId_ptr: ptr, sessionId_len: u64, out: &ByteBuf) -> void {
+    if has_sessionId {
+        // if (ctx.sessionToThread.has(sessionId)) return ctx.sessionToThread.get(sessionId)!;
+        if strmap_has(&ctx.sessionToThread, sessionId_ptr, sessionId_len) {
+            strmap_get_latest(&ctx.sessionToThread, sessionId_ptr, sessionId_len, out);
+            return;
+        };
+        // if (sessionId && !has) ctx.sessionToThread.set(sessionId, ctx.threadId);
+        strmap_set(&ctx.sessionToThread, sessionId_ptr, sessionId_len, &ctx.threadId, ctx.threadId_len);
+    };
+    buf_append_bytes(out, &ctx.threadId, ctx.threadId_len);
+    return;
+}
+
+// Runtime helper (used by ClaudeCompatibleRuntime_getExternalSessionId):
+// find the session id whose mapped thread equals threadId.
+fn projector_session_for_thread(ctx: &ProjectorContext, threadId_ptr: ptr, threadId_len: u64, out: &ByteBuf) -> bool {
+    let koff: u64 = 0;
+    let voff: u64 = 0;
+    let i: u64 = 0;
+    while i < ctx.sessionToThread.keys.count {
+        if ctx.sessionToThread.vals.lens[i] == threadId_len && bytes_eq_buf(PTR_ADD(ctx.sessionToThread.vals.items, voff), threadId_len, threadId_ptr, threadId_len) {
+            buf_append_bytes(out, PTR_ADD(ctx.sessionToThread.keys.items, koff), ctx.sessionToThread.keys.lens[i]);
+            return true;
+        };
+        koff = koff + ctx.sessionToThread.keys.lens[i];
+        voff = voff + ctx.sessionToThread.vals.lens[i];
+        i = i + 1;
+    }
+    return false;
+}
+
+// Check if the turn has already reached a terminal state.
+fn isTerminal(ctx: &ProjectorContext) -> bool {
+    return ctx.turn.status != TURN_STATUS_RUNNING;
+}
+
+// Mark the turn as terminal. Returns true if this is the first terminal transition.
+fn markTerminal(ctx: &ProjectorContext, status: u64) -> bool {
+    if isTerminal(ctx) { return false; };
+    ctx.turn.status = status;
+    ctx.turn_status = status;
+    return true;
+}
+
+fn events_push(events: &[ProjectedEvent], count: &u64, cap: u64, ev: &ProjectedEvent) -> void {
+    if count >= cap { return; };
+    events[count] = ev;
+    count = count + 1;
+    return;
+}
+
+// Build a toolCall item JSON: {type:"toolCall", id, threadId, turnId, name, tool, toolName, input, arguments, status}
+fn build_tool_item(out: &ByteBuf, id_ptr: ptr, id_len: u64, threadId_ptr: ptr, threadId_len: u64, turnId_ptr: ptr, turnId_len: u64, name_ptr: ptr, name_len: u64, args_json_ptr: ptr, args_json_len: u64, status_ptr: ptr, status_len: u64) -> void {
+    buf_append_lit(out, STR_PTR("{\"type\":\"toolCall\",\"id\":\""), STR_LEN("{\"type\":\"toolCall\",\"id\":\""));
+    json_escape_into(out, id_ptr, id_len);
+    buf_append_lit(out, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    json_escape_into(out, threadId_ptr, threadId_len);
+    buf_append_lit(out, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    json_escape_into(out, turnId_ptr, turnId_len);
+    buf_append_lit(out, STR_PTR("\",\"name\":\""), STR_LEN("\",\"name\":\""));
+    json_escape_into(out, name_ptr, name_len);
+    buf_append_lit(out, STR_PTR("\",\"tool\":\""), STR_LEN("\",\"tool\":\""));
+    json_escape_into(out, name_ptr, name_len);
+    buf_append_lit(out, STR_PTR("\",\"toolName\":\""), STR_LEN("\",\"toolName\":\""));
+    json_escape_into(out, name_ptr, name_len);
+    buf_append_lit(out, STR_PTR("\",\"input\":"), STR_LEN("\",\"input\":"));
+    if args_json_len > 0 { buf_append_bytes(out, args_json_ptr, args_json_len); } else { buf_append_lit(out, STR_PTR("{}"), STR_LEN("{}")); };
+    buf_append_lit(out, STR_PTR(",\"arguments\":"), STR_LEN(",\"arguments\":"));
+    if args_json_len > 0 { buf_append_bytes(out, args_json_ptr, args_json_len); } else { buf_append_lit(out, STR_PTR("{}"), STR_LEN("{}")); };
+    buf_append_lit(out, STR_PTR(",\"status\":\""), STR_LEN(",\"status\":\""));
+    buf_append_bytes(out, status_ptr, status_len);
+    buf_append_lit(out, STR_PTR("\"}"), STR_LEN("\"}"));
+    return;
+}
+
+// Build an agentMessage/reasoning completed item JSON.
+fn build_message_item(out: &ByteBuf, is_reasoning: bool, id_ptr: ptr, id_len: u64, threadId_ptr: ptr, threadId_len: u64, text_ptr: ptr, text_len: u64) -> void {
+    if is_reasoning {
+        buf_append_lit(out, STR_PTR("{\"type\":\"reasoning\",\"id\":\""), STR_LEN("{\"type\":\"reasoning\",\"id\":\""));
+        json_escape_into(out, id_ptr, id_len);
+        buf_append_lit(out, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+        json_escape_into(out, threadId_ptr, threadId_len);
+        buf_append_lit(out, STR_PTR("\",\"text\":\""), STR_LEN("\",\"text\":\""));
+        json_escape_into(out, text_ptr, text_len);
+        buf_append_lit(out, STR_PTR("\",\"status\":\"completed\"}"), STR_LEN("\",\"status\":\"completed\"}"));
+        return;
+    };
+    buf_append_lit(out, STR_PTR("{\"type\":\"agentMessage\",\"id\":\""), STR_LEN("{\"type\":\"agentMessage\",\"id\":\""));
+    json_escape_into(out, id_ptr, id_len);
+    buf_append_lit(out, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    json_escape_into(out, threadId_ptr, threadId_len);
+    buf_append_lit(out, STR_PTR("\",\"content\":\""), STR_LEN("\",\"content\":\""));
+    json_escape_into(out, text_ptr, text_len);
+    buf_append_lit(out, STR_PTR("\",\"role\":\"assistant\",\"status\":\"completed\"}"), STR_LEN("\",\"role\":\"assistant\",\"status\":\"completed\"}"));
+    return;
+}
+
+// Project a single parsed Claude message into zero or more normalized events.
+// Returns the number of events written to `events` (TS returns ProjectedEvent[]).
+// DEFECT: message field access — TS casts ClaudeMessage to the concrete
+// interfaces; here fields are probed from message.json with sa_json_* nested /
+// content-block accessors (placeholders, see header DEFECT). Array.isArray
+// checks map to *_count probes returning a has-array flag.
+fn projectMessage(message: &ClaudeMessage, ctx: &ProjectorContext, events: &[ProjectedEvent], cap: u64) -> u64 {
+    let count: u64 = 0;
+    let doc = sa_json_parse(&message.json, message.json_len);
+    if doc == 0 { return 0; };
+    let type_ptr: ptr = &message.type;
+    let type_len: u64 = message.type_len;
+
+    // case "system"
+    if bytes_eq_buf(type_ptr, type_len, STR_PTR("system"), STR_LEN("system")) {
+        // if (message.subtype === "init") { const init = message as ClaudeSystemInitMessage; ... }
+        let subtype: [u8; 64] = [0u8; 64];
+        let subtype_len: u64 = sa_json_get_string(doc, STR_PTR("subtype"), STR_LEN("subtype"), &subtype, 64);
+        if bytes_eq_buf(&subtype, subtype_len, STR_PTR("init"), STR_LEN("init")) {
+            let threadId = ByteBuf { bytes: [0u8; 128], len: 0 };
+            resolveThread(ctx, message.has_session_id, &message.session_id, message.session_id_len, &threadId);
+            let ev = ProjectedEvent { kind: [0u8; 64], kind_len: 0, threadId: [0u8; 128], threadId_len: 0, turnId: [0u8; 128], turnId_len: 0, externalSessionId: [0u8; 128], externalSessionId_len: 0, has_model: false, model: [0u8; 256], model_len: 0, has_cwd: false, cwd: [0u8; 1024], cwd_len: 0, has_error: false, error: [0u8; 4096], error_len: 0, itemId: [0u8; 512], itemId_len: 0, delta: [0u8; 262144], delta_len: 0, item_json: [0u8; 262144], item_json_len: 0, requestId: [0u8; 256], requestId_len: 0, toolName: [0u8; 256], toolName_len: 0, input_json: [0u8; 262144], input_json_len: 0, has_toolUseId: false, toolUseId: [0u8; 128], toolUseId_len: 0, has_version: false, version: [0u8; 64], version_len: 0, has_permissionMode: false, permissionMode: [0u8; 64], permissionMode_len: 0, json: [0u8; 262144], json_len: 0 };
+            projected_event_new(STR_PTR("system/init"), STR_LEN("system/init"), &threadId.bytes, threadId.len, &ctx.turnId, ctx.turnId_len, &ev);
+            ev.externalSessionId_len = message.session_id_len;
+            buf_copy_buf(&message.session_id, message.session_id_len, &ev.externalSessionId);
+            // version: init.claude_code_version; model; cwd; permissionMode (all required in TS init interface)
+            ev.has_version = true;
+            ev.version_len = sa_json_get_string(doc, STR_PTR("claude_code_version"), STR_LEN("claude_code_version"), &ev.version, 64);
+            ev.has_model = true;
+            ev.model_len = sa_json_get_string(doc, STR_PTR("model"), STR_LEN("model"), &ev.model, 256);
+            ev.has_cwd = true;
+            ev.cwd_len = sa_json_get_string(doc, STR_PTR("cwd"), STR_LEN("cwd"), &ev.cwd, 1024);
+            ev.has_permissionMode = true;
+            ev.permissionMode_len = sa_json_get_string(doc, STR_PTR("permissionMode"), STR_LEN("permissionMode"), &ev.permissionMode, 64);
+            events_push(events, &count, cap, &ev);
+        };
+        sa_json_free(doc);
+        return count;
+    };
+
+    // case "assistant"
+    if bytes_eq_buf(type_ptr, type_len, STR_PTR("assistant"), STR_LEN("assistant")) {
+        if isTerminal(ctx) { sa_json_free(doc); return count; };
+        let threadId = ByteBuf { bytes: [0u8; 128], len: 0 };
+        resolveThread(ctx, message.has_session_id, &message.session_id, message.session_id_len, &threadId);
+        // const content = msg.message?.content; if (!Array.isArray(content)) return events;
+        let has_content: bool = false;
+        let block_count: u64 = sa_json_message_content_count(doc, &has_content);
+        if has_content == false { sa_json_free(doc); return count; };
+        // msg.message.id (for stable stream item ids)
+        let msg_id: [u8; 128] = [0u8; 128];
+        let msg_id_len: u64 = sa_json_get_nested_string(doc, STR_PTR("message"), STR_LEN("message"), STR_PTR("id"), STR_LEN("id"), &msg_id, 128);
+        let blockIndex: u64 = 0;
+        while blockIndex < block_count {
+            let btype: [u8; 64] = [0u8; 64];
+            let btype_len: u64 = sa_json_content_block_string(doc, blockIndex, STR_PTR("type"), STR_LEN("type"), &btype, 64);
+            if bytes_eq_buf(&btype, btype_len, STR_PTR("text"), STR_LEN("text")) {
+                // block.type === "text" && typeof block.text === "string"
+                let btext = ByteBuf { bytes: [0u8; 262144], len: 0 };
+                let has_text: bool = sa_json_content_block_has(doc, blockIndex, STR_PTR("text"), STR_LEN("text"));
+                let bt_len: u64 = sa_json_content_block_string(doc, blockIndex, STR_PTR("text"), STR_LEN("text"), &btext.bytes, 262144);
+                btext.len = bt_len;
+                if has_text {
+                    project_assistant_text_block(ctx, &threadId, &msg_id, msg_id_len, message, blockIndex, &btext, events, &count, cap);
+                };
+            } else if bytes_eq_buf(&btype, btype_len, STR_PTR("thinking"), STR_LEN("thinking")) {
+                let bthink = ByteBuf { bytes: [0u8; 262144], len: 0 };
+                let has_think: bool = sa_json_content_block_has(doc, blockIndex, STR_PTR("thinking"), STR_LEN("thinking"));
+                let bk_len: u64 = sa_json_content_block_string(doc, blockIndex, STR_PTR("thinking"), STR_LEN("thinking"), &bthink.bytes, 262144);
+                bthink.len = bk_len;
+                if has_think {
+                    project_assistant_thinking_block(ctx, &threadId, &msg_id, msg_id_len, message, blockIndex, &bthink, events, &count, cap);
+                };
+            } else if bytes_eq_buf(&btype, btype_len, STR_PTR("tool_use"), STR_LEN("tool_use")) {
+                // block.type === "tool_use" && typeof block.id === "string"
+                let bid: [u8; 128] = [0u8; 128];
+                let bid_len: u64 = sa_json_content_block_string(doc, blockIndex, STR_PTR("id"), STR_LEN("id"), &bid, 128);
+                if bid_len > 0 || sa_json_content_block_has(doc, blockIndex, STR_PTR("id"), STR_LEN("id")) {
+                    // const toolArgs = (block.input ?? {}) as JsonValue; const toolName = block.name as string;
+                    let toolArgs = ByteBuf { bytes: [0u8; 262144], len: 0 };
+                    if sa_json_content_block_json(doc, blockIndex, STR_PTR("input"), STR_LEN("input"), &toolArgs) == false {
+                        buf_append_lit(&toolArgs, STR_PTR("{}"), STR_LEN("{}"));
+                    };
+                    let bname: [u8; 256] = [0u8; 256];
+                    let bname_len: u64 = sa_json_content_block_string(doc, blockIndex, STR_PTR("name"), STR_LEN("name"), &bname, 256);
+                    let item = ByteBuf { bytes: [0u8; 262144], len: 0 };
+                    build_tool_item(&item, &bid, bid_len, &threadId.bytes, threadId.len, &ctx.turnId, ctx.turnId_len, &bname, bname_len, &toolArgs.bytes, toolArgs.len, STR_PTR("inProgress"), STR_LEN("inProgress"));
+                    // ctx.turn.toolItems.set(block.id, item);
+                    toolItems_set(ctx, &bid, bid_len, &item.bytes, item.len);
+                    // events.push({ kind: "item/started", threadId, turnId, item });
+                    push_item_event(events, &count, cap, STR_PTR("item/started"), STR_LEN("item/started"), &threadId, ctx, &item);
+                };
+            };
+            blockIndex = blockIndex + 1;
+        }
+        sa_json_free(doc);
+        return count;
+    };
+
+    // case "user"
+    if bytes_eq_buf(type_ptr, type_len, STR_PTR("user"), STR_LEN("user")) {
+        if isTerminal(ctx) { sa_json_free(doc); return count; };
+        let threadId = ByteBuf { bytes: [0u8; 128], len: 0 };
+        resolveThread(ctx, message.has_session_id, &message.session_id, message.session_id_len, &threadId);
+        let has_content: bool = false;
+        let block_count: u64 = sa_json_message_content_count(doc, &has_content);
+        if has_content {
+            let blockIndex: u64 = 0;
+            while blockIndex < block_count {
+                let btype: [u8; 64] = [0u8; 64];
+                let btype_len: u64 = sa_json_content_block_string(doc, blockIndex, STR_PTR("type"), STR_LEN("type"), &btype, 64);
+                if bytes_eq_buf(&btype, btype_len, STR_PTR("tool_result"), STR_LEN("tool_result")) {
+                    let tuid: [u8; 128] = [0u8; 128];
+                    let tuid_len: u64 = sa_json_content_block_string(doc, blockIndex, STR_PTR("tool_use_id"), STR_LEN("tool_use_id"), &tuid, 128);
+                    if tuid_len > 0 || sa_json_content_block_has(doc, blockIndex, STR_PTR("tool_use_id"), STR_LEN("tool_use_id")) {
+                        project_tool_result_block(ctx, doc, blockIndex, &threadId, &tuid, tuid_len, events, &count, cap);
+                    };
+                };
+                blockIndex = blockIndex + 1;
+            }
+        };
+        sa_json_free(doc);
+        return count;
+    };
+
+    // case "stream_event"
+    if bytes_eq_buf(type_ptr, type_len, STR_PTR("stream_event"), STR_LEN("stream_event")) {
+        if isTerminal(ctx) { sa_json_free(doc); return count; };
+        project_stream_event(doc, message, ctx, events, &count, cap);
+        sa_json_free(doc);
+        return count;
+    };
+
+    // case "streamlined_text"
+    if bytes_eq_buf(type_ptr, type_len, STR_PTR("streamlined_text"), STR_LEN("streamlined_text")) {
+        if isTerminal(ctx) { sa_json_free(doc); return count; };
+        let threadId = ByteBuf { bytes: [0u8; 128], len: 0 };
+        resolveThread(ctx, message.has_session_id, &message.session_id, message.session_id_len, &threadId);
+        let text = ByteBuf { bytes: [0u8; 262144], len: 0 };
+        text.len = sa_json_get_string(doc, STR_PTR("text"), STR_LEN("text"), &text.bytes, 262144);
+        // const itemId = (msg.uuid ?? ctx.turnId) + "-text";
+        let itemId = ByteBuf { bytes: [0u8; 512], len: 0 };
+        append_uuid_or_turn(message, ctx, &itemId);
+        buf_append_lit(&itemId, STR_PTR("-text"), STR_LEN("-text"));
+        if strset_has(&ctx.turn.assistantItemIds, &itemId.bytes, itemId.len) == false {
+            strset_add(&ctx.turn.assistantItemIds, &itemId.bytes, itemId.len);
+            strlist_push_buf(&ctx.turn.assistantTextBlocks, &text.bytes, text.len);
+            let item = ByteBuf { bytes: [0u8; 262144], len: 0 };
+            build_message_item(&item, false, &itemId.bytes, itemId.len, &threadId.bytes, threadId.len, &text.bytes, text.len);
+            push_item_event(events, &count, cap, STR_PTR("item/completed"), STR_LEN("item/completed"), &threadId, ctx, &item);
+        };
+        sa_json_free(doc);
+        return count;
+    };
+
+    // case "result"
+    if bytes_eq_buf(type_ptr, type_len, STR_PTR("result"), STR_LEN("result")) {
+        if isTerminal(ctx) { sa_json_free(doc); return count; };
+        project_result_message(doc, message, ctx, events, &count, cap);
+        sa_json_free(doc);
+        return count;
+    };
+
+    // case "control_request"
+    if bytes_eq_buf(type_ptr, type_len, STR_PTR("control_request"), STR_LEN("control_request")) {
+        // if (msg.request?.subtype === "can_use_tool") { ... }
+        let rsubtype: [u8; 64] = [0u8; 64];
+        let rsubtype_len: u64 = sa_json_get_nested_string(doc, STR_PTR("request"), STR_LEN("request"), STR_PTR("subtype"), STR_LEN("subtype"), &rsubtype, 64);
+        if bytes_eq_buf(&rsubtype, rsubtype_len, STR_PTR("can_use_tool"), STR_LEN("can_use_tool")) {
+            let threadId = ByteBuf { bytes: [0u8; 128], len: 0 };
+            resolveThread(ctx, message.has_session_id, &message.session_id, message.session_id_len, &threadId);
+            let ev = ProjectedEvent { kind: [0u8; 64], kind_len: 0, threadId: [0u8; 128], threadId_len: 0, turnId: [0u8; 128], turnId_len: 0, externalSessionId: [0u8; 128], externalSessionId_len: 0, has_model: false, model: [0u8; 256], model_len: 0, has_cwd: false, cwd: [0u8; 1024], cwd_len: 0, has_error: false, error: [0u8; 4096], error_len: 0, itemId: [0u8; 512], itemId_len: 0, delta: [0u8; 262144], delta_len: 0, item_json: [0u8; 262144], item_json_len: 0, requestId: [0u8; 256], requestId_len: 0, toolName: [0u8; 256], toolName_len: 0, input_json: [0u8; 262144], input_json_len: 0, has_toolUseId: false, toolUseId: [0u8; 128], toolUseId_len: 0, has_version: false, version: [0u8; 64], version_len: 0, has_permissionMode: false, permissionMode: [0u8; 64], permissionMode_len: 0, json: [0u8; 262144], json_len: 0 };
+            projected_event_new(STR_PTR("item/permissionRequest"), STR_LEN("item/permissionRequest"), &threadId.bytes, threadId.len, &ctx.turnId, ctx.turnId_len, &ev);
+            // requestId: msg.request_id
+            ev.requestId_len = sa_json_get_string(doc, STR_PTR("request_id"), STR_LEN("request_id"), &ev.requestId, 256);
+            // toolName: msg.request.tool_name ?? "unknown"
+            ev.toolName_len = sa_json_get_nested_string(doc, STR_PTR("request"), STR_LEN("request"), STR_PTR("tool_name"), STR_LEN("tool_name"), &ev.toolName, 256);
+            if ev.toolName_len == 0 && sa_json_get_nested_has(doc, STR_PTR("request"), STR_LEN("request"), STR_PTR("tool_name"), STR_LEN("tool_name")) == false {
+                ev.toolName_len = STR_LEN("unknown");
+                buf_copy_lit_to(STR_PTR("unknown"), STR_LEN("unknown"), &ev.toolName);
+            };
+            // input: (msg.request.input ?? {}) as JsonValue
+            let input = ByteBuf { bytes: [0u8; 262144], len: 0 };
+            if sa_json_get_nested_json(doc, STR_PTR("request"), STR_LEN("request"), STR_PTR("input"), STR_LEN("input"), &input) == false {
+                buf_append_lit(&input, STR_PTR("{}"), STR_LEN("{}"));
+            };
+            ev.input_json_len = input.len;
+            buf_copy_to(&input, &ev.input_json);
+            // ...(msg.request.tool_use_id ? { toolUseId } : {})
+            let tuid: [u8; 128] = [0u8; 128];
+            let tuid_len: u64 = sa_json_get_nested_string(doc, STR_PTR("request"), STR_LEN("request"), STR_PTR("tool_use_id"), STR_LEN("tool_use_id"), &tuid, 128);
+            if tuid_len > 0 {
+                ev.has_toolUseId = true;
+                ev.toolUseId_len = tuid_len;
+                buf_copy_buf(&tuid, tuid_len, &ev.toolUseId);
+            };
+            events_push(events, &count, cap, &ev);
+        };
+        sa_json_free(doc);
+        return count;
+    };
+
+    // default: return events;
+    sa_json_free(doc);
+    return count;
+}
+
+fn push_item_event(events: &[ProjectedEvent], count: &u64, cap: u64, kind_ptr: ptr, kind_len: u64, threadId: &ByteBuf, ctx: &ProjectorContext, item: &ByteBuf) -> void {
+    let ev = ProjectedEvent { kind: [0u8; 64], kind_len: 0, threadId: [0u8; 128], threadId_len: 0, turnId: [0u8; 128], turnId_len: 0, externalSessionId: [0u8; 128], externalSessionId_len: 0, has_model: false, model: [0u8; 256], model_len: 0, has_cwd: false, cwd: [0u8; 1024], cwd_len: 0, has_error: false, error: [0u8; 4096], error_len: 0, itemId: [0u8; 512], itemId_len: 0, delta: [0u8; 262144], delta_len: 0, item_json: [0u8; 262144], item_json_len: 0, requestId: [0u8; 256], requestId_len: 0, toolName: [0u8; 256], toolName_len: 0, input_json: [0u8; 262144], input_json_len: 0, has_toolUseId: false, toolUseId: [0u8; 128], toolUseId_len: 0, has_version: false, version: [0u8; 64], version_len: 0, has_permissionMode: false, permissionMode: [0u8; 64], permissionMode_len: 0, json: [0u8; 262144], json_len: 0 };
+    projected_event_new(kind_ptr, kind_len, &threadId.bytes, threadId.len, &ctx.turnId, ctx.turnId_len, &ev);
+    ev.item_json_len = item.len;
+    buf_copy_to(item, &ev.item_json);
+    events_push(events, count, cap, &ev);
+    return;
+}
+
+// (msg.uuid ?? ctx.turnId) prefix used by several itemId constructions.
+// DEFECT: the ClaudeMessage union struct in claudeCompatibleProtocol.sla does not
+// carry uuid (it lives on the concrete message structs); probed from raw JSON here.
+fn append_uuid_or_turn(message: &ClaudeMessage, ctx: &ProjectorContext, out: &ByteBuf) -> void {
+    let doc = sa_json_parse(&message.json, message.json_len);
+    let uuid: [u8; 128] = [0u8; 128];
+    let uuid_len: u64 = 0;
+    if doc != 0 {
+        uuid_len = sa_json_get_string(doc, STR_PTR("uuid"), STR_LEN("uuid"), &uuid, 128);
+        sa_json_free(doc);
+    };
+    if uuid_len > 0 {
+        buf_append_bytes(out, &uuid, uuid_len);
+        return;
+    };
+    buf_append_bytes(out, &ctx.turnId, ctx.turnId_len);
+    return;
+}
+
+fn message_uuid(message: &ClaudeMessage, out: &ByteBuf) -> bool {
+    let doc = sa_json_parse(&message.json, message.json_len);
+    if doc == 0 { return false; };
+    let n: u64 = sa_json_get_string(doc, STR_PTR("uuid"), STR_LEN("uuid"), &out.bytes, 128);
+    sa_json_free(doc);
+    out.len = n;
+    return n > 0;
+}
+
+// Assistant "text" block projection (the big dedup/reconcile branch in TS).
+fn project_assistant_text_block(ctx: &ProjectorContext, threadId: &ByteBuf, msg_id: &[u8], msg_id_len: u64, message: &ClaudeMessage, blockIndex: u64, btext: &ByteBuf, events: &[ProjectedEvent], count: &u64, cap: u64) -> void {
+    // const streamedText = [...ctx.turn.streamedAssistantItems.values()].join("");
+    let streamedText = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    strmap_join_values(&ctx.turn.streamedAssistantItems, &streamedText);
+    // const stableStreamItemId = msg.message.id ? `${msg.message.id}-text-${blockIndex}` : undefined;
+    let stableId = ByteBuf { bytes: [0u8; 512], len: 0 };
+    let has_stable: bool = msg_id_len > 0;
+    if has_stable {
+        buf_append_bytes(&stableId, msg_id, msg_id_len);
+        buf_append_lit(&stableId, STR_PTR("-text-"), STR_LEN("-text-"));
+        buf_append_u64(&stableId, blockIndex);
+    };
+    // const matchesStableStreamItem = Boolean(stableStreamItemId && ctx.turn.streamedAssistantItems.has(stableStreamItemId));
+    let matches: bool = has_stable && strmap_has(&ctx.turn.streamedAssistantItems, &stableId.bytes, stableId.len);
+    // if (matchesStableStreamItem) ctx.turn.streamedAssistantItems.set(stableStreamItemId!, block.text);
+    if matches {
+        strmap_set(&ctx.turn.streamedAssistantItems, &stableId.bytes, stableId.len, &btext.bytes, btext.len);
+    };
+    // if (matches || reconcileStreamedItem(...) || (normalize(streamedText) && normalize(streamedText).includes(normalize(block.text)))) continue;
+    let skip: bool = matches;
+    if skip == false { skip = reconcileStreamedItem(&ctx.turn.streamedAssistantItems, &btext.bytes, btext.len); };
+    if skip == false {
+        let nst = ByteBuf { bytes: [0u8; 262144], len: 0 };
+        normalizeAssistantText(&streamedText.bytes, streamedText.len, &nst);
+        let nbt = ByteBuf { bytes: [0u8; 262144], len: 0 };
+        normalizeAssistantText(&btext.bytes, btext.len, &nbt);
+        if nst.len > 0 && buf_contains(&nst.bytes, nst.len, &nbt.bytes, nbt.len) { skip = true; };
+    };
+    if skip { return; };
+    // const itemId = (msg.uuid ?? ctx.turnId) + "-text-" + blockIndex;
+    let itemId = ByteBuf { bytes: [0u8; 512], len: 0 };
+    append_uuid_or_turn(message, ctx, &itemId);
+    buf_append_lit(&itemId, STR_PTR("-text-"), STR_LEN("-text-"));
+    buf_append_u64(&itemId, blockIndex);
+    // if (!ctx.turn.assistantItemIds.has(itemId)) { add; push block; push item/completed agentMessage }
+    if strset_has(&ctx.turn.assistantItemIds, &itemId.bytes, itemId.len) == false {
+        strset_add(&ctx.turn.assistantItemIds, &itemId.bytes, itemId.len);
+        strlist_push_buf(&ctx.turn.assistantTextBlocks, &btext.bytes, btext.len);
+        let item = ByteBuf { bytes: [0u8; 262144], len: 0 };
+        build_message_item(&item, false, &itemId.bytes, itemId.len, &threadId.bytes, threadId.len, &btext.bytes, btext.len);
+        push_item_event(events, count, cap, STR_PTR("item/completed"), STR_LEN("item/completed"), threadId, ctx, &item);
+    };
+    return;
+}
+
+// Assistant "thinking" block projection (symmetric to text; reasoning items).
+fn project_assistant_thinking_block(ctx: &ProjectorContext, threadId: &ByteBuf, msg_id: &[u8], msg_id_len: u64, message: &ClaudeMessage, blockIndex: u64, bthink: &ByteBuf, events: &[ProjectedEvent], count: &u64, cap: u64) -> void {
+    let streamedReasoning = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    strmap_join_values(&ctx.turn.streamedReasoningItems, &streamedReasoning);
+    let stableId = ByteBuf { bytes: [0u8; 512], len: 0 };
+    let has_stable: bool = msg_id_len > 0;
+    if has_stable {
+        buf_append_bytes(&stableId, msg_id, msg_id_len);
+        buf_append_lit(&stableId, STR_PTR("-reasoning-"), STR_LEN("-reasoning-"));
+        buf_append_u64(&stableId, blockIndex);
+    };
+    let matches: bool = has_stable && strmap_has(&ctx.turn.streamedReasoningItems, &stableId.bytes, stableId.len);
+    if matches {
+        strmap_set(&ctx.turn.streamedReasoningItems, &stableId.bytes, stableId.len, &bthink.bytes, bthink.len);
+    };
+    let skip: bool = matches;
+    if skip == false { skip = reconcileStreamedItem(&ctx.turn.streamedReasoningItems, &bthink.bytes, bthink.len); };
+    if skip == false {
+        let nst = ByteBuf { bytes: [0u8; 262144], len: 0 };
+        normalizeAssistantText(&streamedReasoning.bytes, streamedReasoning.len, &nst);
+        let nbt = ByteBuf { bytes: [0u8; 262144], len: 0 };
+        normalizeAssistantText(&bthink.bytes, bthink.len, &nbt);
+        if nst.len > 0 && buf_contains(&nst.bytes, nst.len, &nbt.bytes, nbt.len) { skip = true; };
+    };
+    if skip { return; };
+    let itemId = ByteBuf { bytes: [0u8; 512], len: 0 };
+    append_uuid_or_turn(message, ctx, &itemId);
+    buf_append_lit(&itemId, STR_PTR("-thinking-"), STR_LEN("-thinking-"));
+    buf_append_u64(&itemId, blockIndex);
+    if strset_has(&ctx.turn.assistantItemIds, &itemId.bytes, itemId.len) == false {
+        strset_add(&ctx.turn.assistantItemIds, &itemId.bytes, itemId.len);
+        let item = ByteBuf { bytes: [0u8; 262144], len: 0 };
+        build_message_item(&item, true, &itemId.bytes, itemId.len, &threadId.bytes, threadId.len, &bthink.bytes, bthink.len);
+        push_item_event(events, count, cap, STR_PTR("item/completed"), STR_LEN("item/completed"), threadId, ctx, &item);
+    };
+    return;
+}
+
+fn strmap_join_values(m: &StrMap, out: &ByteBuf) -> void {
+    // [...map.values()].join("") — latest value per key under append-only storage
+    // is approximated by concatenating all stored values in insertion order.
+    // DEFECT: replaced values would double-count; acceptable bulk approximation.
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < m.vals.count {
+        buf_append_bytes(out, PTR_ADD(m.vals.items, off), m.vals.lens[i]);
+        off = off + m.vals.lens[i];
+        i = i + 1;
+    }
+    return;
+}
+
+// User "tool_result" block projection.
+fn project_tool_result_block(ctx: &ProjectorContext, doc: u64, blockIndex: u64, threadId: &ByteBuf, tuid: &[u8], tuid_len: u64, events: &[ProjectedEvent], count: &u64, cap: u64) -> void {
+    // const existing = ctx.turn.toolItems.get(block.tool_use_id);
+    let existing = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    let has_existing: bool = toolItems_get_latest(ctx, tuid, tuid_len, &existing);
+    // const toolName = existing?.toolName ?? existing?.name ?? "Tool";
+    // const toolArgs = existing?.arguments ?? existing?.input ?? {};
+    let toolName = ByteBuf { bytes: [0u8; 256], len: 0 };
+    let toolArgs = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    if has_existing {
+        let edoc = sa_json_parse(&existing.bytes, existing.len);
+        if edoc != 0 {
+            toolName.len = sa_json_get_string(edoc, STR_PTR("toolName"), STR_LEN("toolName"), &toolName.bytes, 256);
+            if toolName.len == 0 { toolName.len = sa_json_get_string(edoc, STR_PTR("name"), STR_LEN("name"), &toolName.bytes, 256); };
+            if sa_json_get_json_field(edoc, STR_PTR("arguments"), STR_LEN("arguments"), &toolArgs) == false {
+                if sa_json_get_json_field(edoc, STR_PTR("input"), STR_LEN("input"), &toolArgs) == false {
+                    buf_append_lit(&toolArgs, STR_PTR("{}"), STR_LEN("{}"));
+                };
+            };
+            sa_json_free(edoc);
+        };
+    };
+    if toolName.len == 0 { buf_append_lit(&toolName, STR_PTR("Tool"), STR_LEN("Tool")); };
+    if toolArgs.len == 0 { buf_append_lit(&toolArgs, STR_PTR("{}"), STR_LEN("{}")); };
+    // const item = { ...(existing ?? {}), type: "toolCall", id, threadId, turnId, name/tool/toolName, input, arguments, result: { content: block.content ?? "" }, status: is_error ? "failed" : "completed" };
+    // DEFECT: object spread of the existing item approximated by rebuilding the
+    // item from its probed fields (unknown extra fields of `existing` are lost).
+    let content = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    if sa_json_content_block_json(doc, blockIndex, STR_PTR("content"), STR_LEN("content"), &content) == false {
+        buf_append_lit(&content, STR_PTR("\"\""), STR_LEN("\"\""));
+    };
+    let is_error: bool = sa_json_content_block_bool(doc, blockIndex, STR_PTR("is_error"), STR_LEN("is_error"));
+    let status_ptr: ptr = STR_PTR("completed");
+    let status_len: u64 = STR_LEN("completed");
+    if is_error { status_ptr = STR_PTR("failed"); status_len = STR_LEN("failed"); };
+    let item = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    buf_append_lit(&item, STR_PTR("{\"type\":\"toolCall\",\"id\":\""), STR_LEN("{\"type\":\"toolCall\",\"id\":\""));
+    json_escape_into(&item, tuid, tuid_len);
+    buf_append_lit(&item, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    json_escape_into(&item, &threadId.bytes, threadId.len);
+    buf_append_lit(&item, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    json_escape_into(&item, &ctx.turnId, ctx.turnId_len);
+    buf_append_lit(&item, STR_PTR("\",\"name\":\""), STR_LEN("\",\"name\":\""));
+    json_escape_into(&item, &toolName.bytes, toolName.len);
+    buf_append_lit(&item, STR_PTR("\",\"tool\":\""), STR_LEN("\",\"tool\":\""));
+    json_escape_into(&item, &toolName.bytes, toolName.len);
+    buf_append_lit(&item, STR_PTR("\",\"toolName\":\""), STR_LEN("\",\"toolName\":\""));
+    json_escape_into(&item, &toolName.bytes, toolName.len);
+    buf_append_lit(&item, STR_PTR("\",\"input\":"), STR_LEN("\",\"input\":"));
+    buf_append_bytes(&item, &toolArgs.bytes, toolArgs.len);
+    buf_append_lit(&item, STR_PTR(",\"arguments\":"), STR_LEN(",\"arguments\":"));
+    buf_append_bytes(&item, &toolArgs.bytes, toolArgs.len);
+    buf_append_lit(&item, STR_PTR(",\"result\":{\"content\":"), STR_LEN(",\"result\":{\"content\":"));
+    buf_append_bytes(&item, &content.bytes, content.len);
+    buf_append_lit(&item, STR_PTR("},\"status\":\""), STR_LEN("},\"status\":\""));
+    buf_append_bytes(&item, status_ptr, status_len);
+    buf_append_lit(&item, STR_PTR("\"}"), STR_LEN("\"}"));
+    // ctx.turn.toolItems.set(block.tool_use_id, item);
+    toolItems_set(ctx, tuid, tuid_len, &item.bytes, item.len);
+    push_item_event(events, count, cap, STR_PTR("item/completed"), STR_LEN("item/completed"), threadId, ctx, &item);
+    return;
+}
+
+// stream_event case body.
+// DEFECT: event.* nested field access via sa_json_event_* placeholder probes
+// (event.content_block.*, event.delta.*, event.message.*).
+fn project_stream_event(doc: u64, message: &ClaudeMessage, ctx: &ProjectorContext, events: &[ProjectedEvent], count: &u64, cap: u64) -> void {
+    let threadId = ByteBuf { bytes: [0u8; 128], len: 0 };
+    resolveThread(ctx, message.has_session_id, &message.session_id, message.session_id_len, &threadId);
+    // const event = msg.event;
+    let etype: [u8; 64] = [0u8; 64];
+    let etype_len: u64 = sa_json_get_nested_string(doc, STR_PTR("event"), STR_LEN("event"), STR_PTR("type"), STR_LEN("type"), &etype, 64);
+    let ev_msg_id: [u8; 128] = [0u8; 128];
+    let ev_msg_id_len: u64 = sa_json_event_message_string(doc, STR_PTR("id"), STR_LEN("id"), &ev_msg_id, 128);
+    // if (event.type === "message_start" && event.message?.id) ctx.turn.streamMessageId = event.message.id;
+    // else if (!ctx.turn.streamMessageId && msg.uuid) ctx.turn.streamMessageId = msg.uuid;
+    if bytes_eq_buf(&etype, etype_len, STR_PTR("message_start"), STR_LEN("message_start")) && ev_msg_id_len > 0 {
+        ctx.turn.has_streamMessageId = true;
+        ctx.turn.streamMessageId_len = ev_msg_id_len;
+        buf_copy_buf(&ev_msg_id, ev_msg_id_len, &ctx.turn.streamMessageId);
+    } else if ctx.turn.has_streamMessageId == false {
+        let uuid = ByteBuf { bytes: [0u8; 128], len: 0 };
+        if message_uuid(message, &uuid) {
+            ctx.turn.has_streamMessageId = true;
+            ctx.turn.streamMessageId_len = uuid.len;
+            buf_copy_to(&uuid, &ctx.turn.streamMessageId);
+        };
+    };
+    // const blockIndex = typeof event.index === "number" && Number.isFinite(event.index) ? event.index : 0;
+    let blockIndex: u64 = 0;
+    let idx_val: i64 = 0;
+    if sa_json_get_nested_number(doc, STR_PTR("event"), STR_LEN("event"), STR_PTR("index"), STR_LEN("index"), &idx_val) {
+        if idx_val >= 0 { blockIndex = idx_val; };
+    };
+    if bytes_eq_buf(&etype, etype_len, STR_PTR("content_block_start"), STR_LEN("content_block_start")) {
+        project_content_block_start(doc, ctx, &threadId, blockIndex, &ev_msg_id, ev_msg_id_len, events, count, cap);
+        return;
+    };
+    if bytes_eq_buf(&etype, etype_len, STR_PTR("content_block_delta"), STR_LEN("content_block_delta")) {
+        project_content_block_delta(doc, ctx, &threadId, blockIndex, &ev_msg_id, ev_msg_id_len, events, count, cap);
+        return;
+    };
+    return;
+}
+
+fn push_delta_event(ctx: &ProjectorContext, threadId: &ByteBuf, is_reasoning: bool, itemId: &ByteBuf, text: &ByteBuf, events: &[ProjectedEvent], count: &u64, cap: u64) -> void {
+    // Append text to the streamed items map: items.set(itemId, `${items.get(itemId) ?? ""}${text}`)
+    let map_ptr: u64 = 0;
+    let existing = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    if is_reasoning {
+        strmap_get_latest(&ctx.turn.streamedReasoningItems, &itemId.bytes, itemId.len, &existing);
+        buf_append_bytes(&existing, &text.bytes, text.len);
+        strmap_set(&ctx.turn.streamedReasoningItems, &itemId.bytes, itemId.len, &existing.bytes, existing.len);
+    } else {
+        strmap_get_latest(&ctx.turn.streamedAssistantItems, &itemId.bytes, itemId.len, &existing);
+        buf_append_bytes(&existing, &text.bytes, text.len);
+        strmap_set(&ctx.turn.streamedAssistantItems, &itemId.bytes, itemId.len, &existing.bytes, existing.len);
+    };
+    // events.push({ kind: channel === "reasoning" ? "item/reasoning/textDelta" : "item/agentMessage/delta", threadId, turnId, itemId, delta: text })
+    let ev = ProjectedEvent { kind: [0u8; 64], kind_len: 0, threadId: [0u8; 128], threadId_len: 0, turnId: [0u8; 128], turnId_len: 0, externalSessionId: [0u8; 128], externalSessionId_len: 0, has_model: false, model: [0u8; 256], model_len: 0, has_cwd: false, cwd: [0u8; 1024], cwd_len: 0, has_error: false, error: [0u8; 4096], error_len: 0, itemId: [0u8; 512], itemId_len: 0, delta: [0u8; 262144], delta_len: 0, item_json: [0u8; 262144], item_json_len: 0, requestId: [0u8; 256], requestId_len: 0, toolName: [0u8; 256], toolName_len: 0, input_json: [0u8; 262144], input_json_len: 0, has_toolUseId: false, toolUseId: [0u8; 128], toolUseId_len: 0, has_version: false, version: [0u8; 64], version_len: 0, has_permissionMode: false, permissionMode: [0u8; 64], permissionMode_len: 0, json: [0u8; 262144], json_len: 0 };
+    if is_reasoning {
+        projected_event_new(STR_PTR("item/reasoning/textDelta"), STR_LEN("item/reasoning/textDelta"), &threadId.bytes, threadId.len, &ctx.turnId, ctx.turnId_len, &ev);
+    } else {
+        projected_event_new(STR_PTR("item/agentMessage/delta"), STR_LEN("item/agentMessage/delta"), &threadId.bytes, threadId.len, &ctx.turnId, ctx.turnId_len, &ev);
+    };
+    ev.itemId_len = itemId.len;
+    buf_copy_to(itemId, &ev.itemId);
+    ev.delta_len = text.len;
+    buf_copy_to(text, &ev.delta);
+    events_push(events, count, cap, &ev);
+    return;
+}
+
+fn project_content_block_start(doc: u64, ctx: &ProjectorContext, threadId: &ByteBuf, blockIndex: u64, ev_msg_id: &[u8], ev_msg_id_len: u64, events: &[ProjectedEvent], count: &u64, cap: u64) -> void {
+    // const cb = event.content_block;
+    let cbtype: [u8; 64] = [0u8; 64];
+    let cbtype_len: u64 = sa_json_event_block_string(doc, STR_PTR("type"), STR_LEN("type"), &cbtype, 64);
+    // const channel = cb?.type === "thinking" ? "reasoning" : cb?.type === "text" ? "text" : undefined;
+    let channel: u64 = 0; // 0 none, 1 text, 2 reasoning
+    if bytes_eq_buf(&cbtype, cbtype_len, STR_PTR("thinking"), STR_LEN("thinking")) { channel = 2; };
+    if bytes_eq_buf(&cbtype, cbtype_len, STR_PTR("text"), STR_LEN("text")) { channel = 1; };
+    // const text = typeof cb?.text === "string" ? cb.text : typeof cb?.thinking === "string" ? cb.thinking : "";
+    let text = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    if sa_json_event_block_has(doc, STR_PTR("text"), STR_LEN("text")) {
+        text.len = sa_json_event_block_string(doc, STR_PTR("text"), STR_LEN("text"), &text.bytes, 262144);
+    } else if sa_json_event_block_has(doc, STR_PTR("thinking"), STR_LEN("thinking")) {
+        text.len = sa_json_event_block_string(doc, STR_PTR("thinking"), STR_LEN("thinking"), &text.bytes, 262144);
+    };
+    // if (cb?.type === "tool_use" && typeof cb.id === "string" && typeof cb.name === "string" && cb.name !== "Agent" && cb.name !== "Task")
+    if bytes_eq_buf(&cbtype, cbtype_len, STR_PTR("tool_use"), STR_LEN("tool_use")) {
+        let cbid: [u8; 128] = [0u8; 128];
+        let cbid_len: u64 = sa_json_event_block_string(doc, STR_PTR("id"), STR_LEN("id"), &cbid, 128);
+        let cbname: [u8; 256] = [0u8; 256];
+        let cbname_len: u64 = sa_json_event_block_string(doc, STR_PTR("name"), STR_LEN("name"), &cbname, 256);
+        let name_ok: bool = cbname_len > 0 && bytes_eq_buf(&cbname, cbname_len, STR_PTR("Agent"), STR_LEN("Agent")) == false && bytes_eq_buf(&cbname, cbname_len, STR_PTR("Task"), STR_LEN("Task")) == false;
+        if cbid_len > 0 && name_ok && blockIndex < 64 {
+            // const toolBlock = { id: cb.id, name: cb.name, argumentsJson: "", initialInput: (cb.input ?? {}) };
+            let tb = &ctx.turn.streamToolBlocks[blockIndex];
+            tb.occupied = true;
+            tb.id_len = cbid_len;
+            buf_copy_buf(&cbid, cbid_len, &tb.id);
+            tb.name_len = cbname_len;
+            buf_copy_buf(&cbname, cbname_len, &tb.name);
+            tb.argumentsJson_len = 0;
+            tb.initialInput_json_len = 0;
+            let init_input = ByteBuf { bytes: [0u8; 262144], len: 0 };
+            if sa_json_event_block_json(doc, STR_PTR("input"), STR_LEN("input"), &init_input) == false {
+                buf_append_lit(&init_input, STR_PTR("{}"), STR_LEN("{}"));
+            };
+            tb.initialInput_json_len = init_input.len;
+            buf_copy_to(&init_input, &tb.initialInput_json);
+            // const startArgs = streamedToolArguments(toolBlock); item started; toolItems.set
+            let startArgs = ByteBuf { bytes: [0u8; 262144], len: 0 };
+            streamedToolArguments(tb, &startArgs);
+            let item = ByteBuf { bytes: [0u8; 262144], len: 0 };
+            build_tool_item(&item, &cbid, cbid_len, &threadId.bytes, threadId.len, &ctx.turnId, ctx.turnId_len, &cbname, cbname_len, &startArgs.bytes, startArgs.len, STR_PTR("inProgress"), STR_LEN("inProgress"));
+            toolItems_set(ctx, &cbid, cbid_len, &item.bytes, item.len);
+            push_item_event(events, count, cap, STR_PTR("item/started"), STR_LEN("item/started"), threadId, ctx, &item);
+        };
+    };
+    // if (channel && text.length > 0) { itemId = ...; items.set(...); events.push(delta) }
+    if channel != 0 && text.len > 0 {
+        let itemId = ByteBuf { bytes: [0u8; 512], len: 0 };
+        if ctx.turn.has_streamMessageId {
+            buf_append_bytes(&itemId, &ctx.turn.streamMessageId, ctx.turn.streamMessageId_len);
+        } else if ev_msg_id_len > 0 {
+            buf_append_bytes(&itemId, ev_msg_id, ev_msg_id_len);
+        } else {
+            buf_append_bytes(&itemId, &ctx.turnId, ctx.turnId_len);
+        };
+        if channel == 2 { buf_append_lit(&itemId, STR_PTR("-reasoning-"), STR_LEN("-reasoning-")); } else { buf_append_lit(&itemId, STR_PTR("-text-"), STR_LEN("-text-")); };
+        buf_append_u64(&itemId, blockIndex);
+        push_delta_event(ctx, threadId, channel == 2, &itemId, &text, events, count, cap);
+    };
+    return;
+}
+
+fn project_content_block_delta(doc: u64, ctx: &ProjectorContext, threadId: &ByteBuf, blockIndex: u64, ev_msg_id: &[u8], ev_msg_id_len: u64, events: &[ProjectedEvent], count: &u64, cap: u64) -> void {
+    // const delta = event.delta;
+    let dtype: [u8; 64] = [0u8; 64];
+    let dtype_len: u64 = sa_json_event_delta_string(doc, STR_PTR("type"), STR_LEN("type"), &dtype, 64);
+    // if (delta?.type === "input_json_delta" && typeof delta.partial_json === "string")
+    if bytes_eq_buf(&dtype, dtype_len, STR_PTR("input_json_delta"), STR_LEN("input_json_delta")) && sa_json_event_delta_has(doc, STR_PTR("partial_json"), STR_LEN("partial_json")) {
+        let partial = ByteBuf { bytes: [0u8; 262144], len: 0 };
+        partial.len = sa_json_event_delta_string(doc, STR_PTR("partial_json"), STR_LEN("partial_json"), &partial.bytes, 262144);
+        // const toolBlock = ctx.turn.streamToolBlocks.get(blockIndex); if (toolBlock) { toolBlock.argumentsJson += partial; ... push item/started }
+        if blockIndex < 64 && ctx.turn.streamToolBlocks[blockIndex].occupied {
+            let tb = &ctx.turn.streamToolBlocks[blockIndex];
+            let i: u64 = 0;
+            while i < partial.len { tb.argumentsJson[tb.argumentsJson_len + i] = partial.bytes[i]; i = i + 1; };
+            tb.argumentsJson_len = tb.argumentsJson_len + partial.len;
+            let deltaArgs = ByteBuf { bytes: [0u8; 262144], len: 0 };
+            streamedToolArguments(tb, &deltaArgs);
+            let item = ByteBuf { bytes: [0u8; 262144], len: 0 };
+            build_tool_item(&item, &tb.id, tb.id_len, &threadId.bytes, threadId.len, &ctx.turnId, ctx.turnId_len, &tb.name, tb.name_len, &deltaArgs.bytes, deltaArgs.len, STR_PTR("inProgress"), STR_LEN("inProgress"));
+            toolItems_set(ctx, &tb.id, tb.id_len, &item.bytes, item.len);
+            push_item_event(events, count, cap, STR_PTR("item/started"), STR_LEN("item/started"), threadId, ctx, &item);
+        };
+    };
+    // const channel = delta?.type === "thinking_delta" || typeof delta?.thinking === "string" ? "reasoning" : typeof delta?.text === "string" || delta?.type === "text_delta" ? "text" : undefined;
+    let channel: u64 = 0;
+    let has_thinking: bool = sa_json_event_delta_has(doc, STR_PTR("thinking"), STR_LEN("thinking"));
+    let has_text: bool = sa_json_event_delta_has(doc, STR_PTR("text"), STR_LEN("text"));
+    if bytes_eq_buf(&dtype, dtype_len, STR_PTR("thinking_delta"), STR_LEN("thinking_delta")) || has_thinking { channel = 2; }
+    else if has_text || bytes_eq_buf(&dtype, dtype_len, STR_PTR("text_delta"), STR_LEN("text_delta")) { channel = 1; };
+    // const text = channel === "reasoning" ? (typeof delta?.thinking === "string" ? delta.thinking : "") : (typeof delta?.text === "string" ? delta.text : "");
+    let text = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    if channel == 2 && has_thinking { text.len = sa_json_event_delta_string(doc, STR_PTR("thinking"), STR_LEN("thinking"), &text.bytes, 262144); };
+    if channel == 1 && has_text { text.len = sa_json_event_delta_string(doc, STR_PTR("text"), STR_LEN("text"), &text.bytes, 262144); };
+    if channel != 0 && text.len > 0 {
+        let itemId = ByteBuf { bytes: [0u8; 512], len: 0 };
+        if ctx.turn.has_streamMessageId {
+            buf_append_bytes(&itemId, &ctx.turn.streamMessageId, ctx.turn.streamMessageId_len);
+        } else if ev_msg_id_len > 0 {
+            buf_append_bytes(&itemId, ev_msg_id, ev_msg_id_len);
+        } else {
+            buf_append_bytes(&itemId, &ctx.turnId, ctx.turnId_len);
+        };
+        if channel == 2 { buf_append_lit(&itemId, STR_PTR("-reasoning-"), STR_LEN("-reasoning-")); } else { buf_append_lit(&itemId, STR_PTR("-text-"), STR_LEN("-text-")); };
+        buf_append_u64(&itemId, blockIndex);
+        push_delta_event(ctx, threadId, channel == 2, &itemId, &text, events, count, cap);
+    };
+    return;
+}
+
+// result case body.
+fn project_result_message(doc: u64, message: &ClaudeMessage, ctx: &ProjectorContext, events: &[ProjectedEvent], count: &u64, cap: u64) -> void {
+    let threadId = ByteBuf { bytes: [0u8; 128], len: 0 };
+    resolveThread(ctx, message.has_session_id, &message.session_id, message.session_id_len, &threadId);
+    // const isError = msg.is_error === true || msg.subtype !== "success";
+    let isError: bool = sa_json_get_bool(doc, STR_PTR("is_error"), STR_LEN("is_error"));
+    let subtype: [u8; 64] = [0u8; 64];
+    let subtype_len: u64 = sa_json_get_string(doc, STR_PTR("subtype"), STR_LEN("subtype"), &subtype, 64);
+    if bytes_eq_buf(&subtype, subtype_len, STR_PTR("success"), STR_LEN("success")) == false { isError = true; };
+    // for (const [itemId, text] of ctx.turn.streamedReasoningItems) { flush as reasoning item/completed }
+    flush_streamed_items(ctx, &threadId, true, events, count, cap);
+    // for (const [itemId, text] of ctx.turn.streamedAssistantItems) { flush as agentMessage item/completed + assistantTextBlocks.push }
+    flush_streamed_items(ctx, &threadId, false, events, count, cap);
+    // if (typeof msg.result === "string" && msg.result.length > 0) { ... }
+    let result = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    result.len = sa_json_get_string(doc, STR_PTR("result"), STR_LEN("result"), &result.bytes, 262144);
+    if result.len > 0 {
+        // const resultItemId = "result-" + (msg.session_id ?? ctx.turnId);
+        let resultItemId = ByteBuf { bytes: [0u8; 512], len: 0 };
+        buf_append_lit(&resultItemId, STR_PTR("result-"), STR_LEN("result-"));
+        if message.has_session_id { buf_append_bytes(&resultItemId, &message.session_id, message.session_id_len); } else { buf_append_bytes(&resultItemId, &ctx.turnId, ctx.turnId_len); };
+        let normalizedResult = ByteBuf { bytes: [0u8; 262144], len: 0 };
+        normalizeAssistantText(&result.bytes, result.len, &normalizedResult);
+        if strset_has(&ctx.turn.assistantItemIds, &resultItemId.bytes, resultItemId.len) == false && assistantResultAlreadyProjected(&ctx.turn.assistantTextBlocks, &normalizedResult.bytes, normalizedResult.len) == false {
+            strset_add(&ctx.turn.assistantItemIds, &resultItemId.bytes, resultItemId.len);
+            strlist_push_buf(&ctx.turn.assistantTextBlocks, &result.bytes, result.len);
+            let item = ByteBuf { bytes: [0u8; 262144], len: 0 };
+            build_message_item(&item, false, &resultItemId.bytes, resultItemId.len, &threadId.bytes, threadId.len, &result.bytes, result.len);
+            push_item_event(events, count, cap, STR_PTR("item/completed"), STR_LEN("item/completed"), &threadId, ctx, &item);
+        };
+    };
+    // if (markTerminal(ctx, isError ? "failed" : "completed")) events.push({ kind, threadId, turnId, ...(isError && msg.errors?.length ? { error: msg.errors[0] } : {}) });
+    let status: u64 = TURN_STATUS_COMPLETED;
+    if isError { status = TURN_STATUS_FAILED; };
+    if markTerminal(ctx, status) {
+        let ev = ProjectedEvent { kind: [0u8; 64], kind_len: 0, threadId: [0u8; 128], threadId_len: 0, turnId: [0u8; 128], turnId_len: 0, externalSessionId: [0u8; 128], externalSessionId_len: 0, has_model: false, model: [0u8; 256], model_len: 0, has_cwd: false, cwd: [0u8; 1024], cwd_len: 0, has_error: false, error: [0u8; 4096], error_len: 0, itemId: [0u8; 512], itemId_len: 0, delta: [0u8; 262144], delta_len: 0, item_json: [0u8; 262144], item_json_len: 0, requestId: [0u8; 256], requestId_len: 0, toolName: [0u8; 256], toolName_len: 0, input_json: [0u8; 262144], input_json_len: 0, has_toolUseId: false, toolUseId: [0u8; 128], toolUseId_len: 0, has_version: false, version: [0u8; 64], version_len: 0, has_permissionMode: false, permissionMode: [0u8; 64], permissionMode_len: 0, json: [0u8; 262144], json_len: 0 };
+        if isError {
+            projected_event_new(STR_PTR("turn/failed"), STR_LEN("turn/failed"), &threadId.bytes, threadId.len, &ctx.turnId, ctx.turnId_len, &ev);
+            // msg.errors && msg.errors.length > 0 -> error: msg.errors[0]
+            let err_count: u64 = sa_json_errors_count(doc);
+            if err_count > 0 {
+                ev.has_error = true;
+                ev.error_len = sa_json_errors_get(doc, 0, &ev.error, 4096);
+            };
+        } else {
+            projected_event_new(STR_PTR("turn/completed"), STR_LEN("turn/completed"), &threadId.bytes, threadId.len, &ctx.turnId, ctx.turnId_len, &ev);
+        };
+        events_push(events, count, cap, &ev);
+    };
+    return;
+}
+
+fn flush_streamed_items(ctx: &ProjectorContext, threadId: &ByteBuf, is_reasoning: bool, events: &[ProjectedEvent], count: &u64, cap: u64) -> void {
+    // for (const [itemId, text] of items) { if (!text || assistantItemIds.has(itemId)) continue; add; [assistant only: assistantTextBlocks.push(text)]; push item/completed }
+    // DEFECT: iteration over the Map uses unique keys (latest value per key) —
+    // approximated by scanning stored pairs and skipping shadowed duplicates.
+    let keys = &ctx.turn.streamedAssistantItems.keys;
+    let vals = &ctx.turn.streamedAssistantItems.vals;
+    if is_reasoning {
+        keys = &ctx.turn.streamedReasoningItems.keys;
+        vals = &ctx.turn.streamedReasoningItems.vals;
+    };
+    let koff: u64 = 0;
+    let voff: u64 = 0;
+    let i: u64 = 0;
+    while i < keys.count {
+        let klen: u64 = keys.lens[i];
+        let vlen: u64 = vals.lens[i];
+        if vlen > 0 && strset_has(&ctx.turn.assistantItemIds, PTR_ADD(keys.items, koff), klen) == false {
+            strset_add(&ctx.turn.assistantItemIds, PTR_ADD(keys.items, koff), klen);
+            if is_reasoning == false {
+                strlist_push(&ctx.turn.assistantTextBlocks, PTR_ADD(vals.items, voff), vlen);
+            };
+            let item = ByteBuf { bytes: [0u8; 262144], len: 0 };
+            build_message_item(&item, is_reasoning, PTR_ADD(keys.items, koff), klen, &threadId.bytes, threadId.len, PTR_ADD(vals.items, voff), vlen);
+            push_item_event(events, count, cap, STR_PTR("item/completed"), STR_LEN("item/completed"), threadId, ctx, &item);
+        };
+        koff = koff + klen;
+        voff = voff + vlen;
+        i = i + 1;
+    }
+    return;
+}
+
+// Force-terminate the turn (e.g., when the CLI process exits unexpectedly).
+// Returns a terminal event if the turn was still running (has_out mirrors TS null).
+fn forceTerminate(ctx: &ProjectorContext, error_ptr: ptr, error_len: u64, out: &ProjectedEvent, has_out: &bool) -> void {
+    has_out = false;
+    // if (markTerminal(ctx, "failed")) return { kind: "turn/failed", threadId, turnId, ...(error ? { error } : {}) };
+    if markTerminal(ctx, TURN_STATUS_FAILED) {
+        projected_event_new(STR_PTR("turn/failed"), STR_LEN("turn/failed"), &ctx.threadId, ctx.threadId_len, &ctx.turnId, ctx.turnId_len, out);
+        if error_len > 0 {
+            out.has_error = true;
+            out.error_len = error_len;
+            buf_copy_ptr_to(error_ptr, error_len, &out.error);
+        };
+        has_out = true;
+    };
+    return;
+}
+
+// Mark the turn as interrupted (e.g., when the user sends turn/interrupt).
+fn markInterrupted(ctx: &ProjectorContext, out: &ProjectedEvent, has_out: &bool) -> void {
+    has_out = false;
+    if markTerminal(ctx, TURN_STATUS_INTERRUPTED) {
+        projected_event_new(STR_PTR("turn/interrupted"), STR_LEN("turn/interrupted"), &ctx.threadId, ctx.threadId_len, &ctx.turnId, ctx.turnId_len, out);
+        has_out = true;
+    };
+    return;
+}

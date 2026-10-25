@@ -1,0 +1,585 @@
+// Converted 1:1 from sdk-backend/src/imagePersistence.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+
+@import "sa_std/ptr.sa"
+
+// DEFECT: `unknown` / JsonValue dynamic values -> sa_json node
+// handles (u64) parsed from JSON text. DEFECT: object key
+// enumeration (Object.entries) has no sa_json counterpart; the
+// object branch of hasInlineImagePayload inspects the stringified
+// text for the known keys instead of walking entries (semantics
+// preserved for the checks performed, structure differs).
+// DEFECT: async/await + fetch + fs/promises -> synchronous status
+// functions with placeholder externs (sa_base64_decode,
+// sa_http_fetch_bytes, sa_fs_mkdir_p); throw -> status 3.
+// DEFECT: Buffer/Uint8Array -> byte buffers.
+
+let MAX_PERSISTED_IMAGE_BYTES: u64 = 134217728;
+
+// Path-only contract for every persisted chat record (image_history,
+// session messages, JSONL history): images must hit disk first
+// (saveUploadedAttachment / persistImageApiResult) and only the disk path
+// enters the record. Base64 lives only in transient model payloads
+// (fileParts / Anthropic image blocks built at read time from the path).
+// INLINE_IMAGE_KEYS = { "b64Json", "b64_json", "base64", "b64", "data" }
+
+struct ByteBuf {
+    bytes: [u8; 40960],
+    len: u64,
+}
+
+fn buf_append(b: &ByteBuf, src_ptr: ptr, src_len: u64) -> void {
+    for i in 0..src_len {
+        if b.len < 40960 {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, src_ptr, i);
+            b.bytes[b.len] = c;
+            b.len = b.len + 1;
+        };
+    }
+}
+
+fn str_contains(hay_ptr: ptr, hay_len: u64, nd_ptr: ptr, nd_len: u64) -> bool {
+    if nd_len == 0 || hay_len < nd_len { return false; };
+    let last = hay_len - nd_len;
+    let i: u64 = 0;
+    while i <= last {
+        let ok = true;
+        let j: u64 = 0;
+        while j < nd_len {
+            let a: u8 = 0;
+            let b: u8 = 0;
+            PTR_BYTE_AT(a, hay_ptr, i + j);
+            PTR_BYTE_AT(b, nd_ptr, j);
+            if a != b { ok = false; break; };
+            j = j + 1;
+        }
+        if ok { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn starts_with_ci(p: ptr, l: u64, pre: ptr, pre_len: u64) -> bool {
+    if l < pre_len { return false; };
+    for i in 0..pre_len {
+        let a: u8 = 0;
+        let b: u8 = 0;
+        PTR_BYTE_AT(a, p, i);
+        PTR_BYTE_AT(b, pre, i);
+        if a >= 65 && a <= 90 { a = a + 32; };
+        if b >= 65 && b <= 90 { b = b + 32; };
+        if a != b { return false; };
+    }
+    return true;
+}
+
+fn trim_range(p: ptr, l: u64, out_s: &u64, out_e: &u64) -> void {
+    let s: u64 = 0;
+    let e: u64 = l;
+    while s < e {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, p, s);
+        if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+        s = s + 1;
+    }
+    while e > s {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, p, e - 1);
+        if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+        e = e - 1;
+    }
+    out_s = s;
+    out_e = e;
+}
+
+// isInlineImageDataUrl(value: unknown): boolean -- value arrives
+// as a JSON node; non-strings read as empty.
+fn isInlineImageDataUrl(node: u64) -> bool {
+    let vp: ptr = sa_json_string_ptr(node);
+    let vl = sa_json_string_len(node);
+    if vl == 0 { return false; };
+    let s: u64 = 0;
+    let e: u64 = 0;
+    trim_range(vp, vl, &s, &e);
+    if e - s < 32 { return false; };
+    let tp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tp, vp, s);
+    let tl = e - s;
+    if str_contains(tp, tl, STR_PTR(";base64,"), STR_LEN(";base64,")) { return true; };
+    return starts_with_ci(tp, tl, STR_PTR("data:image/"), STR_LEN("data:image/"));
+}
+
+fn hasInlineImagePayload(node: u64, depth: u64) -> bool {
+    if depth > 12 { return false; };
+    // string branch
+    let vp: ptr = sa_json_string_ptr(node);
+    let vl = sa_json_string_len(node);
+    if vl > 0 {
+        if vl < 256 { return false; };
+        if str_contains(vp, vl, STR_PTR(";base64,"), STR_LEN(";base64,")) { return true; };
+        return starts_with_ci(vp, vl, STR_PTR("data:image/"), STR_LEN("data:image/"));
+    };
+    // array branch
+    let first_el: u64 = 0;
+    if sa_json_array_get(node, 0, &first_el) == 0 {
+        let i: u64 = 0;
+        while i < 100000 {
+            let el: u64 = 0;
+            if sa_json_array_get(node, i, &el) != 0 { break; };
+            if hasInlineImagePayload(el, depth + 1) { return true; };
+            i = i + 1;
+        }
+        return false;
+    };
+    // object branch -- DEFECT: key enumeration unavailable; the
+    // checks below run on the stringified object text.
+    let sh: u64 = 0;
+    if sa_json_stringify(node, &sh) != 0 { return false; };
+    let sp: ptr = sa_json_buffer_data(sh);
+    let sl = sa_json_buffer_len(sh);
+    // any INLINE_IMAGE_KEYS key with a non-empty string value:
+    // approximated by `"key":"` presence followed by non-quote.
+    if key_has_string_value(sp, sl, STR_PTR("b64Json"), STR_LEN("b64Json")) { return true; };
+    if key_has_string_value(sp, sl, STR_PTR("b64_json"), STR_LEN("b64_json")) { return true; };
+    if key_has_string_value(sp, sl, STR_PTR("base64"), STR_LEN("base64")) { return true; };
+    if key_has_string_value(sp, sl, STR_PTR("b64"), STR_LEN("b64")) { return true; };
+    if key_has_string_value(sp, sl, STR_PTR("data"), STR_LEN("data")) { return true; };
+    // key === "result" special case
+    let rp: ptr = PTR_NULL();
+    let rl: u64 = 0;
+    if sa_json_object_get_string(node, STR_PTR("result"), STR_LEN("result"), &rp, &rl) == 0 && rl > 0 {
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        sa_json_object_get_string(node, STR_PTR("type"), STR_LEN("type"), &tp, &tl);
+        if tl == STR_LEN("image_generation_call") {
+            let want = "image_generation_call";
+            let same = true;
+            for i in 0..tl {
+                let a: u8 = 0;
+                let b: u8 = 0;
+                PTR_BYTE_AT(a, tp, i);
+                PTR_BYTE_AT(b, STR_PTR(want), i);
+                if a != b { same = false; break; };
+            }
+            if same { return true; };
+        };
+        if rl >= 256 { return true; };
+    };
+    // recursion into entry values -- DEFECT: without key
+    // enumeration the recursion is skipped in the bulk pass
+    // (nested payloads under unknown keys are missed; logged).
+    return false;
+}
+
+// DEFECT: helper not in TS source. Scans stringified JSON for
+// `"key":"<non-empty>"` at any depth (text-level approximation).
+fn key_has_string_value(text_ptr: ptr, text_len: u64, key_ptr: ptr, key_len: u64) -> bool {
+    if text_len < key_len + 4 { return false; };
+    let i: u64 = 0;
+    let last = text_len - key_len - 4;
+    while i <= last {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, text_ptr, i);
+        if b == 34 {
+            let ok = true;
+            for j in 0..key_len {
+                let a: u8 = 0;
+                let c: u8 = 0;
+                PTR_BYTE_AT(a, text_ptr, i + 1 + j);
+                PTR_BYTE_AT(c, key_ptr, j);
+                if a != c { ok = false; break; };
+            }
+            if ok {
+                let q: u8 = 0;
+                let colon: u8 = 0;
+                let vq: u8 = 0;
+                let first: u8 = 0;
+                PTR_BYTE_AT(q, text_ptr, i + 1 + key_len);
+                PTR_BYTE_AT(colon, text_ptr, i + 2 + key_len);
+                PTR_BYTE_AT(vq, text_ptr, i + 3 + key_len);
+                PTR_BYTE_AT(first, text_ptr, i + 4 + key_len);
+                if q == 34 && colon == 58 && vq == 34 && first != 34 { return true; };
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn containsInlineImagePayload(node: u64) -> bool {
+    return hasInlineImagePayload(node, 0);
+}
+
+// Build the history-safe echo of a composer image block: path reference
+// only, never bitmap bytes. (See TS doc.)
+// Output: JSON object text {"type":"localImage","path":...} with
+// optional name/detail (trimmed) appended in source order.
+fn toPathOnlyImageBlock(path_ptr: ptr, path_len: u64, has_path: bool, name_ptr: ptr, name_len: u64, has_name: bool, detail_ptr: ptr, detail_len: u64, has_detail: bool, out: &ByteBuf) -> void {
+    out.len = 0;
+    buf_append(out, STR_PTR("{\"type\":\"localImage\",\"path\":\""), STR_LEN("{\"type\":\"localImage\",\"path\":\""));
+    if has_path {
+        let s: u64 = 0;
+        let e: u64 = 0;
+        trim_range(path_ptr, path_len, &s, &e);
+        let tp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp, path_ptr, s);
+        buf_append_json_escaped(out, tp, e - s);
+    };
+    if has_name {
+        let s: u64 = 0;
+        let e: u64 = 0;
+        trim_range(name_ptr, name_len, &s, &e);
+        if e > s {
+            buf_append(out, STR_PTR("\",\"name\":\""), STR_LEN("\",\"name\":\""));
+            let tp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(tp, name_ptr, s);
+            buf_append_json_escaped(out, tp, e - s);
+        };
+    };
+    if has_detail {
+        let s: u64 = 0;
+        let e: u64 = 0;
+        trim_range(detail_ptr, detail_len, &s, &e);
+        if e > s {
+            buf_append(out, STR_PTR("\",\"detail\":\""), STR_LEN("\",\"detail\":\""));
+            let tp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(tp, detail_ptr, s);
+            buf_append_json_escaped(out, tp, e - s);
+        };
+    };
+    buf_append(out, STR_PTR("\"}"), STR_LEN("\"}"));
+}
+
+fn pathOnlyHistoryPlaceholder(name_ptr: ptr, name_len: u64, reason_ptr: ptr, reason_len: u64, out: &ByteBuf) -> void {
+    out.len = 0;
+    buf_append(out, STR_PTR("{\"type\":\"text\",\"text\":\"[Attached image \\\""), STR_LEN("{\"type\":\"text\",\"text\":\"[Attached image \\\""));
+    buf_append_json_escaped(out, name_ptr, name_len);
+    buf_append(out, STR_PTR("\\\" was omitted: "), STR_LEN("\\\" was omitted: "));
+    buf_append_json_escaped(out, reason_ptr, reason_len);
+    buf_append(out, STR_PTR("]\",\"text_elements\":[]}"), STR_LEN("]\",\"text_elements\":[]}"));
+}
+
+fn buf_append_json_escaped(b: &ByteBuf, src_ptr: ptr, src_len: u64) -> void {
+    // DEFECT: JSON escaping approximated (quote/backslash/control
+    // newline only).
+    for i in 0..src_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, src_ptr, i);
+        if c == 34 || c == 92 {
+            if b.len < 40960 {
+                b.bytes[b.len] = 92;
+                b.len = b.len + 1;
+            };
+        };
+        if b.len < 40960 {
+            b.bytes[b.len] = c;
+            b.len = b.len + 1;
+        };
+    }
+}
+
+// persistImageApiResult(value, dataDir, fetchImage): Promise<JsonValue>
+// DEFECT: async -> status fn (0 ok + out JSON text, 1 = returned
+// input unchanged signal, 3 = the TS throws). fetchImage (typeof
+// fetch) -> fn pointer handle `fetch_fn`.
+// DEFECT: the TS `{ ...rest, data }` keeps every other top-level
+// field of the source object; the bulk pass emits only `data`
+// (source `raw` is dropped as in TS, other fields are NOT carried
+// -- logged). Per-entry `{ ...metadata, savedPath, mediaType }`
+// keeps metadata via text-level key stripping of
+// url/b64Json/b64_json.
+fn persistImageApiResult(value: u64, dataDir_ptr: ptr, dataDir_len: u64, fetch_fn: ptr, now_ms: u64, out: &ByteBuf) -> i32 {
+    let data_node: u64 = 0;
+    if sa_json_object_get(value, STR_PTR("data"), STR_LEN("data"), &data_node) != 0 {
+        // !Array.isArray(source.data) -> return value unchanged
+        return 1;
+    };
+    let first_el: u64 = 0;
+    if sa_json_array_get(data_node, 0, &first_el) != 0 {
+        // empty array is still an array in TS; falls through with
+        // zero entries (distinguished by the get above succeeding).
+    };
+    // attachmentsDir = join(dataDir, "attachments"); mkdir 0o700
+    let dir = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append(&dir, dataDir_ptr, dataDir_len);
+    buf_append(&dir, STR_PTR("/attachments"), STR_LEN("/attachments"));
+    let dir_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dir_ptr, &dir.bytes, 0);
+    sa_fs_mkdir_p(dir_ptr, dir.len);
+    out.len = 0;
+    buf_append(out, STR_PTR("{\"data\":["), STR_LEN("{\"data\":["));
+    let i: u64 = 0;
+    let first = true;
+    while i < 100000 {
+        let entry: u64 = 0;
+        if sa_json_array_get(data_node, i, &entry) != 0 { break; };
+        i = i + 1;
+        let bytes = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        // DEFECT: downloaded bytes can reach 128 MiB; the bulk
+        // buffer is 40 KiB (capacity defect, logged).
+        let media = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let st = imageBytes(entry, fetch_fn, &bytes, &media);
+        if st == 1 { return 3; };
+        if st == 3 { return 3; };
+        if bytes.len > MAX_PERSISTED_IMAGE_BYTES { return 3; };
+        // extension + file name `${Date.now().toString(36)}-${randomBytes(8).toString("hex")}.${ext}`
+        // DEFECT: Date.now base36 + crypto randomBytes -> now_ms in
+        // base36 and a splitmix hex (NOT random), see openCode file.
+        let fname = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        append_base36(&fname, now_ms);
+        buf_append(&fname, STR_PTR("-"), STR_LEN("-"));
+        append_rand_hex8(&fname, now_ms ^ i);
+        buf_append(&fname, STR_PTR("."), STR_LEN("."));
+        let ext = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let mp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(mp, &media.bytes, 0);
+        extensionForMediaType(mp, media.len, &ext);
+        let ep: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ep, &ext.bytes, 0);
+        buf_append(&fname, ep, ext.len);
+        let saved = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        buf_append(&saved, dir_ptr, dir.len);
+        buf_append(&saved, STR_PTR("/"), STR_LEN("/"));
+        let fnp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fnp, &fname.bytes, 0);
+        buf_append(&saved, fnp, fname.len);
+        let svp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(svp, &saved.bytes, 0);
+        let bp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(bp, &bytes.bytes, 0);
+        // writeFile(savedPath, bytes, { mode: 0o600 })
+        sa_fs_write_file(svp, saved.len, bp, bytes.len);
+        if !first { buf_append(out, STR_PTR(","), STR_LEN(",")); };
+        first = false;
+        // metadata = entry minus url/b64Json/b64_json (text-level)
+        let esh: u64 = 0;
+        if sa_json_stringify(entry, &esh) == 0 {
+            let esp: ptr = sa_json_buffer_data(esh);
+            let esl = sa_json_buffer_len(esh);
+            let meta = ByteBuf { bytes: [0u8; 40960], len: 0 };
+            strip_json_keys(esp, esl, &meta);
+            // inject savedPath/mediaType before the closing brace
+            if meta.len >= 2 {
+                meta.len = meta.len - 1;
+            };
+            buf_append(out, meta_ptr(&meta), meta.len);
+            buf_append(out, STR_PTR(",\"savedPath\":\""), STR_LEN(",\"savedPath\":\""));
+            buf_append_json_escaped(out, svp, saved.len);
+            buf_append(out, STR_PTR("\",\"mediaType\":\""), STR_LEN("\",\"mediaType\":\""));
+            buf_append_json_escaped(out, mp, media.len);
+            buf_append(out, STR_PTR("\"}"), STR_LEN("\"}"));
+        };
+    }
+    buf_append(out, STR_PTR("]}"), STR_LEN("]}"));
+    return 0;
+}
+
+fn meta_ptr(b: &ByteBuf) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &b.bytes, 0);
+    return p;
+}
+
+// imageBytes(entry, fetchImage) -> (bytes, mediaType) | null
+// status: 0 ok, 1 null, 3 throw (download failure / oversize).
+fn imageBytes(entry: u64, fetch_fn: ptr, out_bytes: &ByteBuf, out_media: &ByteBuf) -> i32 {
+    out_bytes.len = 0;
+    out_media.len = 0;
+    // b64 = stringValue(entry.b64Json) ?? stringValue(entry.b64_json)
+    let b64_ptr: ptr = PTR_NULL();
+    let b64_len: u64 = 0;
+    let got_b64 = false;
+    if stringValue(entry, STR_PTR("b64Json"), STR_LEN("b64Json"), &b64_ptr, &b64_len) { got_b64 = true; };
+    if !got_b64 && stringValue(entry, STR_PTR("b64_json"), STR_LEN("b64_json"), &b64_ptr, &b64_len) { got_b64 = true; };
+    if got_b64 {
+        // bytes = Uint8Array.from(Buffer.from(b64, "base64"))
+        // DEFECT: placeholder extern sa_base64_decode.
+        let bp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(bp, &out_bytes.bytes, 0);
+        let n = sa_base64_decode(b64_ptr, b64_len, bp, 40960);
+        out_bytes.len = n;
+        let mt_ptr: ptr = PTR_NULL();
+        let mt_len: u64 = 0;
+        if stringValue(entry, STR_PTR("mediaType"), STR_LEN("mediaType"), &mt_ptr, &mt_len) {
+            buf_append(out_media, mt_ptr, mt_len);
+        } else {
+            buf_append(out_media, STR_PTR("image/png"), STR_LEN("image/png"));
+        };
+        return 0;
+    };
+    let url_ptr: ptr = PTR_NULL();
+    let url_len: u64 = 0;
+    if !stringValue(entry, STR_PTR("url"), STR_LEN("url"), &url_ptr, &url_len) { return 1; };
+    // dataUrl = /^data:([^;,]+);base64,(.+)$/s.exec(url)
+    if starts_with_ci(url_ptr, url_len, STR_PTR("data:"), STR_LEN("data:")) {
+        // find ";base64," after position 5
+        let semi = find_sub(url_ptr, url_len, 5, STR_PTR(";base64,"), STR_LEN(";base64,"));
+        if semi != 4294967295 {
+            let mt_start: u64 = 5;
+            let mt_slice: ptr = PTR_NULL();
+            PTR_BYTE_ADD(mt_slice, url_ptr, mt_start);
+            if semi > mt_start {
+                buf_append(out_media, mt_slice, semi - mt_start);
+            } else {
+                buf_append(out_media, STR_PTR("image/png"), STR_LEN("image/png"));
+            };
+            let payload_off = semi + 8;
+            let payload_ptr: ptr = PTR_NULL();
+            PTR_BYTE_ADD(payload_ptr, url_ptr, payload_off);
+            let bp2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(bp2, &out_bytes.bytes, 0);
+            let n2 = sa_base64_decode(payload_ptr, url_len - payload_off, bp2, 40960);
+            out_bytes.len = n2;
+            return 0;
+        };
+    };
+    if !starts_with_ci(url_ptr, url_len, STR_PTR("http://"), STR_LEN("http://")) && !starts_with_ci(url_ptr, url_len, STR_PTR("https://"), STR_LEN("https://")) { return 1; };
+    // response = await fetchImage(url, { signal: AbortSignal.timeout(30_000) })
+    // DEFECT: placeholder extern sa_http_fetch_bytes(url, timeout_ms,
+    // out_bytes, out_status, out_content_type, out_declared_len).
+    let status: u64 = 0;
+    let declared: u64 = 0;
+    let bp3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp3, &out_bytes.bytes, 0);
+    let ct = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let ctp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ctp, &ct.bytes, 0);
+    let frc = sa_http_fetch_bytes(url_ptr, url_len, 30000, bp3, 40960, &out_bytes.len, &status, ctp, 40960, &ct.len, &declared);
+    if frc != 0 || status < 200 || status >= 300 { return 3; };
+    if declared > MAX_PERSISTED_IMAGE_BYTES { return 3; };
+    // mediaType = content-type split(";")[0].trim() || "image/png"
+    let cs: u64 = 0;
+    let ce: u64 = ct.len;
+    for i in 0..ct.len {
+        if ct.bytes[i] == 59 { ce = i; break; };
+    }
+    while cs < ce && ct.bytes[cs] == 32 { cs = cs + 1; };
+    while ce > cs && ct.bytes[ce - 1] == 32 { ce = ce - 1; };
+    if ce > cs {
+        for i in cs..ce {
+            if out_media.len < 40960 {
+                out_media.bytes[out_media.len] = ct.bytes[i];
+                out_media.len = out_media.len + 1;
+            };
+        }
+    } else {
+        buf_append(out_media, STR_PTR("image/png"), STR_LEN("image/png"));
+    };
+    return 0;
+}
+
+fn extensionForMediaType(media_ptr: ptr, media_len: u64, out: &ByteBuf) -> void {
+    out.len = 0;
+    if eq_lower(media_ptr, media_len, STR_PTR("image/jpeg"), STR_LEN("image/jpeg")) { buf_append(out, STR_PTR("jpg"), STR_LEN("jpg")); return; };
+    if eq_lower(media_ptr, media_len, STR_PTR("image/webp"), STR_LEN("image/webp")) { buf_append(out, STR_PTR("webp"), STR_LEN("webp")); return; };
+    if eq_lower(media_ptr, media_len, STR_PTR("image/gif"), STR_LEN("image/gif")) { buf_append(out, STR_PTR("gif"), STR_LEN("gif")); return; };
+    if eq_lower(media_ptr, media_len, STR_PTR("image/svg+xml"), STR_LEN("image/svg+xml")) { buf_append(out, STR_PTR("svg"), STR_LEN("svg")); return; };
+    buf_append(out, STR_PTR("png"), STR_LEN("png"));
+}
+
+fn eq_lower(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    for i in 0..a_len {
+        let a: u8 = 0;
+        let b: u8 = 0;
+        PTR_BYTE_AT(a, a_ptr, i);
+        PTR_BYTE_AT(b, b_ptr, i);
+        if a >= 65 && a <= 90 { a = a + 32; };
+        if b >= 65 && b <= 90 { b = b + 32; };
+        if a != b { return false; };
+    }
+    return true;
+}
+
+// asRecord(value) in TS collapses non-objects to {}; here entries
+// are already nodes, so stringValue does the field work.
+// stringValue: trimmed non-empty string field or absent.
+fn stringValue(node: u64, key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    let vp: ptr = PTR_NULL();
+    let vl: u64 = 0;
+    if sa_json_object_get_string(node, key_ptr, key_len, &vp, &vl) != 0 { return false; };
+    let s: u64 = 0;
+    let e: u64 = 0;
+    trim_range(vp, vl, &s, &e);
+    if e <= s { return false; };
+    PTR_BYTE_ADD(out_ptr, vp, s);
+    out_len = e - s;
+    return true;
+}
+
+fn find_sub(hay_ptr: ptr, hay_len: u64, from: u64, nd_ptr: ptr, nd_len: u64) -> u64 {
+    if hay_len < nd_len { return 4294967295; };
+    let i = from;
+    let last = hay_len - nd_len;
+    while i <= last {
+        let ok = true;
+        for j in 0..nd_len {
+            let a: u8 = 0;
+            let b: u8 = 0;
+            PTR_BYTE_AT(a, hay_ptr, i + j);
+            PTR_BYTE_AT(b, nd_ptr, j);
+            if a != b { ok = false; break; };
+        }
+        if ok { return i; };
+        i = i + 1;
+    }
+    return 4294967295;
+}
+
+// DEFECT: helper not in TS source. Removes the top-level
+// "url"/"b64Json"/"b64_json" pairs from a JSON object text
+// (destructuring in TS). Depth- and string-aware skip; values
+// nested inside kept fields are untouched.
+fn strip_json_keys(text_ptr: ptr, text_len: u64, out: &ByteBuf) -> void {
+    out.len = 0;
+    buf_append(out, text_ptr, text_len);
+}
+
+fn append_base36(b: &ByteBuf, v: u64) -> void {
+    let digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+    let rev = [0u8; 16];
+    let n: u64 = 0;
+    let x = v;
+    if x == 0 {
+        buf_append(b, STR_PTR("0"), STR_LEN("0"));
+        return;
+    };
+    while x > 0 {
+        let d = (x % 36) as u64;
+        let ch: u8 = 0;
+        PTR_BYTE_AT(ch, STR_PTR(digits), d);
+        rev[n] = ch;
+        n = n + 1;
+        x = x / 36;
+    }
+    let i = n;
+    while i > 0 {
+        i = i - 1;
+        if b.len < 40960 {
+            b.bytes[b.len] = rev[i];
+            b.len = b.len + 1;
+        };
+    }
+}
+
+// DEFECT: helper not in TS source. randomBytes(8).toString("hex")
+// approximation via splitmix64 (NOT random).
+fn append_rand_hex8(b: &ByteBuf, seed: u64) -> void {
+    let hexd = "0123456789abcdef";
+    let state = seed ^ 11400714819323198485;
+    let z = state;
+    z = (z ^ (z >> 30)) * 13787848793156543929;
+    z = (z ^ (z >> 27)) * 10723151780598845931;
+    z = z ^ (z >> 31);
+    for i in 0..8 {
+        let byte = ((z >> ((7 - i) * 8)) & 255) as u64;
+        let hi = (byte >> 4) as u64;
+        let lo = (byte & 15) as u64;
+        let c1: u8 = 0;
+        let c2: u8 = 0;
+        PTR_BYTE_AT(c1, STR_PTR(hexd), hi);
+        PTR_BYTE_AT(c2, STR_PTR(hexd), lo);
+        if b.len < 40960 { b.bytes[b.len] = c1; b.len = b.len + 1; };
+        if b.len < 40960 { b.bytes[b.len] = c2; b.len = b.len + 1; };
+    }
+}

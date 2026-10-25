@@ -1,0 +1,181 @@
+// Converted 1:1 from backends/command-code/src/runtime/commandCodeProviders.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// Config files inside the isolated Command Code home (the bridge
+// spawns the CLI with HOME=<homeDir>, so `~/.commandcode`
+// resolves there — never the user's real home):
+//  - <homeDir>/.commandcode/providers.json — BYOK providers in
+//    the format command-code 1.88 parses: {"provider": {"<id>":
+//    {api, baseURL, apiKey, models}}}. Raw secrets are REJECTED
+//    by the CLI's parser, so the apiKey is an env reference the
+//    bridge sets at spawn time.
+//  - <homeDir>/.commandcode/mcp.json — user-scope MCP servers.
+//
+// DEFECT: dynamic JSON objects (Record<string, unknown>) — the
+// providers file is carried as a parsed sa_json doc handle plus
+// raw text; JSON mutation (object set) is not in the verified
+// std surface — calls are marked DEFECT inline.
+// DEFECT: node:path join — '/' byte-concat approximation.
+// DEFECT: node:fs sync APIs map to sa_std fs externs; mkdir has
+// no verified std counterpart yet.
+
+// COMMAND_CODE_RELAY_KEY_ENV = "CXU_COMMAND_CODE_RELAY_KEY"
+fn COMMAND_CODE_RELAY_KEY_ENV_ptr() -> ptr { return STR_PTR("CXU_COMMAND_CODE_RELAY_KEY"); }
+fn COMMAND_CODE_RELAY_KEY_ENV_len() -> u64 { return STR_LEN("CXU_COMMAND_CODE_RELAY_KEY"); }
+
+// COMMAND_CODE_RELAY_KEY_PLACEHOLDER = "command-code-relay-key"
+// Placeholder key value: the loopback relay gateway ignores it
+// and resolves the real upstream keys server-side.
+fn COMMAND_CODE_RELAY_KEY_PLACEHOLDER_ptr() -> ptr { return STR_PTR("command-code-relay-key"); }
+fn COMMAND_CODE_RELAY_KEY_PLACEHOLDER_len() -> u64 { return STR_LEN("command-code-relay-key"); }
+
+// COMMAND_CODE_LOCAL_API_KEY_PLACEHOLDER = "cxu-local-byok"
+// Placeholder COMMAND_CODE_API_KEY: satisfies the CLI's headless
+// auth gate; with --local-only no Command Code account traffic
+// happens and model calls go to the BYOK provider.
+fn COMMAND_CODE_LOCAL_API_KEY_PLACEHOLDER_ptr() -> ptr { return STR_PTR("cxu-local-byok"); }
+fn COMMAND_CODE_LOCAL_API_KEY_PLACEHOLDER_len() -> u64 { return STR_LEN("cxu-local-byok"); }
+
+// commandCodeProvidersPath(homeDir): join(homeDir, ".commandcode", "providers.json")
+fn commandCodeProvidersPath(homeDir_ptr: ptr, homeDir_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    out_len = join3(out, out_cap, homeDir_ptr, homeDir_len, STR_PTR(".commandcode"), STR_LEN(".commandcode"), STR_PTR("providers.json"), STR_LEN("providers.json"));
+}
+
+// commandCodeMcpPath(homeDir): join(homeDir, ".commandcode", "mcp.json")
+fn commandCodeMcpPath(homeDir_ptr: ptr, homeDir_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    out_len = join3(out, out_cap, homeDir_ptr, homeDir_len, STR_PTR(".commandcode"), STR_LEN(".commandcode"), STR_PTR("mcp.json"), STR_LEN("mcp.json"));
+}
+
+// commandCodeProjectsDir(homeDir): join(homeDir, ".commandcode", "projects")
+fn commandCodeProjectsDir(homeDir_ptr: ptr, homeDir_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    out_len = join3(out, out_cap, homeDir_ptr, homeDir_len, STR_PTR(".commandcode"), STR_LEN(".commandcode"), STR_PTR("projects"), STR_LEN("projects"));
+}
+
+// interface CommandCodeProvidersFile {
+//   provider: Record<string, unknown>; [key: string]: unknown }
+// DEFECT: dynamic object — doc handle + raw text stand in.
+struct CommandCodeProvidersFile {
+    doc: u64,
+    raw: [u8; 16384],
+    raw_len: u64,
+}
+
+// readProvidersFile(path): parse; default { provider: {} } on
+// missing/malformed input (spread merge keeps doc authoritative).
+// DEFECT: try/catch folded into status checks.
+fn readProvidersFile(path_ptr: ptr, path_len: u64, out: &CommandCodeProvidersFile) -> void {
+    out.doc = 0;
+    out.raw_len = 0;
+    let total: u64 = 0;
+    if sa_std_fs_len(path_ptr, path_len, &total) == 0 && total <= 16384 {
+        let fh: u64 = 0;
+        if sa_std_fs_open_read(path_ptr, path_len, &fh) == 0 {
+            let read_n: u64 = 0;
+            let rst = sa_std_fs_file_read(fh, &out.raw, 16384, &read_n);
+            sa_fs_file_close(fh);
+            if rst == 0 {
+                out.raw_len = read_n;
+                let doc = sa_json_parse(&out.raw, out.raw_len);
+                if doc != 0 {
+                    out.doc = doc;
+                    return;
+                };
+            };
+        };
+    };
+    let dflt = "{\"provider\":{}}";
+    let dp: ptr = STR_PTR(dflt);
+    let dl = STR_LEN(dflt);
+    for i in 0..dl {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, dp, i);
+        out.raw[i] = b;
+    }
+    out.raw_len = dl;
+    out.doc = sa_json_parse(&out.raw, out.raw_len);
+}
+
+// writeCommandCodeRelayProvider(homeDir, providerId, entry):
+// register (or refresh) the relay station as a BYOK provider in
+// the isolated home. One slot ("cxu-relay") rewritten per
+// configure — the station's gateway URL and model change, the id
+// stays stable so thread metadata never dangles.
+// file.provider[providerId] = { api: "openai-completions",
+//   baseURL: entry.baseUrl, apiKey: "$" + COMMAND_CODE_RELAY_KEY_ENV,
+//   models: { [entry.model]: {} } }
+// DEFECT: computed property key { [entry.model]: {} } and the
+// dynamic mutation/stringify chain — see header; entry text is
+// assembled for the repair phase.
+fn writeCommandCodeRelayProvider(homeDir_ptr: ptr, homeDir_len: u64, providerId_ptr: ptr, providerId_len: u64, baseUrl_ptr: ptr, baseUrl_len: u64, model_ptr: ptr, model_len: u64) -> void {
+    let path = [0u8; 1024];
+    let path_len: u64 = 0;
+    commandCodeProvidersPath(homeDir_ptr, homeDir_len, &path, 1024, &path_len);
+    // mkdirSync(join(homeDir, ".commandcode"), { recursive: true })
+    // DEFECT: mkdir — no verified std extern in this pass.
+    let file = CommandCodeProvidersFile { doc: 0, raw: [0u8; 16384], raw_len: 0 };
+    readProvidersFile(&path, path_len, &file);
+    let entry = [0u8; 4096];
+    let entry_len: u64 = 0;
+    entry_len = entry_len + buf_put(&entry, 4096, entry_len, STR_PTR("{\"api\":\"openai-completions\",\"baseURL\":\""), STR_LEN("{\"api\":\"openai-completions\",\"baseURL\":\""));
+    entry_len = entry_len + buf_put(&entry, 4096, entry_len, baseUrl_ptr, baseUrl_len);
+    entry_len = entry_len + buf_put(&entry, 4096, entry_len, STR_PTR("\",\"apiKey\":\"$"), STR_LEN("\",\"apiKey\":\"$"));
+    entry_len = entry_len + buf_put(&entry, 4096, entry_len, COMMAND_CODE_RELAY_KEY_ENV_ptr(), COMMAND_CODE_RELAY_KEY_ENV_len());
+    entry_len = entry_len + buf_put(&entry, 4096, entry_len, STR_PTR("\",\"models\":{\""), STR_LEN("\",\"models\":{\""));
+    entry_len = entry_len + buf_put(&entry, 4096, entry_len, model_ptr, model_len);
+    entry_len = entry_len + buf_put(&entry, 4096, entry_len, STR_PTR("\":{}}}"), STR_LEN("\":{}}}"));
+    // DEFECT: JSON string escaping of interpolated values not
+    // applied in this pass; provider[providerId] = <entry> +
+    // JSON.stringify(file, null, 2) + "\n" + writeFileSync are
+    // pending the JSON mutation surface (see defect log).
+    if file.doc != 0 {
+        let sh: u64 = 0;
+        if sa_json_stringify(file.doc, &sh) == 0 {
+            let sp: ptr = sa_json_buffer_data(sh);
+            let sl = sa_json_buffer_len(sh);
+            sa_fs_write_file(&path, path_len, sp, sl);
+        };
+    };
+}
+
+// ensureCommandCodeMcpFile(homeDir): ensure the user-scope MCP
+// file exists for the host's sa-vm upsert. Returns the path.
+// DEFECT: try/catch + console.error — errors swallowed; path
+// returned regardless, exactly like the source.
+fn ensureCommandCodeMcpFile(homeDir_ptr: ptr, homeDir_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    commandCodeMcpPath(homeDir_ptr, homeDir_len, out, out_cap, out_len);
+    // mkdirSync(join(homeDir, ".commandcode"), { recursive: true })
+    // DEFECT: mkdir — see header.
+    let total: u64 = 0;
+    if sa_std_fs_len(out, out_len, &total) != 0 {
+        let seed = "{\n  \"mcpServers\": {}\n}\n";
+        sa_fs_write_file(out, out_len, STR_PTR(seed), STR_LEN(seed));
+    };
+}
+
+// ---- local helpers ----
+
+fn join3(out: ptr, cap: u64, a: ptr, a_len: u64, b: ptr, b_len: u64, c: ptr, c_len: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + buf_put_raw(out, cap, n, a, a_len);
+    if n < cap { PTR_BYTE_SET(out, n, 47); n = n + 1; };
+    n = n + buf_put_raw(out, cap, n, b, b_len);
+    if n < cap { PTR_BYTE_SET(out, n, 47); n = n + 1; };
+    n = n + buf_put_raw(out, cap, n, c, c_len);
+    return n;
+}
+
+fn buf_put_raw(out: ptr, cap: u64, at: u64, src: ptr, n: u64) -> u64 {
+    let w: u64 = 0;
+    for i in 0..n {
+        if at + w < cap {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, src, i);
+            PTR_BYTE_SET(out, at + w, b);
+            w = w + 1;
+        };
+    }
+    return w;
+}
+
+fn buf_put(buf: ptr, cap: u64, at: u64, src: ptr, n: u64) -> u64 {
+    return buf_put_raw(buf, cap, at, src, n);
+}

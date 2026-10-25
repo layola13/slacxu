@@ -1,0 +1,323 @@
+// Converted 1:1 from sdk-backend/src/openCodeSessionProtocol.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// OpenCode session protocol helpers (moved from the relay-config
+// plugin so every backend can use them through the SDK).
+//
+// Pure protocol surface: per-backend User-Agent identities, the
+// gateway-internal backend hint header, deterministic per-thread
+// session ids, and the process-rotated session/project identity the
+// OpenCode-compatible upstreams key routing and prompt caching on.
+// The only state is the process-local rotated session cache below.
+
+@import "sa_std/ptr.sa"
+
+// DEFECT: node:crypto createHash/randomUUID -- sha256 via the
+// sa_std surface (sa_sha256_hex placeholder shape, see
+// memoryFilePaths.sla); randomUUID has no sa_std counterpart and
+// is approximated by a hash of (counter, timestamp) formatted as
+// a UUID (NOT random -- fix phase must wire real entropy).
+// DEFECT: Date.now() -> now_ms parameters. Record<string,string>
+// return -> serialized JSON object text.
+
+// Dedicated OpenCode Go client identities per backend runtime.
+// OpenCode Go requires a purpose-built User-Agent (never a generic SDK /
+// HTTP-library name such as curl): each programming-agent backend sends
+// its own identifier so upstream can attribute typical agent traffic.
+// OpenCodeBackendKind = "pi" | "grok" | "agy" | "claude" | "openclaude"
+let OPENCODE_BACKEND_USER_AGENTS_PI = "codex-ultra-pi/1.0";
+let OPENCODE_BACKEND_USER_AGENTS_GROK = "codex-ultra-grok/1.0";
+let OPENCODE_BACKEND_USER_AGENTS_AGY = "codex-ultra-agy/1.0";
+let OPENCODE_BACKEND_USER_AGENTS_CLAUDE = "codex-ultra-claude/1.0";
+let OPENCODE_BACKEND_USER_AGENTS_OPENCLAUDE = "codex-ultra-openclaude/1.0";
+
+// DEFECT: the `as const` record + keyof type -> lookup fn with
+// kind tag: 0 pi, 1 grok, 2 agy, 3 claude, 4 openclaude.
+fn openCodeBackendUserAgent(kind: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    if kind == 0 { out_ptr = STR_PTR("codex-ultra-pi/1.0"); out_len = STR_LEN("codex-ultra-pi/1.0"); return; };
+    if kind == 1 { out_ptr = STR_PTR("codex-ultra-grok/1.0"); out_len = STR_LEN("codex-ultra-grok/1.0"); return; };
+    if kind == 2 { out_ptr = STR_PTR("codex-ultra-agy/1.0"); out_len = STR_LEN("codex-ultra-agy/1.0"); return; };
+    if kind == 3 { out_ptr = STR_PTR("codex-ultra-claude/1.0"); out_len = STR_LEN("codex-ultra-claude/1.0"); return; };
+    out_ptr = STR_PTR("codex-ultra-openclaude/1.0");
+    out_len = STR_LEN("codex-ultra-openclaude/1.0");
+}
+
+// Gateway-internal hint identifying which CLI backend a relayed request came
+// from (`claude` | `openclaude`). Sent by the Claude bridges on
+// `ANTHROPIC_CUSTOM_HEADERS`; the relay gateway consumes it for per-backend
+// User-Agent attribution and never forwards it upstream (`upstreamHeaders()`
+// builds a fresh header set and only copies a small passthrough whitelist).
+let OPENCODE_CLI_BACKEND_HEADER = "x-codex-cli-backend";
+
+struct StrBuf {
+    bytes: [u8; 512],
+    len: u64,
+}
+
+fn sb_append(sb: &StrBuf, src_ptr: ptr, src_len: u64) -> void {
+    for i in 0..src_len {
+        if sb.len < 512 {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, src_ptr, i);
+            sb.bytes[sb.len] = b;
+            sb.len = sb.len + 1;
+        };
+    }
+}
+
+fn sb_append_byte(sb: &StrBuf, b: u8) -> void {
+    if sb.len < 512 {
+        sb.bytes[sb.len] = b;
+        sb.len = sb.len + 1;
+    };
+}
+
+// Stable per-conversation OpenCode session id derived deterministically
+// from the caller thread id. (See TS doc: sha256 of
+// `codex-ultra-opencode-session:${threadId.trim()}`, first 32 hex
+// chars, UUID-formatted.)
+fn deriveOpenCodeSessionId(thread_ptr: ptr, thread_len: u64, out: &StrBuf) -> void {
+    let input = StrBuf { bytes: [0u8; 512], len: 0 };
+    sb_append(&input, STR_PTR("codex-ultra-opencode-session:"), STR_LEN("codex-ultra-opencode-session:"));
+    // threadId.trim()
+    let s: u64 = 0;
+    let e: u64 = thread_len;
+    while s < e {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, thread_ptr, s);
+        if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+        s = s + 1;
+    }
+    while e > s {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, thread_ptr, e - 1);
+        if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+        e = e - 1;
+    }
+    let tp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tp, thread_ptr, s);
+    sb_append(&input, tp, e - s);
+    let ip: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip, &input.bytes, 0);
+    let hex = [0u8; 64];
+    sa_sha256_hex(ip, input.len, &hex);
+    out.len = 0;
+    // `${d[0:8]}-${d[8:12]}-${d[12:16]}-${d[16:20]}-${d[20:32]}`
+    for i in 0..8 { sb_append_byte(out, hex[i]); };
+    sb_append_byte(out, 45);
+    for i2 in 8..12 { sb_append_byte(out, hex[i2]); };
+    sb_append_byte(out, 45);
+    for i3 in 12..16 { sb_append_byte(out, hex[i3]); };
+    sb_append_byte(out, 45);
+    for i4 in 16..20 { sb_append_byte(out, hex[i4]); };
+    sb_append_byte(out, 45);
+    for i5 in 20..32 { sb_append_byte(out, hex[i5]); };
+}
+
+// Record-form OpenCode Go headers (see TS doc). Output is a JSON
+// object text: {"User-Agent":...,"x-opencode-client":...,
+// "x-opencode-project":...,"x-opencode-session":...,
+// "x-opencode-request":...}
+fn openCodeThreadHeaders(thread_ptr: ptr, thread_len: u64, has_thread: bool, backend: u64, now_ms: u64, out: &StrBuf) -> void {
+    out.len = 0;
+    sb_append(out, STR_PTR("{\"User-Agent\":\""), STR_LEN("{\"User-Agent\":\""));
+    let ua_ptr: ptr = PTR_NULL();
+    let ua_len: u64 = 0;
+    let e_ua = sa_env_get(STR_PTR("OPENCODE_USER_AGENT"), STR_LEN("OPENCODE_USER_AGENT"));
+    if e_ua != 0 {
+        ua_ptr = sa_env_buffer_data(e_ua);
+        ua_len = sa_env_buffer_len(e_ua);
+    };
+    if ua_len == 0 {
+        openCodeBackendUserAgent(backend, &ua_ptr, &ua_len);
+    };
+    sb_append(out, ua_ptr, ua_len);
+    sb_append(out, STR_PTR("\",\"x-opencode-client\":\""), STR_LEN("\",\"x-opencode-client\":\""));
+    let cl_ptr: ptr = STR_PTR("desktop");
+    let cl_len: u64 = STR_LEN("desktop");
+    let e_cl = sa_env_get(STR_PTR("OPENCODE_CLIENT"), STR_LEN("OPENCODE_CLIENT"));
+    if e_cl != 0 {
+        let vp: ptr = sa_env_buffer_data(e_cl);
+        let vl = sa_env_buffer_len(e_cl);
+        if vl > 0 { cl_ptr = vp; cl_len = vl; };
+    };
+    sb_append(out, cl_ptr, cl_len);
+    sb_append(out, STR_PTR("\",\"x-opencode-project\":\""), STR_LEN("\",\"x-opencode-project\":\""));
+    let proj = StrBuf { bytes: [0u8; 512], len: 0 };
+    getOpenCodeProjectId(&proj);
+    let pp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pp, &proj.bytes, 0);
+    sb_append(out, pp, proj.len);
+    sb_append(out, STR_PTR("\",\"x-opencode-session\":\""), STR_LEN("\",\"x-opencode-session\":\""));
+    let sess = StrBuf { bytes: [0u8; 512], len: 0 };
+    let use_thread = false;
+    if has_thread {
+        // trimmed ? derive...(trimmed) : getOpenCodeSessionId()
+        let s: u64 = 0;
+        let e: u64 = thread_len;
+        while s < e {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, thread_ptr, s);
+            if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+            s = s + 1;
+        }
+        while e > s {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, thread_ptr, e - 1);
+            if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+            e = e - 1;
+        }
+        if e > s { use_thread = true; };
+    };
+    if use_thread {
+        deriveOpenCodeSessionId(thread_ptr, thread_len, &sess);
+    } else {
+        getOpenCodeSessionId(false, now_ms, &sess);
+    };
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, &sess.bytes, 0);
+    sb_append(out, sp, sess.len);
+    sb_append(out, STR_PTR("\",\"x-opencode-request\":\""), STR_LEN("\",\"x-opencode-request\":\""));
+    let req = StrBuf { bytes: [0u8; 512], len: 0 };
+    random_uuid_approx(now_ms, &req);
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &req.bytes, 0);
+    sb_append(out, rp, req.len);
+    sb_append(out, STR_PTR("\"}"), STR_LEN("\"}"));
+}
+
+let CROCKFORD_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+fn generateOpenCodeUlid(seedTime: u64, has_seed: bool, now_ms: u64, out: &StrBuf) -> void {
+    let time = seedTime;
+    if !has_seed { time = now_ms; };
+    // time part: 10 chars, big-endian base32 of the ms timestamp
+    let rev = [0u8; 10];
+    let t = time;
+    let i: u64 = 10;
+    while i > 0 {
+        i = i - 1;
+        let m = (t % 32) as u64;
+        let cp: ptr = STR_PTR("0123456789ABCDEFGHJKMNPQRSTVWXYZ");
+        let ch: u8 = 0;
+        PTR_BYTE_AT(ch, cp, m);
+        rev[i] = ch;
+        t = t / 32;
+    }
+    out.len = 0;
+    for k in 0..10 { sb_append_byte(out, rev[k]); };
+    // rand part: 16 chars of Math.random()*32
+    // DEFECT: Math.random has no sa_std counterpart; a splitmix
+    // counter seeded by now_ms is used (NOT random).
+    let state = now_ms ^ 2654435769;
+    for j in 0..16 {
+        state = state + 11400714819323198485;
+        let z = state;
+        z = (z ^ (z >> 30)) * 13787848793156543929;
+        z = (z ^ (z >> 27)) * 10723151780598845931;
+        z = z ^ (z >> 31);
+        let m2 = (z % 32) as u64;
+        let cp2: ptr = STR_PTR("0123456789ABCDEFGHJKMNPQRSTVWXYZ");
+        let ch2: u8 = 0;
+        PTR_BYTE_AT(ch2, cp2, m2);
+        sb_append_byte(out, ch2);
+    }
+}
+
+// Process-local rotated session cache (module state in TS).
+let cachedOpenCodeProjectId: StrBuf;
+let cachedOpenCodeProjectId_set: bool = false;
+let cachedOpenCodeSessionId: StrBuf;
+let cachedOpenCodeSessionId_set: bool = false;
+let openCodeSessionCreatedAt: u64 = 0;
+let OPENCODE_SESSION_TTL_MS: u64 = 2700000;
+
+fn getOpenCodeProjectId(out: &StrBuf) -> void {
+    if !cachedOpenCodeProjectId_set {
+        cachedOpenCodeProjectId.len = 0;
+        let e_p = sa_env_get(STR_PTR("OPENCODE_PROJECT"), STR_LEN("OPENCODE_PROJECT"));
+        let got = false;
+        if e_p != 0 {
+            let vp: ptr = sa_env_buffer_data(e_p);
+            let vl = sa_env_buffer_len(e_p);
+            // .trim() approximated by space trim
+            let s: u64 = 0;
+            let e: u64 = vl;
+            while s < e {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, vp, s);
+                if b != 32 { break; };
+                s = s + 1;
+            }
+            while e > s {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, vp, e - 1);
+                if b != 32 { break; };
+                e = e - 1;
+            }
+            if e > s {
+                let tp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(tp, vp, s);
+                sb_append(&cachedOpenCodeProjectId, tp, e - s);
+                got = true;
+            };
+        };
+        if !got {
+            sb_append(&cachedOpenCodeProjectId, STR_PTR("global"), STR_LEN("global"));
+        };
+        cachedOpenCodeProjectId_set = true;
+    };
+    out.len = 0;
+    let cp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cp, &cachedOpenCodeProjectId.bytes, 0);
+    sb_append(out, cp, cachedOpenCodeProjectId.len);
+}
+
+fn getOpenCodeSessionId(forceNew: bool, now_ms: u64, out: &StrBuf) -> void {
+    if forceNew || !cachedOpenCodeSessionId_set || now_ms - openCodeSessionCreatedAt > OPENCODE_SESSION_TTL_MS {
+        cachedOpenCodeSessionId.len = 0;
+        random_uuid_approx(now_ms, &cachedOpenCodeSessionId);
+        cachedOpenCodeSessionId_set = true;
+        openCodeSessionCreatedAt = now_ms;
+    };
+    out.len = 0;
+    let cp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cp, &cachedOpenCodeSessionId.bytes, 0);
+    sb_append(out, cp, cachedOpenCodeSessionId.len);
+}
+
+fn rotateOpenCodeSession(now_ms: u64) -> void {
+    let sink = StrBuf { bytes: [0u8; 512], len: 0 };
+    getOpenCodeSessionId(true, now_ms, &sink);
+}
+
+fn clearOpenCodeSession() -> void {
+    cachedOpenCodeSessionId_set = false;
+    cachedOpenCodeSessionId.len = 0;
+    cachedOpenCodeProjectId_set = false;
+    cachedOpenCodeProjectId.len = 0;
+    openCodeSessionCreatedAt = 0;
+}
+
+// DEFECT: helper not in TS source. randomUUID() approximation:
+// splitmix64 output formatted 8-4-4-4-12 hex. NOT random.
+let uuid_counter: u64 = 0;
+
+fn random_uuid_approx(now_ms: u64, out: &StrBuf) -> void {
+    uuid_counter = uuid_counter + 1;
+    let state = now_ms ^ (uuid_counter * 11400714819323198485);
+    let hex = [0u8; 64];
+    let seedbuf = [0u8; 8];
+    for i in 0..8 {
+        seedbuf[i] = ((state >> ((7 - i) * 8)) & 255) as u8;
+    }
+    sa_sha256_hex(&seedbuf, 8, &hex);
+    out.len = 0;
+    for i in 0..8 { sb_append_byte(out, hex[i]); };
+    sb_append_byte(out, 45);
+    for i2 in 8..12 { sb_append_byte(out, hex[i2]); };
+    sb_append_byte(out, 45);
+    for i3 in 12..16 { sb_append_byte(out, hex[i3]); };
+    sb_append_byte(out, 45);
+    for i4 in 16..20 { sb_append_byte(out, hex[i4]); };
+    sb_append_byte(out, 45);
+    for i5 in 20..32 { sb_append_byte(out, hex[i5]); };
+}

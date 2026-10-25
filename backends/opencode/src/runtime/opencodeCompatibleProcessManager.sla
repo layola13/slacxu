@@ -1,0 +1,1949 @@
+// Converted 1:1 from backends/opencode/src/runtime/opencodeCompatibleProcessManager.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/ptr.sa"
+@import "sa_std/io/print.sai"
+@import "opencodeCompatibleProbe.sla"
+
+// TS imports:
+//   spawn, spawnSync, ChildProcessWithoutNullStreams from "node:child_process"
+//     -> intent externs sa_host_spawn_* / sa_host_child_* (MISSING)
+//   EventEmitter from "node:events" -> DEFECT: no event emitter; emit()
+//     calls are documented no-op stubs (pm_emit_*) in the manager section.
+//   createServer from "node:net" -> intent extern sa_net_try_bind
+//   randomUUID from "node:crypto" -> intent extern sa_uuid_random
+//   existsSync/mkdirSync/writeFileSync from "node:fs" -> sa_std_fs_*
+//   tmpdir from "node:os" -> intent extern sa_std_os_tmpdir
+//   join from "node:path" -> pm_join helpers
+//   ModelCapabilityDescriptor / resolveModelContextWindow from
+//     "@codex-ui/shared" -> descriptor as JSON buffer; resolver intent
+//     extern sa_shared_resolve_model_context_window (MISSING)
+//   findOpencodeBin/findOpencodeV2Bin/probeOpencodeCliCommand/
+//   isOpencodeVersionSupported/isOpencodeV2Version/
+//   OPENCODE_MIN_SUPPORTED_VERSION from "./opencodeCompatibleProbe.js"
+//     -> opencodeCompatibleProbe.sla (imported above)
+//   pluginHostServices from "@cxu/sdk-backend" -> intent externs
+// DEFECT: Node/host surfaces have no confirmed sa_std counterparts; all
+// extern names here are intent-level for the fix phase.
+
+// ---- local helpers (pm_ prefix; probe.sla helpers are separate) ----
+struct PmBuf {
+    bytes: [u8; 65536],
+    len: u64,
+}
+
+fn pm_copy(dst: ptr, cap: u64, src: ptr, src_len: u64) -> u64 {
+    let n = src_len;
+    if n > cap { n = cap; };
+    let i: u64 = 0;
+    while i < n {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, src, i);
+        PTR_BYTE_SET(dst, i, c);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn pm_buf_append(b: &PmBuf, src: ptr, src_len: u64) -> void {
+    let dst: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dst, &b.bytes, b.len);
+    let n = pm_copy(dst, 65536 - b.len, src, src_len);
+    b.len = b.len + n;
+}
+
+fn pm_buf_lit(b: &PmBuf, lit: ptr, lit_len: u64) -> void { pm_buf_append(b, lit, lit_len); }
+
+fn pm_equal(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    let i: u64 = 0;
+    while i < a_len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a_ptr, i);
+        PTR_BYTE_AT(y, b_ptr, i);
+        if x != y { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn pm_is_space(b: u8) -> bool { return b == 32 || b == 9 || b == 10 || b == 13; }
+
+fn pm_trim_span(s_ptr: ptr, s_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    let start: u64 = 0;
+    while start < s_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, s_ptr, start);
+        if !pm_is_space(b) { break; };
+        start = start + 1;
+    }
+    let end = s_len;
+    while end > start {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, s_ptr, end - 1);
+        if !pm_is_space(b) { break; };
+        end = end - 1;
+    }
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, s_ptr, start);
+    *out_ptr = p;
+    *out_len = end - start;
+}
+
+fn pm_lower_byte(b: u8) -> u8 {
+    if b >= 65 && b <= 90 { return b + 32; };
+    return b;
+}
+
+// Case-insensitive substring search (for String.includes on lowered text
+// and the /opencode\.ai/i regex test).
+fn pm_contains_ci(hay_ptr: ptr, hay_len: u64, needle_ptr: ptr, needle_len: u64) -> bool {
+    if needle_len == 0 { return true; };
+    if hay_len < needle_len { return false; };
+    let i: u64 = 0;
+    while i + needle_len <= hay_len {
+        let ok = true;
+        let j: u64 = 0;
+        while j < needle_len {
+            let a: u8 = 0;
+            let c: u8 = 0;
+            PTR_BYTE_AT(a, hay_ptr, i + j);
+            PTR_BYTE_AT(c, needle_ptr, j);
+            if pm_lower_byte(a) != pm_lower_byte(c) { ok = false; break; };
+            j = j + 1;
+        }
+        if ok { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// u64 -> decimal digits into out (returns len).
+fn pm_u64_to_dec(v: u64, out: ptr) -> u64 {
+    let tmp = [0u8; 20];
+    let n: u64 = 0;
+    let x = v;
+    if x == 0 {
+        PTR_BYTE_SET(out, 0, 48);
+        return 1;
+    };
+    while x > 0 {
+        tmp[n] = 48 + (x % 10) as u8;
+        n = n + 1;
+        x = x / 10;
+    }
+    let i: u64 = 0;
+    while i < n {
+        PTR_BYTE_SET(out, i, tmp[n - 1 - i]);
+        i = i + 1;
+    }
+    return n;
+}
+
+// Append a JSON string literal (quoted + escaped) of (src,len) to b.
+// DEFECT: JSON.stringify string escaping approximated for the common
+// cases (", \, control chars as \u00XX is NOT emitted — control chars are
+// passed through; config values here are paths/ids/URLs).
+fn pm_buf_json_string(b: &PmBuf, src: ptr, src_len: u64) -> void {
+    pm_buf_lit(b, STR_PTR("\""), STR_LEN("\""));
+    let i: u64 = 0;
+    while i < src_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, src, i);
+        if c == 34 || c == 92 {
+            pm_buf_lit(b, STR_PTR("\\"), STR_LEN("\\"));
+        };
+        let one: ptr = PTR_NULL();
+        PTR_BYTE_ADD(one, src, i);
+        pm_buf_append(b, one, 1);
+        i = i + 1;
+    }
+    pm_buf_lit(b, STR_PTR("\""), STR_LEN("\""));
+}
+
+fn pm_buf_u64(b: &PmBuf, v: u64) -> void {
+    let tmp = [0u8; 20];
+    let tp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tp, &tmp, 0);
+    let n = pm_u64_to_dec(v, tp);
+    pm_buf_append(b, tp, n);
+}
+
+// encodeURIComponent approximation: unreserved [A-Za-z0-9-_.!~*'()] kept,
+// everything else %XX uppercase hex.
+// DEFECT: full encodeURIComponent semantics approximated by this table.
+fn pm_buf_uri_component(b: &PmBuf, src: ptr, src_len: u64) -> void {
+    let hex = STR_PTR("0123456789ABCDEF");
+    let i: u64 = 0;
+    while i < src_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, src, i);
+        let unreserved = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57)
+            || c == 45 || c == 95 || c == 46 || c == 33 || c == 126 || c == 42 || c == 39 || c == 40 || c == 41;
+        if unreserved {
+            let one: ptr = PTR_NULL();
+            PTR_BYTE_ADD(one, src, i);
+            pm_buf_append(b, one, 1);
+        } else {
+            pm_buf_lit(b, STR_PTR("%"), STR_LEN("%"));
+            let hi: ptr = PTR_NULL();
+            PTR_BYTE_ADD(hi, hex, (c / 16) as u64);
+            pm_buf_append(b, hi, 1);
+            let lo: ptr = PTR_NULL();
+            PTR_BYTE_ADD(lo, hex, (c % 16) as u64);
+            pm_buf_append(b, lo, 1);
+        };
+        i = i + 1;
+    }
+}
+
+// join(a, b) into a ProbePath-shaped slot (reuse probe.sla ProbePath).
+fn pm_join2(slot: &ProbePath, a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> void {
+    let dst: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dst, &slot.bytes, 0);
+    let n = pm_copy(dst, 1024, a_ptr, a_len);
+    if n > 0 && n < 1024 {
+        PTR_BYTE_SET(dst, n, 47);
+        n = n + 1;
+    };
+    let rest: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rest, dst, n);
+    n = n + pm_copy(rest, 1024 - n, b_ptr, b_len);
+    slot.len = n;
+}
+
+// ---- TS: export interface OpencodeRelayProviderConfig ----
+struct PmStringList {
+    items: [ProbePath; 32],
+    len: u64,
+}
+
+// ModelCapabilityDescriptor — DEFECT: shared-package type -> JSON buffer.
+struct PmModelCapability {
+    json: [u8; 8192],
+    json_len: u64,
+    // present=false: TS undefined; the source coalesces undefined and null
+    // identically in the places used here.
+    present: bool,
+}
+
+struct OpencodeRelayProviderConfig {
+    // providerId: string (e.g. "codex-relay")
+    providerId: [u8; 512],
+    providerId_len: u64,
+    // baseURL: string (loopback relay-gateway base URL)
+    baseURL: [u8; 1024],
+    baseURL_len: u64,
+    // apiKey: string (placeholder key)
+    apiKey: [u8; 512],
+    apiKey_len: u64,
+    // models: string[]
+    models: PmStringList,
+    // contextWindow?: number
+    contextWindow: u64,
+    has_contextWindow: bool,
+    // modelCapability?: ModelCapabilityDescriptor | null
+    modelCapability: PmModelCapability,
+}
+
+// ---- TS: export interface OpencodeSaVmMcpConfig ----
+struct OpencodeSaVmMcpConfig {
+    // scriptPath: absolute path to `sa-vm-mcp.mjs`
+    scriptPath: [u8; 1024],
+    scriptPath_len: u64,
+    // enabled?: boolean (defaults true)
+    enabled: bool,
+    has_enabled: bool,
+}
+
+// ---- TS: export interface OpencodeProcessConfig ----
+// envOverrides?: Record<string, string> — DEFECT: dynamic object -> JSON buffer.
+struct OpencodeProcessConfig {
+    binPath: [u8; 1024],
+    binPath_len: u64,
+    has_binPath: bool,
+    // apiVersion?: 1 | 2 (defaults 1) — v1/v2 servers never share a pool entry
+    apiVersion: u32,
+    has_apiVersion: bool,
+    // serverEntryArgs?: string[]
+    serverEntryArgs: PmStringList,
+    has_serverEntryArgs: bool,
+    cwd: [u8; 1024],
+    cwd_len: u64,
+    has_cwd: bool,
+    hostname: [u8; 256],
+    hostname_len: u64,
+    has_hostname: bool,
+    port: u64,
+    has_port: bool,
+    dangerous: bool,
+    has_dangerous: bool,
+    readyTimeoutMs: u64,
+    has_readyTimeoutMs: bool,
+    envOverrides_json: [u8; 8192],
+    envOverrides_json_len: u64,
+    has_envOverrides: bool,
+    relayProvider: OpencodeRelayProviderConfig,
+    has_relayProvider: bool,
+    saVmMcp: OpencodeSaVmMcpConfig,
+    has_saVmMcp: bool,
+    isolateThirdParty: bool,
+    has_isolateThirdParty: bool,
+}
+
+// TS: export function buildOpencodeSaVmMcpEntry(scriptPath: string):
+//   { type: "local"; command: string[]; enabled: boolean }
+struct OpencodeSaVmMcpEntry {
+    // type: "local"
+    type_str: [u8; 16],
+    type_str_len: u64,
+    // command: ["node", scriptPath]
+    command: PmStringList,
+    enabled: bool,
+}
+
+fn buildOpencodeSaVmMcpEntry(script_ptr: ptr, script_len: u64, out: &OpencodeSaVmMcpEntry) -> void {
+    let d: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d, &out.type_str, 0);
+    out.type_str_len = pm_copy(d, 16, STR_PTR("local"), STR_LEN("local"));
+    out.command.len = 2;
+    let c0: ptr = PTR_NULL();
+    PTR_BYTE_ADD(c0, &out.command.items[0].bytes, 0);
+    out.command.items[0].len = pm_copy(c0, 1024, STR_PTR("node"), STR_LEN("node"));
+    let c1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(c1, &out.command.items[1].bytes, 0);
+    out.command.items[1].len = pm_copy(c1, 1024, script_ptr, script_len);
+    out.enabled = true;
+}
+
+// TS: export const OPENCODE_RELAY_PROVIDER_ID = "codex-relay";
+fn opencode_relay_provider_id(out_len: &u64) -> ptr {
+    *out_len = STR_LEN("codex-relay");
+    return STR_PTR("codex-relay");
+}
+
+// TS: export function isOpencodeSharedRelayBlocked(providerId?, groupId?, baseUrl?): boolean
+// (Long source comment: shared relay cli/v1 contract; Zen free pool models
+// must never get a shared relay URL — opencode.ai/zen is official-client
+// only, external /v1 proxying gets 400/403.)
+fn isOpencodeSharedRelayBlocked(prov_ptr: ptr, prov_len: u64, has_prov: bool, group_ptr: ptr, group_len: u64, has_group: bool, url_ptr: ptr, url_len: u64, has_url: bool) -> bool {
+    // const ids = [String(providerId ?? "").toLowerCase(), String(groupId ?? "").toLowerCase()];
+    // if (ids.includes("opencode") || ids.includes("opencode-free")) return true;
+    if has_prov && pm_equal_lower(prov_ptr, prov_len, STR_PTR("opencode"), STR_LEN("opencode")) { return true; };
+    if has_group && pm_equal_lower(group_ptr, group_len, STR_PTR("opencode"), STR_LEN("opencode")) { return true; };
+    if has_prov && pm_equal_lower(prov_ptr, prov_len, STR_PTR("opencode-free"), STR_LEN("opencode-free")) { return true; };
+    if has_group && pm_equal_lower(group_ptr, group_len, STR_PTR("opencode-free"), STR_LEN("opencode-free")) { return true; };
+    // if (baseUrl && /opencode\.ai/i.test(baseUrl)) return true;
+    if has_url && url_len > 0 && pm_contains_ci(url_ptr, url_len, STR_PTR("opencode.ai"), STR_LEN("opencode.ai")) { return true; };
+    return false;
+}
+
+fn pm_equal_lower(a_ptr: ptr, a_len: u64, lit_ptr: ptr, lit_len: u64) -> bool {
+    if a_len != lit_len { return false; };
+    let i: u64 = 0;
+    while i < a_len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a_ptr, i);
+        PTR_BYTE_AT(y, lit_ptr, i);
+        if pm_lower_byte(x) != y { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// TS: export function buildOpencodeSharedRelayUrl(providerId, groupId, port, host = "127.0.0.1"): string
+// DEFECT: throw new Error(...) -> status code (0 ok, 1 empty provider,
+// 2 empty group, 3 invalid port, 4 blocked Zen target); the Error message
+// texts are preserved in comments at each return site.
+fn buildOpencodeSharedRelayUrl(prov_ptr: ptr, prov_len: u64, group_ptr: ptr, group_len: u64, port: u64, host_ptr: ptr, host_len: u64, has_host: bool, out: &PmBuf) -> i32 {
+    out.len = 0;
+    // const provider = (providerId ?? "").trim(); const group = ....trim();
+    let pp: ptr = PTR_NULL();
+    let pl: u64 = 0;
+    pm_trim_span(prov_ptr, prov_len, &pp, &pl);
+    let gp: ptr = PTR_NULL();
+    let gl: u64 = 0;
+    pm_trim_span(group_ptr, group_len, &gp, &gl);
+    // const cleanHost = (host ?? "").trim() || "127.0.0.1";
+    let hp = STR_PTR("127.0.0.1");
+    let hl = STR_LEN("127.0.0.1");
+    if has_host {
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        pm_trim_span(host_ptr, host_len, &tp, &tl);
+        if tl > 0 { hp = tp; hl = tl; };
+    };
+    // if (!provider) throw new Error("buildOpencodeSharedRelayUrl requires a non-empty providerId");
+    if pl == 0 { return 1; };
+    // if (!group) throw new Error("buildOpencodeSharedRelayUrl requires a non-empty groupId");
+    if gl == 0 { return 2; };
+    // if (!Number.isFinite(port) || port <= 0 || port >= 65536) throw ...
+    // DEFECT: port arrives as u64; the isFinite/NaN case is not expressible.
+    if port == 0 || port >= 65536 { return 3; };
+    // if (isOpencodeSharedRelayBlocked(provider, group)) throw new Error(
+    //   `Refusing shared relay for Zen free target "${provider}/${group}": ...`);
+    if isOpencodeSharedRelayBlocked(pp, pl, true, gp, gl, true, STR_PTR(""), 0, false) { return 4; };
+    // return `http://${cleanHost}:${port}/api/relay-gateway/${encodeURIComponent(provider)}/${encodeURIComponent(group)}/v1`;
+    pm_buf_lit(out, STR_PTR("http://"), STR_LEN("http://"));
+    pm_buf_append(out, hp, hl);
+    pm_buf_lit(out, STR_PTR(":"), STR_LEN(":"));
+    pm_buf_u64(out, port);
+    pm_buf_lit(out, STR_PTR("/api/relay-gateway/"), STR_LEN("/api/relay-gateway/"));
+    pm_buf_uri_component(out, pp, pl);
+    pm_buf_lit(out, STR_PTR("/"), STR_LEN("/"));
+    pm_buf_uri_component(out, gp, gl);
+    pm_buf_lit(out, STR_PTR("/v1"), STR_LEN("/v1"));
+    return 0;
+}
+
+// TS: export function buildOpencodeSharedRelayProvider(relayUrl, models, opts?): OpencodeRelayProviderConfig
+// DEFECT: throw -> status code (0 ok, 1 empty relayUrl, 2 blocked upstream,
+// 3 no models). opts?: { apiKey?; contextWindow?; modelCapability? } ->
+// explicit params.
+fn buildOpencodeSharedRelayProvider(url_ptr: ptr, url_len: u64, models: &PmStringList, api_key_ptr: ptr, api_key_len: u64, has_api_key: bool, ctx_window: u64, has_ctx_window: bool, cap: &PmModelCapability, out: &OpencodeRelayProviderConfig) -> i32 {
+    // const baseURL = (relayUrl ?? "").trim();
+    let bp: ptr = PTR_NULL();
+    let bl: u64 = 0;
+    pm_trim_span(url_ptr, url_len, &bp, &bl);
+    // if (!baseURL) throw new Error("buildOpencodeSharedRelayProvider requires a non-empty relayUrl");
+    if bl == 0 { return 1; };
+    // if (isOpencodeSharedRelayBlocked(undefined, undefined, baseURL)) throw ...
+    if isOpencodeSharedRelayBlocked(STR_PTR(""), 0, false, STR_PTR(""), 0, false, bp, bl, true) { return 2; };
+    // const cleanModels = [...new Set((models ?? []).map((m) => String(m ?? "").trim()).filter(Boolean))];
+    out.models.len = 0;
+    let i: u64 = 0;
+    while i < models.len {
+        let mp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(mp, &models.items[i].bytes, 0);
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        pm_trim_span(mp, models.items[i].len, &tp, &tl);
+        if tl > 0 {
+            // Set dedupe
+            let dup = false;
+            let j: u64 = 0;
+            while j < out.models.len {
+                let ep: ptr = PTR_NULL();
+                PTR_BYTE_ADD(ep, &out.models.items[j].bytes, 0);
+                if pm_equal(ep, out.models.items[j].len, tp, tl) { dup = true; break; };
+                j = j + 1;
+            }
+            if !dup && out.models.len < 32 {
+                let d: ptr = PTR_NULL();
+                PTR_BYTE_ADD(d, &out.models.items[out.models.len].bytes, 0);
+                out.models.items[out.models.len].len = pm_copy(d, 1024, tp, tl);
+                out.models.len = out.models.len + 1;
+            };
+        };
+        i = i + 1;
+    }
+    // if (cleanModels.length === 0) throw new Error("... requires at least one model");
+    if out.models.len == 0 { return 3; };
+    // return { providerId: OPENCODE_RELAY_PROVIDER_ID, baseURL,
+    //   apiKey: <redacted>
+    //   contextWindow: typeof opts?.contextWindow === "number" && > 0 ? Math.round : undefined,
+    //   modelCapability: opts?.modelCapability ?? null };
+    let d: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d, &out.providerId, 0);
+    out.providerId_len = pm_copy(d, 512, STR_PTR("codex-relay"), STR_LEN("codex-relay"));
+    PTR_BYTE_ADD(d, &out.baseURL, 0);
+    out.baseURL_len = pm_copy(d, 1024, bp, bl);
+    PTR_BYTE_ADD(d, &out.apiKey, 0);
+    if has_api_key {
+        out.apiKey_len = pm_copy(d, 512, api_key_ptr, api_key_len);
+    } else {
+        out.apiKey_len = pm_copy(d, 512, STR_PTR("codex-relay"), STR_LEN("codex-relay"));
+    };
+    // DEFECT: Math.round on a float context window -> u64 param arrives
+    // already integral in this conversion (rounding noted).
+    out.has_contextWindow = has_ctx_window && ctx_window > 0;
+    out.contextWindow = ctx_window;
+    out.modelCapability = *cap;
+    return 0;
+}
+
+// ---- TS: export interface OpencodeModelLimit ----
+struct OpencodeModelLimit {
+    context: u64,
+    output: u64,
+}
+
+// TS: function inferOpencodeOutputLimit(modelId?: string): number
+// (modelId lowercased once; substring includes checks)
+fn inferOpencodeOutputLimit(model_ptr: ptr, model_len: u64, has_model: bool) -> u64 {
+    if has_model {
+        if pm_contains_ci(model_ptr, model_len, STR_PTR("claude-3-5"), STR_LEN("claude-3-5")) { return 8192; };
+        if pm_contains_ci(model_ptr, model_len, STR_PTR("sonnet-3-5"), STR_LEN("sonnet-3-5")) { return 8192; };
+        if pm_contains_ci(model_ptr, model_len, STR_PTR("opus-3"), STR_LEN("opus-3")) { return 8192; };
+        if pm_contains_ci(model_ptr, model_len, STR_PTR("gpt-4o"), STR_LEN("gpt-4o")) { return 16384; };
+        if pm_contains_ci(model_ptr, model_len, STR_PTR("o1"), STR_LEN("o1")) { return 16384; };
+        if pm_contains_ci(model_ptr, model_len, STR_PTR("o3"), STR_LEN("o3")) { return 16384; };
+    };
+    return 8192;
+}
+
+// TS: export function inferOpencodeModelLimits(modelId?, explicitContextWindow?, modelCapability?): OpencodeModelLimit
+fn inferOpencodeModelLimits(model_ptr: ptr, model_len: u64, has_model: bool, explicit_ctx: u64, has_explicit_ctx: bool, cap: &PmModelCapability, out: &OpencodeModelLimit) -> void {
+    // if (typeof explicitContextWindow === "number" && explicitContextWindow > 0)
+    if has_explicit_ctx && explicit_ctx > 0 {
+        out.context = explicit_ctx;
+        out.output = inferOpencodeOutputLimit(model_ptr, model_len, has_model);
+        return;
+    };
+    if has_model {
+        // const resolved = resolveModelContextWindow(modelId, modelCapability ?? undefined);
+        let resolved: u64 = 0;
+        let has_resolved = false;
+        let cap_ptr: ptr = PTR_NULL();
+        let cap_len: u64 = 0;
+        if cap.present {
+            PTR_BYTE_ADD(cap_ptr, &cap.json, 0);
+            cap_len = cap.json_len;
+        };
+        sa_shared_resolve_model_context_window(model_ptr, model_len, cap_ptr, cap_len, cap.present, &resolved, &has_resolved);
+        if has_resolved && resolved > 0 {
+            out.context = resolved;
+            out.output = inferOpencodeOutputLimit(model_ptr, model_len, true);
+            return;
+        };
+    };
+    // Heuristic chain on the lowercased model id (pm_contains_ci covers the
+    // toLowerCase()).
+    let context: u64 = 128000;
+    if has_model && pm_contains_ci(model_ptr, model_len, STR_PTR("muse-spark"), STR_LEN("muse-spark")) { context = 272000; };
+    if has_model && (pm_contains_ci(model_ptr, model_len, STR_PTR("1m"), STR_LEN("1m")) || pm_contains_ci(model_ptr, model_len, STR_PTR("1000k"), STR_LEN("1000k"))) {
+        context = 1000000;
+    } else if has_model && (pm_contains_ci(model_ptr, model_len, STR_PTR("200k"), STR_LEN("200k")) || pm_contains_ci(model_ptr, model_len, STR_PTR("claude"), STR_LEN("claude")) || pm_contains_ci(model_ptr, model_len, STR_PTR("sonnet"), STR_LEN("sonnet")) || pm_contains_ci(model_ptr, model_len, STR_PTR("opus"), STR_LEN("opus"))) {
+        context = 200000;
+    } else if has_model && (pm_contains_ci(model_ptr, model_len, STR_PTR("128k"), STR_LEN("128k")) || pm_contains_ci(model_ptr, model_len, STR_PTR("gpt-4"), STR_LEN("gpt-4")) || pm_contains_ci(model_ptr, model_len, STR_PTR("o1"), STR_LEN("o1")) || pm_contains_ci(model_ptr, model_len, STR_PTR("o3"), STR_LEN("o3")) || pm_contains_ci(model_ptr, model_len, STR_PTR("deepseek"), STR_LEN("deepseek")) || pm_contains_ci(model_ptr, model_len, STR_PTR("gemini"), STR_LEN("gemini"))) {
+        context = 128000;
+    } else if has_model && pm_contains_ci(model_ptr, model_len, STR_PTR("64k"), STR_LEN("64k")) {
+        context = 65536;
+    } else if has_model && pm_contains_ci(model_ptr, model_len, STR_PTR("32k"), STR_LEN("32k")) {
+        context = 32768;
+    } else if has_model && pm_contains_ci(model_ptr, model_len, STR_PTR("16k"), STR_LEN("16k")) {
+        context = 16384;
+    } else if has_model && pm_contains_ci(model_ptr, model_len, STR_PTR("8k"), STR_LEN("8k")) {
+        context = 8192;
+    };
+    out.context = context;
+    out.output = inferOpencodeOutputLimit(model_ptr, model_len, has_model);
+}
+
+// ---- TS: export function buildOpencodeConfigContent(dangerous, relayProvider?, saVmMcp?, passThrough = false, apiVersion = 1): string ----
+// Builds the OPENCODE_CONFIG_CONTENT JSON. The TS builds an object via
+// spreads and JSON.stringify's it; here the JSON text is appended in the
+// same key order: permission, tools, plugin, compaction, mcp, provider.
+// DEFECT: dynamic object construction + JSON.stringify -> manual JSON
+// text assembly (escaping approximated, see pm_buf_json_string).
+fn buildOpencodeConfigContent(dangerous: bool, has_dangerous: bool, relay: &OpencodeRelayProviderConfig, has_relay: bool, mcp: &OpencodeSaVmMcpConfig, has_mcp: bool, pass_through: bool, api_version: u32, out: &PmBuf) -> void {
+    out.len = 0;
+    // const permissionConfig = passThrough ? { permission: { "*": "deny" } }
+    //   : dangerous ? { permission: { "*": "allow" } } : { permission: { "*": "ask" } };
+    // const toolsConfig = passThrough ? { tools: { "*": false, read: true } } : {};
+    // (`read` stays advertised: the free-tier gate 403s an emptied tool list;
+    //  permission: deny still blocks execution.)
+    // const pluginConfig = passThrough && apiVersion !== 2
+    //   ? { plugin: [opencodePassThroughPluginPath()] } : {};
+    // (v2 removed the experimental.chat.system.transform hook, so v2
+    //  pass-through cannot strip the built-in system prompt.)
+    // const compactionConfig = passThrough ? { compaction: { auto: false, prune: false } }
+    //   : { compaction: { auto: true, prune: true, reserved: 20_000 } };
+    // const saVmMcpScript = !passThrough && saVmMcp && saVmMcp.enabled !== false
+    //   ? saVmMcp.scriptPath.trim() : "";
+    let script_ptr: ptr = PTR_NULL();
+    let script_len: u64 = 0;
+    let has_script = false;
+    if !pass_through && has_mcp {
+        let enabled_ok = !mcp.has_enabled || mcp.enabled;
+        if enabled_ok {
+            let sp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(sp, &mcp.scriptPath, 0);
+            pm_trim_span(sp, mcp.scriptPath_len, &script_ptr, &script_len);
+            has_script = script_len > 0;
+        };
+    };
+    // const mcpConfig = !saVmMcpScript ? {} : { mcp: { "sa-vm": entry,
+    //   servers: { "sa-vm": { type: "local", command: ["node", script] } } } };
+    // (v1 reads mcp.<name>, v2 reads mcp.servers.<name>; both shapes emitted.)
+    pm_buf_lit(out, STR_PTR("{"), STR_LEN("{"));
+    // permission
+    pm_buf_lit(out, STR_PTR("\"permission\":{\"*\":\""), STR_LEN("\"permission\":{\"*\":\""));
+    if pass_through {
+        pm_buf_lit(out, STR_PTR("deny"), STR_LEN("deny"));
+    } else if has_dangerous && dangerous {
+        pm_buf_lit(out, STR_PTR("allow"), STR_LEN("allow"));
+    } else {
+        pm_buf_lit(out, STR_PTR("ask"), STR_LEN("ask"));
+    };
+    pm_buf_lit(out, STR_PTR("\"}"), STR_LEN("\"}"));
+    // tools (passThrough only)
+    if pass_through {
+        pm_buf_lit(out, STR_PTR(",\"tools\":{\"*\":false,\"read\":true}"), STR_LEN(",\"tools\":{\"*\":false,\"read\":true}"));
+    };
+    // plugin (passThrough && apiVersion !== 2)
+    if pass_through && api_version != 2 {
+        let plugin_path = ProbePath { bytes: [0u8; 1024], len: 0 };
+        opencodePassThroughPluginPath(0, false, &plugin_path);
+        pm_buf_lit(out, STR_PTR(",\"plugin\":["), STR_LEN(",\"plugin\":["));
+        let pp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(pp2, &plugin_path.bytes, 0);
+        pm_buf_json_string(out, pp2, plugin_path.len);
+        pm_buf_lit(out, STR_PTR("]"), STR_LEN("]"));
+    };
+    // compaction
+    if pass_through {
+        pm_buf_lit(out, STR_PTR(",\"compaction\":{\"auto\":false,\"prune\":false}"), STR_LEN(",\"compaction\":{\"auto\":false,\"prune\":false}"));
+    } else {
+        pm_buf_lit(out, STR_PTR(",\"compaction\":{\"auto\":true,\"prune\":true,\"reserved\":20000}"), STR_LEN(",\"compaction\":{\"auto\":true,\"prune\":true,\"reserved\":20000}"));
+    };
+    // mcp
+    if has_script {
+        pm_buf_lit(out, STR_PTR(",\"mcp\":{\"sa-vm\":{\"type\":\"local\",\"command\":[\"node\","), STR_LEN(",\"mcp\":{\"sa-vm\":{\"type\":\"local\",\"command\":[\"node\","));
+        pm_buf_json_string(out, script_ptr, script_len);
+        pm_buf_lit(out, STR_PTR("],\"enabled\":true},\"servers\":{\"sa-vm\":{\"type\":\"local\",\"command\":[\"node\","), STR_LEN("],\"enabled\":true},\"servers\":{\"sa-vm\":{\"type\":\"local\",\"command\":[\"node\","));
+        pm_buf_json_string(out, script_ptr, script_len);
+        pm_buf_lit(out, STR_PTR("]}}}"), STR_LEN("]}}}"));
+    };
+    // if (!relayProvider || relayProvider.models.length === 0) return JSON.stringify({...});
+    if !has_relay || relay.models.len == 0 {
+        pm_buf_lit(out, STR_PTR("}"), STR_LEN("}"));
+        return;
+    };
+    // const models: Record<string, { name; limit }> = {};
+    // for (const m of relayProvider.models) if (m.trim()) models[m] = {...};
+    pm_buf_lit(out, STR_PTR(",\"provider\":{"), STR_LEN(",\"provider\":{"));
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &relay.providerId, 0);
+    pm_buf_json_string(out, rp, relay.providerId_len);
+    pm_buf_lit(out, STR_PTR(":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"Codex Relay\",\"options\":{\"baseURL\":"), STR_LEN(":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"Codex Relay\",\"options\":{\"baseURL\":"));
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &relay.baseURL, 0);
+    pm_buf_json_string(out, bp, relay.baseURL_len);
+    pm_buf_lit(out, STR_PTR(",\"apiKey\":"), STR_LEN(",\"apiKey\":"));
+    let kp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(kp, &relay.apiKey, 0);
+    pm_buf_json_string(out, kp, relay.apiKey_len);
+    pm_buf_lit(out, STR_PTR("},\"models\":{"), STR_LEN("},\"models\":{"));
+    let first = true;
+    let i: u64 = 0;
+    while i < relay.models.len {
+        let mp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(mp, &relay.models.items[i].bytes, 0);
+        let ml = relay.models.items[i].len;
+        // if (m.trim())
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        pm_trim_span(mp, ml, &tp, &tl);
+        if tl > 0 {
+            if !first { pm_buf_lit(out, STR_PTR(","), STR_LEN(",")); };
+            first = false;
+            pm_buf_json_string(out, mp, ml);
+            pm_buf_lit(out, STR_PTR(":{\"name\":"), STR_LEN(":{\"name\":"));
+            pm_buf_json_string(out, mp, ml);
+            // limit: inferOpencodeModelLimits(m, relayProvider.contextWindow, relayProvider.modelCapability)
+            let lim = OpencodeModelLimit { context: 0, output: 0 };
+            inferOpencodeModelLimits(mp, ml, true, relay.contextWindow, relay.has_contextWindow, &relay.modelCapability, &lim);
+            pm_buf_lit(out, STR_PTR(",\"limit\":{\"context\":"), STR_LEN(",\"limit\":{\"context\":"));
+            pm_buf_u64(out, lim.context);
+            pm_buf_lit(out, STR_PTR(",\"output\":"), STR_LEN(",\"output\":"));
+            pm_buf_u64(out, lim.output);
+            pm_buf_lit(out, STR_PTR("}}"), STR_LEN("}}"));
+        };
+        i = i + 1;
+    }
+    pm_buf_lit(out, STR_PTR("}}}"), STR_LEN("}}}"));
+    pm_buf_lit(out, STR_PTR("}"), STR_LEN("}"));
+}
+
+// ---- TS: export interface OpencodeServerInfo ----
+struct OpencodeServerInfo {
+    url: [u8; 1024],
+    url_len: u64,
+    hostname: [u8; 256],
+    hostname_len: u64,
+    port: u64,
+    password: [u8; 128],
+    password_len: u64,
+}
+
+// TS: export function opencodeIsolationDir(): string
+//   return join(tmpdir(), "codex-ui-opencode-isolated");
+fn opencodeIsolationDir(out: &ProbePath) -> void {
+    let td_ptr: ptr = PTR_NULL();
+    let td_len: u64 = 0;
+    sa_std_os_tmpdir(&td_ptr, &td_len);
+    pm_join2(out, td_ptr, td_len, STR_PTR("codex-ui-opencode-isolated"), STR_LEN("codex-ui-opencode-isolated"));
+}
+
+// TS: export function opencodePassThroughPluginPath(pid = process.pid): string
+//   return join(opencodeIsolationDir(), `pass-through-system-strip-${pid}.mjs`);
+// DEFECT: template literal + process.pid -> pm_u64_to_dec + intent extern
+// sa_std_process_pid when has_pid is false.
+fn opencodePassThroughPluginPath(pid: u64, has_pid: bool, out: &ProbePath) -> void {
+    let dir = ProbePath { bytes: [0u8; 1024], len: 0 };
+    opencodeIsolationDir(&dir);
+    let use_pid = pid;
+    if !has_pid {
+        use_pid = sa_std_process_pid();
+    };
+    // filename: pass-through-system-strip-<pid>.mjs
+    let name = ProbePath { bytes: [0u8; 1024], len: 0 };
+    let nb = PmBuf { bytes: [0u8; 65536], len: 0 };
+    pm_buf_lit(&nb, STR_PTR("pass-through-system-strip-"), STR_LEN("pass-through-system-strip-"));
+    pm_buf_u64(&nb, use_pid);
+    pm_buf_lit(&nb, STR_PTR(".mjs"), STR_LEN(".mjs"));
+    let nd: ptr = PTR_NULL();
+    PTR_BYTE_ADD(nd, &name.bytes, 0);
+    // PmBuf storage is 64KB; the name is short — copy its head via a small span
+    let srcb: ptr = PTR_NULL();
+    PTR_BYTE_ADD(srcb, &nb.bytes, 0);
+    name.len = pm_copy(nd, 1024, srcb, nb.len);
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, &dir.bytes, 0);
+    let np: ptr = PTR_NULL();
+    PTR_BYTE_ADD(np, &name.bytes, 0);
+    pm_join2(out, dp, dir.len, np, name.len);
+}
+
+// TS: const OPENCODE_PASS_THROUGH_PLUGIN_SOURCE = `export default async () => ({...})`;
+// (multi-line template literal; the joined text is returned verbatim)
+fn opencode_pass_through_plugin_source(out_len: &u64) -> ptr {
+    let s = "export default async () => ({\n  \"experimental.chat.system.transform\": async (_input, output) => {\n    output.system.length = 0;\n  },\n});\n";
+    *out_len = STR_LEN("export default async () => ({\n  \"experimental.chat.system.transform\": async (_input, output) => {\n    output.system.length = 0;\n  },\n});\n");
+    return STR_PTR("export default async () => ({\n  \"experimental.chat.system.transform\": async (_input, output) => {\n    output.system.length = 0;\n  },\n});\n");
+}
+
+// TS: export function ensureOpencodePassThroughPlugin(): string
+// Materialize the pass-through plugin (mkdir 0o700, write 0o600).
+fn ensureOpencodePassThroughPlugin(out: &ProbePath) -> void {
+    let dir = ProbePath { bytes: [0u8; 1024], len: 0 };
+    opencodeIsolationDir(&dir);
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, &dir.bytes, 0);
+    // mkdirSync(dir, { recursive: true, mode: 0o700 })
+    sa_std_fs_mkdir_mode(dp, dir.len, 448);
+    opencodePassThroughPluginPath(0, false, out);
+    let src_len: u64 = 0;
+    let src = opencode_pass_through_plugin_source(&src_len);
+    let pp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pp, &out.bytes, 0);
+    // writeFileSync(path, SOURCE, { mode: 0o600 })
+    sa_std_fs_write_file_mode(pp, out.len, src, src_len, 384);
+}
+
+// TS: export function buildOpencodeIsolationEnv(platform, apiVersion = 1): Record<string, string>
+// DEFECT: Record<string,string> return -> PmEnvList of name/value entries.
+struct PmEnvEntry {
+    name: [u8; 64],
+    name_len: u64,
+    value: [u8; 1024],
+    value_len: u64,
+}
+
+struct PmEnvList {
+    items: [PmEnvEntry; 24],
+    len: u64,
+}
+
+fn pm_env_set(list: &PmEnvList, name_ptr: ptr, name_len: u64, val_ptr: ptr, val_len: u64) -> void {
+    if list.len >= 24 { return; };
+    let e = &list.items[list.len];
+    let d: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d, &e.name, 0);
+    e.name_len = pm_copy(d, 64, name_ptr, name_len);
+    PTR_BYTE_ADD(d, &e.value, 0);
+    e.value_len = pm_copy(d, 1024, val_ptr, val_len);
+    list.len = list.len + 1;
+}
+
+fn buildOpencodeIsolationEnv(is_win32: bool, api_version: u32, out: &PmEnvList) -> void {
+    out.len = 0;
+    let iso = ProbePath { bytes: [0u8; 1024], len: 0 };
+    opencodeIsolationDir(&iso);
+    let ip: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip, &iso.bytes, 0);
+    // try { mkdirSync(isolationDir, { recursive: true }); } catch { /* best-effort */ }
+    sa_std_fs_mkdir_mode(ip, iso.len, 493);
+    if api_version == 2 {
+        // v2 honors only a subset of the v1 isolation flags (source comment).
+        pm_env_set(out, STR_PTR("OPENCODE_CONFIG"), STR_LEN("OPENCODE_CONFIG"), STR_PTR(""), 0);
+        pm_env_set(out, STR_PTR("OPENCODE_CONFIG_DIR"), STR_LEN("OPENCODE_CONFIG_DIR"), STR_PTR(""), 0);
+        pm_env_set(out, STR_PTR("OPENCODE_DISABLE_PROJECT_CONFIG"), STR_LEN("OPENCODE_DISABLE_PROJECT_CONFIG"), STR_PTR("1"), STR_LEN("1"));
+        pm_env_set(out, STR_PTR("OPENCODE_DISABLE_CLAUDE_CODE"), STR_LEN("OPENCODE_DISABLE_CLAUDE_CODE"), STR_PTR("1"), STR_LEN("1"));
+        pm_env_set(out, STR_PTR("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"), STR_LEN("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"), STR_PTR("1"), STR_LEN("1"));
+        pm_env_set(out, STR_PTR("OPENCODE_TEST_HOME"), STR_LEN("OPENCODE_TEST_HOME"), ip, iso.len);
+        pm_env_set(out, STR_PTR("XDG_CONFIG_HOME"), STR_LEN("XDG_CONFIG_HOME"), ip, iso.len);
+        if is_win32 {
+            pm_env_set(out, STR_PTR("APPDATA"), STR_LEN("APPDATA"), ip, iso.len);
+        };
+        return;
+    };
+    pm_env_set(out, STR_PTR("OPENCODE_CONFIG"), STR_LEN("OPENCODE_CONFIG"), STR_PTR(""), 0);
+    pm_env_set(out, STR_PTR("OPENCODE_CONFIG_DIR"), STR_LEN("OPENCODE_CONFIG_DIR"), STR_PTR(""), 0);
+    pm_env_set(out, STR_PTR("OPENCODE_PERMISSION"), STR_LEN("OPENCODE_PERMISSION"), STR_PTR(""), 0);
+    pm_env_set(out, STR_PTR("OPENCODE_DISABLE_PROJECT_CONFIG"), STR_LEN("OPENCODE_DISABLE_PROJECT_CONFIG"), STR_PTR("1"), STR_LEN("1"));
+    pm_env_set(out, STR_PTR("OPENCODE_DISABLE_EXTERNAL_SKILLS"), STR_LEN("OPENCODE_DISABLE_EXTERNAL_SKILLS"), STR_PTR("1"), STR_LEN("1"));
+    pm_env_set(out, STR_PTR("OPENCODE_DISABLE_CLAUDE_CODE"), STR_LEN("OPENCODE_DISABLE_CLAUDE_CODE"), STR_PTR("1"), STR_LEN("1"));
+    pm_env_set(out, STR_PTR("OPENCODE_DISABLE_CLAUDE_CODE_PROMPT"), STR_LEN("OPENCODE_DISABLE_CLAUDE_CODE_PROMPT"), STR_PTR("1"), STR_LEN("1"));
+    pm_env_set(out, STR_PTR("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"), STR_LEN("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"), STR_PTR("1"), STR_LEN("1"));
+    pm_env_set(out, STR_PTR("OPENCODE_DISABLE_DEFAULT_PLUGINS"), STR_LEN("OPENCODE_DISABLE_DEFAULT_PLUGINS"), STR_PTR("1"), STR_LEN("1"));
+    pm_env_set(out, STR_PTR("OPENCODE_DISABLE_AUTOCOMPACT"), STR_LEN("OPENCODE_DISABLE_AUTOCOMPACT"), STR_PTR("1"), STR_LEN("1"));
+    pm_env_set(out, STR_PTR("OPENCODE_DISABLE_PRUNE"), STR_LEN("OPENCODE_DISABLE_PRUNE"), STR_PTR("1"), STR_LEN("1"));
+    // OPENCODE_PURE: "0" — the only external plugin is the system-stripping
+    // pass-through plugin injected through OPENCODE_CONFIG_CONTENT.
+    pm_env_set(out, STR_PTR("OPENCODE_PURE"), STR_LEN("OPENCODE_PURE"), STR_PTR("0"), STR_LEN("0"));
+    pm_env_set(out, STR_PTR("OPENCODE_TEST_HOME"), STR_LEN("OPENCODE_TEST_HOME"), ip, iso.len);
+    pm_env_set(out, STR_PTR("XDG_CONFIG_HOME"), STR_LEN("XDG_CONFIG_HOME"), ip, iso.len);
+    if is_win32 {
+        pm_env_set(out, STR_PTR("APPDATA"), STR_LEN("APPDATA"), ip, iso.len);
+    };
+}
+
+// TS: export async function isPortAvailable(port, hostname = "127.0.0.1"): Promise<boolean>
+// Check if a TCP port is available on loopback.
+// DEFECT: async + net.Server event Promise -> intent extern
+// sa_net_try_bind (bind+listen+close attempt). Reserved ports first.
+fn isPortAvailable(port: u64, host_ptr: ptr, host_len: u64) -> bool {
+    // Never bind on Codex Ultra reserved ports
+    if port == 43120 || port == 43121 { return false; };
+    return sa_net_try_bind(host_ptr, host_len, port) != 0;
+}
+
+// TS: export async function findAvailableOpencodePort(startPort = 4096, hostname): Promise<number>
+// DEFECT: async/await loop -> synchronous loop; throw at the end ->
+// (found=false) out.
+fn findAvailableOpencodePort(start_port: u64, host_ptr: ptr, host_len: u64, out_port: &u64, found: &bool) -> void {
+    *found = false;
+    let candidate = start_port;
+    while candidate < 65535 {
+        if candidate != 43120 && candidate != 43121 {
+            if isPortAvailable(candidate, host_ptr, host_len) {
+                *out_port = candidate;
+                *found = true;
+                return;
+            };
+        };
+        candidate = candidate + 1;
+    }
+    // throw new Error("No available port found for OpenCode server");
+}
+
+// ---- TS: export class OpencodeCompatibleProcessManager extends EventEmitter ----
+// DEFECT: class + EventEmitter inheritance -> struct + function family.
+// DEFECT: EventEmitter — emit("stderr"/"stdoutLine"/"exit"/"error") and
+// once("exit") have no SLA counterpart; emissions are no-op stubs below
+// (pm_emit_*) and the pool's once("exit") becomes an explicit
+// pm_pool_handle_manager_exit call the host loop must make.
+// DEFECT: ChildProcessWithoutNullStreams -> opaque child handle u64
+// (0 = none) + pid.
+struct OpencodeCompatibleProcessManager {
+    // pool/test identity (TS compares manager object identity) — assigned
+    // by the pool or the caller; 0 = unassigned.
+    self_id: u64,
+    // public readonly config: OpencodeProcessConfig
+    config: OpencodeProcessConfig,
+    // private child
+    child: u64,
+    child_pid: u64,
+    has_child_pid: bool,
+    // private serverInfo: OpencodeServerInfo | null
+    server_info: OpencodeServerInfo,
+    has_server_info: bool,
+    // private stopping = false
+    stopping: bool,
+    // private stderrTail: string[] — chunks capped at maxStderrLines
+    stderr_tail: PmStringList,
+    // private maxStderrLines = 100 (PmStringList capacity is 32 —
+    // DEFECT: capacity approximation, noted in the defect log)
+    max_stderr_lines: u64,
+}
+
+// Event emission stubs (see EventEmitter defect above).
+fn pm_emit_stderr(self_m: &OpencodeCompatibleProcessManager, text_ptr: ptr, text_len: u64) -> void {
+    // TS: this.emit("stderr", text);
+}
+fn pm_emit_stdout_line(self_m: &OpencodeCompatibleProcessManager, line_ptr: ptr, line_len: u64) -> void {
+    // TS: this.emit("stdoutLine", line);
+}
+fn pm_emit_exit(self_m: &OpencodeCompatibleProcessManager, code: i32, has_code: bool) -> void {
+    // TS: this.emit("exit", { code, signal, stopping: this.stopping });
+}
+fn pm_emit_error(self_m: &OpencodeCompatibleProcessManager) -> void {
+    // TS: this.emit("error", err);
+}
+
+// TS: constructor(public readonly config: OpencodeProcessConfig = {})
+fn OpencodeCompatibleProcessManager_new(self_m: &OpencodeCompatibleProcessManager, config: &OpencodeProcessConfig, has_config: bool) -> void {
+    if has_config {
+        self_m.config = *config;
+    };
+    self_m.child = 0;
+    self_m.has_child_pid = false;
+    self_m.child_pid = 0;
+    self_m.has_server_info = false;
+    self_m.stopping = false;
+    self_m.stderr_tail.len = 0;
+    self_m.max_stderr_lines = 100;
+}
+
+// TS: get isRunning(): boolean { return this.child !== null && !this.stopping; }
+fn OpencodeCompatibleProcessManager_isRunning(self_m: &OpencodeCompatibleProcessManager) -> bool {
+    return self_m.child != 0 && !self_m.stopping;
+}
+
+// TS: get url(): string | undefined { return this.serverInfo?.url; }
+fn OpencodeCompatibleProcessManager_url(self_m: &OpencodeCompatibleProcessManager, out: &ProbePath) -> bool {
+    if !self_m.has_server_info { out.len = 0; return false; };
+    let d: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d, &out.bytes, 0);
+    let s: ptr = PTR_NULL();
+    PTR_BYTE_ADD(s, &self_m.server_info.url, 0);
+    out.len = pm_copy(d, 1024, s, self_m.server_info.url_len);
+    return true;
+}
+
+// TS: get password(): string | undefined
+fn OpencodeCompatibleProcessManager_password(self_m: &OpencodeCompatibleProcessManager, out: &ProbePath) -> bool {
+    if !self_m.has_server_info { out.len = 0; return false; };
+    let d: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d, &out.bytes, 0);
+    let s: ptr = PTR_NULL();
+    PTR_BYTE_ADD(s, &self_m.server_info.password, 0);
+    out.len = pm_copy(d, 1024, s, self_m.server_info.password_len);
+    return true;
+}
+
+// TS: get info(): OpencodeServerInfo | null
+fn OpencodeCompatibleProcessManager_info(self_m: &OpencodeCompatibleProcessManager, out: &OpencodeServerInfo) -> bool {
+    if !self_m.has_server_info { return false; };
+    *out = self_m.server_info;
+    return true;
+}
+
+// TS: get pid(): number | undefined { return this.child?.pid; }
+fn OpencodeCompatibleProcessManager_pid(self_m: &OpencodeCompatibleProcessManager, out_pid: &u64) -> bool {
+    if !self_m.has_child_pid { return false; };
+    *out_pid = self_m.child_pid;
+    return true;
+}
+
+// TS: killTreeSync(): void
+// Best-effort synchronous process-tree kill for `exit` hooks.
+// Windows: taskkill /pid <pid> /T /F; POSIX: kill the direct child.
+fn OpencodeCompatibleProcessManager_killTreeSync(self_m: &OpencodeCompatibleProcessManager) -> void {
+    if !self_m.has_child_pid { return; };
+    let pid = self_m.child_pid;
+    self_m.stopping = true;
+    // try { ... } catch { /* best-effort */ }
+    if sa_std_platform_is_win32() != 0 {
+        // spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], {...})
+        sa_host_taskkill_tree_sync(pid);
+    } else {
+        // try { this.child?.kill("SIGKILL"); } catch {}
+        if self_m.child != 0 {
+            sa_host_child_kill(self_m.child, STR_PTR("SIGKILL"), STR_LEN("SIGKILL"));
+        };
+    };
+    self_m.child = 0;
+    self_m.has_child_pid = false;
+    self_m.has_server_info = false;
+}
+
+// Parse one stdout line for the listening patterns:
+//   /listening on (https?:\/\/([^\s:]+):(\d+))/i
+//   /opencode server listening on (https?:\/\/[^\s]+)/i
+// On match fills url/hostname/port outs and returns true.
+// DEFECT: RegExp -> hand scan for "listening on " then the URL token.
+fn pm_parse_listening_line(line_ptr: ptr, line_len: u64, url_out: &ProbePath, host_out: &ProbePath, port_out: &u64) -> bool {
+    // find "listening on " (case-insensitive)
+    let marker = STR_PTR("listening on ");
+    let marker_len = STR_LEN("listening on ");
+    let pos: u64 = 0;
+    let found = false;
+    while pos + marker_len <= line_len {
+        let seg: ptr = PTR_NULL();
+        PTR_BYTE_ADD(seg, line_ptr, pos);
+        // case-insensitive compare of the marker
+        let ok = true;
+        let j: u64 = 0;
+        while j < marker_len {
+            let a: u8 = 0;
+            let b: u8 = 0;
+            PTR_BYTE_AT(a, seg, j);
+            PTR_BYTE_AT(b, marker, j);
+            if pm_lower_byte(a) != b { ok = false; break; };
+            j = j + 1;
+        }
+        if ok { found = true; break; };
+        pos = pos + 1;
+    }
+    if !found { return false; };
+    let url_start = pos + marker_len;
+    // URL token: up to next whitespace
+    let url_end = url_start;
+    while url_end < line_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, line_ptr, url_end);
+        if pm_is_space(b) { break; };
+        url_end = url_end + 1;
+    }
+    if url_end <= url_start { return false; };
+    let up: ptr = PTR_NULL();
+    PTR_BYTE_ADD(up, line_ptr, url_start);
+    let ul = url_end - url_start;
+    // must start with http:// or https://
+    if !pm_contains_ci(up, ul, STR_PTR("http"), STR_LEN("http")) { return false; };
+    let d: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d, &url_out.bytes, 0);
+    url_out.len = pm_copy(d, 1024, up, ul);
+    // const parsed = new URL(serverUrl); actualHostname = parsed.hostname;
+    // actualPort = Number(parsed.port || port) — the fallback to the
+    // configured port happens in start() when has_port is false here.
+    // Host: after "://", up to ':' or '/' or end. Port: digits after ':'
+    // in the authority segment.
+    let auth = url_start;
+    // skip scheme
+    let k = url_start;
+    while k + 2 < url_end {
+        let b0: u8 = 0;
+        let b1: u8 = 0;
+        let b2: u8 = 0;
+        PTR_BYTE_AT(b0, line_ptr, k);
+        PTR_BYTE_AT(b1, line_ptr, k + 1);
+        PTR_BYTE_AT(b2, line_ptr, k + 2);
+        if b0 == 58 && b1 == 47 && b2 == 47 { auth = k + 3; break; };
+        k = k + 1;
+    }
+    let host_end = auth;
+    let port_val: u64 = 0;
+    let has_port = false;
+    while host_end < url_end {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, line_ptr, host_end);
+        if b == 58 || b == 47 { break; };
+        host_end = host_end + 1;
+    }
+    let hp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(hp, line_ptr, auth);
+    let hd: ptr = PTR_NULL();
+    PTR_BYTE_ADD(hd, &host_out.bytes, 0);
+    host_out.len = pm_copy(hd, 1024, hp, host_end - auth);
+    if host_end < url_end {
+        let colon: u8 = 0;
+        PTR_BYTE_AT(colon, line_ptr, host_end);
+        if colon == 58 {
+            let p = host_end + 1;
+            while p < url_end {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, line_ptr, p);
+                if b < 48 || b > 57 { break; };
+                port_val = port_val * 10 + (b - 48) as u64;
+                has_port = true;
+                p = p + 1;
+            }
+        };
+    };
+    *port_out = port_val;
+    // has_port is encoded by port_out caller-side sentinel: start() treats
+    // 0 as "use configured port" (source: Number(parsed.port || port)).
+    return true;
+}
+
+// TS: async start(): Promise<OpencodeServerInfo>
+// DEFECT: async -> synchronous; returns status (0 ok, 1 no port,
+// 2 ready timeout, 3 premature exit, 4 spawn error) and fills out info.
+// DEFECT: the ready Promise (stdout data handler + exit/error handlers +
+// setTimeout) -> intent extern sa_host_child_wait_ready which pumps the
+// child streams until a listening line, exit, error, or timeout, and
+// drains stderr into the tail (the onStdoutData/onExit/onError bodies are
+// reproduced as the outcome dispatch below).
+fn OpencodeCompatibleProcessManager_start(self_m: &OpencodeCompatibleProcessManager, out: &OpencodeServerInfo) -> i32 {
+    // if (this.serverInfo && this.isRunning) return this.serverInfo;
+    if self_m.has_server_info && OpencodeCompatibleProcessManager_isRunning(self_m) {
+        *out = self_m.server_info;
+        return 0;
+    };
+    // const hostname = this.config.hostname ?? "127.0.0.1";
+    let host = ProbePath { bytes: [0u8; 1024], len: 0 };
+    if self_m.config.has_hostname {
+        let d: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d, &host.bytes, 0);
+        let s: ptr = PTR_NULL();
+        PTR_BYTE_ADD(s, &self_m.config.hostname, 0);
+        host.len = pm_copy(d, 1024, s, self_m.config.hostname_len);
+    } else {
+        let d: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d, &host.bytes, 0);
+        host.len = pm_copy(d, 1024, STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"));
+    };
+    let hp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(hp, &host.bytes, 0);
+    // const port = this.config.port ?? (await findAvailableOpencodePort(4096, hostname));
+    let port: u64 = 0;
+    if self_m.config.has_port {
+        port = self_m.config.port;
+    } else {
+        let found = false;
+        findAvailableOpencodePort(4096, hp, host.len, &port, &found);
+        if !found { return 1; };
+    };
+    // const password = randomUUID();
+    let password = ProbePath { bytes: [0u8; 1024], len: 0 };
+    sa_uuid_random(&password);
+    // const apiVersion = this.config.apiVersion ?? 1;
+    let api_version: u32 = 1;
+    if self_m.config.has_apiVersion { api_version = self_m.config.apiVersion; };
+    // const binPath = this.config.binPath ?? (apiVersion === 2 ? findOpencodeV2Bin() : findOpencodeBin());
+    let bin = ProbePath { bytes: [0u8; 1024], len: 0 };
+    if self_m.config.has_binPath {
+        let d: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d, &bin.bytes, 0);
+        let s: ptr = PTR_NULL();
+        PTR_BYTE_ADD(s, &self_m.config.binPath, 0);
+        bin.len = pm_copy(d, 1024, s, self_m.config.binPath_len);
+    } else if api_version == 2 {
+        findOpencodeV2Bin(&bin);
+    } else {
+        findOpencodeBin(&bin);
+    };
+    // if (this.config.isolateThirdParty && apiVersion !== 2) ensureOpencodePassThroughPlugin();
+    if self_m.config.has_isolateThirdParty && self_m.config.isolateThirdParty && api_version != 2 {
+        let pp_path = ProbePath { bytes: [0u8; 1024], len: 0 };
+        ensureOpencodePassThroughPlugin(&pp_path);
+    };
+    // const readyTimeoutMs = this.config.readyTimeoutMs ?? 15_000;
+    let ready_timeout: u64 = 15000;
+    if self_m.config.has_readyTimeoutMs { ready_timeout = self_m.config.readyTimeoutMs; };
+    // Version visibility (warn-only, try/catch best-effort):
+    //   probed = probeOpencodeCliCommand(binPath);
+    //   v2 binary on v1 flow / v1 binary on v2 flow / below floor ->
+    //   console.warn(...) — never blocks.
+    let probe = OpencodeCliProbeResult { available: false, binPath: [0u8; 1024], binPath_len: 0, version: [0u8; 64], version_len: 0, has_version: false, error: [0u8; 2048], error_len: 0, has_error: false };
+    let bp2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp2, &bin.bytes, 0);
+    probeOpencodeCliCommand(bp2, bin.len, &probe);
+    if probe.has_version {
+        let vp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(vp, &probe.version, 0);
+        let warn = PmBuf { bytes: [0u8; 65536], len: 0 };
+        if api_version == 2 && !isOpencodeV2Version(vp, probe.version_len, true) {
+            pm_buf_lit(&warn, STR_PTR("[opencode-v2] binary version "), STR_LEN("[opencode-v2] binary version "));
+            pm_buf_append(&warn, vp, probe.version_len);
+            pm_buf_lit(&warn, STR_PTR(" is not an OpenCode v2 line; the v2 API flow will not work against it. Point OPENCODE_V2_BIN at a v2 binary."), STR_LEN(" is not an OpenCode v2 line; the v2 API flow will not work against it. Point OPENCODE_V2_BIN at a v2 binary."));
+            pm_console_warn(&warn);
+        } else if api_version != 2 && isOpencodeV2Version(vp, probe.version_len, true) {
+            pm_buf_lit(&warn, STR_PTR("[opencode] binary version "), STR_LEN("[opencode] binary version "));
+            pm_buf_append(&warn, vp, probe.version_len);
+            pm_buf_lit(&warn, STR_PTR(" is an OpenCode v2 line but this flow speaks the v1 API; use the OpenCode v2 backend for this binary."), STR_LEN(" is an OpenCode v2 line but this flow speaks the v1 API; use the OpenCode v2 backend for this binary."));
+            pm_console_warn(&warn);
+        } else if !isOpencodeVersionSupported(vp, probe.version_len, true) {
+            pm_buf_lit(&warn, STR_PTR("[opencode] binary version "), STR_LEN("[opencode] binary version "));
+            pm_buf_append(&warn, vp, probe.version_len);
+            pm_buf_lit(&warn, STR_PTR(" is below the verified floor 1.0.0; proceeding anyway, watch for 404s."), STR_LEN(" is below the verified floor 1.0.0; proceeding anyway, watch for 404s."));
+            pm_console_warn(&warn);
+        };
+    };
+    // const env: NodeJS.ProcessEnv = { ...process.env,
+    //   OPENCODE_SERVER_PASSWORD: <redacted>
+    //   OPENCODE_CONFIG_CONTENT: buildOpencodeConfigContent(...),
+    //   OPENCODE_DISABLE_AUTOUPDATE: "1", OPENCODE_DISABLE_MODELS_FETCH: "1",
+    //   ...this.config.envOverrides };
+    // if (this.config.isolateThirdParty) Object.assign(env, buildOpencodeIsolationEnv(...));
+    // DEFECT: env as a dynamic record -> assembled as PmEnvList + the
+    // envOverrides JSON buffer, passed to the spawn extern.
+    let env_list = PmEnvList { items: [PmEnvEntry; 24], len: 0 };
+    let pw_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pw_ptr, &password.bytes, 0);
+    pm_env_set(&env_list, STR_PTR("OPENCODE_SERVER_PASSWORD"), STR_LEN("OPENCODE_SERVER_PASSWORD"), pw_ptr, password.len);
+    let config_content = PmBuf { bytes: [0u8; 65536], len: 0 };
+    buildOpencodeConfigContent(self_m.config.has_dangerous && self_m.config.dangerous, self_m.config.has_dangerous, &self_m.config.relayProvider, self_m.config.has_relayProvider, &self_m.config.saVmMcp, self_m.config.has_saVmMcp, self_m.config.has_isolateThirdParty && self_m.config.isolateThirdParty, api_version, &config_content);
+    let cc_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cc_ptr, &config_content.bytes, 0);
+    // Stored as a pseudo-entry holding the JSON text (value cap is 1024 in
+    // PmEnvEntry — DEFECT: config content can exceed it; the spawn extern
+    // receives config_content separately in the fix phase. The truncated
+    // entry keeps the shape visible here.)
+    pm_env_set(&env_list, STR_PTR("OPENCODE_CONFIG_CONTENT"), STR_LEN("OPENCODE_CONFIG_CONTENT"), cc_ptr, config_content.len);
+    pm_env_set(&env_list, STR_PTR("OPENCODE_DISABLE_AUTOUPDATE"), STR_LEN("OPENCODE_DISABLE_AUTOUPDATE"), STR_PTR("1"), STR_LEN("1"));
+    pm_env_set(&env_list, STR_PTR("OPENCODE_DISABLE_MODELS_FETCH"), STR_LEN("OPENCODE_DISABLE_MODELS_FETCH"), STR_PTR("1"), STR_LEN("1"));
+    if self_m.config.has_isolateThirdParty && self_m.config.isolateThirdParty {
+        let iso_env = PmEnvList { items: [PmEnvEntry; 24], len: 0 };
+        buildOpencodeIsolationEnv(sa_std_platform_is_win32() != 0, api_version, &iso_env);
+        // Object.assign(env, isoEnv): overwrite/append each entry
+        let ei: u64 = 0;
+        while ei < iso_env.len {
+            let np: ptr = PTR_NULL();
+            PTR_BYTE_ADD(np, &iso_env.items[ei].name, 0);
+            let vp2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(vp2, &iso_env.items[ei].value, 0);
+            pm_env_set(&env_list, np, iso_env.items[ei].name_len, vp2, iso_env.items[ei].value_len);
+            ei = ei + 1;
+        }
+    };
+    // const args = [...(this.config.serverEntryArgs ?? []), "serve", `--hostname=${hostname}`, `--port=${port}`];
+    let args = PmStringList { items: [ProbePath; 32], len: 0 };
+    if self_m.config.has_serverEntryArgs {
+        let ai: u64 = 0;
+        while ai < self_m.config.serverEntryArgs.len {
+            args.items[args.len] = self_m.config.serverEntryArgs.items[ai];
+            args.len = args.len + 1;
+            ai = ai + 1;
+        }
+    };
+    let sv: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sv, &args.items[args.len].bytes, 0);
+    args.items[args.len].len = pm_copy(sv, 1024, STR_PTR("serve"), STR_LEN("serve"));
+    args.len = args.len + 1;
+    // --hostname=<hostname>
+    let hnb = PmBuf { bytes: [0u8; 65536], len: 0 };
+    pm_buf_lit(&hnb, STR_PTR("--hostname="), STR_LEN("--hostname="));
+    pm_buf_append(&hnb, hp, host.len);
+    let hb: ptr = PTR_NULL();
+    PTR_BYTE_ADD(hb, &hnb.bytes, 0);
+    PTR_BYTE_ADD(sv, &args.items[args.len].bytes, 0);
+    args.items[args.len].len = pm_copy(sv, 1024, hb, hnb.len);
+    args.len = args.len + 1;
+    // --port=<port>
+    let ptb = PmBuf { bytes: [0u8; 65536], len: 0 };
+    pm_buf_lit(&ptb, STR_PTR("--port="), STR_LEN("--port="));
+    pm_buf_u64(&ptb, port);
+    let pb: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pb, &ptb.bytes, 0);
+    PTR_BYTE_ADD(sv, &args.items[args.len].bytes, 0);
+    args.items[args.len].len = pm_copy(sv, 1024, pb, ptb.len);
+    args.len = args.len + 1;
+    // const child = pluginHostServices().codex.spawnCodexCommand(binPath, args, {
+    //   env, ...(cwd && existsSync(cwd) ? { cwd } : {}) });
+    let cwd_ptr: ptr = PTR_NULL();
+    let cwd_len: u64 = 0;
+    let has_cwd = false;
+    if self_m.config.has_cwd {
+        let cp3: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp3, &self_m.config.cwd, 0);
+        if sa_std_fs_exists(cp3, self_m.config.cwd_len) != 0 {
+            cwd_ptr = cp3;
+            cwd_len = self_m.config.cwd_len;
+            has_cwd = true;
+        };
+    };
+    let child: u64 = 0;
+    let child_pid: u64 = 0;
+    let has_pid = false;
+    // DEFECT: spawn failure in TS surfaces via the child "error" event /
+    // ready rejection; here the extern status folds into outcome 4 below.
+    let spawn_rc = sa_host_spawn_codex_command(bp2, bin.len, &args, &env_list, &self_m.config.envOverrides_json, self_m.config.envOverrides_json_len, self_m.config.has_envOverrides, cwd_ptr, cwd_len, has_cwd, &child, &child_pid, &has_pid);
+    self_m.child = child;
+    self_m.child_pid = child_pid;
+    self_m.has_child_pid = has_pid;
+    self_m.stopping = false;
+    self_m.stderr_tail.len = 0;
+    if spawn_rc != 0 {
+        self_m.child = 0;
+        self_m.has_server_info = false;
+        pm_emit_error(self_m);
+        return 4;
+    };
+    // child.stderr.on("data", (chunk) => { tail.push; shift if > 100; emit })
+    // — handled inside the wait extern's drain, which appends chunks into
+    // this.stderrTail (dropping the oldest beyond maxStderrLines) and would
+    // fire pm_emit_stderr per chunk.
+    // const readyPromise = new Promise((resolve, reject) => { ... });
+    // outcome: 0 ready (line filled), 1 timeout, 2 exit, 3 error
+    let line = ProbePath { bytes: [0u8; 1024], len: 0 };
+    let exit_code: i32 = 0;
+    let outcome = sa_host_child_wait_ready(child, ready_timeout, &line, &self_m.stderr_tail, self_m.max_stderr_lines, &exit_code);
+    if outcome == 0 {
+        // onStdoutData match path: build info, this.serverInfo = info; resolve(info);
+        let url = ProbePath { bytes: [0u8; 1024], len: 0 };
+        let ahost = ProbePath { bytes: [0u8; 1024], len: 0 };
+        let aport: u64 = 0;
+        let lp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(lp, &line.bytes, 0);
+        pm_emit_stdout_line(self_m, lp, line.len);
+        if pm_parse_listening_line(lp, line.len, &url, &ahost, &aport) {
+            // const actualPort = Number(parsed.port || port);
+            if aport == 0 { aport = port; };
+            // url: `http://${actualHostname}:${actualPort}`
+            let info = OpencodeServerInfo { url: [0u8; 1024], url_len: 0, hostname: [0u8; 256], hostname_len: 0, port: 0, password: [u8; 128], password_len: 0 };
+            let ub = PmBuf { bytes: [0u8; 65536], len: 0 };
+            pm_buf_lit(&ub, STR_PTR("http://"), STR_LEN("http://"));
+            let ahp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ahp, &ahost.bytes, 0);
+            pm_buf_append(&ub, ahp, ahost.len);
+            pm_buf_lit(&ub, STR_PTR(":"), STR_LEN(":"));
+            pm_buf_u64(&ub, aport);
+            let ubp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ubp, &ub.bytes, 0);
+            let id2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(id2, &info.url, 0);
+            info.url_len = pm_copy(id2, 1024, ubp, ub.len);
+            PTR_BYTE_ADD(id2, &info.hostname, 0);
+            info.hostname_len = pm_copy(id2, 256, ahp, ahost.len);
+            info.port = aport;
+            PTR_BYTE_ADD(id2, &info.password, 0);
+            info.password_len = pm_copy(id2, 128, pw_ptr, password.len);
+            self_m.server_info = info;
+            self_m.has_server_info = true;
+            *out = info;
+            return 0;
+        };
+        // A ready outcome without a parseable line cannot happen with the
+        // extern contract; treat as premature exit.
+        return 3;
+    };
+    if outcome == 1 {
+        // timeout path: resolved=true; this.stop().catch(() => {});
+        // reject(new Error(`OpenCode server did not become ready within ${readyTimeoutMs}ms. Stderr: ${tail.slice(-2000)}`))
+        OpencodeCompatibleProcessManager_stop(self_m);
+        return 2;
+    };
+    if outcome == 2 {
+        // child "exit" handler: clearTimeout; child/serverInfo = null;
+        // emit("exit", {...}); if (!resolved) reject(new Error(
+        //   `OpenCode server exited prematurely with code ${code}. Stderr: ...`))
+        self_m.child = 0;
+        self_m.has_child_pid = false;
+        self_m.has_server_info = false;
+        pm_emit_exit(self_m, exit_code, true);
+        return 3;
+    };
+    // outcome == 3: child "error" handler: clearTimeout; child/serverInfo
+    // = null; emit("error", err); if (!resolved) reject(err);
+    self_m.child = 0;
+    self_m.has_child_pid = false;
+    self_m.has_server_info = false;
+    pm_emit_error(self_m);
+    return 4;
+}
+
+// TS: async stop(): Promise<void>
+// DEFECT: async -> synchronous. The TS Promise (once exit/close + win32
+// taskkill spawn with SIGKILL fallback / POSIX SIGTERM + 3000ms SIGKILL
+// timer) -> intent extern sa_host_child_stop performing that sequence.
+fn OpencodeCompatibleProcessManager_stop(self_m: &OpencodeCompatibleProcessManager) -> void {
+    self_m.stopping = true;
+    let child = self_m.child;
+    if child == 0 {
+        self_m.has_server_info = false;
+        return;
+    };
+    sa_host_child_stop(child, self_m.child_pid, self_m.has_child_pid, sa_std_platform_is_win32() != 0, 3000);
+    // finish(): this.child = null; this.serverInfo = null; resolve();
+    self_m.child = 0;
+    self_m.has_child_pid = false;
+    self_m.has_server_info = false;
+}
+
+// console.warn intent (used by start()'s version warnings).
+fn pm_console_warn(text: &PmBuf) -> void {
+    // DEFECT: console.warn -> println approximation via print extern in the
+    // fix phase; bulk pass keeps the call shape.
+    let _t = text.len;
+}
+
+// ---- TS: function stableStringify(value: unknown): string ----
+// Recursive canonical JSON: undefined -> "undefined"; null/scalars ->
+// JSON.stringify; arrays in order; object keys sorted.
+// DEFECT: recursion over a dynamic value -> intent extern
+// sa_json_canonical_stringify(jsonText) (MISSING) operating on the JSON
+// text form of the value.
+fn stableStringify(json_ptr: ptr, json_len: u64, has_value: bool, out: &PmBuf) -> void {
+    out.len = 0;
+    if !has_value {
+        // if (value === undefined) return "undefined";
+        pm_buf_lit(out, STR_PTR("undefined"), STR_LEN("undefined"));
+        return;
+    };
+    sa_json_canonical_stringify(json_ptr, json_len, out);
+}
+
+// ---- TS: export function fingerprintOpencodeProcessConfig(config): string ----
+// Shared-serve config fingerprint. `cwd`/`port` are NOT in the fingerprint
+// (cwd goes per-request via x-opencode-directory, port is pool-owned);
+// everything deciding OPENCODE_CONFIG_CONTENT / the launch command is in.
+fn fingerprintOpencodeProcessConfig(config: &OpencodeProcessConfig, out: &PmBuf) -> void {
+    // Build the source object as JSON text, then stableStringify it.
+    let obj = PmBuf { bytes: [0u8; 65536], len: 0 };
+    pm_buf_lit(&obj, STR_PTR("{"), STR_LEN("{"));
+    // binPath: (config.binPath ?? "<auto>").trim()
+    pm_buf_lit(&obj, STR_PTR("\"binPath\":"), STR_LEN("\"binPath\":"));
+    if config.has_binPath {
+        let bp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(bp, &config.binPath, 0);
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        pm_trim_span(bp, config.binPath_len, &tp, &tl);
+        pm_buf_json_string(&obj, tp, tl);
+    } else {
+        pm_buf_json_string(&obj, STR_PTR("<auto>"), STR_LEN("<auto>"));
+    };
+    // apiVersion: config.apiVersion ?? 1
+    pm_buf_lit(&obj, STR_PTR(",\"apiVersion\":"), STR_LEN(",\"apiVersion\":"));
+    if config.has_apiVersion { pm_buf_u64(&obj, config.apiVersion as u64); } else { pm_buf_u64(&obj, 1); };
+    // serverEntryArgs: config.serverEntryArgs ?? []
+    pm_buf_lit(&obj, STR_PTR(",\"serverEntryArgs\":["), STR_LEN(",\"serverEntryArgs\":["));
+    if config.has_serverEntryArgs {
+        let i: u64 = 0;
+        while i < config.serverEntryArgs.len {
+            if i > 0 { pm_buf_lit(&obj, STR_PTR(","), STR_LEN(",")); };
+            let ap: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ap, &config.serverEntryArgs.items[i].bytes, 0);
+            pm_buf_json_string(&obj, ap, config.serverEntryArgs.items[i].len);
+            i = i + 1;
+        }
+    };
+    pm_buf_lit(&obj, STR_PTR("]"), STR_LEN("]"));
+    // hostname: config.hostname ?? "127.0.0.1"
+    pm_buf_lit(&obj, STR_PTR(",\"hostname\":"), STR_LEN(",\"hostname\":"));
+    if config.has_hostname {
+        let hp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(hp, &config.hostname, 0);
+        pm_buf_json_string(&obj, hp, config.hostname_len);
+    } else {
+        pm_buf_json_string(&obj, STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"));
+    };
+    // dangerous: config.dangerous ?? false
+    pm_buf_lit(&obj, STR_PTR(",\"dangerous\":"), STR_LEN(",\"dangerous\":"));
+    if config.has_dangerous && config.dangerous { pm_buf_lit(&obj, STR_PTR("true"), STR_LEN("true")); } else { pm_buf_lit(&obj, STR_PTR("false"), STR_LEN("false")); };
+    // isolateThirdParty: config.isolateThirdParty ?? false
+    pm_buf_lit(&obj, STR_PTR(",\"isolateThirdParty\":"), STR_LEN(",\"isolateThirdParty\":"));
+    if config.has_isolateThirdParty && config.isolateThirdParty { pm_buf_lit(&obj, STR_PTR("true"), STR_LEN("true")); } else { pm_buf_lit(&obj, STR_PTR("false"), STR_LEN("false")); };
+    // relay: config.relayProvider ? { providerId, baseURL, apiKey,
+    //   models: [...models].sort(), contextWindow: ?? null,
+    //   modelCapability: ?? null } : null
+    pm_buf_lit(&obj, STR_PTR(",\"relay\":"), STR_LEN(",\"relay\":"));
+    if config.has_relayProvider {
+        let relay = &config.relayProvider;
+        pm_buf_lit(&obj, STR_PTR("{\"providerId\":"), STR_LEN("{\"providerId\":"));
+        let rp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp, &relay.providerId, 0);
+        pm_buf_json_string(&obj, rp, relay.providerId_len);
+        pm_buf_lit(&obj, STR_PTR(",\"baseURL\":"), STR_LEN(",\"baseURL\":"));
+        PTR_BYTE_ADD(rp, &relay.baseURL, 0);
+        pm_buf_json_string(&obj, rp, relay.baseURL_len);
+        pm_buf_lit(&obj, STR_PTR(",\"apiKey\":"), STR_LEN(",\"apiKey\":"));
+        PTR_BYTE_ADD(rp, &relay.apiKey, 0);
+        pm_buf_json_string(&obj, rp, relay.apiKey_len);
+        // models sorted (lexicographic by code unit — insertion sort on a copy)
+        let sorted = relay.models;
+        let i2: u64 = 1;
+        while i2 < sorted.len {
+            let j2 = i2;
+            while j2 > 0 && pm_path_greater(&sorted.items[j2 - 1], &sorted.items[j2]) {
+                let tmp = sorted.items[j2 - 1];
+                sorted.items[j2 - 1] = sorted.items[j2];
+                sorted.items[j2] = tmp;
+                j2 = j2 - 1;
+            }
+            i2 = i2 + 1;
+        }
+        pm_buf_lit(&obj, STR_PTR(",\"models\":["), STR_LEN(",\"models\":["));
+        let mi: u64 = 0;
+        while mi < sorted.len {
+            if mi > 0 { pm_buf_lit(&obj, STR_PTR(","), STR_LEN(",")); };
+            let mp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(mp, &sorted.items[mi].bytes, 0);
+            pm_buf_json_string(&obj, mp, sorted.items[mi].len);
+            mi = mi + 1;
+        }
+        pm_buf_lit(&obj, STR_PTR("]"), STR_LEN("]"));
+        pm_buf_lit(&obj, STR_PTR(",\"contextWindow\":"), STR_LEN(",\"contextWindow\":"));
+        if relay.has_contextWindow { pm_buf_u64(&obj, relay.contextWindow); } else { pm_buf_lit(&obj, STR_PTR("null"), STR_LEN("null")); };
+        pm_buf_lit(&obj, STR_PTR(",\"modelCapability\":"), STR_LEN(",\"modelCapability\":"));
+        if relay.modelCapability.present {
+            let cp4: ptr = PTR_NULL();
+            PTR_BYTE_ADD(cp4, &relay.modelCapability.json, 0);
+            pm_buf_append(&obj, cp4, relay.modelCapability.json_len);
+        } else {
+            pm_buf_lit(&obj, STR_PTR("null"), STR_LEN("null"));
+        };
+        pm_buf_lit(&obj, STR_PTR("}"), STR_LEN("}"));
+    } else {
+        pm_buf_lit(&obj, STR_PTR("null"), STR_LEN("null"));
+    };
+    // saVmMcp: !config.saVmMcp || enabled === false || !scriptPath.trim()
+    //   ? null : { scriptPath: scriptPath.trim() }
+    pm_buf_lit(&obj, STR_PTR(",\"saVmMcp\":"), STR_LEN(",\"saVmMcp\":"));
+    let mcp_ok = false;
+    let mcp_tp: ptr = PTR_NULL();
+    let mcp_tl: u64 = 0;
+    if config.has_saVmMcp {
+        let disabled = config.saVmMcp.has_enabled && !config.saVmMcp.enabled;
+        if !disabled {
+            let sp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(sp, &config.saVmMcp.scriptPath, 0);
+            pm_trim_span(sp, config.saVmMcp.scriptPath_len, &mcp_tp, &mcp_tl);
+            mcp_ok = mcp_tl > 0;
+        };
+    };
+    if mcp_ok {
+        pm_buf_lit(&obj, STR_PTR("{\"scriptPath\":"), STR_LEN("{\"scriptPath\":"));
+        pm_buf_json_string(&obj, mcp_tp, mcp_tl);
+        pm_buf_lit(&obj, STR_PTR("}"), STR_LEN("}"));
+    } else {
+        pm_buf_lit(&obj, STR_PTR("null"), STR_LEN("null"));
+    };
+    // envOverrides: config.envOverrides ?? {}
+    pm_buf_lit(&obj, STR_PTR(",\"envOverrides\":"), STR_LEN(",\"envOverrides\":"));
+    if config.has_envOverrides {
+        let ep: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ep, &config.envOverrides_json, 0);
+        pm_buf_append(&obj, ep, config.envOverrides_json_len);
+    } else {
+        pm_buf_lit(&obj, STR_PTR("{}"), STR_LEN("{}"));
+    };
+    pm_buf_lit(&obj, STR_PTR("}"), STR_LEN("}"));
+    // return stableStringify({...});
+    let op: ptr = PTR_NULL();
+    PTR_BYTE_ADD(op, &obj.bytes, 0);
+    stableStringify(op, obj.len, true, out);
+}
+
+fn pm_path_greater(a: &ProbePath, b: &ProbePath) -> bool {
+    let ap: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ap, &a.bytes, 0);
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &b.bytes, 0);
+    let n = a.len;
+    if b.len < n { n = b.len; };
+    let i: u64 = 0;
+    while i < n {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, ap, i);
+        PTR_BYTE_AT(y, bp, i);
+        if x != y { return x > y; };
+        i = i + 1;
+    }
+    return a.len > b.len;
+}
+
+// ---- shared pool (TS module-level state) ----
+// TS: interface PooledOpencodeServer { manager; info; refCount; idleTimer }
+// TS: const pooledServers = new Map<string, PooledOpencodeServer>();
+// TS: const pooledInflight = new Map<string, Promise<...>>();
+// TS: let opencodeShutdownHooksInstalled = false;
+// DEFECT: module-level mutable Maps/Promise/global -> explicit PmPoolState
+// passed by reference. DEFECT: idleTimer (setTimeout handle) -> idle
+// deadline timestamp (ms); expiry is performed by pm_pool_reap_expired,
+// which the host loop must call (no timers in SLA). DEFECT: pooledInflight
+// — in a synchronous conversion a start completes before any other caller
+// can observe the inflight entry, so the map is kept only as key set for
+// shape parity.
+struct PmPooledServer {
+    key: [u8; 8192],
+    key_len: u64,
+    manager: OpencodeCompatibleProcessManager,
+    info: OpencodeServerInfo,
+    ref_count: u64,
+    idle_deadline_ms: u64,
+    has_idle_deadline: bool,
+}
+
+struct PmPoolState {
+    servers: [PmPooledServer; 32],
+    servers_len: u64,
+    inflight_keys: [ProbePath; 32],
+    inflight_len: u64,
+    hooks_installed: bool,
+    next_manager_id: u64,
+}
+
+// TS: export function opencodeSharedPoolIdleMs(): number
+// Zero-ref reuse window; CODEX_UI_OPENCODE_POOL_IDLE_MS override,
+// default 5 * 60_000; invalid/negative-garbage -> default; 0 allowed.
+fn opencodeSharedPoolIdleMs() -> u64 {
+    let raw_ptr: ptr = PTR_NULL();
+    let raw_len: u64 = 0;
+    let has_raw = false;
+    sa_std_env_get(STR_PTR("CODEX_UI_OPENCODE_POOL_IDLE_MS"), STR_LEN("CODEX_UI_OPENCODE_POOL_IDLE_MS"), &raw_ptr, &raw_len, &has_raw);
+    if !has_raw { return 300000; };
+    // const rawText = (... ?? "").trim(); if (!rawText) return default;
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    pm_trim_span(raw_ptr, raw_len, &tp, &tl);
+    if tl == 0 { return 300000; };
+    // const raw = Number(rawText); if (Number.isFinite(raw) && raw >= 0) return raw;
+    // DEFECT: Number() full-string parse -> digit scan; trailing garbage
+    // makes the whole parse fail in TS (Number("12x") is NaN) — reproduced
+    // by requiring all bytes be digits (a leading '-' fails the >= 0 rule
+    // to the default as well; decimals are truncated — noted).
+    let v: u64 = 0;
+    let i: u64 = 0;
+    let ok = true;
+    while i < tl {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, tp, i);
+        if b < 48 || b > 57 { ok = false; break; };
+        v = v * 10 + (b - 48) as u64;
+        i = i + 1;
+    }
+    if ok { return v; };
+    return 300000;
+}
+
+// TS: function clearPooledIdleTimer(entry): void
+fn clearPooledIdleTimer(entry: &PmPooledServer) -> void {
+    // if (entry.idleTimer) { clearTimeout(entry.idleTimer); entry.idleTimer = null; }
+    entry.has_idle_deadline = false;
+}
+
+fn pm_pool_find(state: &PmPoolState, key_ptr: ptr, key_len: u64, idx_out: &u64) -> bool {
+    let i: u64 = 0;
+    while i < state.servers_len {
+        let kp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(kp, &state.servers[i].key, 0);
+        if pm_equal(kp, state.servers[i].key_len, key_ptr, key_len) {
+            *idx_out = i;
+            return true;
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn pm_pool_remove(state: &PmPoolState, idx: u64) -> void {
+    let i = idx;
+    while i + 1 < state.servers_len {
+        state.servers[i] = state.servers[i + 1];
+        i = i + 1;
+    }
+    if state.servers_len > 0 { state.servers_len = state.servers_len - 1; };
+}
+
+// The TS idle-timer callback body, run by pm_pool_reap_expired:
+//   const current = pooledServers.get(key);
+//   if (!current || current.manager !== entry.manager) return;
+//   if (current.refCount > 0) return;
+//   pooledServers.delete(key); void entry.manager.stop().catch(() => {});
+fn pm_pool_reap_expired(state: &PmPoolState) -> void {
+    let now = sa_time_now_ms();
+    let i: u64 = 0;
+    while i < state.servers_len {
+        let e = &state.servers[i];
+        if e.has_idle_deadline && e.ref_count == 0 && now >= e.idle_deadline_ms {
+            let mgr = state.servers[i].manager;
+            pm_pool_remove(state, i);
+            OpencodeCompatibleProcessManager_stop(&mgr);
+            // do not advance i: the next entry shifted into place
+        } else {
+            i = i + 1;
+        };
+    }
+}
+
+// TS: manager.once("exit", () => { const current = pooledServers.get(key);
+//   if (current && current.manager === manager) { clearPooledIdleTimer(current);
+//   pooledServers.delete(key); } }) — invoked explicitly in this conversion.
+fn pm_pool_handle_manager_exit(state: &PmPoolState, key_ptr: ptr, key_len: u64, manager_id: u64) -> void {
+    let idx: u64 = 0;
+    if pm_pool_find(state, key_ptr, key_len, &idx) {
+        if state.servers[idx].manager.self_id == manager_id {
+            clearPooledIdleTimer(&state.servers[idx]);
+            pm_pool_remove(state, idx);
+        };
+    };
+}
+
+// TS: export async function acquireSharedOpencodeServer(config):
+//   Promise<{ key; manager; info }>
+// Reuse one `opencode serve` per config fingerprint + refcount (root-cause
+// fix in source: previously every runtime spawned its own ~400MB bun).
+// DEFECT: async -> synchronous status (0 ok, else start()'s code); the
+// result manager/info are returned as a pool index + info copy.
+// DEFECT: the inflight race branches (await inflight, re-check, recursive
+// retry) collapse in a synchronous world: an inflight entry can never be
+// observed by a second caller, so the raced/retry paths are unreachable;
+// the source's recursive `return acquireSharedOpencodeServer(config)`
+// becomes the loop retry below for shape parity.
+fn acquireSharedOpencodeServer(state: &PmPoolState, config: &OpencodeProcessConfig, key_out: &ProbePath, idx_out: &u64, info_out: &OpencodeServerInfo) -> i32 {
+    ensureOpencodeShutdownHooks(state);
+    // const key = fingerprintOpencodeProcessConfig(config);
+    let keybuf = PmBuf { bytes: [0u8; 65536], len: 0 };
+    fingerprintOpencodeProcessConfig(config, &keybuf);
+    let key_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(key_ptr, &keybuf.bytes, 0);
+    // key_out copy
+    let kd: ptr = PTR_NULL();
+    PTR_BYTE_ADD(kd, &key_out.bytes, 0);
+    key_out.len = pm_copy(kd, 1024, key_ptr, keybuf.len);
+    // const existing = pooledServers.get(key);
+    let idx: u64 = 0;
+    if pm_pool_find(state, key_ptr, keybuf.len, &idx) {
+        let e = &state.servers[idx];
+        if OpencodeCompatibleProcessManager_isRunning(&e.manager) {
+            // if (existing && existing.manager.isRunning && existing.info)
+            // (pool entries always carry info in this conversion)
+            clearPooledIdleTimer(&state.servers[idx]);
+            state.servers[idx].ref_count = state.servers[idx].ref_count + 1;
+            *idx_out = idx;
+            *info_out = state.servers[idx].info;
+            return 0;
+        };
+        // if (existing && !existing.manager.isRunning) { clear timer; delete }
+        if !OpencodeCompatibleProcessManager_isRunning(&e.manager) {
+            clearPooledIdleTimer(&state.servers[idx]);
+            pm_pool_remove(state, idx);
+        };
+    };
+    // const starter = (async () => { const manager = new ...(config);
+    //   const info = await manager.start(); return { manager, info }; })();
+    // pooledInflight.set(key, starter);
+    if state.inflight_len < 32 {
+        let d: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d, &state.inflight_keys[state.inflight_len].bytes, 0);
+        state.inflight_keys[state.inflight_len].len = pm_copy(d, 1024, key_ptr, keybuf.len);
+        state.inflight_len = state.inflight_len + 1;
+    };
+    let manager = OpencodeCompatibleProcessManager { self_id: 0, config: OpencodeProcessConfig { binPath: [0u8; 1024], binPath_len: 0, has_binPath: false, apiVersion: 1, has_apiVersion: false, serverEntryArgs: PmStringList { items: [ProbePath; 32], len: 0 }, has_serverEntryArgs: false, cwd: [0u8; 1024], cwd_len: 0, has_cwd: false, hostname: [0u8; 256], hostname_len: 0, has_hostname: false, port: 0, has_port: false, dangerous: false, has_dangerous: false, readyTimeoutMs: 0, has_readyTimeoutMs: false, envOverrides_json: [0u8; 8192], envOverrides_json_len: 0, has_envOverrides: false, relayProvider: OpencodeRelayProviderConfig { providerId: [0u8; 512], providerId_len: 0, baseURL: [0u8; 1024], baseURL_len: 0, apiKey: [u8; 512], apiKey_len: 0, models: PmStringList { items: [ProbePath; 32], len: 0 }, has_contextWindow: false, contextWindow: 0, modelCapability: PmModelCapability { json: [0u8; 8192], json_len: 0, present: false } }, has_relayProvider: false, saVmMcp: OpencodeSaVmMcpConfig { scriptPath: [0u8; 1024], scriptPath_len: 0, enabled: false, has_enabled: false }, has_saVmMcp: false, isolateThirdParty: false, has_isolateThirdParty: false }, child: 0, child_pid: 0, has_child_pid: false, server_info: OpencodeServerInfo { url: [0u8; 1024], url_len: 0, hostname: [0u8; 256], hostname_len: 0, port: 0, password: [u8; 128], password_len: 0 }, has_server_info: false, stopping: false, stderr_tail: PmStringList { items: [ProbePath; 32], len: 0 }, max_stderr_lines: 100 };
+    OpencodeCompatibleProcessManager_new(&manager, config, true);
+    state.next_manager_id = state.next_manager_id + 1;
+    manager.self_id = state.next_manager_id;
+    let info = OpencodeServerInfo { url: [0u8; 1024], url_len: 0, hostname: [0u8; 256], hostname_len: 0, port: 0, password: [u8; 128], password_len: 0 };
+    let rc = OpencodeCompatibleProcessManager_start(&manager, &info);
+    // finally { if (pooledInflight.get(key) === starter) pooledInflight.delete(key); }
+    pm_pool_inflight_remove(state, key_ptr, keybuf.len);
+    if rc != 0 {
+        // catch (err) { throw err; } -> status propagation
+        return rc;
+    };
+    // const entry = { manager, info, refCount: 1, idleTimer: null };
+    // pooledServers.set(key, entry);
+    if state.servers_len < 32 {
+        let e2 = &state.servers[state.servers_len];
+        let ed: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ed, &e2.key, 0);
+        e2.key_len = pm_copy(ed, 8192, key_ptr, keybuf.len);
+        e2.manager = manager;
+        e2.info = info;
+        e2.ref_count = 1;
+        e2.has_idle_deadline = false;
+        *idx_out = state.servers_len;
+        state.servers_len = state.servers_len + 1;
+        *info_out = info;
+        return 0;
+    };
+    return 5;
+}
+
+fn pm_pool_inflight_remove(state: &PmPoolState, key_ptr: ptr, key_len: u64) -> void {
+    let i: u64 = 0;
+    while i < state.inflight_len {
+        let kp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(kp, &state.inflight_keys[i].bytes, 0);
+        if pm_equal(kp, state.inflight_keys[i].len, key_ptr, key_len) {
+            let j = i;
+            while j + 1 < state.inflight_len {
+                state.inflight_keys[j] = state.inflight_keys[j + 1];
+                j = j + 1;
+            }
+            state.inflight_len = state.inflight_len - 1;
+            return;
+        };
+        i = i + 1;
+    }
+}
+
+// TS: export function releaseSharedOpencodeServer(key, manager, opts?): number
+fn releaseSharedOpencodeServer(state: &PmPoolState, key_ptr: ptr, key_len: u64, manager_id: u64, stop_when_last: bool, has_opts: bool) -> u64 {
+    let idx: u64 = 0;
+    let found = pm_pool_find(state, key_ptr, key_len, &idx);
+    if !found || state.servers[idx].manager.self_id != manager_id {
+        // Not a pooled instance (or replaced): stop it directly to avoid leaks.
+        // TS: void manager.stop().catch(() => {}); return 0;
+        // The manager object itself is not reachable from the id alone in
+        // this conversion — DEFECT: caller passes non-pooled managers to
+        // OpencodeCompatibleProcessManager_stop directly; here only the
+        // return value (0) is reproduced.
+        return 0;
+    };
+    // entry.refCount = Math.max(0, entry.refCount - 1);
+    if state.servers[idx].ref_count > 0 {
+        state.servers[idx].ref_count = state.servers[idx].ref_count - 1;
+    };
+    let rc_count = state.servers[idx].ref_count;
+    let running = OpencodeCompatibleProcessManager_isRunning(&state.servers[idx].manager);
+    // if (entry.refCount > 0 || !entry.manager.isRunning) { ...; return refCount; }
+    if rc_count > 0 || !running {
+        if !running {
+            clearPooledIdleTimer(&state.servers[idx]);
+            pm_pool_remove(state, idx);
+        };
+        return rc_count;
+    };
+    // if (opts?.stopWhenLast) { clear; delete; void stop; return 0; }
+    if has_opts && stop_when_last {
+        clearPooledIdleTimer(&state.servers[idx]);
+        let mgr = state.servers[idx].manager;
+        pm_pool_remove(state, idx);
+        OpencodeCompatibleProcessManager_stop(&mgr);
+        return 0;
+    };
+    // Zero refs: delayed reclaim — set the idle deadline instead of a timer.
+    clearPooledIdleTimer(&state.servers[idx]);
+    let idle_ms = opencodeSharedPoolIdleMs();
+    if idle_ms == 0 {
+        let mgr2 = state.servers[idx].manager;
+        pm_pool_remove(state, idx);
+        OpencodeCompatibleProcessManager_stop(&mgr2);
+        return 0;
+    };
+    // entry.idleTimer = setTimeout(() => {...}, idleMs); idleTimer.unref?.();
+    state.servers[idx].idle_deadline_ms = sa_time_now_ms() + idle_ms;
+    state.servers[idx].has_idle_deadline = true;
+    return 0;
+}
+
+// TS: export async function __resetSharedOpencodePoolForTests(): Promise<void>
+// DEFECT: async -> synchronous sequential stops.
+fn __resetSharedOpencodePoolForTests(state: &PmPoolState) -> void {
+    state.inflight_len = 0;
+    // const entries = Array.from(pooledServers.entries()); pooledServers.clear();
+    let saved = state.servers;
+    let saved_len = state.servers_len;
+    state.servers_len = 0;
+    let i: u64 = 0;
+    while i < saved_len {
+        let e = &saved[i];
+        clearPooledIdleTimer(e);
+        // await entry.manager.stop().catch(() => {});
+        OpencodeCompatibleProcessManager_stop(&e.manager);
+        i = i + 1;
+    }
+}
+
+// TS: export function __sharedOpencodePoolSnapshotForTests():
+//   Array<{ key: string; refCount: number; running: boolean }>
+struct PmPoolSnapshotEntry {
+    key: [u8; 8192],
+    key_len: u64,
+    ref_count: u64,
+    running: bool,
+}
+
+struct PmPoolSnapshot {
+    items: [PmPoolSnapshotEntry; 32],
+    len: u64,
+}
+
+fn __sharedOpencodePoolSnapshotForTests(state: &PmPoolState, out: &PmPoolSnapshot) -> void {
+    out.len = 0;
+    let i: u64 = 0;
+    while i < state.servers_len {
+        let e = &state.servers[i];
+        let s = &out.items[out.len];
+        let d: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d, &s.key, 0);
+        let kp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(kp, &e.key, 0);
+        s.key_len = pm_copy(d, 8192, kp, e.key_len);
+        s.ref_count = e.ref_count;
+        s.running = OpencodeCompatibleProcessManager_isRunning(&e.manager);
+        out.len = out.len + 1;
+        i = i + 1;
+    }
+}
+
+// TS: export function sharedOpencodePoolRefCount(key: string): number
+// Current pool refcount for a fingerprint (0 = not pooled). Used to decide
+// whether unattributable session.error events can be delivered safely.
+fn sharedOpencodePoolRefCount(state: &PmPoolState, key_ptr: ptr, key_len: u64) -> u64 {
+    let idx: u64 = 0;
+    if pm_pool_find(state, key_ptr, key_len, &idx) {
+        return state.servers[idx].ref_count;
+    };
+    return 0;
+}
+
+// TS: export function __seedSharedOpencodePoolForTests(key, manager, info, refCount = 1): void
+fn __seedSharedOpencodePoolForTests(state: &PmPoolState, key_ptr: ptr, key_len: u64, manager: &OpencodeCompatibleProcessManager, info: &OpencodeServerInfo, ref_count: u64) -> void {
+    let idx: u64 = 0;
+    if pm_pool_find(state, key_ptr, key_len, &idx) {
+        // const prev = pooledServers.get(key); if (prev) clearPooledIdleTimer(prev);
+        clearPooledIdleTimer(&state.servers[idx]);
+        state.servers[idx].manager = *manager;
+        state.servers[idx].info = *info;
+        state.servers[idx].ref_count = ref_count;
+        state.servers[idx].has_idle_deadline = false;
+        return;
+    };
+    if state.servers_len < 32 {
+        let e = &state.servers[state.servers_len];
+        let d: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d, &e.key, 0);
+        e.key_len = pm_copy(d, 8192, key_ptr, key_len);
+        e.manager = *manager;
+        e.info = *info;
+        e.ref_count = ref_count;
+        e.has_idle_deadline = false;
+        state.servers_len = state.servers_len + 1;
+    };
+}
+
+// TS: export function shutdownSharedOpencodePoolSync(): void
+// Parent-exit cleanup: synchronously kill every pooled serve tree (the
+// `exit` hook cannot run async; sync taskkill /T /F is the last resort).
+fn shutdownSharedOpencodePoolSync(state: &PmPoolState) -> void {
+    let saved = state.servers;
+    let saved_len = state.servers_len;
+    state.servers_len = 0;
+    state.inflight_len = 0;
+    let i: u64 = 0;
+    while i < saved_len {
+        let e = &saved[i];
+        // try { clearPooledIdleTimer(entry); } catch {}
+        clearPooledIdleTimer(e);
+        // if (typeof manager.killTreeSync === "function") manager.killTreeSync();
+        // else if (typeof manager.stop === "function") void manager.stop().catch(...)
+        // (fake test managers) — in this conversion every manager has
+        // killTreeSync, so that branch is taken unconditionally.
+        OpencodeCompatibleProcessManager_killTreeSync(&e.manager);
+        i = i + 1;
+    }
+}
+
+// TS: export async function shutdownSharedOpencodePool(): Promise<void>
+// Graceful shutdown: await stop() per entry (signal path).
+// DEFECT: async -> synchronous sequential stops.
+fn shutdownSharedOpencodePool(state: &PmPoolState) -> void {
+    let saved = state.servers;
+    let saved_len = state.servers_len;
+    state.servers_len = 0;
+    state.inflight_len = 0;
+    let i: u64 = 0;
+    while i < saved_len {
+        let e = &saved[i];
+        clearPooledIdleTimer(e);
+        OpencodeCompatibleProcessManager_stop(&e.manager);
+        i = i + 1;
+    }
+}
+
+// TS: function graceful handler body (inside ensureOpencodeShutdownHooks):
+//   void shutdownSharedOpencodePool().catch().finally(() => shutdownSharedOpencodePoolSync());
+//   setTimeout(() => { shutdownSharedOpencodePoolSync(); process.exit(signal === "SIGINT" ? 130 : 143); }, 1500).unref?.();
+// DEFECT: Promise chain + force-exit timer -> sequential calls; the 1500ms
+// grace window and process.exit are intent extern sa_std_process_exit
+// (the timer's "let other handlers run first" semantics are lost).
+fn pm_graceful_shutdown(state: &PmPoolState, is_sigint: bool) -> void {
+    shutdownSharedOpencodePool(state);
+    shutdownSharedOpencodePoolSync(state);
+    if is_sigint {
+        sa_std_process_exit(130);
+    } else {
+        sa_std_process_exit(143);
+    };
+}
+
+// TS: export function ensureOpencodeShutdownHooks(): void
+// Lazily install parent-exit hooks on first acquire: SIGINT/SIGTERM ->
+// graceful shutdown; exit -> synchronous tree kill.
+// DEFECT: process.once/on signal registration -> intent extern
+// sa_host_install_shutdown_hooks (MISSING); the runtime must route the
+// signals/exit to pm_graceful_shutdown / shutdownSharedOpencodePoolSync.
+fn ensureOpencodeShutdownHooks(state: &PmPoolState) -> void {
+    if state.hooks_installed { return; };
+    state.hooks_installed = true;
+    sa_host_install_shutdown_hooks();
+}

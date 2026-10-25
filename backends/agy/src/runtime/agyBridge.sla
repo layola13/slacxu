@@ -1,0 +1,2560 @@
+// Converted 1:1 from backends/agy/src/runtime/agyBridge.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// DEFECT: AgyBridgeOptions callbacks (async resolveRelayEnv /
+// resolveRelayProxyConfig, onSnapshot, loadSnapshot,
+// loadMetadata) — host shim fns declared by use at the bottom
+// of this file. DEFECT: EventEmitter ("message" /
+// "notification") — event queue records drained by the owner.
+// DEFECT: setTimeout(10ms) pending-turn timers — deadline
+// fields fired by AgyBridge_pollPending. DEFECT: sessions Map —
+// a fixed table (cap 16) of embedded session structs; each
+// session embeds a full AgyCompatibleRuntime + AgyProxyServer,
+// so the table is memory-heavy (repair phase: handle-based
+// sessions). DEFECT: messages: JsonValue[] — item JSON texts in
+// a per-session arena. DEFECT: randomUUID / process.cwd /
+// Date.now — shims. DEFECT: URL parsing (formatProxyHost) —
+// hand scan. DEFECT: JSON string escaping in assembled result /
+// snapshot texts — raw append.
+
+@import "./agyCompatibleRuntime.sla"
+@import "./agyCompatibleProxy.sla"
+@import "./agyCompatibleProbe.sla"
+
+// AGY_OFFICIAL_PROVIDER_ID = "agy-official"
+fn AGY_OFFICIAL_PROVIDER_ID_ptr() -> ptr { return STR_PTR("agy-official"); }
+fn AGY_OFFICIAL_PROVIDER_ID_len() -> u64 { return STR_LEN("agy-official"); }
+
+// AGY_OFFICIAL_MODELS (16 entries, source order).
+fn agy_official_model_at(idx: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    if idx == 0 { out_ptr = STR_PTR("gemini-3.8-flash-high"); out_len = STR_LEN("gemini-3.8-flash-high"); return true; };
+    if idx == 1 { out_ptr = STR_PTR("gemini-3.8-flash-medium"); out_len = STR_LEN("gemini-3.8-flash-medium"); return true; };
+    if idx == 2 { out_ptr = STR_PTR("gemini-3.8-flash-low"); out_len = STR_LEN("gemini-3.8-flash-low"); return true; };
+    if idx == 3 { out_ptr = STR_PTR("gemini-3.8-pro-high"); out_len = STR_LEN("gemini-3.8-pro-high"); return true; };
+    if idx == 4 { out_ptr = STR_PTR("gemini-3.8-pro-low"); out_len = STR_LEN("gemini-3.8-pro-low"); return true; };
+    if idx == 5 { out_ptr = STR_PTR("gemini-3.7-flash-high"); out_len = STR_LEN("gemini-3.7-flash-high"); return true; };
+    if idx == 6 { out_ptr = STR_PTR("gemini-3.7-flash-medium"); out_len = STR_LEN("gemini-3.7-flash-medium"); return true; };
+    if idx == 7 { out_ptr = STR_PTR("gemini-3.7-flash-low"); out_len = STR_LEN("gemini-3.7-flash-low"); return true; };
+    if idx == 8 { out_ptr = STR_PTR("gemini-3.6-flash-high"); out_len = STR_LEN("gemini-3.6-flash-high"); return true; };
+    if idx == 9 { out_ptr = STR_PTR("gemini-3.6-flash-medium"); out_len = STR_LEN("gemini-3.6-flash-medium"); return true; };
+    if idx == 10 { out_ptr = STR_PTR("gemini-3.6-flash-low"); out_len = STR_LEN("gemini-3.6-flash-low"); return true; };
+    if idx == 11 { out_ptr = STR_PTR("gemini-3.1-pro-high"); out_len = STR_LEN("gemini-3.1-pro-high"); return true; };
+    if idx == 12 { out_ptr = STR_PTR("gemini-3.1-pro-low"); out_len = STR_LEN("gemini-3.1-pro-low"); return true; };
+    if idx == 13 { out_ptr = STR_PTR("claude-sonnet-4-6"); out_len = STR_LEN("claude-sonnet-4-6"); return true; };
+    if idx == 14 { out_ptr = STR_PTR("claude-opus-4-6-thinking"); out_len = STR_LEN("claude-opus-4-6-thinking"); return true; };
+    if idx == 15 { out_ptr = STR_PTR("gpt-oss-120b-medium"); out_len = STR_LEN("gpt-oss-120b-medium"); return true; };
+    return false;
+}
+
+// isAgyOfficialModel(model?)
+fn isAgyOfficialModel(model_ptr: ptr, model_len: u64, has_model: bool) -> bool {
+    if !has_model { return false; };
+    for i in 0..16 {
+        let p: ptr = PTR_NULL();
+        let l: u64 = 0;
+        agy_official_model_at(i, &p, &l);
+        if l == model_len && bytes_eq(p, model_ptr, l) { return true; };
+    }
+    return false;
+}
+
+// formatProxyHost(url?): "none" for empty, URL host, "unknown"
+// for empty host, "configured" on parse failure.
+fn formatProxyHost(url_ptr: ptr, url_len: u64, has_url: bool, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    if !has_url || url_len == 0 {
+        out_len = buf_copy(out, out_cap, STR_PTR("none"), 4);
+        return;
+    };
+    // host = after "://" up to '/', ':', '?' or '#'
+    let start: u64 = 0;
+    let i: u64 = 0;
+    let found = false;
+    while i + 2 < url_len {
+        if byte_at(url_ptr, i) == 58 && byte_at(url_ptr, i + 1) == 47 && byte_at(url_ptr, i + 2) == 47 {
+            start = i + 3;
+            found = true;
+            break;
+        };
+        i = i + 1;
+    }
+    if !found {
+        out_len = buf_copy(out, out_cap, STR_PTR("configured"), STR_LEN("configured"));
+        return;
+    };
+    let end = start;
+    while end < url_len {
+        let b = byte_at(url_ptr, end);
+        if b == 47 || b == 58 || b == 63 || b == 35 { break; };
+        end = end + 1;
+    }
+    if end == start {
+        out_len = buf_copy(out, out_cap, STR_PTR("unknown"), STR_LEN("unknown"));
+        return;
+    };
+    out_len = buf_copy(out, out_cap, byte_off(url_ptr, start), end - start);
+}
+
+// buildAgyOfficialProvider(): the official ProviderConfig as
+// JSON text (the shared ProviderConfig shape).
+fn buildAgyOfficialProvider(out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let models = [0u8; 1024];
+    let models_len: u64 = 0;
+    models_len = models_len + append_bytes(&models, 1024, models_len, STR_PTR("["), 1);
+    for i in 0..16 {
+        let p: ptr = PTR_NULL();
+        let l: u64 = 0;
+        agy_official_model_at(i, &p, &l);
+        if i > 0 { models_len = models_len + append_bytes(&models, 1024, models_len, STR_PTR(","), 1); };
+        models_len = models_len + append_bytes(&models, 1024, models_len, STR_PTR("\""), 1);
+        models_len = models_len + append_bytes(&models, 1024, models_len, p, l);
+        models_len = models_len + append_bytes(&models, 1024, models_len, STR_PTR("\""), 1);
+    }
+    models_len = models_len + append_bytes(&models, 1024, models_len, STR_PTR("]"), 1);
+    let now = now_ms();
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"id\":\"agy-official\",\"name\":\"Antigravity 官方\",\"kind\":\"responsesRelay\",\"serviceProvider\":{\"id\":\"google-antigravity\",\"name\":\"Google Antigravity\"},\"baseUrl\":\"https://cloudcode-pa.googleapis.com\",\"defaultModel\":\"gemini-3.8-flash-high\",\"nativeModels\":"), STR_LEN("{\"id\":\"agy-official\",\"name\":\"Antigravity 官方\",\"kind\":\"responsesRelay\",\"serviceProvider\":{\"id\":\"google-antigravity\",\"name\":\"Google Antigravity\"},\"baseUrl\":\"https://cloudcode-pa.googleapis.com\",\"defaultModel\":\"gemini-3.8-flash-high\",\"nativeModels\":"));
+    n = n + append_bytes(out, out_cap, n, &models, models_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"modelAliases\":[],\"stationType\":\"official\",\"channelMode\":\"fast\",\"remark\":\"Antigravity Official (Google OAuth)\",\"groups\":[{\"id\":\"default\",\"name\":\"default\",\"baseUrl\":\"https://cloudcode-pa.googleapis.com\",\"kind\":\"text\",\"status\":\"enabled\",\"groupRatio\":1,\"models\":"), STR_LEN(",\"modelAliases\":[],\"stationType\":\"official\",\"channelMode\":\"fast\",\"remark\":\"Antigravity Official (Google OAuth)\",\"groups\":[{\"id\":\"default\",\"name\":\"default\",\"baseUrl\":\"https://cloudcode-pa.googleapis.com\",\"kind\":\"text\",\"status\":\"enabled\",\"groupRatio\":1,\"models\":"));
+    n = n + append_bytes(out, out_cap, n, &models, models_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"responseProtocol\":\"gemini\",\"responseProtocolMode\":\"fixed\",\"remark\":\"Antigravity 官方直连 (Google OAuth)\",\"authType\":\"none\",\"credentialMode\":\"group\",\"keyMode\":\"single\",\"keys\":[]}],\"createdAt\":"), STR_LEN(",\"responseProtocol\":\"gemini\",\"responseProtocolMode\":\"fixed\",\"remark\":\"Antigravity 官方直连 (Google OAuth)\",\"authType\":\"none\",\"credentialMode\":\"group\",\"keyMode\":\"single\",\"keys\":[]}],\"createdAt\":"));
+    n = n + append_u64(out, out_cap, n, now);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"updatedAt\":"), STR_LEN(",\"updatedAt\":"));
+    n = n + append_u64(out, out_cap, n, now);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("}"), 1);
+    out_len = n;
+}
+
+// AgySession (interface) + AgySessionSnapshot (same fields +
+// turns/messages). Strings are caller/doc-owned slots.
+struct AgyTurnRow {
+    id: [u8; 64],
+    id_len: u64,
+    status: [u8; 32],
+    status_len: u64,
+    createdAt: u64,
+}
+
+struct AgySession {
+    threadId_ptr: ptr,
+    threadId_len: u64,
+    ownerId_ptr: ptr,
+    ownerId_len: u64,
+    has_ownerId: bool,
+    cwd_ptr: ptr,
+    cwd_len: u64,
+    addDirs_ptr: ptr,
+    addDirs_len: u64,
+    has_addDirs: bool,
+    model_ptr: ptr,
+    model_len: u64,
+    has_model: bool,
+    effort_ptr: ptr,
+    effort_len: u64,
+    has_effort: bool,
+    developerInstructions_ptr: ptr,
+    developerInstructions_len: u64,
+    has_developerInstructions: bool,
+    mode: u64,
+    has_mode: bool,
+    conversationId_ptr: ptr,
+    conversationId_len: u64,
+    has_conversationId: bool,
+    providerId_ptr: ptr,
+    providerId_len: u64,
+    has_providerId: bool,
+    groupId_ptr: ptr,
+    groupId_len: u64,
+    has_groupId: bool,
+    preview_ptr: ptr,
+    preview_len: u64,
+    has_preview: bool,
+    goalObjective_ptr: ptr,
+    goalObjective_len: u64,
+    has_goalObjective: bool,
+    goal_null: bool,
+    goalStatus_ptr: ptr,
+    goalStatus_len: u64,
+    has_goalStatus: bool,
+    activeTurnId: [u8; 64],
+    activeTurnId_len: u64,
+    has_activeTurnId: bool,
+    pending_deadline: u64,
+    has_pending: bool,
+    pending_prompt: [u8; 262144],
+    pending_prompt_len: u64,
+    pending_turnId: [u8; 64],
+    pending_turnId_len: u64,
+    pending_compact: bool,
+    proxy: AgyProxyServer,
+    has_proxy: bool,
+    runtime: AgyCompatibleRuntime,
+    has_runtime: bool,
+    turns: [AgyTurnRow; 256],
+    turns_count: u64,
+    messages: [u8; 1048576],
+    messages_len: u64,
+    msg_off: [u64; 2048],
+    msg_len_arr: [u64; 2048],
+    msg_count: u64,
+}
+
+struct AgyBridge {
+    sessions: [AgySession; 16],
+    sessions_count: u64,
+    has_options: bool,
+    status_phase: [u8; 32],
+    status_phase_len: u64,
+    status_message: [u8; 1024],
+    status_message_len: u64,
+    eventQueue: [u8; 1048576],
+    eventQueue_len: u64,
+    probeCache: AgyVersionCache,
+}
+
+// resolveAgyWorkspaceDirs(record): roots from
+// runtimeWorkspaceRoots[] + workspace.cwd + cwd (trimmed,
+// non-empty); cwd = roots[0] || record.cwd || process.cwd();
+// addDirs = unique(roots or [cwd]).
+fn resolveAgyWorkspaceDirs(record: u64, out_cwd: ptr, out_cwd_cap: u64, out_cwd_len: &u64, out_addDirs: ptr, out_addDirs_cap: u64, out_addDirs_len: &u64) -> void {
+    let roots = [0u8; 8192];
+    let roots_off: [u64; 64] = [0u64; 64];
+    let roots_len_arr: [u64; 64] = [0u64; 64];
+    let roots_count: u64 = 0;
+    let used: u64 = 0;
+    let arr: u64 = 0;
+    if sa_json_object_get(record, STR_PTR("runtimeWorkspaceRoots"), STR_LEN("runtimeWorkspaceRoots"), &arr) == 0 {
+        let n = sa_json_array_len(arr);
+        for i in 0..n {
+            let node: u64 = 0;
+            if sa_json_array_get(arr, i, &node) != 0 { continue; };
+            let s_ptr: ptr = PTR_NULL();
+            let s_len: u64 = 0;
+            json_node_string(node, &s_ptr, &s_len);
+            let tp: ptr = PTR_NULL();
+            let tl: u64 = 0;
+            trim_span(s_ptr, s_len, &tp, &tl);
+            if tl > 0 && roots_count < 64 {
+                roots_off[roots_count] = used;
+                roots_len_arr[roots_count] = tl;
+                used = used + buf_append(&roots, 8192, tl, tp, tl);
+                roots_count = roots_count + 1;
+            };
+        }
+    };
+    let ws_node: u64 = 0;
+    if sa_json_object_get(record, STR_PTR("workspace"), STR_LEN("workspace"), &ws_node) == 0 {
+        let s_ptr: ptr = PTR_NULL();
+        let s_len: u64 = 0;
+        if sa_json_object_get_string(ws_node, STR_PTR("cwd"), STR_LEN("cwd"), &s_ptr, &s_len) == 0 {
+            let tp: ptr = PTR_NULL();
+            let tl: u64 = 0;
+            trim_span(s_ptr, s_len, &tp, &tl);
+            if tl > 0 && roots_count < 64 {
+                roots_off[roots_count] = used;
+                roots_len_arr[roots_count] = tl;
+                used = used + buf_append(&roots, 8192, tl, tp, tl);
+                roots_count = roots_count + 1;
+            };
+        };
+    };
+    let cwd_ptr: ptr = PTR_NULL();
+    let cwd_len: u64 = 0;
+    let has_cwd_field = sa_json_object_get_string(record, STR_PTR("cwd"), STR_LEN("cwd"), &cwd_ptr, &cwd_len) == 0;
+    if has_cwd_field {
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        trim_span(cwd_ptr, cwd_len, &tp, &tl);
+        if tl > 0 && roots_count < 64 {
+            roots_off[roots_count] = used;
+            roots_len_arr[roots_count] = tl;
+            used = used + buf_append(&roots, 8192, tl, tp, tl);
+            roots_count = roots_count + 1;
+        };
+    };
+    // primaryCwd
+    if roots_count > 0 {
+        out_cwd_len = buf_copy(out_cwd, out_cwd_cap, slot(&roots, roots_off[0]), roots_len_arr[0]);
+    } else if has_cwd_field {
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        trim_span(cwd_ptr, cwd_len, &tp, &tl);
+        if tl > 0 {
+            out_cwd_len = buf_copy(out_cwd, out_cwd_cap, tp, tl);
+        } else {
+            out_cwd_len = process_cwd(out_cwd, out_cwd_cap);
+        };
+    } else {
+        out_cwd_len = process_cwd(out_cwd, out_cwd_cap);
+    };
+    // addDirs = unique(roots or [primaryCwd]) as JSON array text
+    let n: u64 = 0;
+    n = n + append_bytes(out_addDirs, out_addDirs_cap, n, STR_PTR("["), 1);
+    let first = true;
+    if roots_count > 0 {
+        for i in 0..roots_count {
+            let dup = false;
+            for j in 0..i {
+                if roots_len_arr[j] == roots_len_arr[i] && bytes_eq(slot(&roots, roots_off[j]), slot(&roots, roots_off[i]), roots_len_arr[i]) { dup = true; break; };
+            }
+            if dup { continue; };
+            if !first { n = n + append_bytes(out_addDirs, out_addDirs_cap, n, STR_PTR(","), 1); };
+            first = false;
+            n = n + append_bytes(out_addDirs, out_addDirs_cap, n, STR_PTR("\""), 1);
+            n = n + append_bytes(out_addDirs, out_addDirs_cap, n, slot(&roots, roots_off[i]), roots_len_arr[i]);
+            n = n + append_bytes(out_addDirs, out_addDirs_cap, n, STR_PTR("\""), 1);
+        }
+    } else {
+        n = n + append_bytes(out_addDirs, out_addDirs_cap, n, STR_PTR("\""), 1);
+        n = n + append_bytes(out_addDirs, out_addDirs_cap, n, out_cwd, out_cwd_len);
+        n = n + append_bytes(out_addDirs, out_addDirs_cap, n, STR_PTR("\""), 1);
+    };
+    n = n + append_bytes(out_addDirs, out_addDirs_cap, n, STR_PTR("]"), 1);
+    out_addDirs_len = n;
+}
+
+fn AgyBridge_new(self: &AgyBridge, has_options: bool) -> void {
+    self.sessions_count = 0;
+    self.has_options = has_options;
+    self.status_phase_len = buf_copy(&self.status_phase, 32, STR_PTR("ready"), STR_LEN("ready"));
+    self.status_message_len = buf_copy(&self.status_message, 1024, STR_PTR("Antigravity CLI (AGY) ready"), STR_LEN("Antigravity CLI (AGY) ready"));
+    self.eventQueue_len = 0;
+    AgyVersionCache_new(&self.probeCache);
+}
+
+fn AgyBridge_hasSession(self: &AgyBridge, threadId_ptr: ptr, threadId_len: u64) -> bool {
+    return bridge_find(self, threadId_ptr, threadId_len) != 4294967295;
+}
+
+// getStatus(): status as JSON text {phase, transport: "stdio",
+// message}.
+fn AgyBridge_getStatus(self: &AgyBridge, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"phase\":\""), STR_LEN("{\"phase\":\""));
+    n = n + append_bytes(out, out_cap, n, &self.status_phase, self.status_phase_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"transport\":\"stdio\",\"message\":\""), STR_LEN("\",\"transport\":\"stdio\",\"message\":\""));
+    n = n + append_bytes(out, out_cap, n, &self.status_message, self.status_message_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\"}"), 2);
+    out_len = n;
+}
+
+// start(): probe the CLI + launch-configured flag -> status.
+fn AgyBridge_start(self: &AgyBridge) -> void {
+    let bin = [0u8; 1024];
+    let bin_len: u64 = 0;
+    let has_bin = false;
+    findAgyBin(&bin, 1024, &bin_len, &has_bin);
+    let probe = AgyCliProbeResult { available: false, binPath_ptr: PTR_NULL(), binPath_len: 0, version_ptr: PTR_NULL(), version_len: 0, has_version: false, error_ptr: PTR_NULL(), error_len: 0, has_error: false, source_ptr: PTR_NULL(), source_len: 0 };
+    if has_bin {
+        probeAgyCliCommand(&self.probeCache, &bin, bin_len, &probe);
+    } else {
+        probe.error_ptr = STR_PTR("Antigravity CLI not found");
+        probe.error_len = STR_LEN("Antigravity CLI not found");
+        probe.has_error = true;
+    };
+    let launch = isAgyLaunchConfigured();
+    if !probe.available {
+        self.status_phase_len = buf_copy(&self.status_phase, 32, STR_PTR("error"), STR_LEN("error"));
+        if probe.has_error {
+            self.status_message_len = buf_copy(&self.status_message, 1024, probe.error_ptr, probe.error_len);
+        } else {
+            self.status_message_len = buf_copy(&self.status_message, 1024, STR_PTR("Antigravity CLI not found"), STR_LEN("Antigravity CLI not found"));
+        };
+    } else {
+        self.status_phase_len = buf_copy(&self.status_phase, 32, STR_PTR("ready"), STR_LEN("ready"));
+        let n: u64 = 0;
+        n = n + append_bytes(&self.status_message, 1024, n, STR_PTR("Antigravity CLI v"), STR_LEN("Antigravity CLI v"));
+        if probe.has_version {
+            n = n + append_bytes(&self.status_message, 1024, n, probe.version_ptr, probe.version_len);
+        } else {
+            n = n + append_bytes(&self.status_message, 1024, n, STR_PTR("unknown"), STR_LEN("unknown"));
+        };
+        n = n + append_bytes(&self.status_message, 1024, n, STR_PTR(" ready"), STR_LEN(" ready"));
+        if launch {
+            n = n + append_bytes(&self.status_message, 1024, n, STR_PTR(" · agy-launch configured"), STR_LEN(" · agy-launch configured"));
+        };
+        self.status_message_len = n;
+    };
+}
+
+// stop(): interrupt every runtime, stop proxies, clear.
+fn AgyBridge_stop(self: &AgyBridge) -> void {
+    for i in 0..self.sessions_count {
+        let s = &self.sessions[i];
+        if s.has_runtime { AgyCompatibleRuntime_interrupt(&s.runtime); };
+        if s.has_proxy {
+            AgyProxyServer_stop(&s.proxy);
+            s.has_proxy = false;
+        };
+    }
+    self.sessions_count = 0;
+}
+
+// restart(): stop + start.
+fn AgyBridge_restart(self: &AgyBridge) -> void {
+    AgyBridge_stop(self);
+    AgyBridge_start(self);
+}
+
+// notify(method, params): notifications don't expect
+// responses — no-op.
+
+// respond(id, result?, error?): route to the session whose
+// runtime has the pending question.
+fn AgyBridge_respond(self: &AgyBridge, id_ptr: ptr, id_len: u64, result_doc: u64, has_error: bool, err_ptr: ptr, err_len: u64) -> void {
+    for i in 0..self.sessions_count {
+        let s = &self.sessions[i];
+        if s.has_runtime && AgyCompatibleRuntime_hasPendingQuestion(&s.runtime, id_ptr, id_len) {
+            AgyCompatibleRuntime_resolvePendingQuestion(&s.runtime, id_ptr, id_len, result_doc, has_error, err_ptr, err_len);
+            return;
+        };
+    }
+}
+
+// deleteSession(threadId)
+fn AgyBridge_deleteSession(self: &AgyBridge, threadId_ptr: ptr, threadId_len: u64) -> void {
+    let idx = bridge_find(self, threadId_ptr, threadId_len);
+    if idx == 4294967295 { return; };
+    let s = &self.sessions[idx];
+    if s.has_runtime { AgyCompatibleRuntime_interrupt(&s.runtime); };
+    if s.has_proxy {
+        AgyProxyServer_stop(&s.proxy);
+        s.has_proxy = false;
+    };
+    let i = idx;
+    while i + 1 < self.sessions_count {
+        self.sessions[i] = self.sessions[i + 1];
+        i = i + 1;
+    }
+    self.sessions_count = self.sessions_count - 1;
+}
+
+// ---- session table helpers ----
+
+fn bridge_find(self: &AgyBridge, threadId_ptr: ptr, threadId_len: u64) -> u64 {
+    for i in 0..self.sessions_count {
+        if self.sessions[i].threadId_len == threadId_len && bytes_eq(self.sessions[i].threadId_ptr, threadId_ptr, threadId_len) { return i; };
+    }
+    return 4294967295;
+}
+
+fn bridge_emit(self: &AgyBridge, kind_ptr: ptr, kind_len: u64, payload_ptr: ptr, payload_len: u64) -> void {
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, kind_ptr, kind_len);
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, STR_PTR("\t"), 1);
+    if payload_len > 0 {
+        self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, payload_ptr, payload_len);
+    };
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, STR_PTR("\n"), 1);
+}
+
+// session_init: zero a fresh session slot.
+fn session_init(s: &AgySession, threadId_ptr: ptr, threadId_len: u64) -> void {
+    s.threadId_ptr = threadId_ptr;
+    s.threadId_len = threadId_len;
+    s.has_ownerId = false;
+    s.has_addDirs = false;
+    s.has_model = false;
+    s.has_effort = false;
+    s.has_developerInstructions = false;
+    s.has_mode = false;
+    s.has_conversationId = false;
+    s.has_providerId = false;
+    s.has_groupId = false;
+    s.has_preview = false;
+    s.has_goalObjective = false;
+    s.goal_null = true;
+    s.has_goalStatus = false;
+    s.has_activeTurnId = false;
+    s.activeTurnId_len = 0;
+    s.has_pending = false;
+    s.pending_prompt_len = 0;
+    s.pending_turnId_len = 0;
+    s.pending_compact = false;
+    s.has_proxy = false;
+    s.has_runtime = false;
+    s.turns_count = 0;
+    s.messages_len = 0;
+    s.msg_count = 0;
+    // cwd defaults to process.cwd() at the call sites that need
+    // it (snapshot.cwd ?? process.cwd()).
+    s.cwd_ptr = PTR_NULL();
+    s.cwd_len = 0;
+}
+
+fn session_add_turn(s: &AgySession, turnId_ptr: ptr, turnId_len: u64, status_ptr: ptr, status_len: u64, createdAt: u64) -> void {
+    if s.turns_count >= 256 { return; };
+    let idx = s.turns_count;
+    s.turns[idx].id_len = buf_copy(&s.turns[idx].id, 64, turnId_ptr, turnId_len);
+    s.turns[idx].status_len = buf_copy(&s.turns[idx].status, 32, status_ptr, status_len);
+    s.turns[idx].createdAt = createdAt;
+    s.turns_count = s.turns_count + 1;
+}
+
+fn session_set_turn_status(s: &AgySession, turnId_ptr: ptr, turnId_len: u64, status_ptr: ptr, status_len: u64) -> void {
+    for i in 0..s.turns_count {
+        if s.turns[i].id_len == turnId_len && bytes_eq(&s.turns[i].id, turnId_ptr, turnId_len) {
+            s.turns[i].status_len = buf_copy(&s.turns[i].status, 32, status_ptr, status_len);
+            return;
+        };
+    }
+}
+
+fn session_push_message(s: &AgySession, json_ptr: ptr, json_len: u64) -> void {
+    if s.msg_count >= 2048 { return; };
+    let idx = s.msg_count;
+    s.msg_off[idx] = s.messages_len;
+    s.msg_len_arr[idx] = json_len;
+    for i in 0..json_len {
+        if s.messages_len < 1048576 { s.messages[s.messages_len] = byte_at(json_ptr, i); s.messages_len = s.messages_len + 1; };
+    }
+    s.msg_count = s.msg_count + 1;
+}
+
+fn session_msg_ptr(s: &AgySession, idx: u64) -> ptr {
+    let r: ptr = PTR_NULL();
+    PTR_BYTE_ADD(r, &s.messages, s.msg_off[idx]);
+    return r;
+}
+
+// persistSession(session): snapshot JSON -> options.onSnapshot
+// host shim (only when options were supplied).
+fn AgyBridge_persistSession(self: &AgyBridge, s: &AgySession) -> void {
+    if !self.has_options { return; };
+    let snap = [0u8; 1048576];
+    let snap_len: u64 = 0;
+    session_snapshot_json(s, &snap, 1048576, &snap_len);
+    host_on_snapshot(&snap, snap_len);
+}
+
+// session_snapshot_json: the AgySessionSnapshot shape.
+fn session_snapshot_json(s: &AgySession, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"threadId\":\""), STR_LEN("{\"threadId\":\""));
+    n = n + append_bytes(out, out_cap, n, s.threadId_ptr, s.threadId_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    n = append_opt_str_field(out, out_cap, n, STR_PTR("ownerId"), STR_LEN("ownerId"), s.ownerId_ptr, s.ownerId_len, s.has_ownerId);
+    n = append_opt_str_field(out, out_cap, n, STR_PTR("conversationId"), STR_LEN("conversationId"), s.conversationId_ptr, s.conversationId_len, s.has_conversationId);
+    n = append_opt_str_field(out, out_cap, n, STR_PTR("preview"), STR_LEN("preview"), s.preview_ptr, s.preview_len, s.has_preview);
+    n = append_opt_str_field(out, out_cap, n, STR_PTR("model"), STR_LEN("model"), s.model_ptr, s.model_len, s.has_model);
+    n = append_opt_str_field(out, out_cap, n, STR_PTR("effort"), STR_LEN("effort"), s.effort_ptr, s.effort_len, s.has_effort);
+    n = append_opt_str_field(out, out_cap, n, STR_PTR("developerInstructions"), STR_LEN("developerInstructions"), s.developerInstructions_ptr, s.developerInstructions_len, s.has_developerInstructions);
+    n = append_opt_str_field(out, out_cap, n, STR_PTR("cwd"), STR_LEN("cwd"), s.cwd_ptr, s.cwd_len, s.cwd_len > 0);
+    if s.has_addDirs {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"addDirs\":"), STR_LEN(",\"addDirs\":"));
+        n = n + append_bytes(out, out_cap, n, s.addDirs_ptr, s.addDirs_len);
+    };
+    if s.has_mode {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"mode\":\""), STR_LEN(",\"mode\":\""));
+        if s.mode == 2 {
+            n = n + append_bytes(out, out_cap, n, STR_PTR("plan"), 4);
+        } else {
+            n = n + append_bytes(out, out_cap, n, STR_PTR("accept-edits"), STR_LEN("accept-edits"));
+        };
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    };
+    if s.has_goalObjective {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"goalObjective\":\""), STR_LEN(",\"goalObjective\":\""));
+        n = n + append_bytes(out, out_cap, n, s.goalObjective_ptr, s.goalObjective_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    } else if s.goal_null {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"goalObjective\":null"), STR_LEN(",\"goalObjective\":null"));
+    };
+    if s.has_goalStatus {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"goalStatus\":\""), STR_LEN(",\"goalStatus\":\""));
+        n = n + append_bytes(out, out_cap, n, s.goalStatus_ptr, s.goalStatus_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    } else {
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"goalStatus\":null"), STR_LEN(",\"goalStatus\":null"));
+    };
+    // turns
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"turns\":["), STR_LEN(",\"turns\":["));
+    for i in 0..s.turns_count {
+        if i > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+        n = n + append_bytes(out, out_cap, n, &s.turns[i].id, s.turns[i].id_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"status\":\""), STR_LEN("\",\"status\":\""));
+        n = n + append_bytes(out, out_cap, n, &s.turns[i].status, s.turns[i].status_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"createdAt\":"), STR_LEN("\",\"createdAt\":"));
+        n = n + append_u64(out, out_cap, n, s.turns[i].createdAt);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("}"), 1);
+    }
+    n = n + append_bytes(out, out_cap, n, STR_PTR("],\"messages\":["), STR_LEN("],\"messages\":["));
+    for i in 0..s.msg_count {
+        if i > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+        n = n + append_bytes(out, out_cap, n, session_msg_ptr(s, i), s.msg_len_arr[i]);
+    }
+    n = n + append_bytes(out, out_cap, n, STR_PTR("]"), 1);
+    n = append_opt_str_field(out, out_cap, n, STR_PTR("providerId"), STR_LEN("providerId"), s.providerId_ptr, s.providerId_len, s.has_providerId);
+    n = append_opt_str_field(out, out_cap, n, STR_PTR("groupId"), STR_LEN("groupId"), s.groupId_ptr, s.groupId_len, s.has_groupId);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("}"), 1);
+    out_len = n;
+}
+
+fn append_opt_str_field(out: ptr, out_cap: u64, at: u64, key_ptr: ptr, key_len: u64, v_ptr: ptr, v_len: u64, has: bool) -> u64 {
+    if !has { return at; };
+    let n = at;
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\""), 2);
+    n = n + append_bytes(out, out_cap, n, key_ptr, key_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\":\""), 3);
+    n = n + append_bytes(out, out_cap, n, v_ptr, v_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    return n;
+}
+
+// restoreSession(snapshot): merge or create from a snapshot
+// JSON text. Returns the session index.
+fn AgyBridge_restoreSession(self: &AgyBridge, snap_ptr: ptr, snap_len: u64, out_idx: &u64) -> void {
+    let doc = sa_json_parse(snap_ptr, snap_len);
+    let thread_ptr: ptr = PTR_NULL();
+    let thread_len: u64 = 0;
+    sa_json_object_get_string(doc, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len);
+    // effectiveProviderId = snapshot.providerId || "agy-official"
+    let prov_ptr: ptr = PTR_NULL();
+    let prov_len: u64 = 0;
+    let has_prov = sa_json_object_get_string(doc, STR_PTR("providerId"), STR_LEN("providerId"), &prov_ptr, &prov_len) == 0 && prov_len > 0;
+    if !has_prov { prov_ptr = AGY_OFFICIAL_PROVIDER_ID_ptr(); prov_len = AGY_OFFICIAL_PROVIDER_ID_len(); };
+    let is_official = str_is(prov_ptr, prov_len, AGY_OFFICIAL_PROVIDER_ID_ptr(), AGY_OFFICIAL_PROVIDER_ID_len());
+    // effectiveGroupId: undefined when official or
+    // snapshot.groupId === null
+    let group_ptr: ptr = PTR_NULL();
+    let group_len: u64 = 0;
+    let has_group = false;
+    let group_node: u64 = 0;
+    let group_is_null = sa_json_object_get(doc, STR_PTR("groupId"), STR_LEN("groupId"), &group_node) == 0 && json_node_is_null(group_node);
+    if !is_official && !group_is_null {
+        if sa_json_object_get_string(doc, STR_PTR("groupId"), STR_LEN("groupId"), &group_ptr, &group_len) == 0 { has_group = true; };
+    };
+    // effectiveModel: official + (no model or non-official
+    // model) -> "gemini-3.8-flash-high"
+    let model_ptr: ptr = PTR_NULL();
+    let model_len: u64 = 0;
+    let has_model = sa_json_object_get_string(doc, STR_PTR("model"), STR_LEN("model"), &model_ptr, &model_len) == 0 && model_len > 0;
+    if is_official && (!has_model || !isAgyOfficialModel(model_ptr, model_len, has_model)) {
+        model_ptr = STR_PTR("gemini-3.8-flash-high");
+        model_len = STR_LEN("gemini-3.8-flash-high");
+        has_model = true;
+    };
+    let existing = bridge_find(self, thread_ptr, thread_len);
+    if existing != 4294967295 {
+        let s = &self.sessions[existing];
+        let v_ptr: ptr = PTR_NULL();
+        let v_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("conversationId"), STR_LEN("conversationId"), &v_ptr, &v_len) == 0 { s.conversationId_ptr = v_ptr; s.conversationId_len = v_len; s.has_conversationId = true; };
+        if sa_json_object_get_string(doc, STR_PTR("preview"), STR_LEN("preview"), &v_ptr, &v_len) == 0 { s.preview_ptr = v_ptr; s.preview_len = v_len; s.has_preview = true; };
+        // turns / messages replaced when present
+        let turns_node: u64 = 0;
+        if sa_json_object_get(doc, STR_PTR("turns"), STR_LEN("turns"), &turns_node) == 0 { session_load_turns(s, turns_node); };
+        let msgs_node: u64 = 0;
+        if sa_json_object_get(doc, STR_PTR("messages"), STR_LEN("messages"), &msgs_node) == 0 { session_load_messages(s, msgs_node); };
+        s.providerId_ptr = prov_ptr;
+        s.providerId_len = prov_len;
+        s.has_providerId = true;
+        s.groupId_ptr = group_ptr;
+        s.groupId_len = group_len;
+        s.has_groupId = has_group;
+        if has_model { s.model_ptr = model_ptr; s.model_len = model_len; s.has_model = true; };
+        if sa_json_object_get_string(doc, STR_PTR("effort"), STR_LEN("effort"), &v_ptr, &v_len) == 0 { s.effort_ptr = v_ptr; s.effort_len = v_len; s.has_effort = true; };
+        if sa_json_object_get_string(doc, STR_PTR("developerInstructions"), STR_LEN("developerInstructions"), &v_ptr, &v_len) == 0 { s.developerInstructions_ptr = v_ptr; s.developerInstructions_len = v_len; s.has_developerInstructions = true; };
+        if sa_json_object_get_string(doc, STR_PTR("cwd"), STR_LEN("cwd"), &v_ptr, &v_len) == 0 { s.cwd_ptr = v_ptr; s.cwd_len = v_len; };
+        let add_node: u64 = 0;
+        if sa_json_object_get(doc, STR_PTR("addDirs"), STR_LEN("addDirs"), &add_node) == 0 {
+            let h: u64 = 0;
+            if sa_json_stringify(add_node, &h) == 0 {
+                let bp: ptr = PTR_NULL();
+                let bl: u64 = 0;
+                sa_json_buffer_data(h, &bp);
+                sa_json_buffer_len(h, &bl);
+                s.addDirs_ptr = bp;
+                s.addDirs_len = bl;
+                s.has_addDirs = true;
+            };
+        };
+        let mode_ptr: ptr = PTR_NULL();
+        let mode_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("mode"), STR_LEN("mode"), &mode_ptr, &mode_len) == 0 {
+            s.mode = if str_is(mode_ptr, mode_len, STR_PTR("plan"), 4) { 2 } else { 1 };
+            s.has_mode = true;
+        };
+        out_idx = existing;
+        return;
+    };
+    if self.sessions_count >= 16 { out_idx = 4294967295; return; };
+    let idx = self.sessions_count;
+    let s = &self.sessions[idx];
+    session_init(s, thread_ptr, thread_len);
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    if sa_json_object_get_string(doc, STR_PTR("ownerId"), STR_LEN("ownerId"), &v_ptr, &v_len) == 0 { s.ownerId_ptr = v_ptr; s.ownerId_len = v_len; s.has_ownerId = true; };
+    if sa_json_object_get_string(doc, STR_PTR("conversationId"), STR_LEN("conversationId"), &v_ptr, &v_len) == 0 { s.conversationId_ptr = v_ptr; s.conversationId_len = v_len; s.has_conversationId = true; };
+    if sa_json_object_get_string(doc, STR_PTR("preview"), STR_LEN("preview"), &v_ptr, &v_len) == 0 { s.preview_ptr = v_ptr; s.preview_len = v_len; s.has_preview = true; };
+    if has_model { s.model_ptr = model_ptr; s.model_len = model_len; s.has_model = true; };
+    if sa_json_object_get_string(doc, STR_PTR("effort"), STR_LEN("effort"), &v_ptr, &v_len) == 0 { s.effort_ptr = v_ptr; s.effort_len = v_len; s.has_effort = true; };
+    if sa_json_object_get_string(doc, STR_PTR("developerInstructions"), STR_LEN("developerInstructions"), &v_ptr, &v_len) == 0 { s.developerInstructions_ptr = v_ptr; s.developerInstructions_len = v_len; s.has_developerInstructions = true; };
+    if sa_json_object_get_string(doc, STR_PTR("cwd"), STR_LEN("cwd"), &v_ptr, &v_len) == 0 {
+        s.cwd_ptr = v_ptr;
+        s.cwd_len = v_len;
+    } else {
+        // cwd ?? process.cwd() — the cwd buffer is owned by a
+        // bridge scratch in this pass.
+        let cwd_buf = [0u8; 1024];
+        let cwd_len: u64 = 0;
+        cwd_len = process_cwd(&cwd_buf, 1024);
+        s.cwd_ptr = &cwd_buf;
+        s.cwd_len = cwd_len;
+    };
+    let add_node: u64 = 0;
+    if sa_json_object_get(doc, STR_PTR("addDirs"), STR_LEN("addDirs"), &add_node) == 0 {
+        let h: u64 = 0;
+        if sa_json_stringify(add_node, &h) == 0 {
+            let bp: ptr = PTR_NULL();
+            let bl: u64 = 0;
+            sa_json_buffer_data(h, &bp);
+            sa_json_buffer_len(h, &bl);
+            s.addDirs_ptr = bp;
+            s.addDirs_len = bl;
+            s.has_addDirs = true;
+        };
+    };
+    let mode_ptr: ptr = PTR_NULL();
+    let mode_len: u64 = 0;
+    if sa_json_object_get_string(doc, STR_PTR("mode"), STR_LEN("mode"), &mode_ptr, &mode_len) == 0 {
+        s.mode = if str_is(mode_ptr, mode_len, STR_PTR("plan"), 4) { 2 } else { 1 };
+        s.has_mode = true;
+    };
+    if sa_json_object_get_string(doc, STR_PTR("goalObjective"), STR_LEN("goalObjective"), &v_ptr, &v_len) == 0 { s.goalObjective_ptr = v_ptr; s.goalObjective_len = v_len; s.has_goalObjective = true; s.goal_null = false; };
+    if sa_json_object_get_string(doc, STR_PTR("goalStatus"), STR_LEN("goalStatus"), &v_ptr, &v_len) == 0 { s.goalStatus_ptr = v_ptr; s.goalStatus_len = v_len; s.has_goalStatus = true; };
+    let turns_node: u64 = 0;
+    if sa_json_object_get(doc, STR_PTR("turns"), STR_LEN("turns"), &turns_node) == 0 { session_load_turns(s, turns_node); };
+    let msgs_node: u64 = 0;
+    if sa_json_object_get(doc, STR_PTR("messages"), STR_LEN("messages"), &msgs_node) == 0 { session_load_messages(s, msgs_node); };
+    s.providerId_ptr = prov_ptr;
+    s.providerId_len = prov_len;
+    s.has_providerId = true;
+    s.groupId_ptr = group_ptr;
+    s.groupId_len = group_len;
+    s.has_groupId = has_group;
+    self.sessions_count = self.sessions_count + 1;
+    out_idx = idx;
+}
+
+fn session_load_turns(s: &AgySession, turns_node: u64) -> void {
+    s.turns_count = 0;
+    let n = sa_json_array_len(turns_node);
+    for i in 0..n {
+        let row: u64 = 0;
+        if sa_json_array_get(turns_node, i, &row) != 0 { continue; };
+        let id_ptr: ptr = PTR_NULL();
+        let id_len: u64 = 0;
+        sa_json_object_get_string(row, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len);
+        let st_ptr: ptr = PTR_NULL();
+        let st_len: u64 = 0;
+        sa_json_object_get_string(row, STR_PTR("status"), STR_LEN("status"), &st_ptr, &st_len);
+        let created: i64 = 0;
+        sa_json_object_get_i64(row, STR_PTR("createdAt"), STR_LEN("createdAt"), &created);
+        session_add_turn(s, id_ptr, id_len, st_ptr, st_len, created as u64);
+    }
+}
+
+fn session_load_messages(s: &AgySession, msgs_node: u64) -> void {
+    s.msg_count = 0;
+    s.messages_len = 0;
+    let n = sa_json_array_len(msgs_node);
+    for i in 0..n {
+        let node: u64 = 0;
+        if sa_json_array_get(msgs_node, i, &node) != 0 { continue; };
+        let h: u64 = 0;
+        if sa_json_stringify(node, &h) == 0 {
+            let bp: ptr = PTR_NULL();
+            let bl: u64 = 0;
+            sa_json_buffer_data(h, &bp);
+            sa_json_buffer_len(h, &bl);
+            session_push_message(s, bp, bl);
+            sa_json_buffer_free(h);
+        };
+    }
+}
+
+// getOrRestoreSession(threadId, ownerId?)
+fn AgyBridge_getOrRestoreSession(self: &AgyBridge, threadId_ptr: ptr, threadId_len: u64, ownerId_ptr: ptr, ownerId_len: u64, has_owner: bool, out_idx: &u64, out_has: &bool) -> void {
+    let idx = bridge_find(self, threadId_ptr, threadId_len);
+    if idx != 4294967295 { out_idx = idx; out_has = true; return; };
+    out_has = false;
+    if self.has_options {
+        let snap = [0u8; 1048576];
+        let snap_len: u64 = 0;
+        let has_snap = false;
+        host_load_snapshot(threadId_ptr, threadId_len, ownerId_ptr, ownerId_len, has_owner, &snap, 1048576, &snap_len, &has_snap);
+        if has_snap {
+            AgyBridge_restoreSession(self, &snap, snap_len, &idx);
+            if idx != 4294967295 { out_idx = idx; out_has = true; };
+        };
+    };
+}
+
+// ---- runtime event wiring (wireRuntimeEvents) ----
+// The source subscribes runtime.on(...) per session; here the
+// bridge drains each runtime's event queue in
+// AgyBridge_pumpRuntime (called by the owner loop after
+// AgyCompatibleRuntime_pump).
+
+fn AgyBridge_pumpRuntime(self: &AgyBridge, session_idx: u64) -> void {
+    let s = &self.sessions[session_idx];
+    if !s.has_runtime { return; };
+    let rt = &s.runtime;
+    let pos: u64 = 0;
+    let kind = [0u8; 64];
+    let payload = [0u8; 1048576];
+    while true {
+        let kind_len: u64 = 0;
+        let payload_len: u64 = 0;
+        let has = false;
+        queue_next(&rt.eventQueue, rt.eventQueue_len, &pos, &kind, 64, &kind_len, &payload, 1048576, &payload_len, &has);
+        if !has { break; };
+        if str_is(&kind, kind_len, STR_PTR("conversationId"), STR_LEN("conversationId")) {
+            s.conversationId_ptr = &payload;
+            s.conversationId_len = payload_len;
+            s.has_conversationId = true;
+            // NOTE: payload is the pump scratch — the repair
+            // phase copies it into session-owned storage.
+            AgyBridge_persistSession(self, s);
+        } else if str_is(&kind, kind_len, STR_PTR("serverRequest"), STR_LEN("serverRequest")) {
+            bridge_emit(self, STR_PTR("message"), STR_LEN("message"), &payload, payload_len);
+        } else if str_is(&kind, kind_len, STR_PTR("questionAnswered"), STR_LEN("questionAnswered")) {
+            // prompt = `针对上一轮提问的用户回答如下：${answerText}\n请按此继续执行，不要重复提问。`
+            let doc = sa_json_parse(&payload, payload_len);
+            let a_ptr: ptr = PTR_NULL();
+            let a_len: u64 = 0;
+            let t_ptr: ptr = PTR_NULL();
+            let t_len: u64 = 0;
+            if doc != 0 {
+                sa_json_object_get_string(doc, STR_PTR("answerText"), STR_LEN("answerText"), &a_ptr, &a_len);
+                sa_json_object_get_string(doc, STR_PTR("threadId"), STR_LEN("threadId"), &t_ptr, &t_len);
+            };
+            let prompt = [0u8; 16384];
+            let prompt_len: u64 = 0;
+            prompt_len = prompt_len + append_bytes(&prompt, 16384, prompt_len, STR_PTR("针对上一轮提问的用户回答如下："), STR_LEN("针对上一轮提问的用户回答如下："));
+            prompt_len = prompt_len + append_bytes(&prompt, 16384, prompt_len, a_ptr, a_len);
+            prompt_len = prompt_len + append_bytes(&prompt, 16384, prompt_len, STR_PTR("\n请按此继续执行，不要重复提问。"), STR_LEN("\n请按此继续执行，不要重复提问。"));
+            // void this.request("turn/start", { threadId, prompt })
+            let params = [0u8; 32768];
+            let params_len: u64 = 0;
+            params_len = params_len + append_bytes(&params, 32768, params_len, STR_PTR("{\"threadId\":\""), STR_LEN("{\"threadId\":\""));
+            params_len = params_len + append_bytes(&params, 32768, params_len, t_ptr, t_len);
+            params_len = params_len + append_bytes(&params, 32768, params_len, STR_PTR("\",\"prompt\":\""), STR_LEN("\",\"prompt\":\""));
+            params_len = params_len + append_bytes(&params, 32768, params_len, &prompt, prompt_len);
+            params_len = params_len + append_bytes(&params, 32768, params_len, STR_PTR("\"}"), 2);
+            let result = [0u8; 4096];
+            let result_len: u64 = 0;
+            let err = [0u8; 1024];
+            let err_len: u64 = 0;
+            AgyBridge_request(self, STR_PTR("turn/start"), STR_LEN("turn/start"), &params, params_len, &result, 4096, &result_len, &err, 1024, &err_len);
+        } else if str_is(&kind, kind_len, STR_PTR("notification"), STR_LEN("notification")) {
+            AgyBridge_handleNotification(self, session_idx, &payload, payload_len);
+            bridge_emit(self, STR_PTR("notification"), STR_LEN("notification"), &payload, payload_len);
+        } else if str_is(&kind, kind_len, STR_PTR("error"), STR_LEN("error")) {
+            // The source re-emits runtime "error" only through
+            // its own EventEmitter defaults; notifications were
+            // already produced by the runtime's error path.
+        };
+    }
+    rt.eventQueue_len = 0;
+}
+
+// handleNotification bookkeeping (the wireRuntimeEvents
+// notification branch, before the re-emit).
+fn AgyBridge_handleNotification(self: &AgyBridge, session_idx: u64, payload_ptr: ptr, payload_len: u64) -> void {
+    let s = &self.sessions[session_idx];
+    let doc = sa_json_parse(payload_ptr, payload_len);
+    if doc == 0 { return; };
+    let method_ptr: ptr = PTR_NULL();
+    let method_len: u64 = 0;
+    sa_json_object_get_string(doc, STR_PTR("method"), STR_LEN("method"), &method_ptr, &method_len);
+    let params: u64 = 0;
+    sa_json_object_get(doc, STR_PTR("params"), STR_LEN("params"), &params);
+    if str_is(method_ptr, method_len, STR_PTR("item/completed"), STR_LEN("item/completed")) || str_is(method_ptr, method_len, STR_PTR("item/started"), STR_LEN("item/started")) {
+        let item: u64 = 0;
+        if params == 0 || sa_json_object_get(params, STR_PTR("item"), STR_LEN("item"), &item) != 0 { return; };
+        // item.turnId ??= params.turnId ?? session.activeTurnId
+        let it_turn_ptr: ptr = PTR_NULL();
+        let it_turn_len: u64 = 0;
+        let has_it_turn = sa_json_object_get_string(item, STR_PTR("turnId"), STR_LEN("turnId"), &it_turn_ptr, &it_turn_len) == 0 && it_turn_len > 0;
+        let item_json = [0u8; 262144];
+        let item_len: u64 = 0;
+        item_len = stringify_into(item, &item_json, 262144);
+        if !has_it_turn {
+            // Rebuild with turnId injected (draft: textual —
+            // the item JSON starts with '{').
+            let p_turn_ptr: ptr = PTR_NULL();
+            let p_turn_len: u64 = 0;
+            let has_p_turn = params != 0 && sa_json_object_get_string(params, STR_PTR("turnId"), STR_LEN("turnId"), &p_turn_ptr, &p_turn_len) == 0 && p_turn_len > 0;
+            let fill_ptr = p_turn_ptr;
+            let fill_len = p_turn_len;
+            if !has_p_turn {
+                fill_ptr = &s.activeTurnId;
+                fill_len = s.activeTurnId_len;
+            };
+            if fill_len > 0 && item_len > 1 {
+                let rebuilt = [0u8; 262144];
+                let rebuilt_len: u64 = 0;
+                rebuilt_len = rebuilt_len + append_bytes(&rebuilt, 262144, rebuilt_len, STR_PTR("{\"turnId\":\""), STR_LEN("{\"turnId\":\""));
+                rebuilt_len = rebuilt_len + append_bytes(&rebuilt, 262144, rebuilt_len, fill_ptr, fill_len);
+                rebuilt_len = rebuilt_len + append_bytes(&rebuilt, 262144, rebuilt_len, STR_PTR("\","), 2);
+                rebuilt_len = rebuilt_len + append_bytes(&rebuilt, 262144, rebuilt_len, byte_off(&item_json, 1), item_len - 1);
+                item_len = buf_copy(&item_json, 262144, &rebuilt, rebuilt_len);
+            };
+        };
+        // findIndex by item.id
+        let id_ptr: ptr = PTR_NULL();
+        let id_len: u64 = 0;
+        sa_json_object_get_string(item, STR_PTR("id"), STR_LEN("id"), &id_ptr, &id_len);
+        let found = 4294967295;
+        for i in 0..s.msg_count {
+            let mdoc = sa_json_parse(session_msg_ptr(s, i), s.msg_len_arr[i]);
+            if mdoc == 0 { continue; };
+            let mid_ptr: ptr = PTR_NULL();
+            let mid_len: u64 = 0;
+            if sa_json_object_get_string(mdoc, STR_PTR("id"), STR_LEN("id"), &mid_ptr, &mid_len) == 0 && mid_len == id_len && bytes_eq(mid_ptr, id_ptr, id_len) { found = i; break; };
+        }
+        if found != 4294967295 {
+            // terminal guard for item/started
+            if str_is(method_ptr, method_len, STR_PTR("item/started"), STR_LEN("item/started")) {
+                let mdoc = sa_json_parse(session_msg_ptr(s, found), s.msg_len_arr[found]);
+                let st_ptr: ptr = PTR_NULL();
+                let st_len: u64 = 0;
+                if mdoc != 0 { sa_json_object_get_string(mdoc, STR_PTR("status"), STR_LEN("status"), &st_ptr, &st_len); };
+                if str_is(st_ptr, st_len, STR_PTR("completed"), STR_LEN("completed")) || str_is(st_ptr, st_len, STR_PTR("failed"), STR_LEN("failed")) || str_is(st_ptr, st_len, STR_PTR("interrupted"), STR_LEN("interrupted")) { return; };
+            };
+            // messages[idx] = item (replace bytes in place
+            // when the slot capacity allows; else append —
+            // slot lengths are fixed in this pass, so a longer
+            // replacement truncates: logged).
+            let slot_len = s.msg_len_arr[found];
+            let copy_len = item_len;
+            if copy_len > slot_len { copy_len = slot_len; };
+            let dst = session_msg_ptr(s, found);
+            for i in 0..copy_len {
+                PTR_BYTE_SET(dst, i, byte_at(&item_json, i));
+            }
+        } else {
+            session_push_message(s, &item_json, item_len);
+        };
+        return;
+    };
+    if str_is(method_ptr, method_len, STR_PTR("turn/completed"), STR_LEN("turn/completed")) || str_is(method_ptr, method_len, STR_PTR("turn/failed"), STR_LEN("turn/failed")) || str_is(method_ptr, method_len, STR_PTR("turn/interrupted"), STR_LEN("turn/interrupted")) {
+        let turn_ptr: ptr = PTR_NULL();
+        let turn_len: u64 = 0;
+        if params != 0 { sa_json_object_get_string(params, STR_PTR("turnId"), STR_LEN("turnId"), &turn_ptr, &turn_len); };
+        let status_ptr = STR_PTR("completed");
+        let status_len = STR_LEN("completed");
+        if str_is(method_ptr, method_len, STR_PTR("turn/failed"), STR_LEN("turn/failed")) { status_ptr = STR_PTR("failed"); status_len = STR_LEN("failed"); };
+        if str_is(method_ptr, method_len, STR_PTR("turn/interrupted"), STR_LEN("turn/interrupted")) { status_ptr = STR_PTR("interrupted"); status_len = STR_LEN("interrupted"); };
+        session_set_turn_status(s, turn_ptr, turn_len, status_ptr, status_len);
+        s.has_activeTurnId = false;
+        s.activeTurnId_len = 0;
+        AgyBridge_persistSession(self, s);
+        return;
+    };
+    if str_is(method_ptr, method_len, STR_PTR("agy/init"), STR_LEN("agy/init")) {
+        let conv_ptr: ptr = PTR_NULL();
+        let conv_len: u64 = 0;
+        if params != 0 && sa_json_object_get_string(params, STR_PTR("conversationId"), STR_LEN("conversationId"), &conv_ptr, &conv_len) == 0 && conv_len > 0 {
+            s.conversationId_ptr = conv_ptr;
+            s.conversationId_len = conv_len;
+            s.has_conversationId = true;
+            AgyBridge_persistSession(self, s);
+        };
+        return;
+    };
+}
+
+// ---- configureSessionProxy ----
+// Returns env JSON text (out_env) with out_has_env, or code 1
+// with the source's error message. Mirrors the source's branch
+// order: official -> agy-launch -> gateway env -> proxy config
+// -> relay env fallback -> throw.
+fn AgyBridge_configureSessionProxy(self: &AgyBridge, session_idx: u64, has_session: bool, provider_ptr: ptr, provider_len: u64, has_provider: bool, group_ptr: ptr, group_len: u64, has_group: bool, model_ptr: ptr, model_len: u64, has_model: bool, out_env: ptr, out_env_cap: u64, out_env_len: &u64, out_has_env: &bool, out_err: ptr, out_err_cap: u64, out_err_len: &u64) -> i32 {
+    out_has_env = false;
+    let effective_ptr = AGY_OFFICIAL_PROVIDER_ID_ptr();
+    let effective_len = AGY_OFFICIAL_PROVIDER_ID_len();
+    if has_provider && provider_len > 0 { effective_ptr = provider_ptr; effective_len = provider_len; };
+    let is_launch = (has_provider && str_is(provider_ptr, provider_len, STR_PTR("agy-launch"), STR_LEN("agy-launch"))) || (has_provider && contains(provider_ptr, provider_len, STR_PTR("agy-launch"), STR_LEN("agy-launch")));
+    if str_is(effective_ptr, effective_len, AGY_OFFICIAL_PROVIDER_ID_ptr(), AGY_OFFICIAL_PROVIDER_ID_len()) {
+        if has_session {
+            let s = &self.sessions[session_idx];
+            if s.has_proxy {
+                AgyProxyServer_stop(&s.proxy);
+                s.has_proxy = false;
+            };
+        };
+        return 0;
+    };
+    if is_launch {
+        out_env_len = buf_copy(out_env, out_env_cap, STR_PTR("{\"CLOUD_CODE_URL\":\"http://127.0.0.1:0\"}"), STR_LEN("{\"CLOUD_CODE_URL\":\"http://127.0.0.1:0\"}"));
+        out_has_env = true;
+        return 0;
+    };
+    // Gateway mode first when the host offers relay env with
+    // AGY_LLM_GATEWAY_URL.
+    if self.has_options {
+        let env = [0u8; 16384];
+        let env_len: u64 = 0;
+        let has_env = false;
+        host_resolve_relay_env(effective_ptr, effective_len, group_ptr, group_len, has_group, model_ptr, model_len, has_model, &env, 16384, &env_len, &has_env);
+        if has_env {
+            let doc = sa_json_parse(&env, env_len);
+            let gw_ptr: ptr = PTR_NULL();
+            let gw_len: u64 = 0;
+            if doc != 0 && sa_json_object_get_string(doc, STR_PTR("AGY_LLM_GATEWAY_URL"), STR_LEN("AGY_LLM_GATEWAY_URL"), &gw_ptr, &gw_len) == 0 && gw_len > 0 {
+                if has_session {
+                    let s = &self.sessions[session_idx];
+                    if s.has_proxy {
+                        AgyProxyServer_stop(&s.proxy);
+                        s.has_proxy = false;
+                    };
+                };
+                out_env_len = buf_copy(out_env, out_env_cap, &env, env_len);
+                out_has_env = true;
+                return 0;
+            };
+        };
+    };
+    if self.has_options {
+        let cfg = [0u8; 16384];
+        let cfg_len: u64 = 0;
+        let has_cfg = false;
+        host_resolve_relay_proxy_config(effective_ptr, effective_len, group_ptr, group_len, has_group, model_ptr, model_len, has_model, &cfg, 16384, &cfg_len, &has_cfg);
+        if has_cfg {
+            // proxyConfig.threadId = session.threadId (host
+            // shim receives it through the config text in this
+            // pass — the session id is appended by the caller
+            // in the repair phase).
+            if has_session {
+                let s = &self.sessions[session_idx];
+                if !s.has_proxy {
+                    AgyProxyServer_new(&s.proxy, &cfg, cfg_len);
+                    s.has_proxy = true;
+                    let url = [0u8; 1024];
+                    let url_len: u64 = 0;
+                    AgyProxyServer_start(&s.proxy, &url, 1024, &url_len);
+                    return proxy_env(out_env, out_env_cap, out_env_len, out_has_env, &url, url_len, &cfg, cfg_len);
+                } else {
+                    AgyProxyServer_updateConfig(&s.proxy, &cfg, cfg_len);
+                    return proxy_env(out_env, out_env_cap, out_env_len, out_has_env, &s.proxy.url, s.proxy.url_len, &cfg, cfg_len);
+                };
+            } else {
+                // No session to own the server (the source leaks
+                // it the same way — created, started, unstored).
+                let tmp = AgyProxyServer { config_ptr: PTR_NULL(), config_len: 0, url: [0u8; 1024], url_len: 0, running: false, server: 0, has_server: false, arena: [0u8; 262144], arena_len: 0, eventQueue: [0u8; 262144], eventQueue_len: 0 };
+                AgyProxyServer_new(&tmp, &cfg, cfg_len);
+                let url = [0u8; 1024];
+                let url_len: u64 = 0;
+                AgyProxyServer_start(&tmp, &url, 1024, &url_len);
+                return proxy_env(out_env, out_env_cap, out_env_len, out_has_env, &url, url_len, &cfg, cfg_len);
+            };
+        };
+    };
+    if self.has_options {
+        let env = [0u8; 16384];
+        let env_len: u64 = 0;
+        let has_env = false;
+        host_resolve_relay_env(effective_ptr, effective_len, group_ptr, group_len, has_group, model_ptr, model_len, has_model, &env, 16384, &env_len, &has_env);
+        if has_env {
+            let doc = sa_json_parse(&env, env_len);
+            let cloud_ptr: ptr = PTR_NULL();
+            let cloud_len: u64 = 0;
+            if doc != 0 && sa_json_object_get_string(doc, STR_PTR("CLOUD_CODE_URL"), STR_LEN("CLOUD_CODE_URL"), &cloud_ptr, &cloud_len) == 0 && cloud_len > 0 {
+                // { ...relayEnv, GOOGLE_GEMINI_BASE_URL:
+                // relayEnv.GOOGLE_GEMINI_BASE_URL ||
+                // relayEnv.CLOUD_CODE_URL, GEMINI_API_KEY:
+                // relayEnv.GEMINI_API_KEY || "agy-relay-key" }
+                let base_ptr: ptr = PTR_NULL();
+                let base_len: u64 = 0;
+                if sa_json_object_get_string(doc, STR_PTR("GOOGLE_GEMINI_BASE_URL"), STR_LEN("GOOGLE_GEMINI_BASE_URL"), &base_ptr, &base_len) != 0 || base_len == 0 { base_ptr = cloud_ptr; base_len = cloud_len; };
+                let key_ptr: ptr = PTR_NULL();
+                let key_len: u64 = 0;
+                if sa_json_object_get_string(doc, STR_PTR("GEMINI_API_KEY"), STR_LEN("GEMINI_API_KEY"), &key_ptr, &key_len) != 0 || key_len == 0 { key_ptr = STR_PTR("agy-relay-key"); key_len = STR_LEN("agy-relay-key"); };
+                out_env_len = env_with_overrides(&env, env_len, base_ptr, base_len, key_ptr, key_len, out_env, out_env_cap);
+                out_has_env = true;
+                return 0;
+            };
+        };
+    };
+    let n: u64 = 0;
+    n = n + append_bytes(out_err, out_err_cap, n, STR_PTR("AGY relay proxy configuration failed for providerId="), STR_LEN("AGY relay proxy configuration failed for providerId="));
+    n = n + append_bytes(out_err, out_err_cap, n, effective_ptr, effective_len);
+    n = n + append_bytes(out_err, out_err_cap, n, STR_PTR(" groupId="), STR_LEN(" groupId="));
+    if has_group {
+        n = n + append_bytes(out_err, out_err_cap, n, group_ptr, group_len);
+    } else {
+        n = n + append_bytes(out_err, out_err_cap, n, STR_PTR("default"), STR_LEN("default"));
+    };
+    n = n + append_bytes(out_err, out_err_cap, n, STR_PTR(" model="), STR_LEN(" model="));
+    if has_model {
+        n = n + append_bytes(out_err, out_err_cap, n, model_ptr, model_len);
+    } else {
+        n = n + append_bytes(out_err, out_err_cap, n, STR_PTR("unknown"), STR_LEN("unknown"));
+    };
+    out_err_len = n;
+    return 1;
+}
+
+// proxy_env: { CLOUD_CODE_URL: url, GOOGLE_GEMINI_BASE_URL:
+// url, GEMINI_API_KEY: apiKeys[0] || "agy-relay-key" }.
+fn proxy_env(out_env: ptr, out_env_cap: u64, out_env_len: &u64, out_has_env: &bool, url_ptr: ptr, url_len: u64, cfg_ptr: ptr, cfg_len: u64) -> i32 {
+    let key_ptr = STR_PTR("agy-relay-key");
+    let key_len = STR_LEN("agy-relay-key");
+    let doc = sa_json_parse(cfg_ptr, cfg_len);
+    if doc != 0 {
+        let keys: u64 = 0;
+        if sa_json_object_get(doc, STR_PTR("apiKeys"), STR_LEN("apiKeys"), &keys) == 0 {
+            let first: u64 = 0;
+            if sa_json_array_get(keys, 0, &first) == 0 {
+                let kp: ptr = PTR_NULL();
+                let kl: u64 = 0;
+                json_node_string(first, &kp, &kl);
+                if kl > 0 { key_ptr = kp; key_len = kl; };
+            };
+        };
+    };
+    let n: u64 = 0;
+    n = n + append_bytes(out_env, out_env_cap, n, STR_PTR("{\"CLOUD_CODE_URL\":\""), STR_LEN("{\"CLOUD_CODE_URL\":\""));
+    n = n + append_bytes(out_env, out_env_cap, n, url_ptr, url_len);
+    n = n + append_bytes(out_env, out_env_cap, n, STR_PTR("\",\"GOOGLE_GEMINI_BASE_URL\":\""), STR_LEN("\",\"GOOGLE_GEMINI_BASE_URL\":\""));
+    n = n + append_bytes(out_env, out_env_cap, n, url_ptr, url_len);
+    n = n + append_bytes(out_env, out_env_cap, n, STR_PTR("\",\"GEMINI_API_KEY\":\""), STR_LEN("\",\"GEMINI_API_KEY\":\""));
+    n = n + append_bytes(out_env, out_env_cap, n, key_ptr, key_len);
+    n = n + append_bytes(out_env, out_env_cap, n, STR_PTR("\"}"), 2);
+    out_env_len = n;
+    out_has_env = true;
+    return 0;
+}
+
+// env_with_overrides: copy env JSON text, then set
+// GOOGLE_GEMINI_BASE_URL + GEMINI_API_KEY (draft: appended
+// duplicate keys — JSON last-wins in the std parser; logged).
+fn env_with_overrides(env_ptr: ptr, env_len: u64, base_ptr: ptr, base_len: u64, key_ptr: ptr, key_len: u64, out: ptr, out_cap: u64) -> u64 {
+    let n: u64 = 0;
+    if env_len >= 1 {
+        n = n + append_bytes(out, out_cap, n, env_ptr, env_len - 1);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"GOOGLE_GEMINI_BASE_URL\":\""), STR_LEN(",\"GOOGLE_GEMINI_BASE_URL\":\""));
+    n = n + append_bytes(out, out_cap, n, base_ptr, base_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"GEMINI_API_KEY\":\""), STR_LEN("\",\"GEMINI_API_KEY\":\""));
+    n = n + append_bytes(out, out_cap, n, key_ptr, key_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\"}"), 2);
+    return n;
+}
+
+// runtime_apply_config: the runtime.updateConfig equivalent —
+// Object.assign over AgyRuntimeConfig fields from the session.
+fn runtime_apply_config(rt: &AgyCompatibleRuntime, s: &AgySession, env_ptr: ptr, env_len: u64, has_env: bool) -> void {
+    rt.config.threadId_ptr = s.threadId_ptr;
+    rt.config.threadId_len = s.threadId_len;
+    rt.config.cwd_ptr = s.cwd_ptr;
+    rt.config.cwd_len = s.cwd_len;
+    rt.config.addDirs_ptr = s.addDirs_ptr;
+    rt.config.addDirs_len = s.addDirs_len;
+    rt.config.has_addDirs = s.has_addDirs;
+    rt.config.conversationId_ptr = s.conversationId_ptr;
+    rt.config.conversationId_len = s.conversationId_len;
+    rt.config.has_conversationId = s.has_conversationId;
+    rt.config.model_ptr = s.model_ptr;
+    rt.config.model_len = s.model_len;
+    rt.config.has_model = s.has_model;
+    rt.config.effort_ptr = s.effort_ptr;
+    rt.config.effort_len = s.effort_len;
+    rt.config.has_effort = s.has_effort;
+    rt.config.mode = if s.has_mode { s.mode } else { 0 };
+    rt.config.has_skip = true;
+    rt.config.dangerouslySkipPermissions = true;
+    rt.config.providerId_ptr = s.providerId_ptr;
+    rt.config.providerId_len = s.providerId_len;
+    rt.config.has_providerId = s.has_providerId;
+    rt.config.groupId_ptr = s.groupId_ptr;
+    rt.config.groupId_len = s.groupId_len;
+    rt.config.has_groupId = s.has_groupId;
+    rt.config.envOverrides_ptr = env_ptr;
+    rt.config.envOverrides_len = env_len;
+    rt.config.has_envOverrides = has_env;
+}
+
+// ensure_session_runtime: create the runtime on first use or
+// apply the config update (the source's if/else around
+// new AgyCompatibleRuntime + wireRuntimeEvents).
+fn ensure_session_runtime(self: &AgyBridge, session_idx: u64, env_ptr: ptr, env_len: u64, has_env: bool) -> void {
+    let s = &self.sessions[session_idx];
+    if !s.has_runtime {
+        let blank = AgyRuntimeConfig { threadId_ptr: PTR_NULL(), threadId_len: 0, cwd_ptr: PTR_NULL(), cwd_len: 0, addDirs_ptr: PTR_NULL(), addDirs_len: 0, has_addDirs: false, conversationId_ptr: PTR_NULL(), conversationId_len: 0, has_conversationId: false, model_ptr: PTR_NULL(), model_len: 0, has_model: false, effort_ptr: PTR_NULL(), effort_len: 0, has_effort: false, mode: 0, dangerouslySkipPermissions: true, has_skip: true, providerId_ptr: PTR_NULL(), providerId_len: 0, has_providerId: false, groupId_ptr: PTR_NULL(), groupId_len: 0, has_groupId: false, envOverrides_ptr: PTR_NULL(), envOverrides_len: 0, has_envOverrides: false };
+        AgyCompatibleRuntime_new(&s.runtime, &blank);
+        s.has_runtime = true;
+    };
+    runtime_apply_config(&s.runtime, s, env_ptr, env_len, has_env);
+}
+
+// ---- request() dispatch ----
+// AgyBridge_request: the CodexRuntimeClient request switch.
+// Params arrive as JSON text; results are JSON text. Errors:
+// code 1 + message in out_err (the source's throws).
+
+fn rec_str(record: u64, key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    out_ptr = PTR_NULL();
+    out_len = 0;
+    if record == 0 { return false; };
+    return sa_json_object_get_string(record, key_ptr, key_len, out_ptr, out_len) == 0;
+}
+
+fn is_plan_record(record: u64) -> bool {
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    if rec_str(record, STR_PTR("sandbox"), STR_LEN("sandbox"), &v_ptr, &v_len) && str_is(v_ptr, v_len, STR_PTR("read-only"), STR_LEN("read-only")) { return true; };
+    if rec_str(record, STR_PTR("mode"), STR_LEN("mode"), &v_ptr, &v_len) && str_is(v_ptr, v_len, STR_PTR("plan"), 4) { return true; };
+    if rec_str(record, STR_PTR("collaborationMode"), STR_LEN("collaborationMode"), &v_ptr, &v_len) && str_is(v_ptr, v_len, STR_PTR("plan"), 4) { return true; };
+    let cm: u64 = 0;
+    if sa_json_object_get(record, STR_PTR("collaborationMode"), STR_LEN("collaborationMode"), &cm) == 0 && cm != 0 {
+        if rec_str(cm, STR_PTR("mode"), STR_LEN("mode"), &v_ptr, &v_len) && str_is(v_ptr, v_len, STR_PTR("plan"), 4) { return true; };
+        let settings: u64 = 0;
+        if sa_json_object_get(cm, STR_PTR("settings"), STR_LEN("settings"), &settings) == 0 {
+            if rec_str(settings, STR_PTR("mode"), STR_LEN("mode"), &v_ptr, &v_len) && str_is(v_ptr, v_len, STR_PTR("plan"), 4) { return true; };
+        };
+    };
+    let flag = false;
+    if sa_json_object_get_bool(record, STR_PTR("planModeEnabled"), STR_LEN("planModeEnabled"), &flag) == 0 && flag { return true; };
+    return false;
+}
+
+fn AgyBridge_request(self: &AgyBridge, method_ptr: ptr, method_len: u64, params_ptr: ptr, params_len: u64, out: ptr, out_cap: u64, out_len: &u64, out_err: ptr, out_err_cap: u64, out_err_len: &u64) -> i32 {
+    let record = sa_json_parse(params_ptr, params_len);
+    if str_is(method_ptr, method_len, STR_PTR("thread/start"), STR_LEN("thread/start")) {
+        return request_thread_start(self, record, out, out_cap, out_len, out_err, out_err_cap, out_err_len);
+    };
+    if str_is(method_ptr, method_len, STR_PTR("turn/start"), STR_LEN("turn/start")) {
+        return request_turn_start(self, record, out, out_cap, out_len, out_err, out_err_cap, out_err_len);
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/compact/start"), STR_LEN("thread/compact/start")) {
+        return request_compact_start(self, record, out, out_cap, out_len, out_err, out_err_cap, out_err_len);
+    };
+    if str_is(method_ptr, method_len, STR_PTR("turn/interrupt"), STR_LEN("turn/interrupt")) {
+        return request_turn_interrupt(self, record, out, out_cap, out_len, out_err, out_err_cap, out_err_len);
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/read"), STR_LEN("thread/read")) || str_is(method_ptr, method_len, STR_PTR("thread/resume"), STR_LEN("thread/resume")) {
+        return request_thread_read(self, record, out, out_cap, out_len, out_err, out_err_cap, out_err_len);
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/turns/list"), STR_LEN("thread/turns/list")) {
+        return request_turns_list(self, record, out, out_cap, out_len, out_err, out_err_cap, out_err_len);
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/items/list"), STR_LEN("thread/items/list")) {
+        let thread_ptr: ptr = PTR_NULL();
+        let thread_len: u64 = 0;
+        rec_str(record, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len);
+        let owner_ptr: ptr = PTR_NULL();
+        let owner_len: u64 = 0;
+        let has_owner = rec_str(record, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner_ptr, &owner_len);
+        let idx: u64 = 0;
+        let has = false;
+        AgyBridge_getOrRestoreSession(self, thread_ptr, thread_len, owner_ptr, owner_len, has_owner, &idx, &has);
+        let n: u64 = 0;
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"items\":["), STR_LEN("{\"items\":["));
+        if has {
+            let s = &self.sessions[idx];
+            for i in 0..s.msg_count {
+                if i > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+                n = n + append_bytes(out, out_cap, n, session_msg_ptr(s, i), s.msg_len_arr[i]);
+            }
+        };
+        n = n + append_bytes(out, out_cap, n, STR_PTR("]}"), 2);
+        out_len = n;
+        return 0;
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/goal/set"), STR_LEN("thread/goal/set")) {
+        let thread_ptr: ptr = PTR_NULL();
+        let thread_len: u64 = 0;
+        rec_str(record, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len);
+        let owner_ptr: ptr = PTR_NULL();
+        let owner_len: u64 = 0;
+        let has_owner = rec_str(record, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner_ptr, &owner_len);
+        let idx: u64 = 0;
+        let has = false;
+        AgyBridge_getOrRestoreSession(self, thread_ptr, thread_len, owner_ptr, owner_len, has_owner, &idx, &has);
+        if !has {
+            out_err_len = err_unknown_thread(out_err, out_err_cap, thread_ptr, thread_len);
+            return 1;
+        };
+        let s = &self.sessions[idx];
+        let obj_ptr: ptr = PTR_NULL();
+        let obj_len: u64 = 0;
+        if rec_str(record, STR_PTR("objective"), STR_LEN("objective"), &obj_ptr, &obj_len) {
+            s.goalObjective_ptr = obj_ptr;
+            s.goalObjective_len = obj_len;
+            s.has_goalObjective = true;
+            s.goal_null = false;
+        } else {
+            s.has_goalObjective = false;
+            s.goal_null = true;
+        };
+        let st_ptr: ptr = PTR_NULL();
+        let st_len: u64 = 0;
+        if rec_str(record, STR_PTR("status"), STR_LEN("status"), &st_ptr, &st_len) {
+            s.goalStatus_ptr = st_ptr;
+            s.goalStatus_len = st_len;
+            s.has_goalStatus = true;
+        } else if s.has_goalObjective {
+            s.goalStatus_ptr = STR_PTR("active");
+            s.goalStatus_len = STR_LEN("active");
+            s.has_goalStatus = true;
+        } else {
+            s.has_goalStatus = false;
+        };
+        AgyBridge_persistSession(self, s);
+        let n: u64 = 0;
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"ok\":true,\"goal\":{\"objective\":"), STR_LEN("{\"ok\":true,\"goal\":{\"objective\":"));
+        n = append_nullable_str(out, out_cap, n, s.goalObjective_ptr, s.goalObjective_len, s.has_goalObjective);
+        n = n + append_bytes(out, out_cap, n, STR_PTR(",\"status\":"), STR_LEN(",\"status\":"));
+        n = append_nullable_str(out, out_cap, n, s.goalStatus_ptr, s.goalStatus_len, s.has_goalStatus);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("}}"), 2);
+        out_len = n;
+        return 0;
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/goal/get"), STR_LEN("thread/goal/get")) {
+        let thread_ptr: ptr = PTR_NULL();
+        let thread_len: u64 = 0;
+        rec_str(record, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len);
+        let owner_ptr: ptr = PTR_NULL();
+        let owner_len: u64 = 0;
+        let has_owner = rec_str(record, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner_ptr, &owner_len);
+        let idx: u64 = 0;
+        let has = false;
+        AgyBridge_getOrRestoreSession(self, thread_ptr, thread_len, owner_ptr, owner_len, has_owner, &idx, &has);
+        let n: u64 = 0;
+        if !has {
+            n = n + append_bytes(out, out_cap, n, STR_PTR("{\"goal\":null}"), STR_LEN("{\"goal\":null}"));
+        } else {
+            let s = &self.sessions[idx];
+            n = n + append_bytes(out, out_cap, n, STR_PTR("{\"goal\":{\"objective\":"), STR_LEN("{\"goal\":{\"objective\":"));
+            n = append_nullable_str(out, out_cap, n, s.goalObjective_ptr, s.goalObjective_len, s.has_goalObjective);
+            n = n + append_bytes(out, out_cap, n, STR_PTR(",\"status\":"), STR_LEN(",\"status\":"));
+            n = append_nullable_str(out, out_cap, n, s.goalStatus_ptr, s.goalStatus_len, s.has_goalStatus);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("}}"), 2);
+        };
+        out_len = n;
+        return 0;
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/name/set"), STR_LEN("thread/name/set")) {
+        let thread_ptr: ptr = PTR_NULL();
+        let thread_len: u64 = 0;
+        rec_str(record, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len);
+        let owner_ptr: ptr = PTR_NULL();
+        let owner_len: u64 = 0;
+        let has_owner = rec_str(record, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner_ptr, &owner_len);
+        let idx: u64 = 0;
+        let has = false;
+        AgyBridge_getOrRestoreSession(self, thread_ptr, thread_len, owner_ptr, owner_len, has_owner, &idx, &has);
+        if has {
+            let s = &self.sessions[idx];
+            let name_ptr: ptr = PTR_NULL();
+            let name_len: u64 = 0;
+            if rec_str(record, STR_PTR("name"), STR_LEN("name"), &name_ptr, &name_len) {
+                s.preview_ptr = name_ptr;
+                s.preview_len = name_len;
+                s.has_preview = true;
+            };
+            AgyBridge_persistSession(self, s);
+        };
+        out_len = append_bytes(out, out_cap, 0, STR_PTR("{\"ok\":true}"), STR_LEN("{\"ok\":true}"));
+        return 0;
+    };
+    if str_is(method_ptr, method_len, STR_PTR("thread/delete"), STR_LEN("thread/delete")) {
+        let thread_ptr: ptr = PTR_NULL();
+        let thread_len: u64 = 0;
+        rec_str(record, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len);
+        AgyBridge_deleteSession(self, thread_ptr, thread_len);
+        out_len = append_bytes(out, out_cap, 0, STR_PTR("{\"ok\":true}"), STR_LEN("{\"ok\":true}"));
+        return 0;
+    };
+    out_len = append_bytes(out, out_cap, 0, STR_PTR("{}"), 2);
+    return 0;
+}
+
+fn append_nullable_str(out: ptr, out_cap: u64, at: u64, v_ptr: ptr, v_len: u64, has: bool) -> u64 {
+    if !has { return at + append_bytes(out, out_cap, at, STR_PTR("null"), 4); };
+    let n = at;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    n = n + append_bytes(out, out_cap, n, v_ptr, v_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+    return n;
+}
+
+fn err_unknown_thread(out_err: ptr, out_err_cap: u64, thread_ptr: ptr, thread_len: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out_err, out_err_cap, n, STR_PTR("Unknown thread: "), STR_LEN("Unknown thread: "));
+    n = n + append_bytes(out_err, out_err_cap, n, thread_ptr, thread_len);
+    return n;
+}
+
+fn err_other_owner(out_err: ptr, out_err_cap: u64, thread_ptr: ptr, thread_len: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out_err, out_err_cap, n, STR_PTR("AGY session belongs to another owner: "), STR_LEN("AGY session belongs to another owner: "));
+    n = n + append_bytes(out_err, out_err_cap, n, thread_ptr, thread_len);
+    return n;
+}
+
+// request_thread_start ("thread/start")
+fn request_thread_start(self: &AgyBridge, record: u64, out: ptr, out_cap: u64, out_len: &u64, out_err: ptr, out_err_cap: u64, out_err_len: &u64) -> i32 {
+    let thread_id = [0u8; 64];
+    let thread_len: u64 = 0;
+    uuid_new(&thread_id, 64, &thread_len);
+    let owner_ptr: ptr = PTR_NULL();
+    let owner_len: u64 = 0;
+    let has_owner = rec_str(record, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner_ptr, &owner_len);
+    let cwd = [0u8; 1024];
+    let cwd_len: u64 = 0;
+    let add_dirs = [0u8; 8192];
+    let add_dirs_len: u64 = 0;
+    resolveAgyWorkspaceDirs(record, &cwd, 1024, &cwd_len, &add_dirs, 8192, &add_dirs_len);
+    let prov_ptr: ptr = PTR_NULL();
+    let prov_len: u64 = 0;
+    let provider_ptr = AGY_OFFICIAL_PROVIDER_ID_ptr();
+    let provider_len = AGY_OFFICIAL_PROVIDER_ID_len();
+    if rec_str(record, STR_PTR("providerId"), STR_LEN("providerId"), &prov_ptr, &prov_len) && prov_len > 0 { provider_ptr = prov_ptr; provider_len = prov_len; };
+    let is_official = str_is(provider_ptr, provider_len, AGY_OFFICIAL_PROVIDER_ID_ptr(), AGY_OFFICIAL_PROVIDER_ID_len());
+    // groupId: null or official -> undefined; else trimmed
+    let group_ptr: ptr = PTR_NULL();
+    let group_len: u64 = 0;
+    let has_group = false;
+    let group_node: u64 = 0;
+    let group_is_null = sa_json_object_get(record, STR_PTR("groupId"), STR_LEN("groupId"), &group_node) == 0 && json_node_is_null(group_node);
+    if !group_is_null && !is_official {
+        let g_ptr: ptr = PTR_NULL();
+        let g_len: u64 = 0;
+        if rec_str(record, STR_PTR("groupId"), STR_LEN("groupId"), &g_ptr, &g_len) {
+            let tp: ptr = PTR_NULL();
+            let tl: u64 = 0;
+            trim_span(g_ptr, g_len, &tp, &tl);
+            if tl > 0 { group_ptr = tp; group_len = tl; has_group = true; };
+        };
+    };
+    // model: trimmed record.model; official + invalid ->
+    // default
+    let model_ptr: ptr = PTR_NULL();
+    let model_len: u64 = 0;
+    let has_model = false;
+    let m_ptr: ptr = PTR_NULL();
+    let m_len: u64 = 0;
+    if rec_str(record, STR_PTR("model"), STR_LEN("model"), &m_ptr, &m_len) {
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        trim_span(m_ptr, m_len, &tp, &tl);
+        if tl > 0 { model_ptr = tp; model_len = tl; has_model = true; };
+    };
+    if is_official && (!has_model || !isAgyOfficialModel(model_ptr, model_len, has_model)) {
+        model_ptr = STR_PTR("gemini-3.8-flash-high");
+        model_len = STR_LEN("gemini-3.8-flash-high");
+        has_model = true;
+    };
+    // effort = reasoningEffort || effort || "high"
+    let effort_ptr = STR_PTR("high");
+    let effort_len = STR_LEN("high");
+    let e_ptr: ptr = PTR_NULL();
+    let e_len: u64 = 0;
+    if rec_str(record, STR_PTR("reasoningEffort"), STR_LEN("reasoningEffort"), &e_ptr, &e_len) { effort_ptr = e_ptr; effort_len = e_len; } else if rec_str(record, STR_PTR("effort"), STR_LEN("effort"), &e_ptr, &e_len) { effort_ptr = e_ptr; effort_len = e_len; };
+    let mode: u64 = 1;
+    if is_plan_record(record) { mode = 2; };
+    let dev_ptr: ptr = PTR_NULL();
+    let dev_len: u64 = 0;
+    let has_dev = false;
+    let d_ptr: ptr = PTR_NULL();
+    let d_len: u64 = 0;
+    if rec_str(record, STR_PTR("developerInstructions"), STR_LEN("developerInstructions"), &d_ptr, &d_len) {
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        trim_span(d_ptr, d_len, &tp, &tl);
+        if tl > 0 { dev_ptr = tp; dev_len = tl; has_dev = true; };
+    };
+    if self.sessions_count >= 16 { out_err_len = append_bytes(out_err, out_err_cap, 0, STR_PTR("too many agy sessions"), STR_LEN("too many agy sessions")); return 1; };
+    let idx = self.sessions_count;
+    let s = &self.sessions[idx];
+    session_init(s, &thread_id, thread_len);
+    if has_owner { s.ownerId_ptr = owner_ptr; s.ownerId_len = owner_len; s.has_ownerId = true; };
+    s.cwd_ptr = &cwd;
+    s.cwd_len = cwd_len;
+    s.addDirs_ptr = &add_dirs;
+    s.addDirs_len = add_dirs_len;
+    s.has_addDirs = true;
+    if has_model { s.model_ptr = model_ptr; s.model_len = model_len; s.has_model = true; };
+    s.effort_ptr = effort_ptr;
+    s.effort_len = effort_len;
+    s.has_effort = true;
+    s.mode = mode;
+    s.has_mode = true;
+    if has_dev { s.developerInstructions_ptr = dev_ptr; s.developerInstructions_len = dev_len; s.has_developerInstructions = true; };
+    s.providerId_ptr = provider_ptr;
+    s.providerId_len = provider_len;
+    s.has_providerId = true;
+    s.groupId_ptr = group_ptr;
+    s.groupId_len = group_len;
+    s.has_groupId = has_group;
+    self.sessions_count = self.sessions_count + 1;
+    AgyBridge_persistSession(self, s);
+    // 新机器自举：按工程目录落盘 MCP + 7 方 skill（含 jev）。
+    host_bootstrap_project_savm_assets(&cwd, cwd_len, &thread_id, thread_len);
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"thread\":{\"id\":\""), STR_LEN("{\"thread\":{\"id\":\""));
+    n = n + append_bytes(out, out_cap, n, &thread_id, thread_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"cliBackend\":\"agy\",\"cwd\":\""), STR_LEN("\",\"cliBackend\":\"agy\",\"cwd\":\""));
+    n = n + append_bytes(out, out_cap, n, &cwd, cwd_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"model\":"), STR_LEN("\",\"model\":"));
+    n = append_nullable_str(out, out_cap, n, model_ptr, model_len, has_model);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"status\":\"active\",\"createdAt\":"), STR_LEN(",\"status\":\"active\",\"createdAt\":"));
+    n = n + append_u64(out, out_cap, n, now_ms());
+    n = n + append_bytes(out, out_cap, n, STR_PTR("}}"), 2);
+    out_len = n;
+    return 0;
+}
+
+// request_turn_start ("turn/start") — candidate resolution,
+// proxy configuration BEFORE session mutation, runtime
+// create/update, user item synthesis, deferred execution.
+fn request_turn_start(self: &AgyBridge, record: u64, out: ptr, out_cap: u64, out_len: &u64, out_err: ptr, out_err_cap: u64, out_err_len: &u64) -> i32 {
+    let thread_ptr: ptr = PTR_NULL();
+    let thread_len: u64 = 0;
+    rec_str(record, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len);
+    let owner_ptr: ptr = PTR_NULL();
+    let owner_len: u64 = 0;
+    let has_owner = rec_str(record, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner_ptr, &owner_len);
+    let idx: u64 = 0;
+    let has_session = false;
+    AgyBridge_getOrRestoreSession(self, thread_ptr, thread_len, owner_ptr, owner_len, has_owner, &idx, &has_session);
+    if has_session {
+        let s = &self.sessions[idx];
+        if has_owner && s.has_ownerId && !str_is(s.ownerId_ptr, s.ownerId_len, STR_PTR("local"), STR_LEN("local")) && !bytes_eq(s.ownerId_ptr, owner_ptr, owner_len) {
+            out_err_len = err_other_owner(out_err, out_err_cap, thread_ptr, thread_len);
+            return 1;
+        };
+    };
+    // storedMeta for the no-session case
+    let meta = [0u8; 262144];
+    let meta_len: u64 = 0;
+    let has_meta = false;
+    if !has_session && self.has_options {
+        host_load_metadata(thread_ptr, thread_len, owner_ptr, owner_len, has_owner, &meta, 262144, &meta_len, &has_meta);
+    };
+    let meta_doc: u64 = 0;
+    if has_meta { meta_doc = sa_json_parse(&meta, meta_len); };
+    if has_meta {
+        let mo_ptr: ptr = PTR_NULL();
+        let mo_len: u64 = 0;
+        if rec_str(meta_doc, STR_PTR("ownerId"), STR_LEN("ownerId"), &mo_ptr, &mo_len) && !str_is(mo_ptr, mo_len, STR_PTR("local"), STR_LEN("local")) && has_owner && !bytes_eq(mo_ptr, owner_ptr, mo_len) {
+            out_err_len = err_other_owner(out_err, out_err_cap, thread_ptr, thread_len);
+            return 1;
+        };
+    };
+    // ws = resolveAgyWorkspaceDirs({...record, cwd:
+    // record.cwd ?? meta.cwd, runtimeWorkspaceRoots:
+    // record.runtimeWorkspaceRoots ?? meta.addDirs})
+    let merged = [0u8; 262144];
+    let merged_len: u64 = 0;
+    merged_len = merged_len + append_bytes(&merged, 262144, merged_len, STR_PTR("{\"cwd\":"), STR_LEN("{\"cwd\":"));
+    let rc_ptr: ptr = PTR_NULL();
+    let rc_len: u64 = 0;
+    if rec_str(record, STR_PTR("cwd"), STR_LEN("cwd"), &rc_ptr, &rc_len) {
+        merged_len = merged_len + append_bytes(&merged, 262144, merged_len, STR_PTR("\""), 1);
+        merged_len = merged_len + append_bytes(&merged, 262144, merged_len, rc_ptr, rc_len);
+        merged_len = merged_len + append_bytes(&merged, 262144, merged_len, STR_PTR("\""), 1);
+    } else if has_meta && rec_str(meta_doc, STR_PTR("cwd"), STR_LEN("cwd"), &rc_ptr, &rc_len) {
+        merged_len = merged_len + append_bytes(&merged, 262144, merged_len, STR_PTR("\""), 1);
+        merged_len = merged_len + append_bytes(&merged, 262144, merged_len, rc_ptr, rc_len);
+        merged_len = merged_len + append_bytes(&merged, 262144, merged_len, STR_PTR("\""), 1);
+    } else {
+        merged_len = merged_len + append_bytes(&merged, 262144, merged_len, STR_PTR("null"), 4);
+    };
+    merged_len = merged_len + append_bytes(&merged, 262144, merged_len, STR_PTR(",\"runtimeWorkspaceRoots\":"), STR_LEN(",\"runtimeWorkspaceRoots\":"));
+    let roots_node: u64 = 0;
+    if sa_json_object_get(record, STR_PTR("runtimeWorkspaceRoots"), STR_LEN("runtimeWorkspaceRoots"), &roots_node) == 0 {
+        merged_len = merged_len + stringify_into(roots_node, byte_off(&merged, merged_len), 262144 - merged_len);
+    } else if has_meta {
+        let add_node: u64 = 0;
+        if sa_json_object_get(meta_doc, STR_PTR("addDirs"), STR_LEN("addDirs"), &add_node) == 0 {
+            merged_len = merged_len + stringify_into(add_node, byte_off(&merged, merged_len), 262144 - merged_len);
+        } else {
+            merged_len = merged_len + append_bytes(&merged, 262144, merged_len, STR_PTR("null"), 4);
+        };
+    } else {
+        merged_len = merged_len + append_bytes(&merged, 262144, merged_len, STR_PTR("null"), 4);
+    };
+    merged_len = merged_len + append_bytes(&merged, 262144, merged_len, STR_PTR("}"), 1);
+    let merged_doc = sa_json_parse(&merged, merged_len);
+    let ws_cwd = [0u8; 1024];
+    let ws_cwd_len: u64 = 0;
+    let ws_add = [0u8; 8192];
+    let ws_add_len: u64 = 0;
+    resolveAgyWorkspaceDirs(merged_doc, &ws_cwd, 1024, &ws_cwd_len, &ws_add, 8192, &ws_add_len);
+    // candidateProviderId
+    let cand_prov_ptr: ptr = PTR_NULL();
+    let cand_prov_len: u64 = 0;
+    let p_ptr: ptr = PTR_NULL();
+    let p_len: u64 = 0;
+    if rec_str(record, STR_PTR("providerId"), STR_LEN("providerId"), &p_ptr, &p_len) && p_len > 0 {
+        cand_prov_ptr = p_ptr;
+        cand_prov_len = p_len;
+    } else if has_session && self.sessions[idx].has_providerId {
+        cand_prov_ptr = self.sessions[idx].providerId_ptr;
+        cand_prov_len = self.sessions[idx].providerId_len;
+    } else if has_meta && rec_str(meta_doc, STR_PTR("providerId"), STR_LEN("providerId"), &p_ptr, &p_len) {
+        cand_prov_ptr = p_ptr;
+        cand_prov_len = p_len;
+    } else {
+        cand_prov_ptr = AGY_OFFICIAL_PROVIDER_ID_ptr();
+        cand_prov_len = AGY_OFFICIAL_PROVIDER_ID_len();
+    };
+    let provider_changed = false;
+    if has_session && self.sessions[idx].has_providerId && !bytes_eq(self.sessions[idx].providerId_ptr, cand_prov_ptr, cand_prov_len) { provider_changed = true; };
+    let cand_official = str_is(cand_prov_ptr, cand_prov_len, AGY_OFFICIAL_PROVIDER_ID_ptr(), AGY_OFFICIAL_PROVIDER_ID_len());
+    // candidateGroupId
+    let cand_group_ptr: ptr = PTR_NULL();
+    let cand_group_len: u64 = 0;
+    let has_cand_group = false;
+    let group_node: u64 = 0;
+    let group_is_null = sa_json_object_get(record, STR_PTR("groupId"), STR_LEN("groupId"), &group_node) == 0 && json_node_is_null(group_node);
+    if cand_official || group_is_null {
+        has_cand_group = false;
+    } else if rec_str(record, STR_PTR("groupId"), STR_LEN("groupId"), &p_ptr, &p_len) {
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        trim_span(p_ptr, p_len, &tp, &tl);
+        if tl > 0 { cand_group_ptr = tp; cand_group_len = tl; has_cand_group = true; };
+    } else if provider_changed {
+        has_cand_group = false;
+    } else if has_session && self.sessions[idx].has_groupId {
+        cand_group_ptr = self.sessions[idx].groupId_ptr;
+        cand_group_len = self.sessions[idx].groupId_len;
+        has_cand_group = true;
+    } else if has_meta && rec_str(meta_doc, STR_PTR("groupId"), STR_LEN("groupId"), &p_ptr, &p_len) {
+        cand_group_ptr = p_ptr;
+        cand_group_len = p_len;
+        has_cand_group = true;
+    };
+    // candidateModel
+    let cand_model_ptr: ptr = PTR_NULL();
+    let cand_model_len: u64 = 0;
+    let has_cand_model = false;
+    if rec_str(record, STR_PTR("model"), STR_LEN("model"), &p_ptr, &p_len) {
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        trim_span(p_ptr, p_len, &tp, &tl);
+        if tl > 0 { cand_model_ptr = tp; cand_model_len = tl; has_cand_model = true; };
+    } else if cand_official {
+        if has_session && self.sessions[idx].has_model && isAgyOfficialModel(self.sessions[idx].model_ptr, self.sessions[idx].model_len, true) {
+            cand_model_ptr = self.sessions[idx].model_ptr;
+            cand_model_len = self.sessions[idx].model_len;
+            has_cand_model = true;
+        } else if has_meta && rec_str(meta_doc, STR_PTR("model"), STR_LEN("model"), &p_ptr, &p_len) && isAgyOfficialModel(p_ptr, p_len, true) {
+            cand_model_ptr = p_ptr;
+            cand_model_len = p_len;
+            has_cand_model = true;
+        } else {
+            cand_model_ptr = STR_PTR("gemini-3.8-flash-high");
+            cand_model_len = STR_LEN("gemini-3.8-flash-high");
+            has_cand_model = true;
+        };
+    } else if provider_changed {
+        has_cand_model = false;
+    } else if has_session && self.sessions[idx].has_model {
+        cand_model_ptr = self.sessions[idx].model_ptr;
+        cand_model_len = self.sessions[idx].model_len;
+        has_cand_model = true;
+    } else if has_meta && rec_str(meta_doc, STR_PTR("model"), STR_LEN("model"), &p_ptr, &p_len) {
+        cand_model_ptr = p_ptr;
+        cand_model_len = p_len;
+        has_cand_model = true;
+    };
+    if cand_official && (!has_cand_model || !isAgyOfficialModel(cand_model_ptr, cand_model_len, has_cand_model)) {
+        cand_model_ptr = STR_PTR("gemini-3.8-flash-high");
+        cand_model_len = STR_LEN("gemini-3.8-flash-high");
+        has_cand_model = true;
+    };
+    // effort
+    let effort_ptr: ptr = PTR_NULL();
+    let effort_len: u64 = 0;
+    let has_effort = false;
+    if rec_str(record, STR_PTR("reasoningEffort"), STR_LEN("reasoningEffort"), &effort_ptr, &effort_len) { has_effort = true; } else if rec_str(record, STR_PTR("effort"), STR_LEN("effort"), &effort_ptr, &effort_len) { has_effort = true; } else if has_session && self.sessions[idx].has_effort {
+        effort_ptr = self.sessions[idx].effort_ptr;
+        effort_len = self.sessions[idx].effort_len;
+        has_effort = true;
+    } else {
+        effort_ptr = STR_PTR("high");
+        effort_len = STR_LEN("high");
+        has_effort = true;
+    };
+    // mode
+    let mode: u64 = 0;
+    if is_plan_record(record) {
+        mode = 2;
+    } else if has_session && self.sessions[idx].has_mode {
+        mode = self.sessions[idx].mode;
+    } else {
+        mode = 1;
+    };
+    // developerInstructions
+    let dev_ptr: ptr = PTR_NULL();
+    let dev_len: u64 = 0;
+    let has_dev = false;
+    let d_ptr: ptr = PTR_NULL();
+    let d_len: u64 = 0;
+    if rec_str(record, STR_PTR("developerInstructions"), STR_LEN("developerInstructions"), &d_ptr, &d_len) {
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        trim_span(d_ptr, d_len, &tp, &tl);
+        if tl > 0 { dev_ptr = tp; dev_len = tl; has_dev = true; };
+    };
+    if !has_dev && has_session && self.sessions[idx].has_developerInstructions {
+        dev_ptr = self.sessions[idx].developerInstructions_ptr;
+        dev_len = self.sessions[idx].developerInstructions_len;
+        has_dev = true;
+    };
+    // Interrupt the running turn + clear a pending timer.
+    if has_session {
+        let s = &self.sessions[idx];
+        s.has_pending = false;
+        if s.has_runtime && s.has_activeTurnId {
+            AgyCompatibleRuntime_interrupt(&s.runtime);
+        };
+    };
+    // Proxy FIRST — a throw leaves the session untouched.
+    let env = [0u8; 16384];
+    let env_len: u64 = 0;
+    let has_env = false;
+    let prc = AgyBridge_configureSessionProxy(self, idx, has_session, cand_prov_ptr, cand_prov_len, true, cand_group_ptr, cand_group_len, has_cand_group, cand_model_ptr, cand_model_len, has_cand_model, &env, 16384, &env_len, &has_env, out_err, out_err_cap, out_err_len);
+    if prc != 0 { return prc; };
+    // Commit candidates.
+    if !has_session {
+        if self.sessions_count >= 16 { out_err_len = append_bytes(out_err, out_err_cap, 0, STR_PTR("too many agy sessions"), STR_LEN("too many agy sessions")); return 1; };
+        idx = self.sessions_count;
+        let s = &self.sessions[idx];
+        session_init(s, thread_ptr, thread_len);
+        if has_owner { s.ownerId_ptr = owner_ptr; s.ownerId_len = owner_len; s.has_ownerId = true; };
+        s.cwd_ptr = &ws_cwd;
+        s.cwd_len = ws_cwd_len;
+        s.addDirs_ptr = &ws_add;
+        s.addDirs_len = ws_add_len;
+        s.has_addDirs = true;
+        if has_cand_model { s.model_ptr = cand_model_ptr; s.model_len = cand_model_len; s.has_model = true; };
+        s.effort_ptr = effort_ptr;
+        s.effort_len = effort_len;
+        s.has_effort = true;
+        s.mode = mode;
+        s.has_mode = true;
+        if has_dev { s.developerInstructions_ptr = dev_ptr; s.developerInstructions_len = dev_len; s.has_developerInstructions = true; };
+        s.providerId_ptr = cand_prov_ptr;
+        s.providerId_len = cand_prov_len;
+        s.has_providerId = true;
+        s.groupId_ptr = cand_group_ptr;
+        s.groupId_len = cand_group_len;
+        s.has_groupId = has_cand_group;
+        self.sessions_count = self.sessions_count + 1;
+        has_session = true;
+    } else {
+        let s = &self.sessions[idx];
+        if has_owner { s.ownerId_ptr = owner_ptr; s.ownerId_len = owner_len; s.has_ownerId = true; };
+        s.providerId_ptr = cand_prov_ptr;
+        s.providerId_len = cand_prov_len;
+        s.has_providerId = true;
+        s.groupId_ptr = cand_group_ptr;
+        s.groupId_len = cand_group_len;
+        s.has_groupId = has_cand_group;
+        if has_cand_model { s.model_ptr = cand_model_ptr; s.model_len = cand_model_len; s.has_model = true; } else { s.has_model = false; };
+        if has_effort { s.effort_ptr = effort_ptr; s.effort_len = effort_len; s.has_effort = true; };
+        if has_dev { s.developerInstructions_ptr = dev_ptr; s.developerInstructions_len = dev_len; s.has_developerInstructions = true; };
+        s.mode = mode;
+        s.has_mode = true;
+        // cwd adoption: session.cwd is process.cwd()/empty, or
+        // the request carried a cwd.
+        let cwd_buf = [0u8; 1024];
+        let cwd_buf_len: u64 = 0;
+        cwd_buf_len = process_cwd(&cwd_buf, 1024);
+        let req_cwd_ptr: ptr = PTR_NULL();
+        let req_cwd_len: u64 = 0;
+        let req_has_cwd = rec_str(record, STR_PTR("cwd"), STR_LEN("cwd"), &req_cwd_ptr, &req_cwd_len) && !trim_is_empty(req_cwd_ptr, req_cwd_len);
+        if ws_cwd_len > 0 && (s.cwd_len == 0 || (s.cwd_len == cwd_buf_len && bytes_eq(s.cwd_ptr, &cwd_buf, s.cwd_len)) || req_has_cwd) {
+            s.cwd_ptr = &ws_cwd;
+            s.cwd_len = ws_cwd_len;
+        };
+        if ws_add_len > 2 {
+            // addDirs = unique([...session.addDirs, ...ws.addDirs])
+            let merged_add = [0u8; 16384];
+            let merged_add_len: u64 = 0;
+            merged_add_len = union_add_dirs(s.addDirs_ptr, s.addDirs_len, s.has_addDirs, &ws_add, ws_add_len, &merged_add, 16384);
+            s.addDirs_ptr = &merged_add;
+            s.addDirs_len = merged_add_len;
+            s.has_addDirs = true;
+        };
+    };
+    ensure_session_runtime(self, idx, &env, env_len, has_env);
+    let s = &self.sessions[idx];
+    // turnId + prompt assembly
+    let turn_id = [0u8; 64];
+    let turn_len: u64 = 0;
+    uuid_new(&turn_id, 64, &turn_len);
+    let prompt_text = [0u8; 262144];
+    let prompt_text_len: u64 = 0;
+    let attachments = [0u8; 262144];
+    let attachments_len: u64 = 0;
+    attachments_len = attachments_len + append_bytes(&attachments, 262144, attachments_len, STR_PTR("["), 1);
+    let first_att = true;
+    let input_node: u64 = 0;
+    if sa_json_object_get(record, STR_PTR("input"), STR_LEN("input"), &input_node) == 0 {
+        let n = sa_json_array_len(input_node);
+        for i in 0..n {
+            let item: u64 = 0;
+            if sa_json_array_get(input_node, i, &item) != 0 { continue; };
+            let ty_ptr: ptr = PTR_NULL();
+            let ty_len: u64 = 0;
+            let tx_ptr: ptr = PTR_NULL();
+            let tx_len: u64 = 0;
+            if sa_json_object_get_string(item, STR_PTR("type"), STR_LEN("type"), &ty_ptr, &ty_len) == 0 && str_is(ty_ptr, ty_len, STR_PTR("text"), 4) && sa_json_object_get_string(item, STR_PTR("text"), STR_LEN("text"), &tx_ptr, &tx_len) == 0 {
+                prompt_text_len = prompt_text_len + append_bytes(&prompt_text, 262144, prompt_text_len, tx_ptr, tx_len);
+                prompt_text_len = prompt_text_len + append_bytes(&prompt_text, 262144, prompt_text_len, STR_PTR("\n"), 1);
+            } else {
+                if !first_att { attachments_len = attachments_len + append_bytes(&attachments, 262144, attachments_len, STR_PTR(","), 1); };
+                first_att = false;
+                attachments_len = attachments_len + stringify_into(item, byte_off(&attachments, attachments_len), 262144 - attachments_len);
+            };
+        }
+    } else {
+        let pr_ptr: ptr = PTR_NULL();
+        let pr_len: u64 = 0;
+        if rec_str(record, STR_PTR("prompt"), STR_LEN("prompt"), &pr_ptr, &pr_len) {
+            prompt_text_len = buf_copy(&prompt_text, 262144, pr_ptr, pr_len);
+        };
+    };
+    attachments_len = attachments_len + append_bytes(&attachments, 262144, attachments_len, STR_PTR("]"), 1);
+    // cleanPrompt = promptText.trim() — bound to sa_std
+    // ts_string (@ts_str_trim) per the TS inventory.
+    let clean_ptr: ptr = PTR_NULL();
+    let clean_len: u64 = 0;
+    ts_trim_span(&prompt_text, prompt_text_len, &clean_ptr, &clean_len);
+    // executionPrompt
+    let exec_prompt = [0u8; 262144];
+    let exec_prompt_len: u64 = 0;
+    if has_dev {
+        exec_prompt_len = exec_prompt_len + append_bytes(&exec_prompt, 262144, exec_prompt_len, dev_ptr, dev_len);
+        exec_prompt_len = exec_prompt_len + append_bytes(&exec_prompt, 262144, exec_prompt_len, STR_PTR("\n\n[User Instruction]\n"), STR_LEN("\n\n[User Instruction]\n"));
+        exec_prompt_len = exec_prompt_len + append_bytes(&exec_prompt, 262144, exec_prompt_len, clean_ptr, clean_len);
+    } else {
+        exec_prompt_len = buf_copy(&exec_prompt, 262144, clean_ptr, clean_len);
+    };
+    // userContent + userItem
+    let user_item = [0u8; 262144];
+    let user_item_len: u64 = 0;
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, STR_PTR("{\"type\":\"userMessage\",\"id\":\"agy-user-"), STR_LEN("{\"type\":\"userMessage\",\"id\":\"agy-user-"));
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, &turn_id, turn_len);
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, &turn_id, turn_len);
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, thread_ptr, thread_len);
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, STR_PTR("\",\"text\":\""), STR_LEN("\",\"text\":\""));
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, clean_ptr, clean_len);
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, STR_PTR("\",\"content\":["), STR_LEN("\",\"content\":["));
+    let wrote_content = false;
+    if clean_len > 0 {
+        user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, STR_PTR("{\"type\":\"text\",\"text\":\""), STR_LEN("{\"type\":\"text\",\"text\":\""));
+        user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, clean_ptr, clean_len);
+        user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, STR_PTR("\",\"text_elements\":[]}"), STR_LEN("\",\"text_elements\":[]}"));
+        wrote_content = true;
+    };
+    if attachments_len > 2 {
+        if wrote_content { user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, STR_PTR(","), 1); };
+        user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, byte_off(&attachments, 1), attachments_len - 2);
+    };
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, STR_PTR("],\"role\":\"user\",\"status\":\"completed\",\"startedAt\":"), STR_LEN("],\"role\":\"user\",\"status\":\"completed\",\"startedAt\":"));
+    user_item_len = user_item_len + append_u64(&user_item, 262144, user_item_len, now_ms() / 1000);
+    user_item_len = user_item_len + append_bytes(&user_item, 262144, user_item_len, STR_PTR("}"), 1);
+    // preview
+    if !s.has_preview && clean_len > 0 {
+        if clean_len > 80 {
+            let prev = [0u8; 128];
+            let prev_len: u64 = 0;
+            prev_len = prev_len + append_bytes(&prev, 128, prev_len, clean_ptr, 80);
+            prev_len = prev_len + append_bytes(&prev, 128, prev_len, STR_PTR("..."), 3);
+            s.preview_ptr = &prev;
+            s.preview_len = prev_len;
+        } else {
+            s.preview_ptr = clean_ptr;
+            s.preview_len = clean_len;
+        };
+        s.has_preview = true;
+    };
+    session_add_turn(s, &turn_id, turn_len, STR_PTR("in_progress"), STR_LEN("in_progress"), now_ms());
+    session_push_message(s, &user_item, user_item_len);
+    s.activeTurnId_len = buf_copy(&s.activeTurnId, 64, &turn_id, turn_len);
+    s.has_activeTurnId = true;
+    AgyBridge_persistSession(self, s);
+    // emit turn/started + item/completed(userItem)
+    let notif = [0u8; 262144];
+    let notif_len: u64 = 0;
+    notif_len = notif_len + append_bytes(&notif, 262144, notif_len, STR_PTR("{\"method\":\"turn/started\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"turn/started\",\"params\":{\"threadId\":\""));
+    notif_len = notif_len + append_bytes(&notif, 262144, notif_len, thread_ptr, thread_len);
+    notif_len = notif_len + append_bytes(&notif, 262144, notif_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    notif_len = notif_len + append_bytes(&notif, 262144, notif_len, &turn_id, turn_len);
+    notif_len = notif_len + append_bytes(&notif, 262144, notif_len, STR_PTR("\",\"turn\":{\"id\":\""), STR_LEN("\",\"turn\":{\"id\":\""));
+    notif_len = notif_len + append_bytes(&notif, 262144, notif_len, &turn_id, turn_len);
+    notif_len = notif_len + append_bytes(&notif, 262144, notif_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    notif_len = notif_len + append_bytes(&notif, 262144, notif_len, thread_ptr, thread_len);
+    notif_len = notif_len + append_bytes(&notif, 262144, notif_len, STR_PTR("\",\"status\":\"inProgress\"}}}"), STR_LEN("\",\"status\":\"inProgress\"}}}"));
+    bridge_emit(self, STR_PTR("notification"), STR_LEN("notification"), &notif, notif_len);
+    let notif2 = [0u8; 262144];
+    let notif2_len: u64 = 0;
+    notif2_len = notif2_len + append_bytes(&notif2, 262144, notif2_len, STR_PTR("{\"method\":\"item/completed\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"item/completed\",\"params\":{\"threadId\":\""));
+    notif2_len = notif2_len + append_bytes(&notif2, 262144, notif2_len, thread_ptr, thread_len);
+    notif2_len = notif2_len + append_bytes(&notif2, 262144, notif2_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    notif2_len = notif2_len + append_bytes(&notif2, 262144, notif2_len, &turn_id, turn_len);
+    notif2_len = notif2_len + append_bytes(&notif2, 262144, notif2_len, STR_PTR("\",\"item\":"), STR_LEN("\",\"item\":"));
+    notif2_len = notif2_len + append_bytes(&notif2, 262144, notif2_len, &user_item, user_item_len);
+    notif2_len = notif2_len + append_bytes(&notif2, 262144, notif2_len, STR_PTR("}}"), 2);
+    bridge_emit(self, STR_PTR("notification"), STR_LEN("notification"), &notif2, notif2_len);
+    // Deferred execution (setTimeout 10ms in the source).
+    s.pending_prompt_len = buf_copy(&s.pending_prompt, 262144, &exec_prompt, exec_prompt_len);
+    s.pending_turnId_len = buf_copy(&s.pending_turnId, 64, &turn_id, turn_len);
+    s.pending_compact = false;
+    s.pending_deadline = now_ms() + 10;
+    s.has_pending = true;
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"turn\":{\"id\":\""), STR_LEN("{\"turn\":{\"id\":\""));
+    n = n + append_bytes(out, out_cap, n, &turn_id, turn_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"status\":\"in_progress\"}}"), STR_LEN("\",\"status\":\"in_progress\"}}"));
+    out_len = n;
+    return 0;
+}
+
+// union_add_dirs: JSON array union of two addDirs texts
+// (Set semantics; @ts_arr_* family in the repair phase — the
+// arrays here are JSON texts, deduplicated by string compare).
+fn union_add_dirs(a_ptr: ptr, a_len: u64, has_a: bool, b_ptr: ptr, b_len: u64, out: ptr, out_cap: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("["), 1);
+    let seen = [0u8; 16384];
+    let seen_off: [u64; 128] = [0u64; 128];
+    let seen_len_arr: [u64; 128] = [0u64; 128];
+    let seen_count: u64 = 0;
+    let seen_used: u64 = 0;
+    let first = true;
+    // walk both arrays' string members
+    let sources: [u64; 2] = [0u64; 2];
+    for pass in 0..2 {
+        let doc: u64 = 0;
+        if pass == 0 {
+            if !has_a { continue; };
+            doc = sa_json_parse(a_ptr, a_len);
+        } else {
+            doc = sa_json_parse(b_ptr, b_len);
+        };
+        if doc == 0 { continue; };
+        let count = sa_json_array_len(doc);
+        for i in 0..count {
+            let node: u64 = 0;
+            if sa_json_array_get(doc, i, &node) != 0 { continue; };
+            let s_ptr: ptr = PTR_NULL();
+            let s_len: u64 = 0;
+            json_node_string(node, &s_ptr, &s_len);
+            if s_len == 0 { continue; };
+            let dup = false;
+            for j in 0..seen_count {
+                if seen_len_arr[j] == s_len && bytes_eq(slot(&seen, seen_off[j]), s_ptr, s_len) { dup = true; break; };
+            }
+            if dup { continue; };
+            if seen_count < 128 {
+                seen_off[seen_count] = seen_used;
+                seen_len_arr[seen_count] = s_len;
+                seen_used = seen_used + buf_append(&seen, 16384, s_len, s_ptr, s_len);
+                seen_count = seen_count + 1;
+            };
+            if !first { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+            first = false;
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+            n = n + append_bytes(out, out_cap, n, s_ptr, s_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\""), 1);
+        }
+    }
+    n = n + append_bytes(out, out_cap, n, STR_PTR("]"), 1);
+    return n;
+}
+
+// request_compact_start ("thread/compact/start")
+fn request_compact_start(self: &AgyBridge, record: u64, out: ptr, out_cap: u64, out_len: &u64, out_err: ptr, out_err_cap: u64, out_err_len: &u64) -> i32 {
+    let thread_ptr: ptr = PTR_NULL();
+    let thread_len: u64 = 0;
+    rec_str(record, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len);
+    let owner_ptr: ptr = PTR_NULL();
+    let owner_len: u64 = 0;
+    let has_owner = rec_str(record, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner_ptr, &owner_len);
+    let idx: u64 = 0;
+    let has = false;
+    AgyBridge_getOrRestoreSession(self, thread_ptr, thread_len, owner_ptr, owner_len, has_owner, &idx, &has);
+    if !has {
+        out_err_len = err_unknown_thread(out_err, out_err_cap, thread_ptr, thread_len);
+        return 1;
+    };
+    let s = &self.sessions[idx];
+    if s.has_activeTurnId {
+        out_err_len = append_bytes(out_err, out_err_cap, 0, STR_PTR("Cannot compact while a turn is running"), STR_LEN("Cannot compact while a turn is running"));
+        return 1;
+    };
+    let turn_id = [0u8; 64];
+    let turn_len: u64 = 0;
+    uuid_new(&turn_id, 64, &turn_len);
+    let compaction_prompt = STR_PTR("Please summarize the conversation so far, retaining critical context, technical decisions, file paths, and current status.");
+    let compaction_len = STR_LEN("Please summarize the conversation so far, retaining critical context, technical decisions, file paths, and current status.");
+    let provider_ptr = s.providerId_ptr;
+    let provider_len = s.providerId_len;
+    if !s.has_providerId { provider_ptr = AGY_OFFICIAL_PROVIDER_ID_ptr(); provider_len = AGY_OFFICIAL_PROVIDER_ID_len(); };
+    let is_official = str_is(provider_ptr, provider_len, AGY_OFFICIAL_PROVIDER_ID_ptr(), AGY_OFFICIAL_PROVIDER_ID_len());
+    let group_ptr = s.groupId_ptr;
+    let group_len = s.groupId_len;
+    let has_group = s.has_groupId && !is_official;
+    let model_ptr = s.model_ptr;
+    let model_len = s.model_len;
+    let has_model = s.has_model;
+    if is_official && (!has_model || !isAgyOfficialModel(model_ptr, model_len, has_model)) {
+        model_ptr = STR_PTR("gemini-3.8-flash-high");
+        model_len = STR_LEN("gemini-3.8-flash-high");
+        has_model = true;
+    };
+    let env = [0u8; 16384];
+    let env_len: u64 = 0;
+    let has_env = false;
+    let prc = AgyBridge_configureSessionProxy(self, idx, true, provider_ptr, provider_len, true, group_ptr, group_len, has_group, model_ptr, model_len, has_model, &env, 16384, &env_len, &has_env, out_err, out_err_cap, out_err_len);
+    if prc != 0 { return prc; };
+    ensure_session_runtime(self, idx, &env, env_len, has_env);
+    session_add_turn(s, &turn_id, turn_len, STR_PTR("in_progress"), STR_LEN("in_progress"), now_ms());
+    s.activeTurnId_len = buf_copy(&s.activeTurnId, 64, &turn_id, turn_len);
+    s.has_activeTurnId = true;
+    AgyBridge_persistSession(self, s);
+    let notif = [0u8; 4096];
+    let notif_len: u64 = 0;
+    notif_len = notif_len + append_bytes(&notif, 4096, notif_len, STR_PTR("{\"method\":\"turn/started\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"turn/started\",\"params\":{\"threadId\":\""));
+    notif_len = notif_len + append_bytes(&notif, 4096, notif_len, thread_ptr, thread_len);
+    notif_len = notif_len + append_bytes(&notif, 4096, notif_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    notif_len = notif_len + append_bytes(&notif, 4096, notif_len, &turn_id, turn_len);
+    notif_len = notif_len + append_bytes(&notif, 4096, notif_len, STR_PTR("\",\"turn\":{\"id\":\""), STR_LEN("\",\"turn\":{\"id\":\""));
+    notif_len = notif_len + append_bytes(&notif, 4096, notif_len, &turn_id, turn_len);
+    notif_len = notif_len + append_bytes(&notif, 4096, notif_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    notif_len = notif_len + append_bytes(&notif, 4096, notif_len, thread_ptr, thread_len);
+    notif_len = notif_len + append_bytes(&notif, 4096, notif_len, STR_PTR("\",\"status\":\"inProgress\"}}}"), STR_LEN("\",\"status\":\"inProgress\"}}}"));
+    bridge_emit(self, STR_PTR("notification"), STR_LEN("notification"), &notif, notif_len);
+    let notif2 = [0u8; 4096];
+    let notif2_len: u64 = 0;
+    notif2_len = notif2_len + append_bytes(&notif2, 4096, notif2_len, STR_PTR("{\"method\":\"item/started\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"item/started\",\"params\":{\"threadId\":\""));
+    notif2_len = notif2_len + append_bytes(&notif2, 4096, notif2_len, thread_ptr, thread_len);
+    notif2_len = notif2_len + append_bytes(&notif2, 4096, notif2_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    notif2_len = notif2_len + append_bytes(&notif2, 4096, notif2_len, &turn_id, turn_len);
+    notif2_len = notif2_len + append_bytes(&notif2, 4096, notif2_len, STR_PTR("\",\"item\":{\"id\":\"agy-compact-"), STR_LEN("\",\"item\":{\"id\":\"agy-compact-"));
+    notif2_len = notif2_len + append_bytes(&notif2, 4096, notif2_len, &turn_id, turn_len);
+    notif2_len = notif2_len + append_bytes(&notif2, 4096, notif2_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    notif2_len = notif2_len + append_bytes(&notif2, 4096, notif2_len, thread_ptr, thread_len);
+    notif2_len = notif2_len + append_bytes(&notif2, 4096, notif2_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    notif2_len = notif2_len + append_bytes(&notif2, 4096, notif2_len, &turn_id, turn_len);
+    notif2_len = notif2_len + append_bytes(&notif2, 4096, notif2_len, STR_PTR("\",\"type\":\"compaction\",\"status\":\"inProgress\"}}}"), STR_LEN("\",\"type\":\"compaction\",\"status\":\"inProgress\"}}}"));
+    bridge_emit(self, STR_PTR("notification"), STR_LEN("notification"), &notif2, notif2_len);
+    s.pending_prompt_len = buf_copy(&s.pending_prompt, 262144, compaction_prompt, compaction_len);
+    s.pending_turnId_len = buf_copy(&s.pending_turnId, 64, &turn_id, turn_len);
+    s.pending_compact = true;
+    s.pending_deadline = now_ms() + 10;
+    s.has_pending = true;
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"turn\":{\"id\":\""), STR_LEN("{\"turn\":{\"id\":\""));
+    n = n + append_bytes(out, out_cap, n, &turn_id, turn_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"status\":\"inProgress\"}}"), STR_LEN("\",\"status\":\"inProgress\"}}"));
+    out_len = n;
+    return 0;
+}
+
+// request_turn_interrupt ("turn/interrupt")
+fn request_turn_interrupt(self: &AgyBridge, record: u64, out: ptr, out_cap: u64, out_len: &u64, out_err: ptr, out_err_cap: u64, out_err_len: &u64) -> i32 {
+    let thread_ptr: ptr = PTR_NULL();
+    let thread_len: u64 = 0;
+    rec_str(record, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len);
+    let owner_ptr: ptr = PTR_NULL();
+    let owner_len: u64 = 0;
+    let has_owner = rec_str(record, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner_ptr, &owner_len);
+    let idx: u64 = 0;
+    let has = false;
+    AgyBridge_getOrRestoreSession(self, thread_ptr, thread_len, owner_ptr, owner_len, has_owner, &idx, &has);
+    let active_ptr: ptr = PTR_NULL();
+    let active_len: u64 = 0;
+    let has_active = false;
+    let rec_turn_ptr: ptr = PTR_NULL();
+    let rec_turn_len: u64 = 0;
+    if rec_str(record, STR_PTR("turnId"), STR_LEN("turnId"), &rec_turn_ptr, &rec_turn_len) {
+        active_ptr = rec_turn_ptr;
+        active_len = rec_turn_len;
+        has_active = true;
+    } else if has && self.sessions[idx].has_activeTurnId {
+        active_ptr = &self.sessions[idx].activeTurnId;
+        active_len = self.sessions[idx].activeTurnId_len;
+        has_active = true;
+    };
+    if has {
+        let s = &self.sessions[idx];
+        s.has_pending = false;
+        if s.has_runtime { AgyCompatibleRuntime_interrupt(&s.runtime); };
+        if has_active { session_set_turn_status(s, active_ptr, active_len, STR_PTR("interrupted"), STR_LEN("interrupted")); };
+        s.has_activeTurnId = false;
+        s.activeTurnId_len = 0;
+        AgyBridge_persistSession(self, s);
+    };
+    if thread_len > 0 {
+        let notif = [0u8; 2048];
+        let notif_len: u64 = 0;
+        notif_len = notif_len + append_bytes(&notif, 2048, notif_len, STR_PTR("{\"method\":\"turn/interrupted\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"turn/interrupted\",\"params\":{\"threadId\":\""));
+        notif_len = notif_len + append_bytes(&notif, 2048, notif_len, thread_ptr, thread_len);
+        notif_len = notif_len + append_bytes(&notif, 2048, notif_len, STR_PTR("\""), 1);
+        if has_active {
+            notif_len = notif_len + append_bytes(&notif, 2048, notif_len, STR_PTR(",\"turnId\":\""), STR_LEN(",\"turnId\":\""));
+            notif_len = notif_len + append_bytes(&notif, 2048, notif_len, active_ptr, active_len);
+            notif_len = notif_len + append_bytes(&notif, 2048, notif_len, STR_PTR("\",\"turn\":{\"id\":\""), STR_LEN("\",\"turn\":{\"id\":\""));
+            notif_len = notif_len + append_bytes(&notif, 2048, notif_len, active_ptr, active_len);
+            notif_len = notif_len + append_bytes(&notif, 2048, notif_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+            notif_len = notif_len + append_bytes(&notif, 2048, notif_len, thread_ptr, thread_len);
+            notif_len = notif_len + append_bytes(&notif, 2048, notif_len, STR_PTR("\",\"status\":\"interrupted\",\"completedAt\":"), STR_LEN("\",\"status\":\"interrupted\",\"completedAt\":"));
+            notif_len = notif_len + append_u64(&notif, 2048, notif_len, now_ms() / 1000);
+            notif_len = notif_len + append_bytes(&notif, 2048, notif_len, STR_PTR("}"), 1);
+        };
+        notif_len = notif_len + append_bytes(&notif, 2048, notif_len, STR_PTR("}}"), 2);
+        bridge_emit(self, STR_PTR("notification"), STR_LEN("notification"), &notif, notif_len);
+    };
+    out_len = append_bytes(out, out_cap, 0, STR_PTR("{\"ok\":true}"), STR_LEN("{\"ok\":true}"));
+    return 0;
+}
+
+// request_thread_read ("thread/read" | "thread/resume")
+fn request_thread_read(self: &AgyBridge, record: u64, out: ptr, out_cap: u64, out_len: &u64, out_err: ptr, out_err_cap: u64, out_err_len: &u64) -> i32 {
+    let thread_ptr: ptr = PTR_NULL();
+    let thread_len: u64 = 0;
+    rec_str(record, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len);
+    let owner_ptr: ptr = PTR_NULL();
+    let owner_len: u64 = 0;
+    let has_owner = rec_str(record, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner_ptr, &owner_len);
+    let include_turns = true;
+    let flag = false;
+    if sa_json_object_get_bool(record, STR_PTR("includeTurns"), STR_LEN("includeTurns"), &flag) == 0 { include_turns = flag; };
+    let live = bridge_find(self, thread_ptr, thread_len);
+    if !include_turns && live == 4294967295 && self.has_options {
+        let meta = [0u8; 262144];
+        let meta_len: u64 = 0;
+        let has_meta = false;
+        host_load_metadata(thread_ptr, thread_len, owner_ptr, owner_len, has_owner, &meta, 262144, &meta_len, &has_meta);
+        if !has_meta {
+            out_len = append_bytes(out, out_cap, 0, STR_PTR("{\"thread\":{\"id\":\""), STR_LEN("{\"thread\":{\"id\":\""));
+            out_len = out_len + append_bytes(out, out_cap, out_len, thread_ptr, thread_len);
+            out_len = out_len + append_bytes(out, out_cap, out_len, STR_PTR("\",\"cliBackend\":\"agy\",\"status\":{\"type\":\"idle\"},\"turns\":[]},\"items\":[]}"), STR_LEN("\",\"cliBackend\":\"agy\",\"status\":{\"type\":\"idle\"},\"turns\":[]},\"items\":[]}"));
+            return 0;
+        };
+        // { thread: {...metadata, id, cliBackend: "agy",
+        // historyMode: "paginated", status idle, turns: []},
+        // items: [] } — metadata fields are spliced textually.
+        let n: u64 = 0;
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"thread\":{"), STR_LEN("{\"thread\":{"));
+        if meta_len > 2 {
+            n = n + append_bytes(out, out_cap, n, byte_off(&meta, 1), meta_len - 2);
+            n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1);
+        };
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\"id\":\""), STR_LEN("\"id\":\""));
+        n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"cliBackend\":\"agy\",\"historyMode\":\"paginated\",\"status\":{\"type\":\"idle\"},\"turns\":[]},\"items\":[]}"), STR_LEN("\",\"cliBackend\":\"agy\",\"historyMode\":\"paginated\",\"status\":{\"type\":\"idle\"},\"turns\":[]},\"items\":[]}"));
+        out_len = n;
+        return 0;
+    };
+    let idx: u64 = 0;
+    let has = false;
+    if live != 4294967295 { idx = live; has = true; } else { AgyBridge_getOrRestoreSession(self, thread_ptr, thread_len, owner_ptr, owner_len, has_owner, &idx, &has); };
+    if !has {
+        let n: u64 = 0;
+        n = n + append_bytes(out, out_cap, n, STR_PTR("{\"thread\":{\"id\":\""), STR_LEN("{\"thread\":{\"id\":\""));
+        n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"cliBackend\":\"agy\",\"cwd\":\""), STR_LEN("\",\"cliBackend\":\"agy\",\"cwd\":\""));
+        let cwd_buf = [0u8; 1024];
+        let cwd_len: u64 = 0;
+        cwd_len = process_cwd(&cwd_buf, 1024);
+        n = n + append_bytes(out, out_cap, n, &cwd_buf, cwd_len);
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"status\":{\"type\":\"idle\"},\"turns\":[]},\"items\":[]}"), STR_LEN("\",\"status\":{\"type\":\"idle\"},\"turns\":[]},\"items\":[]}"));
+        out_len = n;
+        return 0;
+    };
+    let s = &self.sessions[idx];
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"thread\":{\"id\":\""), STR_LEN("{\"thread\":{\"id\":\""));
+    n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"sessionId\":\""), STR_LEN("\",\"sessionId\":\""));
+    if s.has_conversationId {
+        n = n + append_bytes(out, out_cap, n, s.conversationId_ptr, s.conversationId_len);
+    } else {
+        n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+    };
+    if s.has_conversationId {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"conversationId\":\""), STR_LEN("\",\"conversationId\":\""));
+        n = n + append_bytes(out, out_cap, n, s.conversationId_ptr, s.conversationId_len);
+    };
+    n = append_opt_str_field(out, out_cap, n, STR_PTR("preview"), STR_LEN("preview"), s.preview_ptr, s.preview_len, s.has_preview);
+    n = append_opt_str_field(out, out_cap, n, STR_PTR("model"), STR_LEN("model"), s.model_ptr, s.model_len, s.has_model);
+    n = n + append_bytes(out, out_cap, n, STR_PTR(",\"cliBackend\":\"agy\",\"status\":{\"type\":\""), STR_LEN(",\"cliBackend\":\"agy\",\"status\":{\"type\":\""));
+    if s.has_activeTurnId {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("running"), STR_LEN("running"));
+    } else {
+        n = n + append_bytes(out, out_cap, n, STR_PTR("idle"), 4);
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\"},\"cwd\":\""), STR_LEN("\"},\"cwd\":\""));
+    n = n + append_bytes(out, out_cap, n, s.cwd_ptr, s.cwd_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"turns\":["), STR_LEN("\",\"turns\":["));
+    if include_turns {
+        for ti in 0..s.turns_count {
+            if ti > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+            n = n + append_bytes(out, out_cap, n, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+            n = n + append_bytes(out, out_cap, n, &s.turns[ti].id, s.turns[ti].id_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+            n = n + append_bytes(out, out_cap, n, thread_ptr, thread_len);
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"status\":\""), STR_LEN("\",\"status\":\""));
+            // in_progress maps to inProgress for the active
+            // turn, interrupted otherwise.
+            if str_is(&s.turns[ti].status, s.turns[ti].status_len, STR_PTR("in_progress"), STR_LEN("in_progress")) {
+                if s.has_activeTurnId && s.activeTurnId_len == s.turns[ti].id_len && bytes_eq(&s.activeTurnId, &s.turns[ti].id, s.turns[ti].id_len) {
+                    n = n + append_bytes(out, out_cap, n, STR_PTR("inProgress"), STR_LEN("inProgress"));
+                } else {
+                    n = n + append_bytes(out, out_cap, n, STR_PTR("interrupted"), STR_LEN("interrupted"));
+                };
+            } else {
+                n = n + append_bytes(out, out_cap, n, &s.turns[ti].status, s.turns[ti].status_len);
+            };
+            n = n + append_bytes(out, out_cap, n, STR_PTR("\",\"startedAt\":"), STR_LEN("\",\"startedAt\":"));
+            n = n + append_u64(out, out_cap, n, s.turns[ti].createdAt / 1000);
+            n = n + append_bytes(out, out_cap, n, STR_PTR(",\"items\":["), STR_LEN(",\"items\":["));
+            let first_item = true;
+            for mi in 0..s.msg_count {
+                let mdoc = sa_json_parse(session_msg_ptr(s, mi), s.msg_len_arr[mi]);
+                if mdoc == 0 { continue; };
+                let mt_ptr: ptr = PTR_NULL();
+                let mt_len: u64 = 0;
+                if sa_json_object_get_string(mdoc, STR_PTR("turnId"), STR_LEN("turnId"), &mt_ptr, &mt_len) != 0 { continue; };
+                if !(mt_len == s.turns[ti].id_len && bytes_eq(mt_ptr, &s.turns[ti].id, mt_len)) { continue; };
+                if !first_item { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+                first_item = false;
+                n = n + append_bytes(out, out_cap, n, session_msg_ptr(s, mi), s.msg_len_arr[mi]);
+            }
+            n = n + append_bytes(out, out_cap, n, STR_PTR("]}"), 2);
+        }
+    };
+    n = n + append_bytes(out, out_cap, n, STR_PTR("]},\"items\":["), STR_LEN("]},\"items\":["));
+    for mi in 0..s.msg_count {
+        if mi > 0 { n = n + append_bytes(out, out_cap, n, STR_PTR(","), 1); };
+        n = n + append_bytes(out, out_cap, n, session_msg_ptr(s, mi), s.msg_len_arr[mi]);
+    }
+    n = n + append_bytes(out, out_cap, n, STR_PTR("]}"), 2);
+    out_len = n;
+    return 0;
+}
+
+// request_turns_list ("thread/turns/list"):
+// pageThreadHistory from @cxu/sdk-backend — host shim in this
+// unit (the sdk unit owns the canonical conversion).
+fn request_turns_list(self: &AgyBridge, record: u64, out: ptr, out_cap: u64, out_len: &u64, out_err: ptr, out_err_cap: u64, out_err_len: &u64) -> i32 {
+    let thread_ptr: ptr = PTR_NULL();
+    let thread_len: u64 = 0;
+    rec_str(record, STR_PTR("threadId"), STR_LEN("threadId"), &thread_ptr, &thread_len);
+    let owner_ptr: ptr = PTR_NULL();
+    let owner_len: u64 = 0;
+    let has_owner = rec_str(record, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner_ptr, &owner_len);
+    let idx: u64 = 0;
+    let has = false;
+    AgyBridge_getOrRestoreSession(self, thread_ptr, thread_len, owner_ptr, owner_len, has_owner, &idx, &has);
+    if !has {
+        out_len = append_bytes(out, out_cap, 0, STR_PTR("{\"turns\":[],\"data\":[],\"nextCursor\":null}"), STR_LEN("{\"turns\":[],\"data\":[],\"nextCursor\":null}"));
+        return 0;
+    };
+    let s = &self.sessions[idx];
+    let snap = [0u8; 1048576];
+    let snap_len: u64 = 0;
+    session_snapshot_json(s, &snap, 1048576, &snap_len);
+    let cursor_ptr: ptr = PTR_NULL();
+    let cursor_len: u64 = 0;
+    let has_cursor = rec_str(record, STR_PTR("cursor"), STR_LEN("cursor"), &cursor_ptr, &cursor_len);
+    let limit: i64 = 32;
+    sa_json_object_get_i64(record, STR_PTR("limit"), STR_LEN("limit"), &limit);
+    let sort_ptr = STR_PTR("desc");
+    let sort_len = STR_LEN("desc");
+    let sp: ptr = PTR_NULL();
+    let sl: u64 = 0;
+    if rec_str(record, STR_PTR("sortDirection"), STR_LEN("sortDirection"), &sp, &sl) { sort_ptr = sp; sort_len = sl; };
+    host_page_thread_history(thread_ptr, thread_len, &snap, snap_len, cursor_ptr, cursor_len, has_cursor, limit, sort_ptr, sort_len, out, out_cap, out_len);
+    return 0;
+}
+
+// AgyBridge_pollPending: fire deferred executeTurn calls whose
+// 10ms deadline passed (the source's setTimeout bodies,
+// including the failure path: mark turn failed, clear active,
+// persist, emit turn/failed).
+fn AgyBridge_pollPending(self: &AgyBridge) -> void {
+    let now = now_ms();
+    for i in 0..self.sessions_count {
+        let s = &self.sessions[i];
+        if !s.has_pending || now < s.pending_deadline { continue; };
+        s.has_pending = false;
+        if !s.has_runtime { continue; };
+        let err = [0u8; 4096];
+        let err_len: u64 = 0;
+        let rc = AgyCompatibleRuntime_executeTurn(&s.runtime, &s.pending_prompt, s.pending_prompt_len, &s.pending_turnId, s.pending_turnId_len, &err, 4096, &err_len);
+        if rc != 0 {
+            session_set_turn_status(s, &s.pending_turnId, s.pending_turnId_len, STR_PTR("failed"), STR_LEN("failed"));
+            s.has_activeTurnId = false;
+            s.activeTurnId_len = 0;
+            AgyBridge_persistSession(self, s);
+            let notif = [0u8; 8192];
+            let notif_len: u64 = 0;
+            notif_len = notif_len + append_bytes(&notif, 8192, notif_len, STR_PTR("{\"method\":\"turn/failed\",\"params\":{\"threadId\":\""), STR_LEN("{\"method\":\"turn/failed\",\"params\":{\"threadId\":\""));
+            notif_len = notif_len + append_bytes(&notif, 8192, notif_len, s.threadId_ptr, s.threadId_len);
+            notif_len = notif_len + append_bytes(&notif, 8192, notif_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+            notif_len = notif_len + append_bytes(&notif, 8192, notif_len, &s.pending_turnId, s.pending_turnId_len);
+            notif_len = notif_len + append_bytes(&notif, 8192, notif_len, STR_PTR("\",\"error\":{\"message\":\""), STR_LEN("\",\"error\":{\"message\":\""));
+            notif_len = notif_len + append_bytes(&notif, 8192, notif_len, &err, err_len);
+            notif_len = notif_len + append_bytes(&notif, 8192, notif_len, STR_PTR("\"}}}"), 4);
+            bridge_emit(self, STR_PTR("notification"), STR_LEN("notification"), &notif, notif_len);
+        };
+    }
+}
+
+// ---- host shims (AgyBridgeOptions + sdk-backend imports) ----
+// DEFECT: callback options have no SLA form; the host supplies
+// these. resolve/load fns report presence via out_has.
+
+fn host_resolve_relay_env(provider_ptr: ptr, provider_len: u64, group_ptr: ptr, group_len: u64, has_group: bool, model_ptr: ptr, model_len: u64, has_model: bool, out: ptr, out_cap: u64, out_len: &u64, out_has: &bool) -> void {
+    out_len = 0;
+    out_has = false;
+}
+
+fn host_resolve_relay_proxy_config(provider_ptr: ptr, provider_len: u64, group_ptr: ptr, group_len: u64, has_group: bool, model_ptr: ptr, model_len: u64, has_model: bool, out: ptr, out_cap: u64, out_len: &u64, out_has: &bool) -> void {
+    out_len = 0;
+    out_has = false;
+}
+
+fn host_on_snapshot(snap_ptr: ptr, snap_len: u64) -> void {
+}
+
+fn host_load_snapshot(thread_ptr: ptr, thread_len: u64, owner_ptr: ptr, owner_len: u64, has_owner: bool, out: ptr, out_cap: u64, out_len: &u64, out_has: &bool) -> void {
+    out_len = 0;
+    out_has = false;
+}
+
+fn host_load_metadata(thread_ptr: ptr, thread_len: u64, owner_ptr: ptr, owner_len: u64, has_owner: bool, out: ptr, out_cap: u64, out_len: &u64, out_has: &bool) -> void {
+    out_len = 0;
+    out_has = false;
+}
+
+// host_page_thread_history: @cxu/sdk-backend pageThreadHistory.
+fn host_page_thread_history(thread_ptr: ptr, thread_len: u64, snap_ptr: ptr, snap_len: u64, cursor_ptr: ptr, cursor_len: u64, has_cursor: bool, limit: i64, sort_ptr: ptr, sort_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    out_len = append_bytes(out, out_cap, 0, STR_PTR("{\"turns\":[],\"data\":[],\"nextCursor\":null}"), STR_LEN("{\"turns\":[],\"data\":[],\"nextCursor\":null}"));
+}
+
+// host_bootstrap_project_savm_assets: @cxu/sdk-backend
+// bootstrapProjectSaVmAssets(cwd, threadId).
+fn host_bootstrap_project_savm_assets(cwd_ptr: ptr, cwd_len: u64, thread_ptr: ptr, thread_len: u64) -> void {
+}
+
+// uuid_new: randomUUID() shim. DEFECT: no verified std uuid.
+fn uuid_new(out: ptr, out_cap: u64, out_len: &u64) -> void {
+    out_len = buf_copy(out, out_cap, STR_PTR("00000000-0000-4000-8000-000000000000"), STR_LEN("00000000-0000-4000-8000-000000000000"));
+}
+
+// process_cwd: process.cwd() via the PWD env shim.
+fn process_cwd(out: ptr, out_cap: u64) -> u64 {
+    let h = sa_env_get(STR_PTR("PWD"), STR_LEN("PWD"));
+    if h == 0 { return 0; };
+    let p: ptr = PTR_NULL();
+    let l: u64 = 0;
+    sa_env_buffer_data(h, &p);
+    sa_env_buffer_len(h, &l);
+    return buf_copy(out, out_cap, p, l);
+}
+
+// now_ms: Date.now() shim. DEFECT: no verified std clock.
+fn now_ms() -> u64 {
+    return 0;
+}
+
+// ts_trim_span: String.prototype.trim — 已绑 sa_std ts 面
+// (@import "sa_std/ts_string.sa" 的 @ts_str_trim；句柄模型
+// {ptr,len}，此处为其 span 形态绑定，精确宏签名在修复阶段对齐）。
+fn ts_trim_span(p: ptr, n: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    @ts_str_trim(out_ptr, out_len, p, n);
+}
+
+// json_node_string / json_node_is_null: bare-node accessors
+// over the sa_json surface. DEFECT: node-kind surface shims.
+fn json_node_string(node: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    out_ptr = PTR_NULL();
+    out_len = 0;
+}
+
+fn json_node_is_null(node: u64) -> bool {
+    return node == 0;
+}
+
+fn stringify_into(node: u64, out: ptr, out_cap: u64) -> u64 {
+    if node == 0 { return append_bytes(out, out_cap, 0, STR_PTR("{}"), 2); };
+    let h: u64 = 0;
+    if sa_json_stringify(node, &h) != 0 { return append_bytes(out, out_cap, 0, STR_PTR("{}"), 2); };
+    let bp: ptr = PTR_NULL();
+    let bl: u64 = 0;
+    sa_json_buffer_data(h, &bp);
+    sa_json_buffer_len(h, &bl);
+    let n = buf_copy(out, out_cap, bp, bl);
+    sa_json_buffer_free(h);
+    return n;
+}
+
+// queue_next: one `kind\tpayload\n` record (same format as the
+// runtime/process-manager queues).
+fn queue_next(queue: ptr, queue_len: u64, pos: &u64, kind_out: ptr, kind_cap: u64, kind_len: &u64, payload_out: ptr, payload_cap: u64, payload_len: &u64, out_has: &bool) -> void {
+    out_has = false;
+    kind_len = 0;
+    payload_len = 0;
+    if pos >= queue_len { return; };
+    let tab = find_byte(queue, queue_len, pos, 9);
+    if tab == 4294967295 { return; };
+    kind_len = buf_copy(kind_out, kind_cap, byte_off(queue, pos), tab - pos);
+    let nl = find_byte(queue, queue_len, tab + 1, 10);
+    let end = queue_len;
+    if nl != 4294967295 { end = nl; };
+    payload_len = buf_copy(payload_out, payload_cap, byte_off(queue, tab + 1), end - tab - 1);
+    pos = end + 1;
+    out_has = true;
+}
+
+// ---- local helpers ----
+
+fn byte_at(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+fn byte_off(p: ptr, off: u64) -> ptr {
+    let r: ptr = PTR_NULL();
+    PTR_BYTE_ADD(r, p, off);
+    return r;
+}
+
+fn slot(arena: ptr, off: u64) -> ptr {
+    return byte_off(arena, off);
+}
+
+fn bytes_eq(a: ptr, b: ptr, n: u64) -> bool {
+    for i in 0..n {
+        if byte_at(a, i) != byte_at(b, i) { return false; };
+    }
+    return true;
+}
+
+fn str_is(p: ptr, n: u64, lit: ptr, lit_len: u64) -> bool {
+    return n == lit_len && bytes_eq(p, lit, n);
+}
+
+fn contains(p: ptr, n: u64, needle: ptr, needle_len: u64) -> bool {
+    if needle_len > n { return false; };
+    let last = n - needle_len;
+    let i: u64 = 0;
+    while i <= last {
+        if bytes_eq(byte_off(p, i), needle, needle_len) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn find_byte(buf: ptr, n: u64, from: u64, want: u8) -> u64 {
+    let i = from;
+    while i < n {
+        if byte_at(buf, i) == want { return i; };
+        i = i + 1;
+    }
+    return 4294967295;
+}
+
+fn trim_span(p: ptr, n: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    let start: u64 = 0;
+    let end = n;
+    while start < end && is_ws(byte_at(p, start)) { start = start + 1; };
+    while end > start && is_ws(byte_at(p, end - 1)) { end = end - 1; };
+    out_ptr = byte_off(p, start);
+    out_len = end - start;
+}
+
+fn trim_is_empty(p: ptr, n: u64) -> bool {
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    trim_span(p, n, &tp, &tl);
+    return tl == 0;
+}
+
+fn is_ws(b: u8) -> bool {
+    return b == 32 || b == 9 || b == 10 || b == 13;
+}
+
+fn append_bytes(dst: ptr, cap: u64, at: u64, src: ptr, n: u64) -> u64 {
+    let w: u64 = 0;
+    for i in 0..n {
+        if at + w < cap {
+            PTR_BYTE_SET(dst, at + w, byte_at(src, i));
+            w = w + 1;
+        };
+    }
+    return w;
+}
+
+fn append_u64(dst: ptr, cap: u64, at: u64, v: u64) -> u64 {
+    let digits = [0u8; 20];
+    let dn: u64 = 0;
+    if v == 0 { return append_bytes(dst, cap, at, STR_PTR("0"), 1); };
+    let x = v;
+    while x > 0 {
+        digits[dn] = 48 + (x % 10) as u8;
+        dn = dn + 1;
+        x = x / 10;
+    }
+    let w: u64 = 0;
+    let i = dn;
+    while i > 0 {
+        i = i - 1;
+        if at + w < cap { PTR_BYTE_SET(dst, at + w, digits[i]); w = w + 1; };
+    }
+    return w;
+}
+
+fn buf_copy(dst: ptr, cap: u64, src: ptr, n: u64) -> u64 {
+    let m = n;
+    if m > cap { m = cap; };
+    for i in 0..m {
+        PTR_BYTE_SET(dst, i, byte_at(src, i));
+    }
+    return m;
+}
+
+fn buf_append(dst: ptr, cap: u64, at: u64, src: ptr, n: u64) -> u64 {
+    return append_bytes(dst, cap, at, src, n);
+}
+
+fn join2(out: ptr, cap: u64, a: ptr, a_len: u64, b: ptr, b_len: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out, cap, n, a, a_len);
+    n = n + append_bytes(out, cap, n, STR_PTR("/"), 1);
+    n = n + append_bytes(out, cap, n, b, b_len);
+    return n;
+}
+
+fn read_file_into(path: ptr, path_len: u64, out: ptr, cap: u64, out_len: &u64) -> bool {
+    out_len = 0;
+    let total: u64 = 0;
+    if sa_std_fs_len(path, path_len, &total) != 0 { return false; };
+    let fh: u64 = 0;
+    if sa_std_fs_open_read(path, path_len, &fh) != 0 { return false; };
+    let read_n: u64 = 0;
+    let rst = sa_std_fs_file_read(fh, out, cap, &read_n);
+    sa_fs_file_close(fh);
+    if rst != 0 { return false; };
+    out_len = read_n;
+    return true;
+}

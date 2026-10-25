@@ -1,0 +1,613 @@
+// Converted 1:1 from apps/duck2api/src/duckgo/tool-simulation.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "response.sla"
+
+// Port of E:/projects/duck2api/internal/duckgo/request.go:625-1019
+// ToolSimulationStream incremental playgame parser. Byte-semantics follow Go:
+// marker `{"playgame":` with whitespace-tolerant pretty-print matching,
+// Windows-command JSON repair, `call_playgame_N` IDs, separator skipping.
+// DEFECT: TS strings are UTF-16 code units; all scanning below is on UTF-8
+// bytes (indices differ for non-ASCII text — byte-faithful only for ASCII).
+// DEFECT: the pending buffer can reach MAX_PLAYGAME_PENDING (256 KiB) in
+// TS; the fixed inline buffer caps it at 262144 bytes and push() truncates
+// beyond that (logged, not fixed). JSON.parse / JSON.stringify map to the
+// sa_json node API.
+
+struct ToolSimulationPart {
+    has_text: bool,
+    text: ByteBuf,
+    has_tool_call: bool,
+    call: ToolCall,
+}
+
+struct ToolSimParts {
+    parts: [ToolSimulationPart; 64],
+    len: u64,
+}
+
+// ToolCall is response.sla's fixed-array struct; a call list is the
+// (array, len) pair response.sla's builders take, wrapped for the parser.
+struct ToolCallList {
+    calls: [ToolCall; 64],
+    len: u64,
+}
+
+fn tool_call_clear(call: &ToolCall) -> void {
+    call.has_index = false;
+    call.index = 0;
+    call.id_len = 0;
+    call.typ_len = 0;
+    call.fn_name_len = 0;
+    call.fn_arguments_len = 0;
+}
+
+fn tc_copy(dst: ptr, cap: u64, src: ptr, len: u64, out_len: &u64) -> void {
+    let n = len;
+    if n > cap { n = cap; };
+    for i in 0..n { PTR_BYTE_SET(dst, i, PTR_BYTE_AT(src, i)); }
+    *out_len = n;
+}
+
+fn tc_set_type_function(call: &ToolCall) -> void {
+    tc_copy(call.typ, 32, STR_PTR("function"), STR_LEN("function"), &call.typ_len);
+}
+
+struct ToolSimPending {
+    bytes: [u8; 262144],
+    len: u64,
+}
+
+// TS: export class ToolSimulationStream { private pending = ""; private nextCall = 0; }
+struct ToolSimulationStream {
+    pending: ToolSimPending,
+    next_call: u64,
+}
+
+fn pending_append(s: &ToolSimPending, p: ptr, l: u64) -> void {
+    for i in 0..l {
+        if s.len < 262144 {
+            PTR_BYTE_SET(s.bytes, s.len, PTR_BYTE_AT(p, i));
+            s.len = s.len + 1;
+        };
+    }
+}
+
+fn pending_drop_front(s: &ToolSimPending, n: u64) -> void {
+    if n >= s.len {
+        s.len = 0;
+        return;
+    };
+    let rest = s.len - n;
+    for i in 0..rest {
+        PTR_BYTE_SET(s.bytes, i, PTR_BYTE_AT(s.bytes, n + i));
+    }
+    s.len = rest;
+}
+
+fn pending_slice(s: &ToolSimPending, start: u64, end: u64, out: &ByteBuf) -> void {
+    buf_reset(out);
+    if end > start {
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, s.bytes, start);
+        buf_append_lit(out, p, end - start);
+    };
+}
+
+// TS: const PLAYGAME_MARKER = `{"playgame":`; MAX_PLAYGAME_PENDING = 256 * 1024
+fn is_json_whitespace_char(ch: u8) -> bool {
+    return ch == 32 || ch == 10 || ch == 13 || ch == 9;
+}
+
+// TS: function findPlaygameMarker(value: string): number  (-1 -> 4294967295)
+fn find_playgame_marker(v: ptr, len: u64) -> u64 {
+    let offset: u64 = 0;
+    while offset < len {
+        let abs_index = 4294967295;
+        for scan in offset..len {
+            if PTR_BYTE_AT(v, scan) == 123 { abs_index = scan; break; };
+        }
+        if abs_index == 4294967295 { return 4294967295; };
+        let cursor = abs_index + 1;
+        while cursor < len && is_json_whitespace_char(PTR_BYTE_AT(v, cursor)) { cursor = cursor + 1; }
+        if cursor >= len { return 4294967295; };
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, v, cursor);
+        if !(cursor + 10 <= len && bytes_eq_str(cp, 10, STR_PTR("\"playgame\""), STR_LEN("\"playgame\""))) {
+            offset = abs_index + 1;
+            continue;
+        };
+        cursor = cursor + 10;
+        while cursor < len && is_json_whitespace_char(PTR_BYTE_AT(v, cursor)) { cursor = cursor + 1; }
+        if cursor >= len || PTR_BYTE_AT(v, cursor) != 58 {
+            offset = abs_index + 1;
+            continue;
+        };
+        return abs_index;
+    }
+    return 4294967295;
+}
+
+// TS: function suffixMarkerPrefixLength(value, marker): number
+fn suffix_marker_prefix_length(v: ptr, len: u64, marker: ptr, marker_len: u64) -> u64 {
+    let max = len;
+    if max >= marker_len { max = marker_len - 1; };
+    let l = max;
+    while l > 0 {
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, v, len - l);
+        if bytes_eq_str(sp, l, marker, l) { return l; };
+        l = l - 1;
+    }
+    return 0;
+}
+
+// TS: function suffixPlaygamePrefixLength(value: string): number
+fn suffix_playgame_prefix_length(v: ptr, len: u64) -> u64 {
+    let last_brace = 4294967295;
+    let i = len;
+    while i > 0 {
+        i = i - 1;
+        if PTR_BYTE_AT(v, i) == 123 { last_brace = i; break; };
+    }
+    if last_brace == 4294967295 { return 0; };
+    let suffix_start = last_brace + 1;
+    while suffix_start < len && is_json_whitespace_char(PTR_BYTE_AT(v, suffix_start)) { suffix_start = suffix_start + 1; };
+    let suffix_len = len - suffix_start;
+    if suffix_len == 0 { return len - last_brace; };
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, v, suffix_start);
+    if suffix_len <= 11 && bytes_eq_str(STR_PTR("\"playgame\":"), suffix_len, sp, suffix_len) {
+        // TS: `"playgame":`.startsWith(suffix)
+        return len - last_brace;
+    };
+    return suffix_marker_prefix_length(v, len, STR_PTR("{\"playgame\":"), STR_LEN("{\"playgame\":"));
+}
+
+fn is_json_structural(ch: u8) -> bool {
+    return ch == 58 || ch == 44 || ch == 125 || ch == 93;
+}
+
+fn is_valid_json_escape(ch: u8) -> bool {
+    return ch == 34 || ch == 92 || ch == 47 || ch == 98 || ch == 102 || ch == 110 || ch == 114 || ch == 116 || ch == 117;
+}
+
+// TS: function nextNonJSONWhitespace(value, start): number
+fn next_non_json_whitespace(v: ptr, len: u64, start: u64) -> u64 {
+    for i in start..len {
+        if !is_json_whitespace_char(PTR_BYTE_AT(v, i)) { return i; };
+    }
+    return 4294967295;
+}
+
+// TS: function extractPlaygameCandidate(text): { candidate; consumed; complete }
+fn extract_playgame_candidate(text: ptr, len: u64, out_candidate: &ByteBuf, out_consumed: &u64, out_complete: &bool) -> void {
+    buf_reset(out_candidate);
+    *out_consumed = 0;
+    *out_complete = false;
+    if len == 0 || PTR_BYTE_AT(text, 0) != 123 { return; };
+    let depth: u64 = 0;
+    let in_string = false;
+    let escaped = false;
+    for index in 0..len {
+        let ch = PTR_BYTE_AT(text, index);
+        if in_string {
+            if ch == 92 {
+                escaped = !escaped;
+                continue;
+            };
+            if ch == 34 && !escaped {
+                let next = next_non_json_whitespace(text, len, index + 1);
+                if next == 4294967295 || is_json_structural(PTR_BYTE_AT(text, next)) { in_string = false; };
+            };
+            escaped = false;
+            continue;
+        };
+        if ch == 34 {
+            in_string = true;
+            continue;
+        };
+        if ch == 123 { depth = depth + 1; }
+        else if ch == 125 {
+            depth = depth - 1;
+            if depth == 0 {
+                buf_append_lit(out_candidate, text, index + 1);
+                *out_consumed = index + 1;
+                *out_complete = true;
+                return;
+            };
+        };
+    }
+    buf_append_lit(out_candidate, text, len);
+}
+
+// TS: function repairPlaygameJSON(text: string): string
+fn repair_playgame_json(out: &ByteBuf, text: ptr, len: u64) -> void {
+    buf_reset(out);
+    let in_string = false;
+    let i: u64 = 0;
+    while i < len {
+        let ch = PTR_BYTE_AT(text, i);
+        if !in_string {
+            buf_append_byte(out, ch);
+            if ch == 34 { in_string = true; };
+            i = i + 1;
+            continue;
+        };
+        if ch == 92 {
+            if i + 1 < len {
+                let next = PTR_BYTE_AT(text, i + 1);
+                if is_valid_json_escape(next) {
+                    buf_append_byte(out, ch);
+                    buf_append_byte(out, next);
+                    i = i + 2;
+                    continue;
+                };
+            };
+            buf_append_lit(out, STR_PTR("\\\\"), STR_LEN("\\\\"));
+            i = i + 1;
+            continue;
+        };
+        if ch == 34 {
+            let next = next_non_json_whitespace(text, len, i + 1);
+            if next == 4294967295 || is_json_structural(PTR_BYTE_AT(text, next)) {
+                buf_append_byte(out, ch);
+                in_string = false;
+            } else {
+                buf_append_lit(out, STR_PTR("\\\""), STR_LEN("\\\""));
+            };
+            i = i + 1;
+            continue;
+        };
+        buf_append_byte(out, ch);
+        i = i + 1;
+    }
+}
+
+// TS: function skipPlaygameSeparators(value: string): string — returns chars skipped
+fn skip_playgame_separators(v: ptr, len: u64) -> u64 {
+    let i: u64 = 0;
+    while i < len {
+        let ch = PTR_BYTE_AT(v, i);
+        if ch == 32 || ch == 10 || ch == 9 || ch == 13 || ch == 125 { i = i + 1; } else { break; };
+    }
+    return i;
+}
+
+// TS: interface Decoded { status: "complete"|"incomplete"|"invalid"; consumed: number; call?: ToolCall }
+struct PlaygameDecoded {
+    status: u8, // 0 complete, 1 incomplete, 2 invalid
+    consumed: u64,
+    has_call: bool,
+    call: ToolCall,
+}
+
+// TS: function toCall(action, argsRaw): ToolCall
+fn playgame_to_call(call: &ToolCall, action_ptr: ptr, action_len: u64, args: &ByteBuf) -> void {
+    tool_call_clear(call);
+    tc_set_type_function(call);
+    tc_copy(call.fn_name, 128, action_ptr, action_len, &call.fn_name_len);
+    if args.len == 0 || (args.len == 4 && bytes_eq_str(&args.bytes, args.len, STR_PTR("null"), STR_LEN("null"))) {
+        tc_copy(call.fn_arguments, 4096, STR_PTR("{}"), STR_LEN("{}"), &call.fn_arguments_len);
+    } else {
+        tc_copy(call.fn_arguments, 4096, &args.bytes, args.len, &call.fn_arguments_len);
+    };
+}
+
+// TS: function parseEnvelope(text): { action; argsRaw } | null
+fn parse_envelope(text: ptr, len: u64, out_action: &StrField, out_args: &ByteBuf) -> bool {
+    let root: u64 = 0;
+    if sa_json_parse(text, len, &root) != 0 || root == 0 { return false; };
+    let pg: u64 = 0;
+    if sa_json_object_get(root, STR_PTR("playgame"), STR_LEN("playgame"), &pg) != 0 || pg == 0 { return false; };
+    let ap: ptr = PTR_NULL();
+    let al: u64 = 0;
+    sa_json_object_get_string(pg, STR_PTR("action"), STR_LEN("action"), &ap, &al);
+    if al == 0 { return false; };
+    str_field_set(out_action, ap, al);
+    let args_node: u64 = 0;
+    let has_args = sa_json_object_get(pg, STR_PTR("args"), STR_LEN("args"), &args_node) == 0 && args_node != 0 && sa_json_kind_of(args_node) != 0;
+    buf_reset(out_args);
+    if !has_args {
+        buf_append_lit(out_args, STR_PTR("{}"), STR_LEN("{}"));
+    } else if sa_json_kind_of(args_node) == 1 {
+        let sp: ptr = PTR_NULL();
+        let sl: u64 = 0;
+        sa_json_get_string(args_node, &sp, &sl);
+        buf_append_lit(out_args, sp, sl);
+    } else {
+        // TS: JSON.stringify(args)
+        sa_json_stringify(args_node, out_args);
+    };
+    if out_args.len == 0 || (out_args.len == 4 && bytes_eq_str(&out_args.bytes, out_args.len, STR_PTR("null"), STR_LEN("null"))) {
+        buf_reset(out_args);
+        buf_append_lit(out_args, STR_PTR("{}"), STR_LEN("{}"));
+    };
+    return true;
+}
+
+// TS: function jsonValueEnd(value, start): number — end (exclusive) of the
+// leading JSON value, mirroring Go json.Decoder.InputOffset.
+fn json_value_end(v: ptr, len: u64, start: u64) -> u64 {
+    let index = start;
+    while index < len && is_json_whitespace_char(PTR_BYTE_AT(v, index)) { index = index + 1; }
+    if index >= len { return 4294967295; };
+    let first = PTR_BYTE_AT(v, index);
+    if first == 34 {
+        index = index + 1;
+        let escaped = false;
+        while index < len {
+            let ch = PTR_BYTE_AT(v, index);
+            if escaped { escaped = false; }
+            else if ch == 92 { escaped = true; }
+            else if ch == 34 { return index + 1; };
+            index = index + 1;
+        }
+        return 4294967295;
+    };
+    if first == 123 || first == 91 {
+        let stack: [u8; 64] = [0u8; 64];
+        let depth: u64 = 0;
+        stack[depth] = if first == 123 { 125 } else { 93 };
+        depth = 1;
+        let quoted = false;
+        let escaped = false;
+        index = index + 1;
+        while index < len {
+            let ch = PTR_BYTE_AT(v, index);
+            if quoted {
+                if escaped { escaped = false; }
+                else if ch == 92 { escaped = true; }
+                else if ch == 34 { quoted = false; };
+                index = index + 1;
+                continue;
+            };
+            if ch == 34 { quoted = true; index = index + 1; continue; };
+            if ch == 123 || ch == 91 {
+                if depth < 64 {
+                    stack[depth] = if ch == 123 { 125 } else { 93 };
+                    depth = depth + 1;
+                };
+            } else if depth > 0 && ch == stack[depth - 1] {
+                depth = depth - 1;
+                if depth == 0 { return index + 1; };
+            } else if ch == 125 || ch == 93 {
+                return 4294967295;
+            };
+            index = index + 1;
+        }
+        return 4294967295;
+    };
+    index = index + 1;
+    while index < len {
+        let ch = PTR_BYTE_AT(v, index);
+        if is_json_whitespace_char(ch) || ch == 44 || ch == 125 || ch == 93 { break; };
+        index = index + 1;
+    }
+    if index > start { return index; };
+    return 4294967295;
+}
+
+// TS: function decodePlaygame(text, final): Decoded
+fn decode_playgame(out: &PlaygameDecoded, text: ptr, len: u64, final: bool) -> void {
+    out.status = 2;
+    out.consumed = 0;
+    out.has_call = false;
+    let action = StrField { bytes: [0u8; 512], len: 0 };
+    let args = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let end = json_value_end(text, len, 0);
+    if end != 4294967295 {
+        if parse_envelope(text, end, &action, &args) {
+            out.status = 0;
+            out.consumed = end;
+            out.has_call = true;
+            playgame_to_call(&out.call, &action.bytes, action.len, &args);
+            return;
+        };
+        // Valid JSON value but no action: a playgame envelope without an
+        // action is invalid; anything else falls through to repair.
+        let root: u64 = 0;
+        if sa_json_parse(text, end, &root) == 0 && root != 0 && sa_json_object_has(root, STR_PTR("playgame"), STR_LEN("playgame")) {
+            out.status = 2;
+            return;
+        };
+    };
+    let candidate = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let consumed: u64 = 0;
+    let complete = false;
+    extract_playgame_candidate(text, len, &candidate, &consumed, &complete);
+    if complete {
+        let repaired = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        repair_playgame_json(&repaired, &candidate.bytes, candidate.len);
+        if parse_envelope(&repaired.bytes, repaired.len, &action, &args) {
+            out.status = 0;
+            out.consumed = consumed;
+            out.has_call = true;
+            playgame_to_call(&out.call, &action.bytes, action.len, &args);
+            return;
+        };
+    } else if final {
+        let repaired = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        repair_playgame_json(&repaired, text, len);
+        if parse_envelope(&repaired.bytes, repaired.len, &action, &args) {
+            out.status = 0;
+            out.consumed = len;
+            out.has_call = true;
+            playgame_to_call(&out.call, &action.bytes, action.len, &args);
+            return;
+        };
+        out.status = 1;
+        return;
+    } else {
+        out.status = 1;
+        return;
+    };
+    out.status = 2;
+}
+
+fn parts_push_text(parts: &ToolSimParts, p: ptr, l: u64) -> void {
+    if parts.len >= 64 { return; };
+    let part = parts.parts[parts.len];
+    part.has_text = true;
+    buf_reset(&part.text);
+    buf_append_lit(&part.text, p, l);
+    part.has_tool_call = false;
+    parts.parts[parts.len] = part;
+    parts.len = parts.len + 1;
+}
+
+fn parts_push_call(parts: &ToolSimParts, call: &ToolCall) -> void {
+    if parts.len >= 64 { return; };
+    let part = parts.parts[parts.len];
+    part.has_text = false;
+    part.has_tool_call = true;
+    part.call = *call;
+    parts.parts[parts.len] = part;
+    parts.len = parts.len + 1;
+}
+
+// TS: private drain(final): ToolSimulationPart[]
+fn tool_sim_drain(stream: &ToolSimulationStream, parts: &ToolSimParts, final: bool) -> void {
+    parts.len = 0;
+    while stream.pending.len != 0 {
+        let marker_index = find_playgame_marker(stream.pending.bytes, stream.pending.len);
+        if marker_index == 4294967295 {
+            if final {
+                let tmp = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                pending_slice(&stream.pending, 0, stream.pending.len, &tmp);
+                parts_push_text(parts, &tmp.bytes, tmp.len);
+                stream.pending.len = 0;
+                break;
+            };
+            let keep = suffix_playgame_prefix_length(stream.pending.bytes, stream.pending.len);
+            if keep == stream.pending.len { break; };
+            if keep > 0 {
+                let emit_len = stream.pending.len - keep;
+                let tmp = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                pending_slice(&stream.pending, 0, emit_len, &tmp);
+                parts_push_text(parts, &tmp.bytes, tmp.len);
+                pending_drop_front(&stream.pending, emit_len);
+            } else {
+                let tmp = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                pending_slice(&stream.pending, 0, stream.pending.len, &tmp);
+                parts_push_text(parts, &tmp.bytes, tmp.len);
+                stream.pending.len = 0;
+            };
+            break;
+        };
+        if marker_index > 0 {
+            let tmp = ByteBuf { bytes: [0u8; 40960], len: 0 };
+            pending_slice(&stream.pending, 0, marker_index, &tmp);
+            parts_push_text(parts, &tmp.bytes, tmp.len);
+            pending_drop_front(&stream.pending, marker_index);
+            continue;
+        };
+        let decoded = PlaygameDecoded { status: 2, consumed: 0, has_call: false, call: ToolCall { has_index: false, index: 0, id: [0u8; 128], id_len: 0, typ: [0u8; 32], typ_len: 0, fn_name: [0u8; 128], fn_name_len: 0, fn_arguments: [0u8; 4096], fn_arguments_len: 0 } };
+        decode_playgame(&decoded, stream.pending.bytes, stream.pending.len, final);
+        if decoded.status == 1 {
+            if stream.pending.len > 262144 {
+                let tmp = ByteBuf { bytes: [0u8; 40960], len: 0 };
+                pending_slice(&stream.pending, 0, stream.pending.len, &tmp);
+                parts_push_text(parts, &tmp.bytes, tmp.len);
+                stream.pending.len = 0;
+            };
+            return;
+        };
+        if decoded.status == 2 {
+            let tmp = ByteBuf { bytes: [0u8; 40960], len: 0 };
+            pending_slice(&stream.pending, 0, 1, &tmp);
+            parts_push_text(parts, &tmp.bytes, tmp.len);
+            pending_drop_front(&stream.pending, 1);
+            continue;
+        };
+        stream.next_call = stream.next_call + 1;
+        // call.id = `call_playgame_${nextCall}`
+        let idb = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        buf_append_lit(&idb, STR_PTR("call_playgame_"), STR_LEN("call_playgame_"));
+        buf_append_u64(&idb, stream.next_call);
+        tc_copy(decoded.call.id, 128, &idb.bytes, idb.len, &decoded.call.id_len);
+        parts_push_call(parts, &decoded.call);
+        pending_drop_front(&stream.pending, decoded.consumed);
+        let skipped = skip_playgame_separators(stream.pending.bytes, stream.pending.len);
+        pending_drop_front(&stream.pending, skipped);
+    }
+}
+
+// TS: push(text: string): ToolSimulationPart[]
+fn tool_simulation_stream_push(stream: &ToolSimulationStream, parts: &ToolSimParts, text_ptr: ptr, text_len: u64) -> void {
+    parts.len = 0;
+    if text_len == 0 { return; };
+    pending_append(&stream.pending, text_ptr, text_len);
+    tool_sim_drain(stream, parts, false);
+}
+
+// TS: flush(): ToolSimulationPart[]
+fn tool_simulation_stream_flush(stream: &ToolSimulationStream, parts: &ToolSimParts) -> void {
+    tool_sim_drain(stream, parts, true);
+    if stream.pending.len != 0 {
+        let tmp = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        pending_slice(&stream.pending, 0, stream.pending.len, &tmp);
+        parts_push_text(parts, &tmp.bytes, tmp.len);
+        stream.pending.len = 0;
+    };
+}
+
+// TS: export function nativeToolCall(event): ToolCall | null
+fn native_tool_call(out: &ToolCall, has_name: bool, name_ptr: ptr, name_len: u64, has_id: bool, id_ptr: ptr, id_len: u64, has_args: bool, args_ptr: ptr, args_len: u64) -> bool {
+    if !has_name || !has_args { return false; };
+    let name = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&name, name_ptr, name_len);
+    buf_trim(&name);
+    let lowered = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_buf(&lowered, &name);
+    buf_to_lower(&lowered);
+    if bytes_eq_str(&lowered.bytes, lowered.len, STR_PTR("websearch"), STR_LEN("websearch")) || bytes_eq_str(&lowered.bytes, lowered.len, STR_PTR("web-search"), STR_LEN("web-search")) || bytes_eq_str(&lowered.bytes, lowered.len, STR_PTR("web_search"), STR_LEN("web_search")) {
+        buf_reset(&name);
+        buf_append_lit(&name, STR_PTR("web_search"), STR_LEN("web_search"));
+    };
+    tool_call_clear(out);
+    tc_set_type_function(out);
+    if has_id {
+        tc_copy(out.id, 128, id_ptr, id_len, &out.id_len);
+    };
+    tc_copy(out.fn_name, 128, &name.bytes, name.len, &out.fn_name_len);
+    tc_copy(out.fn_arguments, 4096, args_ptr, args_len, &out.fn_arguments_len);
+    return true;
+}
+
+// TS: export function parseToolSimulations(text): { text: string; calls: ToolCall[] }
+fn parse_tool_simulations(text_ptr: ptr, text_len: u64, out_text: &ByteBuf, out_calls: &ToolCallList) -> void {
+    let stream = ToolSimulationStream { pending: ToolSimPending { bytes: [0u8; 262144], len: 0 }, next_call: 0 };
+    let parts = ToolSimParts { parts: [ToolSimulationPart { has_text: false, text: ByteBuf { bytes: [0u8; 40960], len: 0 }, has_tool_call: false, call: ToolCall { has_index: false, index: 0, id: [0u8; 128], id_len: 0, typ: [0u8; 32], typ_len: 0, fn_name: [0u8; 128], fn_name_len: 0, fn_arguments: [0u8; 4096], fn_arguments_len: 0 } }; 64], len: 0 };
+    out_calls.len = 0;
+    buf_reset(out_text);
+    tool_simulation_stream_push(&stream, &parts, text_ptr, text_len);
+    collect_sim_parts(&parts, out_text, out_calls);
+    tool_simulation_stream_flush(&stream, &parts);
+    collect_sim_parts(&parts, out_text, out_calls);
+    buf_trim(out_text);
+}
+
+fn collect_sim_parts(parts: &ToolSimParts, out_text: &ByteBuf, out_calls: &ToolCallList) -> void {
+    for i in 0..parts.len {
+        if parts.parts[i].has_tool_call {
+            if out_calls.len < 64 {
+                out_calls.calls[out_calls.len] = parts.parts[i].call;
+                out_calls.len = out_calls.len + 1;
+            };
+        } else if parts.parts[i].has_text {
+            buf_append_buf(out_text, &parts.parts[i].text);
+        };
+    }
+}
+
+// TS: export function parseToolSimulation(text): { text: string; call: ToolCall | null }
+fn parse_tool_simulation(text_ptr: ptr, text_len: u64, out_text: &ByteBuf, out_call: &ToolCall) -> bool {
+    let calls = ToolCallList { calls: [ToolCall { has_index: false, index: 0, id: [0u8; 128], id_len: 0, typ: [0u8; 32], typ_len: 0, fn_name: [0u8; 128], fn_name_len: 0, fn_arguments: [0u8; 4096], fn_arguments_len: 0 }; 64], len: 0 };
+    parse_tool_simulations(text_ptr, text_len, out_text, &calls);
+    if calls.len > 0 {
+        *out_call = calls.calls[0];
+        return true;
+    };
+    return false;
+}

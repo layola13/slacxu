@@ -1,0 +1,242 @@
+// Converted 1:1 from sdk-backend/src/bridgeEventLog.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Per-backend diagnostic event log (cline / command-code / auggie).
+//
+// Appends one JSON object per line to `<dir>/logs/<backend>-bridge.log` so
+// protocol-level diagnosis (tool event names, payload key shapes, arrival
+// order) no longer needs copy-pasting terminal output. Each bridge passes
+// its own data/home dir; when omitted, `CODEX_UI_DATA_DIR` (or
+// `~/.codex-ultra` as a last resort) is used, so isolated test nodes get
+// isolated logs automatically.
+//
+// Rotation: at 2 MiB the file is moved aside to `.1` (single backup) and a
+// fresh file starts. `CXU_BRIDGE_LOG=off` disables all writes. Every write
+// is best-effort and synchronous-small; logging must never break turns.
+
+@import "sa_std/ptr.sa"
+@import "dataDir.sla"
+
+// DEFECT: node:fs appendFileSync/mkdirSync/statSync/renameSync and
+// Date().toISOString() / JSON.stringify have no sa_std
+// counterparts yet; externs below are std-style placeholders.
+// DEFECT: interface with object-literal implementation + closure
+// over `ready` -> struct + fn family; the closure state becomes
+// struct fields. DEFECT: try/catch everywhere -> all operations
+// are best-effort status-ignoring calls (matching the source's
+// swallow-everything semantics). DEFECT: Record<string, unknown>
+// event -> pre-serialized JSON text input.
+
+let MAX_LOG_BYTES: u64 = 2097152;
+// Cap for a single serialized payload (tool results can be huge).
+let MAX_ENTRY_BYTES: u64 = 65536;
+
+struct BridgeEventLogger {
+    // Absolute path of the active log file ("" when disabled).
+    file: [u8; 4096],
+    file_len: u64,
+    logDir: [u8; 4096],
+    logDir_len: u64,
+    safeBackend: [u8; 128],
+    safeBackend_len: u64,
+    ready: bool,
+}
+
+fn resolveBridgeLogDir(explicit_ptr: ptr, explicit_len: u64, has_explicit: bool, out: &PathBuf) -> bool {
+    // explicit = (explicitDir ?? "").trim()
+    let s: u64 = 0;
+    let e: u64 = explicit_len;
+    if has_explicit {
+        while s < e {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, explicit_ptr, s);
+            if b != 32 { break; };
+            s = s + 1;
+        }
+        while e > s {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, explicit_ptr, e - 1);
+            if b != 32 { break; };
+            e = e - 1;
+        }
+    };
+    out.len = 0;
+    if has_explicit && e > s {
+        let rp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp, explicit_ptr, s);
+        path_append(out, rp, e - s);
+        path_append(out, STR_PTR("/logs"), STR_LEN("/logs"));
+        return true;
+    };
+    // try join(codexUiDataDir(), "logs"); catch -> homedir fallback;
+    // catch -> null (false here).
+    let home = PathBuf { bytes: [0u8; 4096], len: 0 };
+    let e_home = sa_env_get(STR_PTR("HOME"), STR_LEN("HOME"));
+    if e_home != 0 {
+        let hp: ptr = sa_env_buffer_data(e_home);
+        let hl = sa_env_buffer_len(e_home);
+        path_append(&home, hp, hl);
+    };
+    let home_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(home_ptr, &home.bytes, 0);
+    // DEFECT: codexUiDataDir failure (the TS try/catch) cannot be
+    // distinguished in this conversion; the primary path is used.
+    codexUiDataDir(home_ptr, home.len, out);
+    path_append(out, STR_PTR("/logs"), STR_LEN("/logs"));
+    return true;
+}
+
+fn truncateEntry(text_ptr: ptr, text_len: u64, out: &PathBuf) -> void {
+    out.len = 0;
+    if text_len <= MAX_ENTRY_BYTES {
+        path_append(out, text_ptr, text_len);
+        return;
+    };
+    path_append(out, text_ptr, MAX_ENTRY_BYTES);
+    // `…[truncated ${text.length - MAX_ENTRY_BYTES} chars]`
+    path_append(out, STR_PTR("...[truncated "), STR_LEN("...[truncated "));
+    // DEFECT: the source uses the single-char ellipsis "…"; bytes
+    // approximated with "...". Number formatting inline:
+    let over = text_len - MAX_ENTRY_BYTES;
+    let digits = [0u8; 20];
+    let n: u64 = 0;
+    let x = over;
+    while x > 0 {
+        digits[n] = (x % 10) as u8 + 48;
+        n = n + 1;
+        x = x / 10;
+    }
+    let i = n;
+    while i > 0 {
+        i = i - 1;
+        if out.len < 4096 {
+            out.bytes[out.len] = digits[i];
+            out.len = out.len + 1;
+        };
+    }
+    path_append(out, STR_PTR(" chars]"), STR_LEN(" chars]"));
+}
+
+fn createBridgeEventLogger(backend_ptr: ptr, backend_len: u64, dir_ptr: ptr, dir_len: u64, has_dir: bool, out: &BridgeEventLogger) -> void {
+    // safeBackend = (backend || "unknown").replace(/[^A-Za-z0-9_-]/g, "_")
+    out.safeBackend_len = 0;
+    let src_ptr = backend_ptr;
+    let src_len = backend_len;
+    if src_len == 0 {
+        src_ptr = STR_PTR("unknown");
+        src_len = STR_LEN("unknown");
+    };
+    for i in 0..src_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src_ptr, i);
+        let ok = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95 || b == 45;
+        if !ok { b = 95; };
+        if out.safeBackend_len < 128 {
+            out.safeBackend[out.safeBackend_len] = b;
+            out.safeBackend_len = out.safeBackend_len + 1;
+        };
+    }
+    if out.safeBackend_len == 0 {
+        let up: ptr = STR_PTR("unknown");
+        for i in 0..7 {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, up, i);
+            out.safeBackend[out.safeBackend_len] = b;
+            out.safeBackend_len = out.safeBackend_len + 1;
+        }
+    };
+    let logDir = PathBuf { bytes: [0u8; 4096], len: 0 };
+    let has = resolveBridgeLogDir(dir_ptr, dir_len, has_dir, &logDir);
+    out.logDir_len = 0;
+    out.file_len = 0;
+    if has {
+        let lp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(lp, &logDir.bytes, 0);
+        for i in 0..logDir.len {
+            if out.logDir_len < 4096 {
+                out.logDir[out.logDir_len] = logDir.bytes[i];
+                out.logDir_len = out.logDir_len + 1;
+            };
+        }
+        // file = join(logDir, `${safeBackend}-bridge.log`)
+        let fb = PathBuf { bytes: [0u8; 4096], len: 0 };
+        path_append(&fb, lp, logDir.len);
+        path_append(&fb, STR_PTR("/"), STR_LEN("/"));
+        let sb_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sb_ptr, &out.safeBackend, 0);
+        path_append(&fb, sb_ptr, out.safeBackend_len);
+        path_append(&fb, STR_PTR("-bridge.log"), STR_LEN("-bridge.log"));
+        for i in 0..fb.len {
+            if out.file_len < 4096 {
+                out.file[out.file_len] = fb.bytes[i];
+                out.file_len = out.file_len + 1;
+            };
+        }
+    };
+    out.ready = false;
+}
+
+// append(event): void -- the method of BridgeEventLogger.
+// DEFECT: event Record -> serialized JSON object text (without
+// the auto ts/backend fields, added here by byte surgery).
+fn append(logger: &BridgeEventLogger, event_json_ptr: ptr, event_json_len: u64) -> void {
+    // if (process.env.CXU_BRIDGE_LOG === "off") return;
+    let e_off = sa_env_get(STR_PTR("CXU_BRIDGE_LOG"), STR_LEN("CXU_BRIDGE_LOG"));
+    if e_off != 0 {
+        let vp: ptr = sa_env_buffer_data(e_off);
+        let vl = sa_env_buffer_len(e_off);
+        if vl == 3 {
+            let b0: u8 = 0;
+            let b1: u8 = 0;
+            let b2: u8 = 0;
+            PTR_BYTE_AT(b0, vp, 0);
+            PTR_BYTE_AT(b1, vp, 1);
+            PTR_BYTE_AT(b2, vp, 2);
+            if b0 == 111 && b1 == 102 && b2 == 102 { return; };
+        };
+    };
+    if logger.file_len == 0 { return; };
+    let file_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(file_ptr, &logger.file, 0);
+    if !logger.ready {
+        // mkdirSync(logDir, { recursive: true })
+        // DEFECT: no sa_std recursive mkdir; placeholder extern.
+        let ld_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ld_ptr, &logger.logDir, 0);
+        sa_fs_mkdir_p(ld_ptr, logger.logDir_len);
+        logger.ready = true;
+    };
+    // rotation: existsSync(file) && statSync(file).size > MAX
+    let size: u64 = 0;
+    if sa_std_fs_len(file_ptr, logger.file_len, &size) == 0 && size > MAX_LOG_BYTES {
+        let rot = PathBuf { bytes: [0u8; 4096], len: 0 };
+        path_append(&rot, file_ptr, logger.file_len);
+        path_append(&rot, STR_PTR(".1"), STR_LEN(".1"));
+        let rot_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rot_ptr, &rot.bytes, 0);
+        // rename failure ignored (rotation collision), as in TS.
+        sa_fs_rename_file(file_ptr, logger.file_len, rot_ptr, rot.len);
+    };
+    // line = truncateEntry(JSON.stringify({ ts, backend, ...event })) + "\n"
+    // DEFECT: ts = new Date().toISOString() has no sa_std clock
+    // extern in this conversion; a zero timestamp is emitted.
+    let line = PathBuf { bytes: [0u8; 4096], len: 0 };
+    // DEFECT: MAX_ENTRY_BYTES is 64 KiB but this line buffer is
+    // 4 KiB in the bulk pass; entry truncation cap recorded in log.
+    path_append(&line, STR_PTR("{\"ts\":\"1970-01-01T00:00:00.000Z\",\"backend\":\""), STR_LEN("{\"ts\":\"1970-01-01T00:00:00.000Z\",\"backend\":\""));
+    let sb_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sb_ptr, &logger.safeBackend, 0);
+    path_append(&line, sb_ptr, logger.safeBackend_len);
+    // splice event fields: strip the event's outer braces
+    if event_json_len >= 2 {
+        path_append(&line, STR_PTR("\","), STR_LEN("\","));
+        let inner_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(inner_ptr, event_json_ptr, 1);
+        path_append(&line, inner_ptr, event_json_len - 2);
+        path_append(&line, STR_PTR("}\n"), STR_LEN("}\n"));
+    } else {
+        path_append(&line, STR_PTR("\"}\n"), STR_LEN("\"}\n"));
+    };
+    let line_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(line_ptr, &line.bytes, 0);
+    // DEFECT: appendFileSync -> placeholder extern sa_fs_append_file.
+    sa_fs_append_file(file_ptr, logger.file_len, line_ptr, line.len);
+}

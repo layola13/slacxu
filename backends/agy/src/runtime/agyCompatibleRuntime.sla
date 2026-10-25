@@ -1,0 +1,1041 @@
+// Converted 1:1 from backends/agy/src/runtime/agyCompatibleRuntime.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// DEFECT: EventEmitter ("notification" / "conversationId" /
+// "questionAnswered" / "serverRequest" / "error") — an event
+// queue buffer with `kind\tpayload\n` records, drained by the
+// bridge. DEFECT: setTimeout watchdogs — deadline fields
+// checked by AgyCompatibleRuntime_pollTimers, called from the
+// owner's pump loop. DEFECT: proc.on(...) subscriptions — the
+// manager's event queue is drained by
+// AgyCompatibleRuntime_pump, which applies the same handlers.
+// DEFECT: async executeTurn — the stop/wait head is blocking
+// here. DEFECT: stripModelContextVariant (@codex-ui/shared) —
+// local approximation; the shared unit owns the canonical one.
+// DEFECT: Number(env) float parsing — prefix parser shim.
+
+@import "./agyCompatibleProcessManager.sla"
+@import "./agyCompatibleTurnProjector.sla"
+@import "./agyCompatibleProtocol.sla"
+@import "./agyRawCapture.sla"
+@import "sa_std/ts_string.sa"
+
+// getAgyTranscriptPath(conversationId): AGY_BRAIN_DIR ||
+// GEMINI_DIR/brain || ~/.gemini/antigravity-cli/brain, then
+// <base>/<conv>/.system_generated/logs/transcript.jsonl.
+fn getAgyTranscriptPath(conv_ptr: ptr, conv_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let base = [0u8; 1024];
+    let base_len: u64 = 0;
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    let has = false;
+    env_get(STR_PTR("AGY_BRAIN_DIR"), STR_LEN("AGY_BRAIN_DIR"), &v_ptr, &v_len, &has);
+    if has && v_len > 0 {
+        base_len = buf_copy(&base, 1024, v_ptr, v_len);
+    } else {
+        env_get(STR_PTR("GEMINI_DIR"), STR_LEN("GEMINI_DIR"), &v_ptr, &v_len, &has);
+        if has && v_len > 0 {
+            base_len = join2(&base, 1024, v_ptr, v_len, STR_PTR("brain"), STR_LEN("brain"));
+        } else {
+            let home = [0u8; 512];
+            let home_len: u64 = 0;
+            home_dir(&home, 512, &home_len);
+            let gem = [0u8; 1024];
+            let gem_len: u64 = 0;
+            gem_len = join2(&gem, 1024, &home, home_len, STR_PTR(".gemini"), STR_LEN(".gemini"));
+            base_len = join2(&base, 1024, &gem, gem_len, STR_PTR("antigravity-cli"), STR_LEN("antigravity-cli"));
+            base_len = join2(&base, 1024, &base, base_len, STR_PTR("brain"), STR_LEN("brain"));
+        };
+    };
+    let with_conv = [0u8; 2048];
+    let with_conv_len: u64 = 0;
+    with_conv_len = join2(&with_conv, 2048, &base, base_len, conv_ptr, conv_len);
+    let with_sg = [0u8; 3072];
+    let with_sg_len: u64 = 0;
+    with_sg_len = join2(&with_sg, 3072, &with_conv, with_conv_len, STR_PTR(".system_generated"), STR_LEN(".system_generated"));
+    let with_logs = [0u8; 4096];
+    let with_logs_len: u64 = 0;
+    with_logs_len = join2(&with_logs, 4096, &with_sg, with_sg_len, STR_PTR("logs"), STR_LEN("logs"));
+    out_len = join2(out, out_cap, &with_logs, with_logs_len, STR_PTR("transcript.jsonl"), STR_LEN("transcript.jsonl"));
+}
+
+// PendingAgyQuestion (interface): id, turnId, threadId,
+// questions (projector question table), timer (deadline here),
+// createdAt.
+struct PendingAgyQuestion {
+    has: bool,
+    id_off: u64,
+    id_len: u64,
+    turnId_off: u64,
+    turnId_len: u64,
+    questions: [AgyProjectedQuestion; 16],
+    questions_count: u64,
+    deadline_ms: u64,
+    has_deadline: bool,
+    createdAt: u64,
+}
+
+// extractUserInputAnswer(result): flatten a requestUserInput
+// result into one answer string. answers{qid:{answers[]}} —
+// "user_note:" entries contribute their note text, other
+// non-empty entries the value; joined ", ". Falls back to
+// decision / response strings.
+fn extractUserInputAnswer(result_doc: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    out_len = 0;
+    if result_doc == 0 { return; };
+    let answers: u64 = 0;
+    if sa_json_object_get(result_doc, STR_PTR("answers"), STR_LEN("answers"), &answers) == 0 && answers != 0 {
+        // DEFECT: Object.keys iteration over a dynamic object
+        // — no key enumeration in the sa_json surface; the
+        // bridge passes answers pre-flattened in the repair
+        // phase. The decision/response fallbacks below are
+        // exact.
+    };
+    let d_ptr: ptr = PTR_NULL();
+    let d_len: u64 = 0;
+    if sa_json_object_get_string(result_doc, STR_PTR("decision"), STR_LEN("decision"), &d_ptr, &d_len) == 0 {
+        out_len = buf_copy(out, out_cap, d_ptr, d_len);
+        return;
+    };
+    let r_ptr: ptr = PTR_NULL();
+    let r_len: u64 = 0;
+    if sa_json_object_get_string(result_doc, STR_PTR("response"), STR_LEN("response"), &r_ptr, &r_len) == 0 {
+        out_len = buf_copy(out, out_cap, r_ptr, r_len);
+        return;
+    };
+}
+
+// AgyRuntimeConfig (interface): threadId, cwd, addDirs?,
+// conversationId?, model?, effort?, mode? (0 unset /
+// 1 accept-edits / 2 plan), dangerouslySkipPermissions?,
+// providerId?, groupId?, envOverrides? (JSON text snapshot).
+struct AgyRuntimeConfig {
+    threadId_ptr: ptr,
+    threadId_len: u64,
+    cwd_ptr: ptr,
+    cwd_len: u64,
+    addDirs_ptr: ptr,
+    addDirs_len: u64,
+    has_addDirs: bool,
+    conversationId_ptr: ptr,
+    conversationId_len: u64,
+    has_conversationId: bool,
+    model_ptr: ptr,
+    model_len: u64,
+    has_model: bool,
+    effort_ptr: ptr,
+    effort_len: u64,
+    has_effort: bool,
+    mode: u64,
+    dangerouslySkipPermissions: bool,
+    has_skip: bool,
+    providerId_ptr: ptr,
+    providerId_len: u64,
+    has_providerId: bool,
+    groupId_ptr: ptr,
+    groupId_len: u64,
+    has_groupId: bool,
+    envOverrides_ptr: ptr,
+    envOverrides_len: u64,
+    has_envOverrides: bool,
+}
+
+struct AgyCompatibleRuntime {
+    proc: AgyCompatibleProcessManager,
+    has_proc: bool,
+    ctx: AgyProjectorContext,
+    has_ctx: bool,
+    config: AgyRuntimeConfig,
+    pendingQuestion: PendingAgyQuestion,
+    emittedQuestionIds: [u8; 65536],
+    emittedQuestionIds_len: u64,
+    emitted_off: [u64; 256],
+    emitted_slen: [u64; 256],
+    emitted_count: u64,
+    watchdog_deadline: u64,
+    has_watchdog: bool,
+    grace_deadline: u64,
+    has_grace: bool,
+    watchedTurnId: [u8; 128],
+    watchedTurnId_len: u64,
+    has_watched: bool,
+    rawCapture: AgyLineCapture,
+    captureDumped: bool,
+    arena: [u8; 262144],
+    arena_len: u64,
+    eventQueue: [u8; 1048576],
+    eventQueue_len: u64,
+}
+
+fn AgyCompatibleRuntime_new(self: &AgyCompatibleRuntime, config: &AgyRuntimeConfig) -> void {
+    self.config = config;
+    self.has_proc = false;
+    self.has_ctx = false;
+    self.pendingQuestion.has = false;
+    self.emittedQuestionIds_len = 0;
+    self.emitted_count = 0;
+    self.has_watchdog = false;
+    self.has_grace = false;
+    self.has_watched = false;
+    self.captureDumped = false;
+    self.arena_len = 0;
+    self.eventQueue_len = 0;
+    createAgyLineCapture(400, &self.rawCapture);
+}
+
+// setEnvOverrides(env): config.envOverrides = env snapshot.
+fn AgyCompatibleRuntime_setEnvOverrides(self: &AgyCompatibleRuntime, env_ptr: ptr, env_len: u64) -> void {
+    self.config.envOverrides_ptr = env_ptr;
+    self.config.envOverrides_len = env_len;
+    self.config.has_envOverrides = true;
+}
+
+// updateConfig(updates): Object.assign — field-wise merge is
+// the caller's Partial application in this pass (DEFECT:
+// Partial<> dynamic merge).
+
+// threadId getter.
+fn AgyCompatibleRuntime_threadId(self: &AgyCompatibleRuntime, out_ptr: &ptr, out_len: &u64) -> void {
+    out_ptr = self.config.threadId_ptr;
+    out_len = self.config.threadId_len;
+}
+
+// conversationId getter: ctx?.conversationId ??
+// config.conversationId.
+fn AgyCompatibleRuntime_conversationId(self: &AgyCompatibleRuntime, out_ptr: &ptr, out_len: &u64, out_has: &bool) -> void {
+    if self.has_ctx && self.ctx.has_conversationId {
+        out_ptr = self.ctx.conversationId_ptr;
+        out_len = self.ctx.conversationId_len;
+        out_has = true;
+        return;
+    };
+    out_ptr = self.config.conversationId_ptr;
+    out_len = self.config.conversationId_len;
+    out_has = self.config.has_conversationId;
+}
+
+fn AgyCompatibleRuntime_hasPendingQuestion(self: &AgyCompatibleRuntime, id_ptr: ptr, id_len: u64) -> bool {
+    return self.pendingQuestion.has && self.pendingQuestion.id_len == id_len && bytes_eq(rt_slot(self, self.pendingQuestion.id_off), id_ptr, id_len);
+}
+
+fn AgyCompatibleRuntime_clearTurnWatchdog(self: &AgyCompatibleRuntime) -> void {
+    self.has_watchdog = false;
+    self.has_grace = false;
+    self.has_watched = false;
+    self.watchedTurnId_len = 0;
+}
+
+fn resolveTurnTimeoutMs() -> u64 {
+    let raw = env_number(STR_PTR("AGY_TURN_TIMEOUT_MS"), STR_LEN("AGY_TURN_TIMEOUT_MS"));
+    if raw > 0 { return raw; };
+    return 480000;
+}
+
+fn resolvePrintTimeoutGraceMs() -> u64 {
+    let raw = env_number(STR_PTR("AGY_PRINT_TIMEOUT_GRACE_MS"), STR_LEN("AGY_PRINT_TIMEOUT_GRACE_MS"));
+    if raw > 0 { return raw; };
+    return 60000;
+}
+
+// armTurnWatchdog(turnId): deadline = now + timeout; the fire
+// body lives in pollTimers (same guards: watched id + ctx
+// identity + status running).
+fn AgyCompatibleRuntime_armTurnWatchdog(self: &AgyCompatibleRuntime, turnId_ptr: ptr, turnId_len: u64) -> void {
+    AgyCompatibleRuntime_clearTurnWatchdog(self);
+    self.watchedTurnId_len = buf_copy(&self.watchedTurnId, 128, turnId_ptr, turnId_len);
+    self.has_watched = true;
+    self.watchdog_deadline = now_ms() + resolveTurnTimeoutMs();
+    self.has_watchdog = true;
+}
+
+// pollTimers(now): fire the watchdog / print-grace / question
+// timeouts whose deadlines passed. Owner-driven replacement
+// for setTimeout.
+fn AgyCompatibleRuntime_pollTimers(self: &AgyCompatibleRuntime) -> void {
+    let now = now_ms();
+    // Question timeout: AGY_QUESTION_TIMEOUT_MS || 120_000 was
+    // armed as pendingQuestion.deadline_ms at emit time.
+    if self.pendingQuestion.has && self.pendingQuestion.has_deadline && now >= self.pendingQuestion.deadline_ms {
+        let id = [0u8; 256];
+        let id_len = buf_copy(&id, 256, rt_slot(self, self.pendingQuestion.id_off), self.pendingQuestion.id_len);
+        AgyCompatibleRuntime_resolvePendingQuestion(self, &id, id_len, 0, true, STR_PTR("Question response timed out"), STR_LEN("Question response timed out"));
+    };
+    if self.has_grace && now >= self.grace_deadline {
+        self.has_grace = false;
+        if !self.has_watched || !self.has_ctx { return; };
+        if !self.has_ctx || self.ctx.status != 0 { return; };
+        if !self.has_proc || !self.proc.isRunning { return; };
+        // grace expired -> force terminate
+        force_terminate_and_emit(self, 1, STR_PTR("AGY reported print timeout with turn in progress and did not exit; process killed, partial output kept, please retry"), STR_LEN("AGY reported print timeout with turn in progress and did not exit; process killed, partial output kept, please retry"));
+        if self.has_proc { AgyCompatibleProcessManager_stop(&self.proc); };
+        AgyCompatibleRuntime_clearTurnWatchdog(self);
+        self.has_ctx = false;
+        return;
+    };
+    if self.has_watchdog && now >= self.watchdog_deadline {
+        if !self.has_watched || !self.has_ctx { self.has_watchdog = false; return; };
+        if self.ctx.status != 0 { self.has_watchdog = false; return; };
+        let timeoutMs = resolveTurnTimeoutMs();
+        let msg = [0u8; 256];
+        let msg_len: u64 = 0;
+        msg_len = msg_len + append_bytes(&msg, 256, msg_len, STR_PTR("AGY turn timed out after "), STR_LEN("AGY turn timed out after "));
+        msg_len = msg_len + append_u64(&msg, 256, msg_len, timeoutMs / 1000);
+        msg_len = msg_len + append_bytes(&msg, 256, msg_len, STR_PTR("s without terminal event; process killed, please retry or interrupt"), STR_LEN("s without terminal event; process killed, please retry or interrupt"));
+        force_terminate_and_emit(self, 1, &msg, msg_len);
+        if self.has_proc { AgyCompatibleProcessManager_stop(&self.proc); };
+        AgyCompatibleRuntime_clearTurnWatchdog(self);
+        self.has_ctx = false;
+    };
+}
+
+// force_terminate_and_emit: forceTerminateAgy(ctx, status,
+// detail) projected notifications -> "notification" queue
+// records. Status code: 1 failed / 2 interrupted (projector
+// vocabulary).
+fn force_terminate_and_emit(self: &AgyCompatibleRuntime, status: u64, detail_ptr: ptr, detail_len: u64) -> void {
+    let list = AgyProjectedList { arena: [0u8; 262144], arena_len: 0, json_off: [0u64; 64], json_len: [0u64; 64], count: 0 };
+    forceTerminateAgy(&self.ctx, status, detail_ptr, detail_len, true, &list);
+    emit_projected_notifications(self, &list);
+}
+
+fn emit_projected_notifications(self: &AgyCompatibleRuntime, list: &AgyProjectedList) -> void {
+    for i in 0..list.count {
+        let notif = [0u8; 65536];
+        let notif_len: u64 = 0;
+        let has = false;
+        toAgyNotification(slot(&list.arena, list.json_off[i]), list.json_len[i], &notif, 65536, &notif_len, &has);
+        if has { rt_queue(self, STR_PTR("notification"), STR_LEN("notification"), &notif, notif_len); };
+    }
+}
+
+// handlePrintTimeoutStderr(text, turnId): /print timeout
+// after/i + /turn in progress/i over stderr arms the grace
+// timer.
+fn AgyCompatibleRuntime_handlePrintTimeoutStderr(self: &AgyCompatibleRuntime, text_ptr: ptr, text_len: u64) -> void {
+    if !contains_ci(text_ptr, text_len, STR_PTR("print timeout after")) { return; };
+    if !contains_ci(text_ptr, text_len, STR_PTR("turn in progress")) { return; };
+    if !self.has_ctx || self.ctx.status != 0 { return; };
+    if self.has_grace { return; };
+    self.grace_deadline = now_ms() + resolvePrintTimeoutGraceMs();
+    self.has_grace = true;
+}
+
+// resolvePendingQuestion(requestId, result?, error?): clear
+// pending, reset ctx flags; on error just log (dropped here);
+// else emit "questionAnswered" with the extracted answer or
+// the skip default.
+fn AgyCompatibleRuntime_resolvePendingQuestion(self: &AgyCompatibleRuntime, requestId_ptr: ptr, requestId_len: u64, result_doc: u64, has_error: bool, err_ptr: ptr, err_len: u64) -> void {
+    if !self.pendingQuestion.has { return; };
+    if !(self.pendingQuestion.id_len == requestId_len && bytes_eq(rt_slot(self, self.pendingQuestion.id_off), requestId_ptr, requestId_len)) { return; };
+    let turnId_off = self.pendingQuestion.turnId_off;
+    let turnId_len = self.pendingQuestion.turnId_len;
+    self.pendingQuestion.has = false;
+    if self.has_ctx {
+        self.ctx.awaitingQuestion = false;
+        self.ctx.has_pendingQuestionId = false;
+    };
+    if has_error { return; };
+    let answer = [0u8; 8192];
+    let answer_len: u64 = 0;
+    extractUserInputAnswer(result_doc, &answer, 8192, &answer_len);
+    if answer_len == 0 {
+        answer_len = buf_copy(&answer, 8192, STR_PTR("(用户跳过提问，请按推荐/默认选项继续，不要重复提问)"), STR_LEN("(用户跳过提问，请按推荐/默认选项继续，不要重复提问)"));
+    };
+    let payload = [0u8; 16384];
+    let payload_len: u64 = 0;
+    payload_len = payload_len + append_bytes(&payload, 16384, payload_len, STR_PTR("{\"threadId\":\""), STR_LEN("{\"threadId\":\""));
+    payload_len = payload_len + append_bytes(&payload, 16384, payload_len, self.config.threadId_ptr, self.config.threadId_len);
+    payload_len = payload_len + append_bytes(&payload, 16384, payload_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    payload_len = payload_len + append_bytes(&payload, 16384, payload_len, rt_slot(self, turnId_off), turnId_len);
+    payload_len = payload_len + append_bytes(&payload, 16384, payload_len, STR_PTR("\",\"answerText\":\""), STR_LEN("\",\"answerText\":\""));
+    payload_len = payload_len + append_bytes(&payload, 16384, payload_len, &answer, answer_len);
+    payload_len = payload_len + append_bytes(&payload, 16384, payload_len, STR_PTR("\"}"), 2);
+    rt_queue(self, STR_PTR("questionAnswered"), STR_LEN("questionAnswered"), &payload, payload_len);
+}
+
+// emitQuestionRequest(questionId, turnId, questions): record
+// emitted id, mark ctx, arm the question timeout, store the
+// pending question, emit "serverRequest" with the
+// item/tool/requestUserInput frame.
+// DEFECT: questions array serialization — assembled manually
+// from the projector question structs (see projector file for
+// the shape); escaping not applied.
+fn AgyCompatibleRuntime_emitQuestionRequest(self: &AgyCompatibleRuntime, questionId_ptr: ptr, questionId_len: u64, turnId_ptr: ptr, turnId_len: u64, questions: &AgyProjectedQuestion, questions_count: u64) -> void {
+    if !emitted_has(self, questionId_ptr, questionId_len) { emitted_add(self, questionId_ptr, questionId_len); };
+    if self.has_ctx {
+        self.ctx.pendingQuestionId_ptr = questionId_ptr;
+        self.ctx.pendingQuestionId_len = questionId_len;
+        self.ctx.has_pendingQuestionId = true;
+        self.ctx.awaitingQuestion = true;
+    };
+    let timeoutMs = env_number(STR_PTR("AGY_QUESTION_TIMEOUT_MS"), STR_LEN("AGY_QUESTION_TIMEOUT_MS"));
+    if timeoutMs == 0 { timeoutMs = 120000; };
+    self.pendingQuestion.has = true;
+    self.pendingQuestion.id_off = rt_put(self, questionId_ptr, questionId_len);
+    self.pendingQuestion.id_len = questionId_len;
+    self.pendingQuestion.turnId_off = rt_put(self, turnId_ptr, turnId_len);
+    self.pendingQuestion.turnId_len = turnId_len;
+    self.pendingQuestion.questions_count = 0;
+    for i in 0..questions_count {
+        if self.pendingQuestion.questions_count < 16 {
+            self.pendingQuestion.questions[self.pendingQuestion.questions_count] = questions[i];
+            self.pendingQuestion.questions_count = self.pendingQuestion.questions_count + 1;
+        };
+    }
+    self.pendingQuestion.deadline_ms = now_ms() + timeoutMs;
+    self.pendingQuestion.has_deadline = true;
+    self.pendingQuestion.createdAt = now_ms();
+    // serverReq frame
+    let frame = [0u8; 65536];
+    let frame_len: u64 = 0;
+    frame_len = frame_len + append_bytes(&frame, 65536, frame_len, STR_PTR("{\"id\":\""), STR_LEN("{\"id\":\""));
+    frame_len = frame_len + append_bytes(&frame, 65536, frame_len, questionId_ptr, questionId_len);
+    frame_len = frame_len + append_bytes(&frame, 65536, frame_len, STR_PTR("\",\"method\":\"item/tool/requestUserInput\",\"params\":{\"itemId\":\""), STR_LEN("\",\"method\":\"item/tool/requestUserInput\",\"params\":{\"itemId\":\""));
+    frame_len = frame_len + append_bytes(&frame, 65536, frame_len, questionId_ptr, questionId_len);
+    frame_len = frame_len + append_bytes(&frame, 65536, frame_len, STR_PTR("\",\"threadId\":\""), STR_LEN("\",\"threadId\":\""));
+    frame_len = frame_len + append_bytes(&frame, 65536, frame_len, self.config.threadId_ptr, self.config.threadId_len);
+    frame_len = frame_len + append_bytes(&frame, 65536, frame_len, STR_PTR("\",\"turnId\":\""), STR_LEN("\",\"turnId\":\""));
+    frame_len = frame_len + append_bytes(&frame, 65536, frame_len, turnId_ptr, turnId_len);
+    frame_len = frame_len + append_bytes(&frame, 65536, frame_len, STR_PTR("\",\"questions\":["), STR_LEN("\",\"questions\":["));
+    for i in 0..questions_count {
+        if i > 0 { frame_len = frame_len + append_bytes(&frame, 65536, frame_len, STR_PTR(","), 1); };
+        frame_len = frame_len + append_bytes(&frame, 65536, frame_len, question_json_ptr(&questions[i]), questions[i].json_len);
+    }
+    frame_len = frame_len + append_bytes(&frame, 65536, frame_len, STR_PTR("]}}"), 3);
+    rt_queue(self, STR_PTR("serverRequest"), STR_LEN("serverRequest"), &frame, frame_len);
+}
+
+// scanTranscriptForQuestions(turnId): read the tail of the
+// conversation transcript; the last 15 lines' tool_calls named
+// ask_question become question requests (id
+// `agy-ask-<conv>-<stepIdx>`), deduped by emittedQuestionIds.
+fn AgyCompatibleRuntime_scanTranscriptForQuestions(self: &AgyCompatibleRuntime, turnId_ptr: ptr, turnId_len: u64) -> void {
+    let conv_ptr: ptr = PTR_NULL();
+    let conv_len: u64 = 0;
+    let has_conv = false;
+    AgyCompatibleRuntime_conversationId(self, &conv_ptr, &conv_len, &has_conv);
+    if !has_conv || conv_len == 0 { return; };
+    let path = [0u8; 4096];
+    let path_len: u64 = 0;
+    getAgyTranscriptPath(conv_ptr, conv_len, &path, 4096, &path_len);
+    let total: u64 = 0;
+    if sa_std_fs_len(&path, path_len, &total) != 0 { return; };
+    let content = [0u8; 4194304];
+    let content_len: u64 = 0;
+    if !read_file_into(&path, path_len, &content, 4194304, &content_len) { return; };
+    // lines: split content; scan the last 15 non-empty lines in
+    // reverse.
+    let line_starts: [u64; 4096] = [0u64; 4096];
+    let line_lens: [u64; 4096] = [0u64; 4096];
+    let line_count: u64 = 0;
+    let start: u64 = 0;
+    let i: u64 = 0;
+    while i <= content_len {
+        if i == content_len || byte_at(&content, i) == 10 {
+            if line_count < 4096 {
+                line_starts[line_count] = start;
+                line_lens[line_count] = i - start;
+                line_count = line_count + 1;
+            };
+            start = i + 1;
+        };
+        i = i + 1;
+    }
+    let scanned: u64 = 0;
+    let li = line_count;
+    while li > 0 && scanned < 15 {
+        li = li - 1;
+        scanned = scanned + 1;
+        let lp = byte_off(&content, line_starts[li]);
+        let ll = line_lens[li];
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        trim_span(lp, ll, &tp, &tl);
+        if tl == 0 || byte_at(tp, 0) != 123 { continue; };
+        let step = sa_json_parse(tp, tl);
+        if step == 0 { continue; };
+        let calls: u64 = 0;
+        if sa_json_object_get(step, STR_PTR("tool_calls"), STR_LEN("tool_calls"), &calls) != 0 { continue; };
+        let cn = sa_json_array_len(calls);
+        for ci in 0..cn {
+            let tc: u64 = 0;
+            if sa_json_array_get(calls, ci, &tc) != 0 { continue; };
+            let nm_ptr: ptr = PTR_NULL();
+            let nm_len: u64 = 0;
+            sa_json_object_get_string(tc, STR_PTR("name"), STR_LEN("name"), &nm_ptr, &nm_len);
+            if !str_is(nm_ptr, nm_len, STR_PTR("ask_question"), STR_LEN("ask_question")) { continue; };
+            let step_idx: i64 = li as i64;
+            let sidx_v: i64 = 0;
+            if sa_json_object_get_i64(step, STR_PTR("step_index"), STR_LEN("step_index"), &sidx_v) == 0 { step_idx = sidx_v; };
+            // questionId = `agy-ask-${convId}-${stepIdx}`
+            let qid = [0u8; 512];
+            let qid_len: u64 = 0;
+            qid_len = qid_len + append_bytes(&qid, 512, qid_len, STR_PTR("agy-ask-"), STR_LEN("agy-ask-"));
+            qid_len = qid_len + append_bytes(&qid, 512, qid_len, conv_ptr, conv_len);
+            qid_len = qid_len + append_bytes(&qid, 512, qid_len, STR_PTR("-"), 1);
+            qid_len = qid_len + append_i64(&qid, 512, qid_len, step_idx);
+            if emitted_has(self, &qid, qid_len) { continue; };
+            // rawQ = tc.args?.questions ?? tc.input?.questions
+            let raw_q: u64 = 0;
+            let args_node: u64 = 0;
+            if sa_json_object_get(tc, STR_PTR("args"), STR_LEN("args"), &args_node) == 0 {
+                sa_json_object_get(args_node, STR_PTR("questions"), STR_LEN("questions"), &raw_q);
+            };
+            if raw_q == 0 {
+                let input_node: u64 = 0;
+                if sa_json_object_get(tc, STR_PTR("input"), STR_LEN("input"), &input_node) == 0 {
+                    sa_json_object_get(input_node, STR_PTR("questions"), STR_LEN("questions"), &raw_q);
+                };
+            };
+            // headerFallback = step.toolAction ??
+            // step.toolSummary ?? tc.toolAction ??
+            // tc.toolSummary
+            let header_ptr: ptr = PTR_NULL();
+            let header_len: u64 = 0;
+            let has_header = false;
+            if sa_json_object_get_string(step, STR_PTR("toolAction"), STR_LEN("toolAction"), &header_ptr, &header_len) == 0 { has_header = true; } else if sa_json_object_get_string(step, STR_PTR("toolSummary"), STR_LEN("toolSummary"), &header_ptr, &header_len) == 0 { has_header = true; } else if sa_json_object_get_string(tc, STR_PTR("toolAction"), STR_LEN("toolAction"), &header_ptr, &header_len) == 0 { has_header = true; } else if sa_json_object_get_string(tc, STR_PTR("toolSummary"), STR_LEN("toolSummary"), &header_ptr, &header_len) == 0 { has_header = true; };
+            let qlist = [AgyProjectedQuestion { json: [0u8; 8192], json_len: 0, id: [0u8; 128], id_len: 0 }; 16];
+            let qcount: u64 = 0;
+            parseAskQuestionData(raw_q, step_idx, header_ptr, header_len, has_header, &qlist, &qcount);
+            if qcount > 0 {
+                AgyCompatibleRuntime_emitQuestionRequest(self, &qid, qid_len, turnId_ptr, turnId_len, &qlist, qcount);
+                return;
+            };
+        }
+    }
+}
+
+// executeTurn(prompt, turnId): stop the old process, build the
+// projector context, resolve provider/model, spawn the process
+// manager, start + write the prompt. Returns 1 with out_err on
+// the relay-config error (the source's throw).
+fn AgyCompatibleRuntime_executeTurn(self: &AgyCompatibleRuntime, prompt_ptr: ptr, prompt_len: u64, turnId_ptr: ptr, turnId_len: u64, out_err: ptr, out_err_cap: u64, out_err_len: &u64) -> i32 {
+    if self.has_proc && self.proc.isRunning {
+        AgyCompatibleProcessManager_stop(&self.proc);
+        AgyCompatibleProcessManager_waitForExit(&self.proc, 3000);
+    };
+    AgyCompatibleRuntime_clearTurnWatchdog(self);
+    createAgyProjectorContext(self.config.threadId_ptr, self.config.threadId_len, turnId_ptr, turnId_len, &self.ctx);
+    self.has_ctx = true;
+    self.ctx.hasStartedTurn = true;
+    if self.config.has_conversationId {
+        self.ctx.conversationId_ptr = self.config.conversationId_ptr;
+        self.ctx.conversationId_len = self.config.conversationId_len;
+        self.ctx.has_conversationId = true;
+    };
+    AgyCompatibleRuntime_armTurnWatchdog(self, turnId_ptr, turnId_len);
+    // effectiveProviderId = config.providerId || "agy-official"
+    let provider_ptr = STR_PTR("agy-official");
+    let provider_len = STR_LEN("agy-official");
+    if self.config.has_providerId {
+        provider_ptr = self.config.providerId_ptr;
+        provider_len = self.config.providerId_len;
+    };
+    let is_official = str_is(provider_ptr, provider_len, STR_PTR("agy-official"), STR_LEN("agy-official"));
+    // gatewayUrl = envOverrides?.AGY_LLM_GATEWAY_URL
+    let gw_ptr: ptr = PTR_NULL();
+    let gw_len: u64 = 0;
+    let has_gw = false;
+    let cloud_ptr: ptr = PTR_NULL();
+    let cloud_len: u64 = 0;
+    let has_cloud = false;
+    if self.config.has_envOverrides {
+        let env_doc = sa_json_parse(self.config.envOverrides_ptr, self.config.envOverrides_len);
+        if env_doc != 0 {
+            if sa_json_object_get_string(env_doc, STR_PTR("AGY_LLM_GATEWAY_URL"), STR_LEN("AGY_LLM_GATEWAY_URL"), &gw_ptr, &gw_len) == 0 { has_gw = true; };
+            if sa_json_object_get_string(env_doc, STR_PTR("CLOUD_CODE_URL"), STR_LEN("CLOUD_CODE_URL"), &cloud_ptr, &cloud_len) == 0 { has_cloud = true; };
+        };
+    };
+    if !is_official && !has_cloud && !has_gw {
+        AgyCompatibleRuntime_clearTurnWatchdog(self);
+        self.has_ctx = false;
+        out_err_len = append_bytes(out_err, out_err_cap, 0, STR_PTR("AGY relay selected but CLOUD_CODE_URL is missing"), STR_LEN("AGY relay selected but CLOUD_CODE_URL is missing"));
+        return 1;
+    };
+    let isRelayProxy = !is_official && has_cloud;
+    // effortSuffix = effort high|medium ? effort : "low"
+    let suffix_ptr = STR_PTR("low");
+    let suffix_len = STR_LEN("low");
+    if self.config.has_effort && (str_is(self.config.effort_ptr, self.config.effort_len, STR_PTR("high"), 4) || str_is(self.config.effort_ptr, self.config.effort_len, STR_PTR("medium"), STR_LEN("medium"))) {
+        suffix_ptr = self.config.effort_ptr;
+        suffix_len = self.config.effort_len;
+    };
+    // cliModel
+    let model = [0u8; 512];
+    let model_len: u64 = 0;
+    let has_model = false;
+    if has_gw {
+        if self.config.has_model {
+            // stripModelContextVariant(model).baseModel || model
+            model_len = strip_model_context_variant(self.config.model_ptr, self.config.model_len, &model, 512);
+            if model_len == 0 { model_len = buf_copy(&model, 512, self.config.model_ptr, self.config.model_len); };
+            has_model = true;
+        };
+    } else if isRelayProxy {
+        model_len = model_len + append_bytes(&model, 512, model_len, STR_PTR("gemini-3.8-flash-"), STR_LEN("gemini-3.8-flash-"));
+        model_len = model_len + append_bytes(&model, 512, model_len, suffix_ptr, suffix_len);
+        has_model = true;
+    } else if self.config.has_model {
+        model_len = buf_copy(&model, 512, self.config.model_ptr, self.config.model_len);
+        has_model = true;
+    };
+    // procConfig
+    let skip = true;
+    if self.config.has_skip { skip = self.config.dangerouslySkipPermissions; };
+    let pc = AgyProcessConfig { cwd_ptr: PTR_NULL(), cwd_len: 0, addDirs_ptr: PTR_NULL(), addDirs_len: 0, conversationId_ptr: PTR_NULL(), conversationId_len: 0, model_ptr: PTR_NULL(), model_len: 0, effort_ptr: PTR_NULL(), effort_len: 0, mode: 0, dangerouslySkipPermissions: true, envOverrides_ptr: PTR_NULL(), envOverrides_len: 0 };
+    pc.cwd_ptr = self.config.cwd_ptr;
+    pc.cwd_len = self.config.cwd_len;
+    pc.addDirs_ptr = self.config.addDirs_ptr;
+    pc.addDirs_len = self.config.addDirs_len;
+    pc.conversationId_ptr = self.config.conversationId_ptr;
+    pc.conversationId_len = self.config.conversationId_len;
+    if has_model {
+        // model lives in the local buffer; the manager copies
+        // config strings at start in this design (repair note).
+        pc.model_ptr = &model;
+        pc.model_len = model_len;
+    };
+    pc.effort_ptr = self.config.effort_ptr;
+    pc.effort_len = self.config.effort_len;
+    pc.mode = self.config.mode;
+    pc.dangerouslySkipPermissions = skip;
+    pc.envOverrides_ptr = self.config.envOverrides_ptr;
+    pc.envOverrides_len = self.config.envOverrides_len;
+    AgyCompatibleProcessManager_new(&self.proc, &pc);
+    self.has_proc = true;
+    createAgyLineCapture(400, &self.rawCapture);
+    self.captureDumped = false;
+    AgyCompatibleProcessManager_start(&self.proc);
+    AgyCompatibleProcessManager_writePrompt(&self.proc, prompt_ptr, prompt_len);
+    return 0;
+}
+
+// maybeDumpCapture: AGY_CAPTURE-gated one-shot dump.
+fn maybeDumpCapture(self: &AgyCompatibleRuntime, turnId_ptr: ptr, turnId_len: u64) -> void {
+    if self.captureDumped || !shouldDumpAgyCapture() { return; };
+    self.captureDumped = true;
+    dumpAgyCapture(self.config.threadId_ptr, self.config.threadId_len, turnId_ptr, turnId_len, &self.rawCapture);
+}
+
+// pump: drain the process manager's event queue and apply the
+// source's proc.on handlers (rawLine / event / stderr / exit /
+// error), then poll timers. The bridge calls this in its loop.
+fn AgyCompatibleRuntime_pump(self: &AgyCompatibleRuntime) -> void {
+    if self.has_proc {
+        let pos: u64 = 0;
+        let kind = [0u8; 64];
+        let payload = [0u8; 1048576];
+        while true {
+            let kind_len: u64 = 0;
+            let payload_len: u64 = 0;
+            let has = false;
+            queue_next(&self.proc.eventQueue, self.proc.eventQueue_len, &pos, &kind, 64, &kind_len, &payload, 1048576, &payload_len, &has);
+            if !has { break; };
+            if str_is(&kind, kind_len, STR_PTR("rawLine"), STR_LEN("rawLine")) {
+                AgyLineCapture_push(&self.rawCapture, &payload, payload_len);
+                if self.has_watched {
+                    AgyCompatibleRuntime_scanTranscriptForQuestions(self, &self.watchedTurnId, self.watchedTurnId_len);
+                };
+            } else if str_is(&kind, kind_len, STR_PTR("event"), STR_LEN("event")) {
+                if self.has_ctx {
+                    let doc = sa_json_parse(&payload, payload_len);
+                    if doc != 0 {
+                        let list = AgyProjectedList { arena: [0u8; 262144], arena_len: 0, json_off: [0u64; 64], json_len: [0u64; 64], count: 0 };
+                        projectAgyEvent(doc, &self.ctx, &list);
+                        for pi in 0..list.count {
+                            let jp = slot(&list.arena, list.json_off[pi]);
+                            let jl = list.json_len[pi];
+                            let kind_ptr: ptr = PTR_NULL();
+                            let kind_len: u64 = 0;
+                            let pdoc = sa_json_parse(jp, jl);
+                            if pdoc != 0 { sa_json_object_get_string(pdoc, STR_PTR("kind"), STR_LEN("kind"), &kind_ptr, &kind_len); };
+                            if str_is(kind_ptr, kind_len, STR_PTR("system/init"), STR_LEN("system/init")) {
+                                let c_ptr: ptr = PTR_NULL();
+                                let c_len: u64 = 0;
+                                if pdoc != 0 { sa_json_object_get_string(pdoc, STR_PTR("conversationId"), STR_LEN("conversationId"), &c_ptr, &c_len); };
+                                self.config.conversationId_ptr = c_ptr;
+                                self.config.conversationId_len = c_len;
+                                self.config.has_conversationId = true;
+                                rt_queue(self, STR_PTR("conversationId"), STR_LEN("conversationId"), c_ptr, c_len);
+                            };
+                            if str_is(kind_ptr, kind_len, STR_PTR("question/asked"), STR_LEN("question/asked")) {
+                                let qid_ptr: ptr = PTR_NULL();
+                                let qid_len: u64 = 0;
+                                let qt_ptr: ptr = PTR_NULL();
+                                let qt_len: u64 = 0;
+                                let qs = [AgyProjectedQuestion { json: [0u8; 8192], json_len: 0, id: [0u8; 128], id_len: 0 }; 16];
+                                let qcount: u64 = 0;
+                                if pdoc != 0 {
+                                    sa_json_object_get_string(pdoc, STR_PTR("questionId"), STR_LEN("questionId"), &qid_ptr, &qid_len);
+                                    sa_json_object_get_string(pdoc, STR_PTR("turnId"), STR_LEN("turnId"), &qt_ptr, &qt_len);
+                                    projected_questions_of(pdoc, &qs, &qcount);
+                                };
+                                AgyCompatibleRuntime_emitQuestionRequest(self, qid_ptr, qid_len, qt_ptr, qt_len, &qs, qcount);
+                            };
+                            let notif = [0u8; 65536];
+                            let notif_len: u64 = 0;
+                            let has_notif = false;
+                            toAgyNotification(jp, jl, &notif, 65536, &notif_len, &has_notif);
+                            if has_notif { rt_queue(self, STR_PTR("notification"), STR_LEN("notification"), &notif, notif_len); };
+                        }
+                    };
+                    if self.has_watched {
+                        AgyCompatibleRuntime_scanTranscriptForQuestions(self, &self.watchedTurnId, self.watchedTurnId_len);
+                    };
+                    if self.ctx.status != 0 {
+                        AgyCompatibleRuntime_clearTurnWatchdog(self);
+                        if self.has_watched { maybeDumpCapture(self, &self.watchedTurnId, self.watchedTurnId_len); };
+                    };
+                };
+            } else if str_is(&kind, kind_len, STR_PTR("stderr"), STR_LEN("stderr")) {
+                if self.has_ctx && self.has_watched {
+                    AgyCompatibleRuntime_handlePrintTimeoutStderr(self, &payload, payload_len);
+                };
+            } else if str_is(&kind, kind_len, STR_PTR("exit"), STR_LEN("exit")) {
+                AgyCompatibleRuntime_onExit(self, &payload, payload_len);
+            } else if str_is(&kind, kind_len, STR_PTR("error"), STR_LEN("error")) {
+                AgyCompatibleRuntime_onError(self, &payload, payload_len);
+            };
+        }
+        self.proc.eventQueue_len = 0;
+    };
+    AgyCompatibleRuntime_pollTimers(self);
+}
+
+// onExit handler ({code, signal, stopping, stderrTail} as JSON
+// text in this pass).
+fn AgyCompatibleRuntime_onExit(self: &AgyCompatibleRuntime, payload_ptr: ptr, payload_len: u64) -> void {
+    AgyCompatibleRuntime_clearTurnWatchdog(self);
+    let doc = sa_json_parse(payload_ptr, payload_len);
+    let code: i64 = 0;
+    let has_code = false;
+    let stopping = false;
+    let tail_ptr: ptr = PTR_NULL();
+    let tail_len: u64 = 0;
+    if doc != 0 {
+        let cv: i64 = 0;
+        if sa_json_object_get_i64(doc, STR_PTR("code"), STR_LEN("code"), &cv) == 0 { code = cv; has_code = true; };
+        let sb = false;
+        if sa_json_object_get_bool(doc, STR_PTR("stopping"), STR_LEN("stopping"), &sb) == 0 { stopping = sb; };
+        sa_json_object_get_string(doc, STR_PTR("stderrTail"), STR_LEN("stderrTail"), &tail_ptr, &tail_len);
+    };
+    if self.has_ctx && self.ctx.status == 0 {
+        // detail when !stopping && code !== 0:
+        // `Process exited (code=<code|unknown>) signal=..: <tail>`
+        let detail = [0u8; 4096];
+        let detail_len: u64 = 0;
+        let has_detail = false;
+        if !stopping && (!has_code || code != 0) {
+            has_detail = true;
+            let tp: ptr = PTR_NULL();
+            let tl: u64 = 0;
+            trim_span(tail_ptr, tail_len, &tp, &tl);
+            if tl > 2000 { tp = byte_off(tp, tl - 2000); tl = 2000; };
+            detail_len = detail_len + append_bytes(&detail, 4096, detail_len, STR_PTR("Process exited (code="), STR_LEN("Process exited (code="));
+            if has_code {
+                detail_len = detail_len + append_i64(&detail, 4096, detail_len, code);
+            } else {
+                detail_len = detail_len + append_bytes(&detail, 4096, detail_len, STR_PTR("unknown"), STR_LEN("unknown"));
+            };
+            detail_len = detail_len + append_bytes(&detail, 4096, detail_len, STR_PTR(")"), 1);
+            if tl > 0 {
+                detail_len = detail_len + append_bytes(&detail, 4096, detail_len, STR_PTR(": "), 2);
+                detail_len = detail_len + append_bytes(&detail, 4096, detail_len, tp, tl);
+            };
+        };
+        force_terminate_and_emit(self, if stopping { 2 } else { 1 }, &detail, detail_len);
+        if self.has_watched { maybeDumpCapture(self, &self.watchedTurnId, self.watchedTurnId_len); };
+    };
+    self.has_proc = false;
+    self.has_ctx = false;
+}
+
+// onError handler (err message text in this pass).
+fn AgyCompatibleRuntime_onError(self: &AgyCompatibleRuntime, err_ptr: ptr, err_len: u64) -> void {
+    AgyCompatibleRuntime_clearTurnWatchdog(self);
+    if self.has_ctx && self.ctx.status == 0 {
+        let detail = [0u8; 4096];
+        let detail_len: u64 = 0;
+        if err_len > 0 {
+            detail_len = detail_len + append_bytes(&detail, 4096, detail_len, STR_PTR("Process error: "), STR_LEN("Process error: "));
+            detail_len = detail_len + append_bytes(&detail, 4096, detail_len, err_ptr, err_len);
+        };
+        force_terminate_and_emit(self, 1, &detail, detail_len);
+        if self.has_watched { maybeDumpCapture(self, &self.watchedTurnId, self.watchedTurnId_len); };
+    };
+    rt_queue(self, STR_PTR("error"), STR_LEN("error"), err_ptr, err_len);
+}
+
+// interrupt(): clear timers + pending question, force
+// terminate a running ctx, stop the process.
+fn AgyCompatibleRuntime_interrupt(self: &AgyCompatibleRuntime) -> void {
+    AgyCompatibleRuntime_clearTurnWatchdog(self);
+    self.pendingQuestion.has = false;
+    if self.has_ctx && self.ctx.status == 0 {
+        force_terminate_and_emit(self, 2, PTR_NULL(), 0);
+    };
+    if self.has_proc {
+        AgyCompatibleProcessManager_stop(&self.proc);
+    };
+}
+
+// ---- helpers ----
+
+fn rt_put(self: &AgyCompatibleRuntime, p: ptr, n: u64) -> u64 {
+    let off = self.arena_len;
+    for i in 0..n {
+        if self.arena_len < 262144 { self.arena[self.arena_len] = byte_at(p, i); self.arena_len = self.arena_len + 1; };
+    }
+    return off;
+}
+
+fn rt_slot(self: &AgyCompatibleRuntime, off: u64) -> ptr {
+    let r: ptr = PTR_NULL();
+    PTR_BYTE_ADD(r, &self.arena, off);
+    return r;
+}
+
+fn rt_queue(self: &AgyCompatibleRuntime, kind_ptr: ptr, kind_len: u64, payload_ptr: ptr, payload_len: u64) -> void {
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, kind_ptr, kind_len);
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, STR_PTR("\t"), 1);
+    if payload_len > 0 {
+        self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, payload_ptr, payload_len);
+    };
+    self.eventQueue_len = self.eventQueue_len + append_bytes(&self.eventQueue, 1048576, self.eventQueue_len, STR_PTR("\n"), 1);
+}
+
+fn emitted_has(self: &AgyCompatibleRuntime, id_ptr: ptr, id_len: u64) -> bool {
+    for i in 0..self.emitted_count {
+        if self.emitted_slen[i] == id_len && bytes_eq(slot(&self.emittedQuestionIds, self.emitted_off[i]), id_ptr, id_len) { return true; };
+    }
+    return false;
+}
+
+fn emitted_add(self: &AgyCompatibleRuntime, id_ptr: ptr, id_len: u64) -> void {
+    if self.emitted_count >= 256 { return; };
+    let idx = self.emitted_count;
+    self.emitted_off[idx] = self.emittedQuestionIds_len;
+    self.emitted_slen[idx] = id_len;
+    for i in 0..id_len {
+        if self.emittedQuestionIds_len < 65536 { self.emittedQuestionIds[self.emittedQuestionIds_len] = byte_at(id_ptr, i); self.emittedQuestionIds_len = self.emittedQuestionIds_len + 1; };
+    }
+    self.emitted_count = self.emitted_count + 1;
+}
+
+// queue_next: read one `kind\tpayload\n` record from a queue
+// buffer at pos (same record format as the process manager).
+fn queue_next(queue: ptr, queue_len: u64, pos: &u64, kind_out: ptr, kind_cap: u64, kind_len: &u64, payload_out: ptr, payload_cap: u64, payload_len: &u64, out_has: &bool) -> void {
+    out_has = false;
+    kind_len = 0;
+    payload_len = 0;
+    if pos >= queue_len { return; };
+    let tab = find_byte(queue, queue_len, pos, 9);
+    if tab == 4294967295 { return; };
+    kind_len = buf_copy(kind_out, kind_cap, byte_off(queue, pos), tab - pos);
+    let nl = find_byte(queue, queue_len, tab + 1, 10);
+    let end = queue_len;
+    if nl != 4294967295 { end = nl; };
+    payload_len = buf_copy(payload_out, payload_cap, byte_off(queue, tab + 1), end - tab - 1);
+    pos = end + 1;
+    out_has = true;
+}
+
+// strip_model_context_variant: @codex-ui/shared
+// stripModelContextVariant approximation — strip a trailing
+// bracketed context variant (e.g. "[1M]") and return the base
+// model. DEFECT: shared unit owns the canonical semantics.
+fn strip_model_context_variant(model_ptr: ptr, model_len: u64, out: ptr, out_cap: u64) -> u64 {
+    let end = model_len;
+    if end > 0 && byte_at(model_ptr, end - 1) == 93 {
+        let i = end - 1;
+        while i > 0 {
+            i = i - 1;
+            if byte_at(model_ptr, i) == 91 { return buf_copy(out, out_cap, model_ptr, i); };
+        }
+    };
+    return buf_copy(out, out_cap, model_ptr, model_len);
+}
+
+// env_number: Number(process.env[key]) — finite positive
+// prefix parse; 0 when unset/invalid.
+fn env_number(key_ptr: ptr, key_len: u64) -> u64 {
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    let has = false;
+    env_get(key_ptr, key_len, &v_ptr, &v_len, &has);
+    if !has { return 0; };
+    let value: u64 = 0;
+    let any = false;
+    for i in 0..v_len {
+        let b = byte_at(v_ptr, i);
+        if b < 48 || b > 57 { break; };
+        value = value * 10 + (b - 48) as u64;
+        any = true;
+    }
+    if !any { return 0; };
+    return value;
+}
+
+fn env_get(key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64, out_has: &bool) -> void {
+    out_has = false;
+    out_ptr = PTR_NULL();
+    out_len = 0;
+    let h = sa_env_get(key_ptr, key_len);
+    if h == 0 { return; };
+    sa_env_buffer_data(h, out_ptr);
+    sa_env_buffer_len(h, out_len);
+    out_has = true;
+}
+
+fn home_dir(out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    let has = false;
+    env_get(STR_PTR("HOME"), STR_LEN("HOME"), &v_ptr, &v_len, &has);
+    out_len = buf_copy(out, out_cap, v_ptr, v_len);
+}
+
+fn now_ms() -> u64 {
+    return 0;
+}
+
+fn read_file_into(path: ptr, path_len: u64, out: ptr, cap: u64, out_len: &u64) -> bool {
+    out_len = 0;
+    let total: u64 = 0;
+    if sa_std_fs_len(path, path_len, &total) != 0 { return false; };
+    let fh: u64 = 0;
+    if sa_std_fs_open_read(path, path_len, &fh) != 0 { return false; };
+    let read_n: u64 = 0;
+    let rst = sa_std_fs_file_read(fh, out, cap, &read_n);
+    sa_fs_file_close(fh);
+    if rst != 0 { return false; };
+    out_len = read_n;
+    return true;
+}
+
+// ---- local helpers ----
+
+fn byte_at(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+fn byte_off(p: ptr, off: u64) -> ptr {
+    let r: ptr = PTR_NULL();
+    PTR_BYTE_ADD(r, p, off);
+    return r;
+}
+
+fn slot(arena: ptr, off: u64) -> ptr {
+    return byte_off(arena, off);
+}
+
+fn bytes_eq(a: ptr, b: ptr, n: u64) -> bool {
+    for i in 0..n {
+        if byte_at(a, i) != byte_at(b, i) { return false; };
+    }
+    return true;
+}
+
+fn str_is(p: ptr, n: u64, lit: ptr, lit_len: u64) -> bool {
+    return n == lit_len && bytes_eq(p, lit, n);
+}
+
+fn contains_ci(p: ptr, n: u64, needle: ptr) -> bool {
+    let needle_len = lit_len(needle);
+    if needle_len > n { return false; };
+    let last = n - needle_len;
+    let i: u64 = 0;
+    while i <= last {
+        let ok = true;
+        for j in 0..needle_len {
+            let a = byte_at(p, i + j);
+            let b = byte_at(needle, j);
+            if a >= 65 && a <= 90 { a = a + 32; };
+            if b >= 65 && b <= 90 { b = b + 32; };
+            if a != b { ok = false; break; };
+        }
+        if ok { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn lit_len(p: ptr) -> u64 {
+    let n: u64 = 0;
+    while byte_at(p, n) != 0 { n = n + 1; };
+    return n;
+}
+
+fn find_byte(buf: ptr, n: u64, from: u64, want: u8) -> u64 {
+    let i = from;
+    while i < n {
+        if byte_at(buf, i) == want { return i; };
+        i = i + 1;
+    }
+    return 4294967295;
+}
+
+fn trim_span(p: ptr, n: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // 已绑 sa_std ts 面 (@ts_str_trim) — wrap-up rebind.
+    @ts_str_trim(out_ptr, out_len, p, n);
+}
+
+fn is_ws(b: u8) -> bool {
+    return b == 32 || b == 9 || b == 10 || b == 13;
+}
+
+fn append_bytes(dst: ptr, cap: u64, at: u64, src: ptr, n: u64) -> u64 {
+    let w: u64 = 0;
+    for i in 0..n {
+        if at + w < cap {
+            PTR_BYTE_SET(dst, at + w, byte_at(src, i));
+            w = w + 1;
+        };
+    }
+    return w;
+}
+
+fn append_u64(dst: ptr, cap: u64, at: u64, v: u64) -> u64 {
+    let digits = [0u8; 20];
+    let dn: u64 = 0;
+    if v == 0 { return append_bytes(dst, cap, at, STR_PTR("0"), 1); };
+    let x = v;
+    while x > 0 {
+        digits[dn] = 48 + (x % 10) as u8;
+        dn = dn + 1;
+        x = x / 10;
+    }
+    let w: u64 = 0;
+    let i = dn;
+    while i > 0 {
+        i = i - 1;
+        if at + w < cap { PTR_BYTE_SET(dst, at + w, digits[i]); w = w + 1; };
+    }
+    return w;
+}
+
+fn append_i64(dst: ptr, cap: u64, at: u64, v: i64) -> u64 {
+    if v < 0 {
+        let n = append_bytes(dst, cap, at, STR_PTR("-"), 1);
+        return n + append_u64(dst, cap, at + n, (0 - v) as u64);
+    };
+    return append_u64(dst, cap, at, v as u64);
+}
+
+fn buf_copy(dst: ptr, cap: u64, src: ptr, n: u64) -> u64 {
+    let m = n;
+    if m > cap { m = cap; };
+    for i in 0..m {
+        PTR_BYTE_SET(dst, i, byte_at(src, i));
+    }
+    return m;
+}
+
+fn join2(out: ptr, cap: u64, a: ptr, a_len: u64, b: ptr, b_len: u64) -> u64 {
+    let n: u64 = 0;
+    n = n + append_bytes(out, cap, n, a, a_len);
+    n = n + append_bytes(out, cap, n, STR_PTR("/"), 1);
+    n = n + append_bytes(out, cap, n, b, b_len);
+    return n;
+}

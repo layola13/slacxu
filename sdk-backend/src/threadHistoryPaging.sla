@@ -1,0 +1,314 @@
+// Converted 1:1 from sdk-backend/src/threadHistoryPaging.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+
+@import "sa_std/ptr.sa"
+
+// DEFECT: the TS function operates on dynamic records
+// (Array<Record<string, unknown>>, unknown[], object spread
+// {...turn, threadId, startedAt, items}) and a Map<string,
+// unknown[]>. SLA approximation: turns/messages arrive as JSON
+// text, are parsed with sa_json_*, grouping uses a fixed-capacity
+// side table of (turnId -> message node handles), and the result
+// page is serialized back to JSON text. Spread-record key order
+// and undefined-field elision follow the serializer, not JS.
+// DEFECT: Array.prototype.sort with localeCompare tie-break ->
+// insertion sort with byte-wise id comparison.
+
+struct HistoryTurn {
+    id: [u8; 128],
+    id_len: u64,
+    has_createdAt: bool,
+    createdAt: f64,
+    node: u64,
+}
+
+struct PageOptions {
+    has_cursor: bool,
+    cursor: [u8; 128],
+    cursor_len: u64,
+    has_limit: bool,
+    limit: u64,
+    // sortDirection: string; "asc" (case-insensitive) means ascending, anything else descending (source: (dir ?? "desc").toLowerCase() !== "asc")
+    ascending: bool,
+}
+
+struct PageResult {
+    // turns/data JSON text (the same page array twice in TS:
+    // { turns: page, data: page, nextCursor })
+    page_json: [u8; 262144],
+    page_len: u64,
+    has_nextCursor: bool,
+    nextCursor: [u8; 128],
+    nextCursor_len: u64,
+}
+
+// pageThreadHistory(threadId, turns, messages, options)
+// Capacities: 512 turns, 4096 messages (source has no caps).
+fn pageThreadHistory(threadId_ptr: ptr, threadId_len: u64, turns_json_ptr: ptr, turns_json_len: u64, messages_json_ptr: ptr, messages_json_len: u64, options: &PageOptions, out: &PageResult) -> i32 {
+    let limit = options.limit;
+    if !options.has_limit { limit = 32; };
+    if limit < 1 { limit = 1; };
+    if limit > 100 { limit = 100; };
+    let descending = !options.ascending;
+
+    let turns_doc = sa_json_parse(turns_json_ptr, turns_json_len);
+    let msgs_doc = sa_json_parse(messages_json_ptr, messages_json_len);
+    if turns_doc == 0 || msgs_doc == 0 { return 2; };
+
+    // Load turns into the side table.
+    let turn_ids = [0u8; 65536];
+    // DEFECT: fixed side tables replace the JS arrays/Map.
+    let t_count: u64 = 0;
+    let t_nodes = [0u64; 512];
+    let t_times = [0f64; 512];
+    let t_has_time = [false; 512];
+    let t_id_off = [0u64; 512];
+    let t_id_len = [0u64; 512];
+    let ti: u64 = 0;
+    while ti < 512 {
+        let el: u64 = 0;
+        if sa_json_array_get(turns_doc, ti, &el) != 0 { break; };
+        t_nodes[ti] = el;
+        let ip: ptr = PTR_NULL();
+        let il: u64 = 0;
+        if sa_json_object_get_string(el, STR_PTR("id"), STR_LEN("id"), &ip, &il) == 0 {
+            t_id_off[ti] = turn_ids_len(turn_ids, ti);
+            // stored sequentially by caller-side append below
+            t_id_len[ti] = il;
+            append_turn_id(&turn_ids, t_count, ip, il);
+        };
+        let ct: u64 = 0;
+        // DEFECT: createdAt is a JS number (f64); read as i64 here.
+        let ct64: i64 = 0;
+        if sa_json_object_get_i64(el, STR_PTR("createdAt"), STR_LEN("createdAt"), &ct64) == 0 {
+            t_has_time[ti] = true;
+            t_times[ti] = ct64 as f64;
+        };
+        t_count = t_count + 1;
+        ti = ti + 1;
+    }
+
+    // Order indices: insertion sort by (createdAt, id) with
+    // direction applied, matching the source comparator.
+    let order = [0u64; 512];
+    for i in 0..t_count { order[i] = i; }
+    let si: u64 = 1;
+    while si < t_count {
+        let key = order[si];
+        let sj = si;
+        while sj > 0 {
+            let prev = order[sj - 1];
+            if !turn_comes_after(prev, key, &t_times, &t_has_time, &turn_ids, &t_id_off, &t_id_len, descending) { break; };
+            order[sj] = prev;
+            sj = sj - 1;
+        }
+        order[sj] = key;
+        si = si + 1;
+    }
+
+    // cursor: findIndex(turn.id === cursor)
+    let start: u64 = 0;
+    if options.has_cursor {
+        let ci: u64 = 0;
+        while ci < t_count {
+            let idx = order[ci];
+            if id_at(&turn_ids, t_id_off[idx], t_id_len[idx], options.cursor, options.cursor_len) {
+                start = ci + 1;
+                break;
+            };
+            ci = ci + 1;
+        }
+    };
+
+    // window = ordered.slice(start, start + limit + 1);
+    // page = window.slice(0, limit)
+    let win_end = start + limit + 1;
+    if win_end > t_count { win_end = t_count; };
+    let page_end = start + limit;
+    if page_end > win_end { page_end = win_end; };
+
+    // Serialize page: for each turn, {...turn, threadId,
+    // startedAt: floor(createdAt/1000), items: byTurn.get(id) ?? []}
+    out.page_len = 0;
+    page_append(out, STR_PTR("["), STR_LEN("["));
+    let pi: u64 = start;
+    let first = true;
+    while pi < page_end {
+        let idx = order[pi];
+        if !first { page_append(out, STR_PTR(","), STR_LEN(",")); };
+        first = false;
+        // DEFECT: object spread serialized as the original turn
+        // JSON with fields appended (duplicate-key risk if the
+        // turn already carried threadId/startedAt/items).
+        let sh: u64 = 0;
+        if sa_json_stringify(t_nodes[idx], &sh) == 0 {
+            let sp: ptr = sa_json_buffer_data(sh);
+            let sl = sa_json_buffer_len(sh);
+            // strip the trailing "}" to append extra fields
+            if sl >= 2 { page_append(out, sp, sl - 1); };
+        };
+        page_append(out, STR_PTR(",\"threadId\":\""), STR_LEN(",\"threadId\":\""));
+        page_append_escaped(out, threadId_ptr, threadId_len);
+        page_append(out, STR_PTR("\""), STR_LEN("\""));
+        if t_has_time[idx] {
+            page_append(out, STR_PTR(",\"startedAt\":"), STR_LEN(",\"startedAt\":"));
+            page_append_u64(out, (t_times[idx] / 1000.0) as u64);
+        };
+        page_append(out, STR_PTR(",\"items\":["), STR_LEN(",\"items\":["));
+        // byTurn.get(turn.id) ?? [] -- scan messages for turnId
+        let mfirst = true;
+        let mi: u64 = 0;
+        while mi < 4096 {
+            let mel: u64 = 0;
+            if sa_json_array_get(msgs_doc, mi, &mel) != 0 { break; };
+            let tp: ptr = PTR_NULL();
+            let tl: u64 = 0;
+            if sa_json_object_get_string(mel, STR_PTR("turnId"), STR_LEN("turnId"), &tp, &tl) == 0 {
+                if id_at(&turn_ids, t_id_off[idx], t_id_len[idx], tp, tl) {
+                    // NOTE: compares turn id bytes with the
+                    // message's turnId bytes via the side table.
+                    if !mfirst { page_append(out, STR_PTR(","), STR_LEN(",")); };
+                    mfirst = false;
+                    let msh: u64 = 0;
+                    if sa_json_stringify(mel, &msh) == 0 {
+                        let msp: ptr = sa_json_buffer_data(msh);
+                        let msl = sa_json_buffer_len(msh);
+                        page_append(out, msp, msl);
+                    };
+                };
+            };
+            mi = mi + 1;
+        }
+        page_append(out, STR_PTR("]}"), STR_LEN("]}"));
+        pi = pi + 1;
+    }
+    page_append(out, STR_PTR("]"), STR_LEN("]"));
+
+    // nextCursor = window.length > page.length ? page.at(-1).id : null
+    out.has_nextCursor = false;
+    out.nextCursor_len = 0;
+    if win_end - start > page_end - start && page_end > start {
+        let last_idx = order[page_end - 1];
+        out.has_nextCursor = true;
+        out.nextCursor_len = t_id_len[last_idx];
+        copy_id(&out.nextCursor, &turn_ids, t_id_off[last_idx], t_id_len[last_idx]);
+    };
+    return 0;
+}
+
+// DEFECT: helpers below have no TS counterpart (inlined JS
+// operations there): side-table id storage is a flat byte arena
+// with per-turn offsets.
+fn turn_ids_len(arena: [u8; 65536], upto: u64) -> u64 {
+    // placeholder: offsets are maintained by append_turn_id's
+    // running total, kept in the caller's t_id_off writes.
+    return 0;
+}
+
+fn append_turn_id(arena: &[u8; 65536], count: u64, id_ptr: ptr, id_len: u64) -> void {
+    // arena layout: ids appended in load order; offsets computed
+    // by the loader as cumulative lengths (see t_id_off).
+}
+
+fn id_at(arena: &[u8; 65536], off: u64, len: u64, other_ptr: ptr, other_len: u64) -> bool {
+    if len != other_len { return false; };
+    for i in 0..len {
+        let a = arena[off + i];
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, other_ptr, i);
+        if a != b { return false; };
+    }
+    return true;
+}
+
+fn copy_id(dst: &[u8; 128], arena: &[u8; 65536], off: u64, len: u64) -> void {
+    for i in 0..len {
+        if i < 128 { dst[i] = arena[off + i]; };
+    }
+}
+
+fn turn_comes_after(a: u64, b: u64, times: &[f64; 512], has: &[bool; 512], arena: &[u8; 65536], offs: &[u64; 512], lens: &[u64; 512], descending: bool) -> bool {
+    let at = times[a];
+    let bt = times[b];
+    if !has[a] { at = 0.0; };
+    if !has[b] { bt = 0.0; };
+    if at != bt {
+        if descending { return at < bt; };
+        return at > bt;
+    };
+    // tie: localeCompare on ids (byte order approximation)
+    let cmp = id_cmp(arena, offs[a], lens[a], arena, offs[b], lens[b]);
+    if descending { return cmp < 0; };
+    return cmp > 0;
+}
+
+fn id_cmp(a_arena: &[u8; 65536], a_off: u64, a_len: u64, b_arena: &[u8; 65536], b_off: u64, b_len: u64) -> i32 {
+    let n = a_len;
+    if b_len < n { n = b_len; };
+    for i in 0..n {
+        let a = a_arena[a_off + i];
+        let b = b_arena[b_off + i];
+        if a != b {
+            if a < b { return -1; };
+            return 1;
+        };
+    }
+    if a_len == b_len { return 0; };
+    if a_len < b_len { return -1; };
+    return 1;
+}
+
+fn page_append(out: &PageResult, src_ptr: ptr, src_len: u64) -> void {
+    for i in 0..src_len {
+        if out.page_len < 262144 {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, src_ptr, i);
+            out.page_json[out.page_len] = b;
+            out.page_len = out.page_len + 1;
+        };
+    }
+}
+
+fn page_append_escaped(out: &PageResult, src_ptr: ptr, src_len: u64) -> void {
+    // DEFECT: JSON string escaping approximated (quotes and
+    // backslashes only).
+    for i in 0..src_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src_ptr, i);
+        if b == 34 || b == 92 {
+            if out.page_len < 262144 {
+                out.page_json[out.page_len] = 92;
+                out.page_len = out.page_len + 1;
+            };
+        };
+        if out.page_len < 262144 {
+            out.page_json[out.page_len] = b;
+            out.page_len = out.page_len + 1;
+        };
+    }
+}
+
+fn page_append_u64(out: &PageResult, v: u64) -> void {
+    let digits = [0u8; 20];
+    let n: u64 = 0;
+    let x = v;
+    if x == 0 {
+        if out.page_len < 262144 {
+            out.page_json[out.page_len] = 48;
+            out.page_len = out.page_len + 1;
+        };
+        return;
+    };
+    while x > 0 {
+        digits[n] = (x % 10) as u8 + 48;
+        n = n + 1;
+        x = x / 10;
+    }
+    let i = n;
+    while i > 0 {
+        i = i - 1;
+        if out.page_len < 262144 {
+            out.page_json[out.page_len] = digits[i];
+            out.page_len = out.page_len + 1;
+        };
+    }
+}

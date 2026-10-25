@@ -1,0 +1,139 @@
+// Converted 1:1 from apps/web/src/state/recentThreadTranscripts.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/ts_array.sa"
+@import "sa_std/ts_string.sa"
+// Per SA_TS_INVENTORY.md: Array push/filter/slice semantics bind to the
+// sa_std ts_array surface (@ts_arr_push_word / @ts_arr_slice_copy) and
+// string equality to @ts_str_equals — 已绑 sa_std ts 面 (call sites
+// finalized in the fix phase; see _defects/web-ts-state.md).
+
+// Keep enough completed transcripts warm for ordinary tab switching without
+// allowing a long-lived renderer to retain every large conversation forever.
+// Active, running, and visible Split View transcripts are never selected for eviction.
+
+// TS: export const MAX_RECENT_THREAD_TRANSCRIPTS = 8;
+fn MAX_RECENT_THREAD_TRANSCRIPTS() -> u64 { return 8; }
+
+// DEFECT: TS string[] / ReadonlySet<string> have no SLA counterpart; a thread-id
+// list is a fixed-capacity array of fixed-size byte slots (128 bytes per id,
+// 64 entries) plus per-entry lengths. Ids longer than 128 bytes are truncated.
+struct ThreadIdList {
+    items: [[u8; 128]; 64],
+    lens: [u64; 64],
+    len: u64,
+}
+
+fn threadIdListContains(list: &ThreadIdList, id_ptr: ptr, id_len: u64) -> bool {
+    for i in 0..list.len {
+        if list.lens[i] == id_len {
+            let same = true;
+            for j in 0..id_len {
+                let a: u8 = 0;
+                PTR_BYTE_AT(a, id_ptr, j);
+                if a != list.items[i][j] { same = false; };
+            }
+            if same { return true; };
+        };
+    }
+    return false;
+}
+
+fn threadIdListPush(list: &ThreadIdList, id_ptr: ptr, id_len: u64) -> void {
+    if list.len >= 64 { return; };
+    let n = id_len;
+    if n > 128 { n = 128; };
+    for j in 0..n {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, id_ptr, j);
+        list.items[list.len][j] = b;
+    }
+    list.lens[list.len] = n;
+    list.len = list.len + 1;
+}
+
+fn threadIdListPushAt(list: &ThreadIdList, src: &ThreadIdList, srcIndex: u64) -> void {
+    if list.len >= 64 { return; };
+    let n = src.lens[srcIndex];
+    for j in 0..n {
+        list.items[list.len][j] = src.items[srcIndex][j];
+    }
+    list.lens[list.len] = n;
+    list.len = list.len + 1;
+}
+
+fn threadIdListRemoveAt(list: &ThreadIdList, index: u64) -> void {
+    let i = index;
+    while i + 1 < list.len {
+        let n = list.lens[i + 1];
+        for j in 0..n {
+            list.items[i][j] = list.items[i + 1][j];
+        }
+        list.lens[i] = n;
+        i = i + 1;
+    }
+    if list.len > 0 { list.len = list.len - 1; };
+}
+
+fn threadIdEqualsAt(list: &ThreadIdList, index: u64, id_ptr: ptr, id_len: u64) -> bool {
+    if list.lens[index] != id_len { return false; };
+    for j in 0..id_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, id_ptr, j);
+        if b != list.items[index][j] { return false; };
+    }
+    return true;
+}
+
+// TS: export function touchRecentThreadTranscript(
+//   recentThreadIds: string[],
+//   threadId: string,
+//   activeThreadId: string | null,
+//   protectedThreadIds: ReadonlySet<string>,
+//   maxEntries = MAX_RECENT_THREAD_TRANSCRIPTS
+// ): { recentThreadIds: string[]; evictedThreadIds: string[] }
+// DEFECT: the TS function returns a fresh object with two new arrays; SLA
+// version writes into caller-provided out lists (recentOut / evictedOut).
+// DEFECT: Array.filter/push/splice/findIndex closures approximated by the
+// explicit loops below; Set.has approximated by threadIdListContains.
+fn touchRecentThreadTranscript(recentThreadIds: &ThreadIdList, threadId_ptr: ptr, threadId_len: u64, hasActiveThreadId: bool, activeThreadId_ptr: ptr, activeThreadId_len: u64, protectedThreadIds: &ThreadIdList, maxEntries: u64, recentOut: &ThreadIdList, evictedOut: &ThreadIdList) -> void {
+    recentOut.len = 0;
+    evictedOut.len = 0;
+    // const recent = recentThreadIds.filter((id) => id !== threadId);
+    for i in 0..recentThreadIds.len {
+        if !threadIdEqualsAt(recentThreadIds, i, threadId_ptr, threadId_len) {
+            threadIdListPushAt(recentOut, recentThreadIds, i);
+        };
+    }
+    // recent.push(threadId);
+    threadIdListPush(recentOut, threadId_ptr, threadId_len);
+    // while (recent.length > maxEntries) { find first evictable; splice it out }
+    while recentOut.len > maxEntries {
+        let candidateIndex: u64 = 0;
+        let found = false;
+        for i in 0..recentOut.len {
+            let isActive = false;
+            if hasActiveThreadId { isActive = threadIdEqualsAt(recentOut, i, activeThreadId_ptr, activeThreadId_len); };
+            // DEFECT: protectedThreadIds.has(candidateId) needs the candidate as
+            // (ptr,len); the fixed-slot storage is compared byte-wise inline in
+            // the fix phase — here the slot bytes are checked via a scratch copy.
+            let isProtected = false;
+            if !isActive {
+                // compare candidate slot against each protected slot
+                for p in 0..protectedThreadIds.len {
+                    if protectedThreadIds.lens[p] == recentOut.lens[i] {
+                        let same = true;
+                        for j in 0..recentOut.lens[i] {
+                            if protectedThreadIds.items[p][j] != recentOut.items[i][j] { same = false; };
+                        }
+                        if same { isProtected = true; };
+                    };
+                }
+            };
+            if !isActive && !isProtected { candidateIndex = i; found = true; break; };
+        }
+        if !found { break; };
+        threadIdListPushAt(evictedOut, recentOut, candidateIndex);
+        threadIdListRemoveAt(recentOut, candidateIndex);
+    }
+}

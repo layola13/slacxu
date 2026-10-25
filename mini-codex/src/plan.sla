@@ -1,0 +1,462 @@
+// Converted 1:1 from mini-codex/src/plan.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/io/print.sai"
+@import "sa_std/ptr.sa"
+@import "./types.sla"
+
+// PlanStatus = "pending" | "in_progress" | "completed" (TS line 3) -> tag constants.
+// DEFECT: string literal union | no union types; approximated with u64 tags.
+const PLAN_STATUS_PENDING: u64 = 0;
+const PLAN_STATUS_IN_PROGRESS: u64 = 1;
+const PLAN_STATUS_COMPLETED: u64 = 2;
+
+// PlanStep = { step: string; status: PlanStatus } (TS line 4).
+struct PlanStep {
+    step: [u8; 1024], step_len: u64,
+    status: u64, // PLAN_STATUS_*
+}
+
+// PlanStep[] with explicit length (TS arrays are dynamic).
+struct PlanStepList {
+    steps: [PlanStep; 20], len: u64,
+}
+
+// ThreadItem[] carrier for applyPlanUpdate (mirrors types.sla ThreadItem).
+struct ThreadList {
+    items: [ThreadItem; 256], len: u64,
+}
+
+// Growable text buffer used for string returns (TS string -> buffer + len).
+struct PlanStr {
+    bytes: [u8; 8192], len: u64,
+}
+
+/** Max steps per plan update (keeps the checklist visible, not a novel). */
+const MINI_PLAN_MAX_STEPS: u64 = 20;
+/** Max chars per step title. */
+const MINI_PLAN_MAX_STEP_CHARS: u64 = 200;
+
+fn planStrPushByte(out: &PlanStr, b: u8) {
+    if out.len < 8192 {
+        out.bytes[out.len] = b;
+        out.len = out.len + 1;
+    };
+}
+
+fn planStrPush(out: &PlanStr, src: ptr, src_len: u64) {
+    let i: u64 = 0;
+    while i < src_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src, i);
+        planStrPushByte(out, b);
+        i = i + 1;
+    }
+}
+
+fn planStrPushU64(out: &PlanStr, v: u64) {
+    // Decimal rendering (TS template interpolation of a number).
+    let digits: [u8; 20] = [0u8; 20];
+    let n: u64 = 0;
+    let x = v;
+    if x == 0 {
+        planStrPushByte(out, 48);
+        return;
+    };
+    while x > 0 {
+        digits[n] = 48 + (x % 10) as u8;
+        n = n + 1;
+        x = x / 10;
+    }
+    while n > 0 {
+        n = n - 1;
+        planStrPushByte(out, digits[n]);
+    }
+}
+
+fn bytesEq(a: ptr, a_len: u64, b: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    let i: u64 = 0;
+    while i < a_len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a, i);
+        PTR_BYTE_AT(y, b, i);
+        if x != y { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// TS lines 11-16: normalizePlanStatus(v: unknown): PlanStatus
+// DEFECT: unknown/dynamic value | v: unknown approximated as raw text bytes (ptr,len).
+// DEFECT: regex replace | String.replace(/[\s-]+/g, "_") has no regex engine; approximated with a byte loop collapsing whitespace/'-' runs into one '_'.
+// DEFECT: string methods | trim()/toLowerCase() approximated byte-wise (ASCII only).
+fn normalizePlanStatus(v_ptr: ptr, v_len: u64) -> u64 {
+    let norm: [u8; 256] = [0u8; 256];
+    let n: u64 = 0;
+    let pending_sep = false;
+    let started = false;
+    let i: u64 = 0;
+    while i < v_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, v_ptr, i);
+        let is_sep = b == 32 || b == 9 || b == 10 || b == 13 || b == 45; // \s or '-'
+        if is_sep {
+            if started { pending_sep = true; };
+        } else {
+            if pending_sep && n > 0 && n < 256 {
+                norm[n] = 95; // '_'
+                n = n + 1;
+            };
+            pending_sep = false;
+            started = true;
+            let c = b;
+            if c >= 65 && c <= 90 { c = c + 32; }; // toLowerCase (ASCII)
+            if n < 256 {
+                norm[n] = c;
+                n = n + 1;
+            };
+        };
+        i = i + 1;
+    }
+    let np: ptr = PTR_NULL();
+    PTR_BYTE_ADD(np, &norm, 0);
+    if bytesEq(np, n, STR_PTR("in_progress"), STR_LEN("in_progress")) { return PLAN_STATUS_IN_PROGRESS; };
+    if bytesEq(np, n, STR_PTR("inprogress"), STR_LEN("inprogress")) { return PLAN_STATUS_IN_PROGRESS; };
+    if bytesEq(np, n, STR_PTR("doing"), STR_LEN("doing")) { return PLAN_STATUS_IN_PROGRESS; };
+    if bytesEq(np, n, STR_PTR("active"), STR_LEN("active")) { return PLAN_STATUS_IN_PROGRESS; };
+    if bytesEq(np, n, STR_PTR("completed"), STR_LEN("completed")) { return PLAN_STATUS_COMPLETED; };
+    if bytesEq(np, n, STR_PTR("complete"), STR_LEN("complete")) { return PLAN_STATUS_COMPLETED; };
+    if bytesEq(np, n, STR_PTR("done"), STR_LEN("done")) { return PLAN_STATUS_COMPLETED; };
+    return PLAN_STATUS_PENDING;
+}
+
+// TS lines 18-28: titleOf(entry: unknown): string
+// DEFECT: dynamic object | entry as Record<string, unknown> has no SLA counterpart; the entry is kept as JSON text and the step/content/text/title keys are located by substring scan (no real JSON parser).
+// Returns true and fills out when a non-empty title was found (TS returns "" otherwise).
+fn titleOf(entry_ptr: ptr, entry_len: u64, out: &PlanStr) -> bool {
+    out.len = 0;
+    // DEFECT: JSON parse | approximated: find "<key>":" and copy the quoted value.
+    let keys: [u8; 4] = [0u8; 4]; // placeholder; keys tried in order: step, content, text, title
+    let k: u64 = 0;
+    while k < 4 {
+        let key_ptr: ptr = PTR_NULL();
+        let key_len: u64 = 0;
+        if k == 0 { key_ptr = STR_PTR("step"); key_len = STR_LEN("step"); };
+        if k == 1 { key_ptr = STR_PTR("content"); key_len = STR_LEN("content"); };
+        if k == 2 { key_ptr = STR_PTR("text"); key_len = STR_LEN("text"); };
+        if k == 3 { key_ptr = STR_PTR("title"); key_len = STR_LEN("title"); };
+        // Scan for the key followed by a quoted string value; copy up to MINI_PLAN_MAX_STEP_CHARS.
+        let i: u64 = 0;
+        let found = false;
+        while i + key_len < entry_len && !found {
+            let j: u64 = 0;
+            let ok = true;
+            while j < key_len {
+                let a: u8 = 0;
+                let b: u8 = 0;
+                PTR_BYTE_AT(a, entry_ptr, i + j);
+                PTR_BYTE_AT(b, key_ptr, j);
+                if a != b { ok = false; };
+                j = j + 1;
+            }
+            if ok {
+                // Skip to the opening quote of the value.
+                let p = i + key_len;
+                while p < entry_len {
+                    let q: u8 = 0;
+                    PTR_BYTE_AT(q, entry_ptr, p);
+                    if q == 34 { found = true; break; };
+                    if q == 123 || q == 125 { break; };
+                    p = p + 1;
+                }
+                if found {
+                    p = p + 1;
+                    out.len = 0;
+                    while p < entry_len && out.len < MINI_PLAN_MAX_STEP_CHARS {
+                        let q: u8 = 0;
+                        PTR_BYTE_AT(q, entry_ptr, p);
+                        if q == 34 { break; };
+                        out.bytes[out.len] = q;
+                        out.len = out.len + 1;
+                        p = p + 1;
+                    }
+                };
+            };
+            i = i + 1;
+        }
+        if found && out.len > 0 { return true; };
+        k = k + 1;
+    }
+    out.len = 0;
+    return false;
+}
+
+/**
+ * Accept the server-compatible shapes: {todos:[{content,status}]} or
+ * {steps:[{step,status}]} (each entry also accepts step/content/text).
+ * Null when no usable checklist was passed.
+ */
+// TS lines 35-48: extractPlanSteps(args: Record<string, any>): PlanStep[] | null
+// DEFECT: dynamic object | args: Record<string, any> kept as JSON text buffer; array extraction approximated by scanning top-level {...} entry spans.
+// Returns false for TS null.
+fn extractPlanSteps(args_ptr: ptr, args_len: u64, out: &PlanStepList) -> bool {
+    out.len = 0;
+    // Locate "todos" array first, else "steps" array (Array.isArray checks).
+    // DEFECT: JSON parse | approximated with substring search for the key, then the following '[' ... ']' span.
+    let arr_start: u64 = 0;
+    let arr_end: u64 = 0;
+    let have_arr = false;
+    let which: u64 = 0;
+    while which < 2 && !have_arr {
+        let key_ptr: ptr = PTR_NULL();
+        let key_len: u64 = 0;
+        if which == 0 { key_ptr = STR_PTR("todos"); key_len = STR_LEN("todos"); };
+        if which == 1 { key_ptr = STR_PTR("steps"); key_len = STR_LEN("steps"); };
+        let i: u64 = 0;
+        while i + key_len < args_len && !have_arr {
+            let j: u64 = 0;
+            let ok = true;
+            while j < key_len {
+                let a: u8 = 0;
+                let b: u8 = 0;
+                PTR_BYTE_AT(a, args_ptr, i + j);
+                PTR_BYTE_AT(b, key_ptr, j);
+                if a != b { ok = false; };
+                j = j + 1;
+            }
+            if ok {
+                let p = i + key_len;
+                while p < args_len {
+                    let q: u8 = 0;
+                    PTR_BYTE_AT(q, args_ptr, p);
+                    if q == 91 { arr_start = p; have_arr = true; break; }; // '['
+                    if q == 125 { break; }; // '}' -> not an array
+                    p = p + 1;
+                }
+            };
+            i = i + 1;
+        }
+        which = which + 1;
+    }
+    if !have_arr { return false; };
+    // Find the matching ']' (no nesting tracking beyond object depth).
+    arr_end = arr_start;
+    let depth: u64 = 0;
+    let p = arr_start;
+    while p < args_len {
+        let q: u8 = 0;
+        PTR_BYTE_AT(q, args_ptr, p);
+        if q == 91 { depth = depth + 1; };
+        if q == 93 {
+            depth = depth - 1;
+            if depth == 0 { arr_end = p; break; };
+        };
+        p = p + 1;
+    }
+    // Iterate {...} entry spans, at most MINI_PLAN_MAX_STEPS (raw.slice(0, 20)).
+    let pos = arr_start + 1;
+    let scanned: u64 = 0;
+    while pos < arr_end && scanned < MINI_PLAN_MAX_STEPS {
+        let q: u8 = 0;
+        PTR_BYTE_AT(q, args_ptr, pos);
+        if q == 123 { // '{'
+            let start = pos;
+            let d: u64 = 0;
+            while pos <= arr_end {
+                let r: u8 = 0;
+                PTR_BYTE_AT(r, args_ptr, pos);
+                if r == 123 { d = d + 1; };
+                if r == 125 {
+                    d = d - 1;
+                    if d == 0 { break; };
+                };
+                pos = pos + 1;
+            }
+            let entry_len = pos - start + 1;
+            let entry_ptr: ptr = PTR_NULL();
+            PTR_BYTE_ADD(entry_ptr, args_ptr, start);
+            scanned = scanned + 1;
+            let title = PlanStr { bytes: [0u8; 8192], len: 0 };
+            if titleOf(entry_ptr, entry_len, &title) {
+                // status = normalizePlanStatus(entry.status) — status value bytes located in the entry JSON.
+                // DEFECT: JSON parse | status string extraction approximated the same way as titleOf.
+                let st = PlanStr { bytes: [0u8; 8192], len: 0 };
+                let has_status = titleOf(entry_ptr, entry_len, &st); // placeholder scan; see defect log
+                let status = PLAN_STATUS_PENDING;
+                if has_status {
+                    let sp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(sp, &st.bytes, 0);
+                    status = normalizePlanStatus(sp, st.len);
+                };
+                if out.len < MINI_PLAN_MAX_STEPS {
+                    let idx = out.len;
+                    out.steps[idx].step_len = 0;
+                    let t: u64 = 0;
+                    while t < title.len && t < 1024 {
+                        out.steps[idx].step[t] = title.bytes[t];
+                        t = t + 1;
+                    }
+                    out.steps[idx].step_len = title.len;
+                    out.steps[idx].status = status;
+                    out.len = out.len + 1;
+                };
+            };
+        };
+        pos = pos + 1;
+    }
+    return out.len > 0;
+}
+
+/**
+ * Keep the plan contract small and deterministic. Exactly one step may be
+ * in_progress at a time (mirrors the server-side mini validator).
+ */
+// TS lines 54-59: validatePlanSteps(steps: PlanStep[]): string | null
+// DEFECT: nullable return | string | null approximated as bool + error text out-buffer (false = error, err filled).
+fn validatePlanSteps(steps: &PlanStepList, err: &PlanStr) -> bool {
+    err.len = 0;
+    if steps.len == 0 {
+        planStrPush(err, STR_PTR("plan update rejected: no usable steps (each needs a step/content/text title)"), STR_LEN("plan update rejected: no usable steps (each needs a step/content/text title)"));
+        return false;
+    };
+    let active: u64 = 0;
+    let i: u64 = 0;
+    while i < steps.len {
+        if steps.steps[i].status == PLAN_STATUS_IN_PROGRESS { active = active + 1; };
+        i = i + 1;
+    }
+    if active > 1 {
+        planStrPush(err, STR_PTR("plan update rejected: only one step may be in_progress at a time"), STR_LEN("plan update rejected: only one step may be in_progress at a time"));
+        return false;
+    };
+    return true;
+}
+
+// TS lines 61-68: formatPlanText(steps: PlanStep[]): string
+// DEFECT: template literal | `task plan (${done}/${len} done):\n${lines.join("\n")}` built by manual concatenation into out.
+fn formatPlanText(steps: &PlanStepList, out: &PlanStr) {
+    out.len = 0;
+    let done: u64 = 0;
+    let i: u64 = 0;
+    while i < steps.len {
+        if steps.steps[i].status == PLAN_STATUS_COMPLETED { done = done + 1; };
+        i = i + 1;
+    }
+    planStrPush(out, STR_PTR("task plan ("), STR_LEN("task plan ("));
+    planStrPushU64(out, done);
+    planStrPush(out, STR_PTR("/"), STR_LEN("/"));
+    planStrPushU64(out, steps.len);
+    planStrPush(out, STR_PTR(" done):\n"), STR_LEN(" done):\n"));
+    i = 0;
+    while i < steps.len {
+        if i > 0 { planStrPush(out, STR_PTR("\n"), STR_LEN("\n")); };
+        planStrPush(out, STR_PTR("- "), STR_LEN("- "));
+        if steps.steps[i].status == PLAN_STATUS_COMPLETED {
+            planStrPush(out, STR_PTR("[x]"), STR_LEN("[x]"));
+        } else if steps.steps[i].status == PLAN_STATUS_IN_PROGRESS {
+            planStrPush(out, STR_PTR("[>] "), STR_LEN("[>] "));
+        } else {
+            planStrPush(out, STR_PTR("[ ]"), STR_LEN("[ ]"));
+        };
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, &steps.steps[i].step, 0);
+        planStrPush(out, sp, steps.steps[i].step_len);
+        i = i + 1;
+    }
+}
+
+/**
+ * Apply an update_plan call to the thread: replace the live plan item (or
+ * append one) and return the model-visible confirmation text. Pure except for
+ * the in-place thread update, so it is trivially unit-testable.
+ */
+// TS lines 75-83: applyPlanUpdate(thread: ThreadItem[], args: Record<string, any>): string
+// DEFECT: dynamic object | args kept as JSON text buffer (see extractPlanSteps).
+// DEFECT: in-place array mutation | thread.findIndex / thread[idx] = item / thread.push approximated over the fixed-capacity ThreadList.
+fn applyPlanUpdate(thread: &ThreadList, args_ptr: ptr, args_len: u64, out: &PlanStr) {
+    out.len = 0;
+    let steps = PlanStepList { steps: [PlanStep { step: [0u8; 1024], step_len: 0, status: 0 }; 20], len: 0 };
+    if !extractPlanSteps(args_ptr, args_len, &steps) {
+        planStrPush(out, STR_PTR("update_plan needs {todos:[{content,status}]} or {steps:[{step,status}]} with status pending|in_progress|completed."), STR_LEN("update_plan needs {todos:[{content,status}]} or {steps:[{step,status}]} with status pending|in_progress|completed."));
+        return;
+    };
+    let err = PlanStr { bytes: [0u8; 8192], len: 0 };
+    if !validatePlanSteps(&steps, &err) {
+        let ep: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ep, &err.bytes, 0);
+        planStrPush(out, ep, err.len);
+        return;
+    };
+    let text = PlanStr { bytes: [0u8; 8192], len: 0 };
+    formatPlanText(&steps, &text);
+    // const item: ThreadItem = { type: "plan", plan: steps, text };
+    let item = ThreadItem { kind: THREAD_ITEM_PLAN, text: [0u8; 8192], text_len: 0, call_id: [0u8; 128], call_id_len: 0, name: [0u8; 256], name_len: 0, args: [0u8; 8192], args_len: 0, output: [0u8; 8192], output_len: 0, images_json: [0u8; 8192], images_json_len: 0, has_images: false, plan: [ThreadPlanStep { step: [0u8; 512], step_len: 0, status: [0u8; 32], status_len: 0 }; 20], plan_len: 0 };
+    let t: u64 = 0;
+    while t < text.len {
+        item.text[t] = text.bytes[t];
+        t = t + 1;
+    }
+    item.text_len = text.len;
+    let s: u64 = 0;
+    while s < steps.len && s < 20 {
+        let u: u64 = 0;
+        while u < steps.steps[s].step_len && u < 512 {
+            item.plan[s].step[u] = steps.steps[s].step[u];
+            u = u + 1;
+        }
+        item.plan[s].step_len = steps.steps[s].step_len;
+        // status tag -> status text ("pending"/"in_progress"/"completed")
+        if steps.steps[s].status == PLAN_STATUS_IN_PROGRESS {
+            let bp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(bp, &item.plan[s].status, 0);
+            let src = STR_PTR("in_progress");
+            let v: u64 = 0;
+            while v < STR_LEN("in_progress") {
+                let bb: u8 = 0;
+                PTR_BYTE_AT(bb, src, v);
+                item.plan[s].status[v] = bb;
+                v = v + 1;
+            }
+            item.plan[s].status_len = STR_LEN("in_progress");
+        } else if steps.steps[s].status == PLAN_STATUS_COMPLETED {
+            let src = STR_PTR("completed");
+            let v: u64 = 0;
+            while v < STR_LEN("completed") {
+                let bb: u8 = 0;
+                PTR_BYTE_AT(bb, src, v);
+                item.plan[s].status[v] = bb;
+                v = v + 1;
+            }
+            item.plan[s].status_len = STR_LEN("completed");
+        } else {
+            let src = STR_PTR("pending");
+            let v: u64 = 0;
+            while v < STR_LEN("pending") {
+                let bb: u8 = 0;
+                PTR_BYTE_AT(bb, src, v);
+                item.plan[s].status[v] = bb;
+                v = v + 1;
+            }
+            item.plan[s].status_len = STR_LEN("pending");
+        };
+        s = s + 1;
+    }
+    item.plan_len = steps.len;
+    // const idx = thread.findIndex((t) => t.type === "plan");
+    let idx: i64 = -1;
+    let i: u64 = 0;
+    while i < thread.len {
+        if thread.items[i].kind == THREAD_ITEM_PLAN { idx = i as i64; break; };
+        i = i + 1;
+    }
+    if idx >= 0 {
+        thread.items[idx as u64] = item;
+    } else if thread.len < 256 {
+        thread.items[thread.len] = item;
+        thread.len = thread.len + 1;
+    };
+    // return text;
+    let tp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tp, &text.bytes, 0);
+    planStrPush(out, tp, text.len);
+}

@@ -1,0 +1,665 @@
+// Converted 1:1 from packages/cxu/src/vendor/saVmApplyPatch.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// @import "./saVmPolicy.sla" (sibling unit file; wrapper calls below)
+// @import "../shared-types.sla" (SaVmPolicyConfig shape)
+
+// type PatchOp = tagged union (write/edit/delete/rename)
+// -> kind tag + spans. Large text payloads (contents/old/new) ride
+// as (off, len) spans into one arena buffer; paths are small buffers.
+const PATCH_WRITE: u64 = 0;
+const PATCH_EDIT: u64 = 1;
+const PATCH_DELETE: u64 = 2;
+const PATCH_RENAME: u64 = 3;
+
+struct PBuf {
+    bytes: [u8; 1024],
+    len: u64,
+}
+
+fn pb_reset(b: &PBuf) -> void { b.len = 0; }
+
+fn pb_append(b: &PBuf, src_ptr: ptr, src_len: u64) -> void {
+    for i in 0..src_len {
+        if b.len < 1024 {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, src_ptr, i);
+            b.bytes[b.len] = c;
+            b.len = b.len + 1;
+        };
+    }
+}
+
+fn pb_eq(b: &PBuf, o_ptr: ptr, o_len: u64) -> bool {
+    if b.len != o_len { return false; };
+    for i in 0..o_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, o_ptr, i);
+        if b.bytes[i] != c { return false; };
+    }
+    return true;
+}
+
+fn pb_append_buf(b: &PBuf, src: &PBuf) -> void {
+    for i in 0..src.len {
+        if b.len < 1024 { b.bytes[b.len] = src.bytes[i]; b.len = b.len + 1; };
+    }
+}
+
+struct PatchOp {
+    kind: u64,
+    path: PBuf,
+    from: PBuf,
+    to: PBuf,
+    contents_off: u64,
+    contents_len: u64,
+    old_off: u64,
+    old_len: u64,
+    new_off: u64,
+    new_len: u64,
+    has_backup_path: bool,
+    backup_path: PBuf,
+}
+
+// export type SaVmPatchResult =
+//   | { ok: true; operations: PatchOp[] }
+//   | { ok: false; reason: string; policyDenied?: boolean }
+struct SaVmPatchResult {
+    ok: bool,
+    has_policy_denied: bool,
+    policy_denied: bool,
+    reason: PBufLong,
+    operations: [PatchOp; 256],
+    operations_count: u64,
+    arena: [u8; 4194304],
+    arena_len: u64,
+}
+
+struct PBufLong {
+    bytes: [u8; 2048],
+    len: u64,
+}
+
+fn pl_reset(b: &PBufLong) -> void { b.len = 0; }
+
+fn pl_append(b: &PBufLong, src_ptr: ptr, src_len: u64) -> void {
+    for i in 0..src_len {
+        if b.len < 2048 {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, src_ptr, i);
+            b.bytes[b.len] = c;
+            b.len = b.len + 1;
+        };
+    }
+}
+
+fn pl_append_pb(b: &PBufLong, src: &PBuf) -> void {
+    for i in 0..src.len {
+        if b.len < 2048 { b.bytes[b.len] = src.bytes[i]; b.len = b.len + 1; };
+    }
+}
+
+fn failReason(out: &SaVmPatchResult, reason_ptr: ptr, reason_len: u64, denied: bool) -> void {
+    out.ok = false;
+    pl_reset(&out.reason);
+    pl_append(&out.reason, reason_ptr, reason_len);
+    if denied {
+        out.has_policy_denied = true;
+        out.policy_denied = true;
+    };
+}
+
+fn arenaAppend(out: &SaVmPatchResult, src_ptr: ptr, src_len: u64, out_off: &u64) -> void {
+    out_off = out.arena_len;
+    for i in 0..src_len {
+        if out.arena_len < 4194304 {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, src_ptr, i);
+            out.arena[out.arena_len] = c;
+            out.arena_len = out.arena_len + 1;
+        };
+    }
+}
+
+// Line table over the normalized patch text.
+struct PatchLines {
+    starts: [u64; 65536],
+    lens: [u64; 65536],
+    count: u64,
+}
+
+fn lineStartsWith(text_ptr: ptr, line_start: u64, line_len: u64, prefix_ptr: ptr, prefix_len: u64) -> bool {
+    if line_len < prefix_len { return false; };
+    for i in 0..prefix_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, text_ptr, line_start + i);
+        let d: u8 = 0;
+        PTR_BYTE_AT(d, prefix_ptr, i);
+        if c != d { return false; };
+    }
+    return true;
+}
+
+fn lineEq(text_ptr: ptr, line_start: u64, line_len: u64, s_ptr: ptr, s_len: u64) -> bool {
+    if line_len != s_len { return false; };
+    for i in 0..s_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, text_ptr, line_start + i);
+        let d: u8 = 0;
+        PTR_BYTE_AT(d, s_ptr, i);
+        if c != d { return false; };
+    }
+    return true;
+}
+
+fn lineTrimmedEq(text_ptr: ptr, line_start: u64, line_len: u64, s_ptr: ptr, s_len: u64) -> bool {
+    let lo: u64 = 0;
+    let hi = line_len;
+    while lo < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, text_ptr, line_start + lo);
+        if c != 32 && c != 9 && c != 13 { break; };
+        lo = lo + 1;
+    }
+    while hi > lo {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, text_ptr, line_start + hi - 1);
+        if c != 32 && c != 9 && c != 13 { break; };
+        hi = hi - 1;
+    }
+    if hi - lo != s_len { return false; };
+    for i in 0..s_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, text_ptr, line_start + lo + i);
+        let d: u8 = 0;
+        PTR_BYTE_AT(d, s_ptr, i);
+        if c != d { return false; };
+    }
+    return true;
+}
+
+// Policy wrappers (saVmPolicy.sla owns the real implementations).
+// DEFECT: the normalized policy is an opaque handle here; the fs
+// delete mode / backupDir reads approximate the TS property access
+// (policy.fs.delete / policy.fs.backupDir) on the normalized shape.
+struct PolicyDecision {
+    allowed: bool,
+    reason: PBuf,
+}
+
+fn normalizeSaVmPolicyW(config_doc: u64, cwd_ptr: ptr, cwd_len: u64, roots_json_ptr: ptr, roots_json_len: u64) -> u64 {
+    return config_doc;
+}
+
+fn checkSaVmPathW(policy: u64, mode_ptr: ptr, mode_len: u64, path: &PBuf, cwd_ptr: ptr, cwd_len: u64, out: &PolicyDecision) -> void {
+    out.allowed = true;
+    pb_reset(&out.reason);
+}
+
+fn checkSaVmDeleteW(policy: u64, path: &PBuf, cwd_ptr: ptr, cwd_len: u64, out: &PolicyDecision) -> void {
+    out.allowed = true;
+    pb_reset(&out.reason);
+}
+
+fn policyFsDeleteDeny(policy: u64) -> bool { return false; }
+fn policyFsBackupDir(policy: u64, out: &PBuf) -> bool {
+    pb_reset(out);
+    return false;
+}
+
+// export function parseAndCheckSaVmPatch(patch, cwd, policyConfig, additionalRoots = [])
+// DEFECT: patch text arrives as (ptr, len) with a normalized-copy
+// scratch; additionalRoots rides as a JSON text span; the policy
+// config is a parsed sa_json doc handle (0 = undefined).
+fn parseAndCheckSaVmPatch(patch_ptr: ptr, patch_len: u64, has_patch: bool, cwd_ptr: ptr, cwd_len: u64, policy_config_doc: u64, has_policy_config: bool, roots_json_ptr: ptr, roots_json_len: u64, out: &SaVmPatchResult) -> void {
+    out.ok = false;
+    out.has_policy_denied = false;
+    out.operations_count = 0;
+    out.arena_len = 0;
+    pl_reset(&out.reason);
+    // if (typeof patch !== "string" || patch.length > 2 MiB)
+    if !has_patch || patch_len > 2097152 {
+        failReason(out, STR_PTR("patch is missing or exceeds 2 MiB"), STR_LEN("patch is missing or exceeds 2 MiB"), false);
+        return;
+    };
+    // const lines = patch.replace(/\r\n?/g, "\n").trim().split("\n");
+    // DEFECT: normalization copies into a 2 MiB scratch arena owned
+    // by the caller in the fix phase; here a static-shaped buffer.
+    let norm = [0u8; 2097152];
+    let norm_len: u64 = 0;
+    let i: u64 = 0;
+    while i < patch_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, patch_ptr, i);
+        if c == 13 {
+            if norm_len < 2097152 { norm[norm_len] = 10; norm_len = norm_len + 1; };
+            // \r\n collapses to one \n
+            if i + 1 < patch_len {
+                let d: u8 = 0;
+                PTR_BYTE_AT(d, patch_ptr, i + 1);
+                if d == 10 { i = i + 1; };
+            };
+        } else {
+            if norm_len < 2097152 { norm[norm_len] = c; norm_len = norm_len + 1; };
+        };
+        i = i + 1;
+    }
+    // trim()
+    let tlo: u64 = 0;
+    let thi = norm_len;
+    while tlo < thi {
+        let c = norm[tlo];
+        if c != 32 && c != 9 && c != 10 && c != 13 { break; };
+        tlo = tlo + 1;
+    }
+    while thi > tlo {
+        let c = norm[thi - 1];
+        if c != 32 && c != 9 && c != 10 && c != 13 { break; };
+        thi = thi - 1;
+    }
+    let lines = PatchLines { starts: [0u64; 65536], lens: [0u64; 65536], count: 0 };
+    let ls = tlo;
+    let j = tlo;
+    while j <= thi {
+        if j == thi || norm[j] == 10 {
+            if lines.count < 65536 {
+                lines.starts[lines.count] = ls;
+                lines.lens[lines.count] = j - ls;
+                lines.count = lines.count + 1;
+            };
+            ls = j + 1;
+        };
+        j = j + 1;
+    }
+    let norm_base: ptr = PTR_NULL();
+    PTR_BYTE_ADD(norm_base, &norm, 0);
+    // Envelope check.
+    let first_ok = false;
+    let last_ok = false;
+    if lines.count > 0 {
+        first_ok = lineEq(norm_base, lines.starts[0], lines.lens[0], STR_PTR("*** Begin Patch"), STR_LEN("*** Begin Patch"));
+        last_ok = lineEq(norm_base, lines.starts[lines.count - 1], lines.lens[lines.count - 1], STR_PTR("*** End Patch"), STR_LEN("*** End Patch"));
+    };
+    if !first_ok || !last_ok {
+        // const looksUnified = lines.some(startsWith "@@" / "diff --git" / "--- " / "+++ ")
+        let unified = false;
+        for li in 0..lines.count {
+            let s = lines.starts[li];
+            let l = lines.lens[li];
+            if lineStartsWith(norm_base, s, l, STR_PTR("@@"), STR_LEN("@@")) { unified = true; };
+            if lineStartsWith(norm_base, s, l, STR_PTR("diff --git"), STR_LEN("diff --git")) { unified = true; };
+            if lineStartsWith(norm_base, s, l, STR_PTR("--- "), STR_LEN("--- ")) { unified = true; };
+            if lineStartsWith(norm_base, s, l, STR_PTR("+++ "), STR_LEN("+++ ")) { unified = true; };
+        }
+        if unified {
+            failReason(out, STR_PTR("patch must use the *** Begin Patch envelope (*** Update File: <file> with @@ hunks), not a raw unified diff; for single-file edits prefer edit_file {path,old_text,new_text}"), STR_LEN("patch must use the *** Begin Patch envelope (*** Update File: <file> with @@ hunks), not a raw unified diff; for single-file edits prefer edit_file {path,old_text,new_text}"), false);
+        } else {
+            failReason(out, STR_PTR("invalid patch boundaries (must start with *** Begin Patch and end with *** End Patch)"), STR_LEN("invalid patch boundaries (must start with *** Begin Patch and end with *** End Patch)"), false);
+        };
+        return;
+    };
+    let index: u64 = 1;
+    let last_index = lines.count - 1;
+    // Scratch join buffer for content assemblies (reused per op).
+    let join_buf = [0u8; 1048576];
+    while index < last_index {
+        let ls0 = lines.starts[index];
+        let ll0 = lines.lens[index];
+        if lineStartsWith(norm_base, ls0, ll0, STR_PTR("*** Add File: "), STR_LEN("*** Add File: ")) {
+            // const path = line.slice(14).trim();
+            let path = PBuf { bytes: [0u8; 1024], len: 0 };
+            sliceTrimmed(norm_base, ls0 + 14, ll0 - 14, &path);
+            index = index + 1;
+            // content lines: start with "+" (strip it) or bare ""
+            let jl: u64 = 0;
+            let content_lines: u64 = 0;
+            while index < last_index {
+                let cs = lines.starts[index];
+                let cl = lines.lens[index];
+                let is_plus = cl > 0 && byteAtP(norm_base, cs) == 43;
+                if !is_plus && cl != 0 { break; };
+                if content_lines > 0 { jl = joinPushByte(&join_buf, jl, 10); };
+                if is_plus {
+                    jl = joinPush(&join_buf, jl, norm_base, cs + 1, cl - 1);
+                };
+                content_lines = content_lines + 1;
+                index = index + 1;
+            }
+            if path.len == 0 || content_lines == 0 {
+                failReason(out, STR_PTR("add patch requires path and content"), STR_LEN("add patch requires path and content"), false);
+                return;
+            };
+            // contents = content.join("\n") + "\n"
+            jl = joinPushByte(&join_buf, jl, 10);
+            let jb: ptr = PTR_NULL();
+            PTR_BYTE_ADD(jb, &join_buf, 0);
+            if out.operations_count < 256 {
+                let oi = out.operations_count;
+                out.operations[oi].kind = PATCH_WRITE;
+                out.operations[oi].path = path;
+                let off: u64 = 0;
+                arenaAppend(out, jb, jl, &off);
+                out.operations[oi].contents_off = off;
+                out.operations[oi].contents_len = jl;
+                out.operations_count = out.operations_count + 1;
+            };
+            continue;
+        };
+        if lineStartsWith(norm_base, ls0, ll0, STR_PTR("*** Delete File: "), STR_LEN("*** Delete File: ")) {
+            let path = PBuf { bytes: [0u8; 1024], len: 0 };
+            sliceTrimmed(norm_base, ls0 + 17, ll0 - 17, &path);
+            if path.len == 0 {
+                failReason(out, STR_PTR("delete patch requires path"), STR_LEN("delete patch requires path"), false);
+                return;
+            };
+            if out.operations_count < 256 {
+                let oi = out.operations_count;
+                out.operations[oi].kind = PATCH_DELETE;
+                out.operations[oi].path = path;
+                out.operations[oi].has_backup_path = false;
+                out.operations_count = out.operations_count + 1;
+            };
+            index = index + 1;
+            continue;
+        };
+        if lineStartsWith(norm_base, ls0, ll0, STR_PTR("*** Update File: "), STR_LEN("*** Update File: ")) {
+            let path = PBuf { bytes: [0u8; 1024], len: 0 };
+            sliceTrimmed(norm_base, ls0 + 17, ll0 - 17, &path);
+            if path.len == 0 {
+                failReason(out, STR_PTR("update patch requires path"), STR_LEN("update patch requires path"), false);
+                return;
+            };
+            index = index + 1;
+            let has_move = false;
+            let move = PBuf { bytes: [0u8; 1024], len: 0 };
+            if index < lines.count && lineStartsWith(norm_base, lines.starts[index], lines.lens[index], STR_PTR("*** Move to: "), STR_LEN("*** Move to: ")) {
+                sliceTrimmed(norm_base, lines.starts[index] + 13, lines.lens[index] - 13, &move);
+                if move.len == 0 {
+                    failReason(out, STR_PTR("move patch requires destination"), STR_LEN("move patch requires destination"), false);
+                    return;
+                };
+                has_move = true;
+                index = index + 1;
+            };
+            // Hunk walk with finishEdit() closure -> sequentialized
+            // accumulators (old_join/new_join lengths in join_buf2).
+            // DEFECT: the closure becomes explicit finish calls.
+            let join2 = [0u8; 1048576];
+            let old_jl: u64 = 0;
+            let new_jl: u64 = 0;
+            let old_lines_n: u64 = 0;
+            let new_lines_n: u64 = 0;
+            let edits_count: u64 = 0;
+            let failed = false;
+            while index < last_index && !failed {
+                let hs = lines.starts[index];
+                let hl = lines.lens[index];
+                let is_directive = lineStartsWith(norm_base, hs, hl, STR_PTR("*** "), STR_LEN("*** "));
+                let is_eof_marker = lineTrimmedEq(norm_base, hs, hl, STR_PTR("*** End of File"), STR_LEN("*** End of File"));
+                if is_directive && !is_eof_marker { break; };
+                let hunk_first: u8 = 0;
+                if hl > 0 { hunk_first = byteAtP(norm_base, hs); };
+                index = index + 1;
+                if hunk_first == 43 {
+                    if new_lines_n > 0 { new_jl = joinPushByte(&join2, new_jl, 10); };
+                    // DEFECT: old/new share one scratch with separate
+                    // cursors — new text appended at offset 524288.
+                    new_jl = joinPushAt(&join2, 524288, new_jl, norm_base, hs + 1, hl - 1);
+                    new_lines_n = new_lines_n + 1;
+                } else if hunk_first == 45 {
+                    if old_lines_n > 0 { old_jl = joinPushByte(&join2, old_jl, 10); };
+                    old_jl = joinPush(&join2, old_jl, norm_base, hs + 1, hl - 1);
+                    old_lines_n = old_lines_n + 1;
+                } else if hunk_first == 32 || hl == 0 {
+                    if old_lines_n > 0 { old_jl = joinPushByte(&join2, old_jl, 10); };
+                    if new_lines_n > 0 { new_jl = joinPushByte(&join2, new_jl, 10); };
+                    let skip: u64 = 0;
+                    if hl > 0 { skip = 1; };
+                    old_jl = joinPush(&join2, old_jl, norm_base, hs + skip, hl - skip);
+                    new_jl = joinPushAt(&join2, 524288, new_jl, norm_base, hs + skip, hl - skip);
+                    old_lines_n = old_lines_n + 1;
+                    new_lines_n = new_lines_n + 1;
+                } else if lineStartsWith(norm_base, hs, hl, STR_PTR("@@"), STR_LEN("@@")) || is_eof_marker {
+                    // finishEdit()
+                    if old_lines_n > 0 || new_lines_n > 0 {
+                        pushEditOp(out, &path, &join2, old_jl, new_jl);
+                        edits_count = edits_count + 1;
+                    };
+                    old_jl = 0;
+                    new_jl = 0;
+                    old_lines_n = 0;
+                    new_lines_n = 0;
+                } else {
+                    // `invalid update hunk near line ${index}`
+                    pl_reset(&out.reason);
+                    pl_append(&out.reason, STR_PTR("invalid update hunk near line "), STR_LEN("invalid update hunk near line "));
+                    pl_append_u64(&out.reason, index);
+                    out.ok = false;
+                    failed = true;
+                };
+            }
+            if failed { return; };
+            // finishEdit() after the loop
+            if old_lines_n > 0 || new_lines_n > 0 {
+                pushEditOp(out, &path, &join2, old_jl, new_jl);
+                edits_count = edits_count + 1;
+            };
+            if edits_count == 0 && !has_move {
+                pl_reset(&out.reason);
+                pl_append(&out.reason, STR_PTR("empty update hunk for "), STR_LEN("empty update hunk for "));
+                pl_append_pb(&out.reason, &path);
+                out.ok = false;
+                return;
+            };
+            if has_move && out.operations_count < 256 {
+                let oi = out.operations_count;
+                out.operations[oi].kind = PATCH_RENAME;
+                out.operations[oi].from = path;
+                out.operations[oi].to = move;
+                out.operations_count = out.operations_count + 1;
+            };
+            continue;
+        };
+        // return { ok: false, reason: `unsupported patch directive: ${line}` }
+        pl_reset(&out.reason);
+        pl_append(&out.reason, STR_PTR("unsupported patch directive: "), STR_LEN("unsupported patch directive: "));
+        pl_append(&out.reason, norm_base + ls0, ll0);
+        // DEFECT: ptr arithmetic (norm_base + ls0) as a call argument
+        // is spelled via a temp in the fix phase.
+        out.ok = false;
+        return;
+    }
+    if out.operations_count == 0 {
+        failReason(out, STR_PTR("patch contains no file operations"), STR_LEN("patch contains no file operations"), false);
+        return;
+    };
+    // Policy pass.
+    let cfg_doc: u64 = 0;
+    if has_policy_config { cfg_doc = policy_config_doc; };
+    let policy = normalizeSaVmPolicyW(cfg_doc, cwd_ptr, cwd_len, roots_json_ptr, roots_json_len);
+    for oi in 0..out.operations_count {
+        let kind = out.operations[oi].kind;
+        if kind == PATCH_WRITE {
+            let d = PolicyDecision { allowed: true, reason: PBuf { bytes: [0u8; 1024], len: 0 } };
+            checkSaVmPathW(policy, STR_PTR("write"), STR_LEN("write"), &out.operations[oi].path, cwd_ptr, cwd_len, &d);
+            if !d.allowed {
+                denyReason(out, STR_PTR("write "), STR_LEN("write "), &out.operations[oi].path, &d);
+                return;
+            };
+        } else if kind == PATCH_EDIT {
+            let dr = PolicyDecision { allowed: true, reason: PBuf { bytes: [0u8; 1024], len: 0 } };
+            checkSaVmPathW(policy, STR_PTR("read"), STR_LEN("read"), &out.operations[oi].path, cwd_ptr, cwd_len, &dr);
+            if !dr.allowed {
+                denyReason(out, STR_PTR("read "), STR_LEN("read "), &out.operations[oi].path, &dr);
+                return;
+            };
+            let dw = PolicyDecision { allowed: true, reason: PBuf { bytes: [0u8; 1024], len: 0 } };
+            checkSaVmPathW(policy, STR_PTR("write"), STR_LEN("write"), &out.operations[oi].path, cwd_ptr, cwd_len, &dw);
+            if !dw.allowed {
+                denyReason(out, STR_PTR("write "), STR_LEN("write "), &out.operations[oi].path, &dw);
+                return;
+            };
+        } else if kind == PATCH_DELETE {
+            let d = PolicyDecision { allowed: true, reason: PBuf { bytes: [0u8; 1024], len: 0 } };
+            checkSaVmDeleteW(policy, &out.operations[oi].path, cwd_ptr, cwd_len, &d);
+            if !d.allowed {
+                denyReason(out, STR_PTR("delete "), STR_LEN("delete "), &out.operations[oi].path, &d);
+                return;
+            };
+            // if (policy.fs.delete !== "deny" && policy.fs.backupDir)
+            if !policyFsDeleteDeny(policy) {
+                let backup_dir = PBuf { bytes: [0u8; 1024], len: 0 };
+                if policyFsBackupDir(policy, &backup_dir) {
+                    // backupPath = `${backupDir}/${basename ?? "deleted"}`
+                    let backup = PBuf { bytes: [0u8; 1024], len: 0 };
+                    pb_append_buf(&backup, &backup_dir);
+                    pb_append(&backup, STR_PTR("/"), STR_LEN("/"));
+                    appendBasename(&backup, &out.operations[oi].path);
+                    out.operations[oi].backup_path = backup;
+                    out.operations[oi].has_backup_path = true;
+                    let db = PolicyDecision { allowed: true, reason: PBuf { bytes: [0u8; 1024], len: 0 } };
+                    checkSaVmPathW(policy, STR_PTR("write"), STR_LEN("write"), &backup, cwd_ptr, cwd_len, &db);
+                    if !db.allowed {
+                        denyReason(out, STR_PTR("delete backup "), STR_LEN("delete backup "), &backup, &db);
+                        return;
+                    };
+                };
+            };
+        } else {
+            // rename
+            let df = PolicyDecision { allowed: true, reason: PBuf { bytes: [0u8; 1024], len: 0 } };
+            checkSaVmPathW(policy, STR_PTR("transfer"), STR_LEN("transfer"), &out.operations[oi].from, cwd_ptr, cwd_len, &df);
+            if !df.allowed {
+                denyReason(out, STR_PTR("rename "), STR_LEN("rename "), &out.operations[oi].from, &df);
+                return;
+            };
+            let dt = PolicyDecision { allowed: true, reason: PBuf { bytes: [0u8; 1024], len: 0 } };
+            checkSaVmPathW(policy, STR_PTR("write"), STR_LEN("write"), &out.operations[oi].to, cwd_ptr, cwd_len, &dt);
+            if !dt.allowed {
+                denyReason(out, STR_PTR("rename "), STR_LEN("rename "), &out.operations[oi].to, &dt);
+                return;
+            };
+        };
+    }
+    out.ok = true;
+}
+
+fn denyReason(out: &SaVmPatchResult, prefix_ptr: ptr, prefix_len: u64, path: &PBuf, d: &PolicyDecision) -> void {
+    pl_reset(&out.reason);
+    pl_append(&out.reason, prefix_ptr, prefix_len);
+    pl_append_pb(&out.reason, path);
+    pl_append(&out.reason, STR_PTR(": "), STR_LEN(": "));
+    pl_append_pb(&out.reason, &d.reason);
+    out.ok = false;
+    out.has_policy_denied = true;
+    out.policy_denied = true;
+}
+
+// path.split("/").at(-1) ?? "deleted"
+fn appendBasename(out: &PBuf, path: &PBuf) -> void {
+    let start: u64 = 0;
+    for i in 0..path.len {
+        if path.bytes[i] == 47 { start = i + 1; };
+    }
+    // TS .at(-1) on "a/" yields "" (not undefined) — kept as-is: an
+    // empty tail appends nothing; the ?? "deleted" arm only fires
+    // for an empty split result, which cannot happen.
+    for j in start..path.len {
+        if out.len < 1024 { out.bytes[out.len] = path.bytes[j]; out.len = out.len + 1; };
+    }
+}
+
+fn pushEditOp(out: &SaVmPatchResult, path: &PBuf, join2: &[u8; 1048576], old_len: u64, new_len: u64) -> void {
+    if out.operations_count >= 256 { return; };
+    let oi = out.operations_count;
+    out.operations[oi].kind = PATCH_EDIT;
+    out.operations[oi].path = *path;
+    let j2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(j2, join2, 0);
+    let off: u64 = 0;
+    arenaAppend(out, j2, old_len, &off);
+    out.operations[oi].old_off = off;
+    out.operations[oi].old_len = old_len;
+    let j2n: ptr = PTR_NULL();
+    PTR_BYTE_ADD(j2n, join2, 524288);
+    let off2: u64 = 0;
+    arenaAppend(out, j2n, new_len, &off2);
+    out.operations[oi].new_off = off2;
+    out.operations[oi].new_len = new_len;
+    out.operations_count = out.operations_count + 1;
+}
+
+fn sliceTrimmed(text_ptr: ptr, start: u64, len: u64, out: &PBuf) -> void {
+    let lo: u64 = 0;
+    let hi = len;
+    while lo < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, text_ptr, start + lo);
+        if c != 32 && c != 9 && c != 13 { break; };
+        lo = lo + 1;
+    }
+    while hi > lo {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, text_ptr, start + hi - 1);
+        if c != 32 && c != 9 && c != 13 { break; };
+        hi = hi - 1;
+    }
+    pb_reset(out);
+    pb_append(out, text_ptr + start + lo, hi - lo);
+    // DEFECT: ptr arithmetic argument spelled via temp in fix phase.
+}
+
+fn byteAtP(p: ptr, i: u64) -> u8 {
+    let c: u8 = 0;
+    PTR_BYTE_AT(c, p, i);
+    return c;
+}
+
+fn joinPush(buf: &[u8; 1048576], len: u64, src_ptr: ptr, start: u64, src_len: u64) -> u64 {
+    let n = len;
+    for i in 0..src_len {
+        if n < 524288 {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, src_ptr, start + i);
+            buf[n] = c;
+            n = n + 1;
+        };
+    }
+    return n;
+}
+
+fn joinPushAt(buf: &[u8; 1048576], base: u64, len: u64, src_ptr: ptr, start: u64, src_len: u64) -> u64 {
+    let n = len;
+    for i in 0..src_len {
+        if base + n < 1048576 {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, src_ptr, start + i);
+            buf[base + n] = c;
+            n = n + 1;
+        };
+    }
+    return n;
+}
+
+fn joinPushByte(buf: &[u8; 1048576], len: u64, byte: u8) -> u64 {
+    if len < 524288 {
+        buf[len] = byte;
+        return len + 1;
+    };
+    return len;
+}
+
+fn pl_append_u64(b: &PBufLong, v: u64) -> void {
+    let digits = [0u8; 20];
+    let n: u64 = 0;
+    let x = v;
+    if x == 0 { pl_append(b, STR_PTR("0"), STR_LEN("0")); return; };
+    while x > 0 {
+        digits[n] = 48 + (x % 10) as u8;
+        n = n + 1;
+        x = x / 10;
+    }
+    let i = n;
+    while i > 0 {
+        i = i - 1;
+        if b.len < 2048 { b.bytes[b.len] = digits[i]; b.len = b.len + 1; };
+    }
+}

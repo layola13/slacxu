@@ -1,0 +1,750 @@
+// Converted 1:1 from frontends/jev/src/jev/jevAutoJudge.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "./jevClient.sla"
+@import "./jevConfig.sla"
+@import "./jevQuestions.sla"
+@import "sa_std/ptr.sa"
+
+// TS: export const JEV_TURN_EVENT = "jev:turn-completed"; etc.
+// DEFECT: SLA has no module-level const exports; event names are
+// accessor functions writing the literal into out params.
+fn JEV_TURN_EVENT(out_ptr: &ptr, out_len: &u64) -> void { *out_ptr = STR_PTR("jev:turn-completed"); *out_len = STR_LEN("jev:turn-completed"); }
+fn JEV_PLAN_EVENT(out_ptr: &ptr, out_len: &u64) -> void { *out_ptr = STR_PTR("jev:plan-created"); *out_len = STR_LEN("jev:plan-created"); }
+fn JEV_SUB_EVENT(out_ptr: &ptr, out_len: &u64) -> void { *out_ptr = STR_PTR("jev:subagent-tool"); *out_len = STR_LEN("jev:subagent-tool"); }
+fn JEV_RESULT_EVENT(out_ptr: &ptr, out_len: &u64) -> void { *out_ptr = STR_PTR("jev:result"); *out_len = STR_LEN("jev:result"); }
+fn JEV_ERROR_EVENT(out_ptr: &ptr, out_len: &u64) -> void { *out_ptr = STR_PTR("jev:error"); *out_len = STR_LEN("jev:error"); }
+
+// DEFECT: JEV_MAX_AUTO_NUDGES is a const re-exported by
+// jevConfig.sla from the SDK; its binding form is a fix-phase
+// decision. Referenced here through this accessor placeholder.
+fn JEV_MAX_AUTO_NUDGES() -> u64 { return 0; }
+
+// ---------- module state ----------
+// TS module-level Set<string>/Map<string,string> singletons.
+// DEFECT: SLA has no module-level mutable state; the sets live
+// in an explicit state struct threaded through every function.
+// Fixed capacities replace unbounded sets (overflow inserts are
+// dropped); FIFO eviction exists only where the source evicts.
+
+struct StringSet {
+    entries: [[u8; 128]; 512],
+    lens: [u64; 512],
+    len: u64,
+}
+
+fn set_has(set: &StringSet, p: ptr, l: u64) -> bool {
+    for i in 0..set.len {
+        if set.lens[i] == l {
+            let same = true;
+            for j in 0..l {
+                let a: u8 = 0;
+                PTR_BYTE_AT(a, p, j);
+                if set.entries[i][j] != a { same = false; break; };
+            }
+            if same { return true; };
+        };
+    }
+    return false;
+}
+
+fn set_add(set: &StringSet, p: ptr, l: u64) -> void {
+    if set_has(set, p, l) { return; };
+    if set.len >= 512 { return; };
+    let slot = set.len;
+    let n = l;
+    if n > 128 { n = 128; };
+    for j in 0..n {
+        let a: u8 = 0;
+        PTR_BYTE_AT(a, p, j);
+        set.entries[slot][j] = a;
+    }
+    set.lens[slot] = n;
+    set.len = set.len + 1;
+}
+
+fn set_delete(set: &StringSet, p: ptr, l: u64) -> void {
+    for i in 0..set.len {
+        if set.lens[i] == l {
+            let same = true;
+            for j in 0..l {
+                let a: u8 = 0;
+                PTR_BYTE_AT(a, p, j);
+                if set.entries[i][j] != a { same = false; break; };
+            }
+            if same {
+                // shift down (insertion order = FIFO order)
+                let k = i;
+                while k + 1 < set.len {
+                    for j2 in 0..128 { set.entries[k][j2] = set.entries[k + 1][j2]; };
+                    set.lens[k] = set.lens[k + 1];
+                    k = k + 1;
+                }
+                set.len = set.len - 1;
+                return;
+            };
+        };
+    }
+}
+
+fn set_clear(set: &StringSet) -> void { set.len = 0; }
+
+// FIFO eviction used by judgedTurns / autoNudgedTurns (> 500).
+fn set_evict_oldest(set: &StringSet) -> void {
+    if set.len == 0 { return; };
+    let k: u64 = 0;
+    while k + 1 < set.len {
+        for j in 0..128 { set.entries[k][j] = set.entries[k + 1][j]; };
+        set.lens[k] = set.lens[k + 1];
+        k = k + 1;
+    }
+    set.len = set.len - 1;
+}
+
+// reviewedPlanContent: Map<string, string> (values up to 6000).
+struct PlanContentMap {
+    keys: [[u8; 128]; 64],
+    key_lens: [u64; 64],
+    vals: [[u8; 6144]; 64],
+    val_lens: [u64; 64],
+    len: u64,
+}
+
+fn map_get(map: &PlanContentMap, kp: ptr, kl: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    for i in 0..map.len {
+        if map.key_lens[i] == kl {
+            let same = true;
+            for j in 0..kl {
+                let a: u8 = 0;
+                PTR_BYTE_AT(a, kp, j);
+                if map.keys[i][j] != a { same = false; break; };
+            }
+            if same {
+                let vp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(vp, &map.vals[i], 0);
+                *out_ptr = vp;
+                *out_len = map.val_lens[i];
+                return true;
+            };
+        };
+    }
+    return false;
+}
+
+fn map_set(map: &PlanContentMap, kp: ptr, kl: u64, vp: ptr, vl: u64) -> void {
+    for i in 0..map.len {
+        if map.key_lens[i] == kl {
+            let same = true;
+            for j in 0..kl {
+                let a: u8 = 0;
+                PTR_BYTE_AT(a, kp, j);
+                if map.keys[i][j] != a { same = false; break; };
+            }
+            if same {
+                let n = vl;
+                if n > 6144 { n = 6144; };
+                for j2 in 0..n {
+                    let b: u8 = 0;
+                    PTR_BYTE_AT(b, vp, j2);
+                    map.vals[i][j2] = b;
+                }
+                map.val_lens[i] = n;
+                return;
+            };
+        };
+    }
+    if map.len >= 64 { return; };
+    let slot = map.len;
+    let kn = kl;
+    if kn > 128 { kn = 128; };
+    for j in 0..kn {
+        let a: u8 = 0;
+        PTR_BYTE_AT(a, kp, j);
+        map.keys[slot][j] = a;
+    }
+    map.key_lens[slot] = kn;
+    let vn = vl;
+    if vn > 6144 { vn = 6144; };
+    for j3 in 0..vn {
+        let b2: u8 = 0;
+        PTR_BYTE_AT(b2, vp, j3);
+        map.vals[slot][j3] = b2;
+    }
+    map.val_lens[slot] = vn;
+    map.len = map.len + 1;
+}
+
+fn map_delete(map: &PlanContentMap, kp: ptr, kl: u64) -> void {
+    for i in 0..map.len {
+        if map.key_lens[i] == kl {
+            let same = true;
+            for j in 0..kl {
+                let a: u8 = 0;
+                PTR_BYTE_AT(a, kp, j);
+                if map.keys[i][j] != a { same = false; break; };
+            }
+            if same {
+                let k = i;
+                while k + 1 < map.len {
+                    for j2 in 0..128 { map.keys[k][j2] = map.keys[k + 1][j2]; };
+                    map.key_lens[k] = map.key_lens[k + 1];
+                    for j3 in 0..6144 { map.vals[k][j3] = map.vals[k + 1][j3]; };
+                    map.val_lens[k] = map.val_lens[k + 1];
+                    k = k + 1;
+                }
+                map.len = map.len - 1;
+                return;
+            };
+        };
+    }
+}
+
+fn map_clear(map: &PlanContentMap) -> void { map.len = 0; }
+
+struct JevAutoJudgeState {
+    reviewed_briefs: StringSet,
+    reviewed_reports: StringSet,
+    reviewed_plan_threads: StringSet,
+    reviewed_plan_content: PlanContentMap,
+    judged_turns: StringSet,
+    in_flight: StringSet,
+    auto_nudged_turns: StringSet,
+    // Registered listener scope (see startJevAutoJudgeListener).
+    scope_getter_id: u64,
+    scope_registered: bool,
+}
+
+// ---------- detail types ----------
+
+// TS: export interface JevSubEventDetail { ... }
+struct JevSubEventDetail {
+    kind_ptr: ptr,
+    kind_len: u64,
+    thread_id_ptr: ptr,
+    thread_id_len: u64,
+    turn_id_ptr: ptr,
+    turn_id_len: u64,
+    agent_id_ptr: ptr,
+    agent_id_len: u64,
+    task_name_ptr: ptr,
+    task_name_len: u64,
+    task_name_has: bool,
+    brief_ptr: ptr,
+    brief_len: u64,
+    brief_has: bool,
+    status_ptr: ptr,
+    status_len: u64,
+    status_has: bool,
+    report_ptr: ptr,
+    report_len: u64,
+    report_has: bool,
+    session_token_ptr: ptr,
+    session_token_len: u64,
+    session_token_has: bool,
+    session_token_is_null: bool,
+}
+
+// TS: export interface JevTurnEventDetail extends JevTurnSnapshot
+// { sessionToken?: string | null }
+struct JevTurnEventDetail {
+    snapshot: JevTurnSnapshot,
+    session_token_ptr: ptr,
+    session_token_len: u64,
+    session_token_has: bool,
+    session_token_is_null: bool,
+}
+
+// TS: export interface JevPlanEventDetail { ... }
+struct JevPlanEventDetail {
+    thread_id_ptr: ptr,
+    thread_id_len: u64,
+    turn_id_ptr: ptr,
+    turn_id_len: u64,
+    plan_text_ptr: ptr,
+    plan_text_len: u64,
+    plan_text_has: bool,
+    user_prompt_ptr: ptr,
+    user_prompt_len: u64,
+    user_prompt_has: bool,
+    session_token_ptr: ptr,
+    session_token_len: u64,
+    session_token_has: bool,
+    session_token_is_null: bool,
+}
+
+// DEFECT: JevConfig is owned by @cxu/sdk-frontend (sdk-frontend
+// unit's jevConfig). This view mirrors only the fields this
+// module reads (enabled, apiKey, baseUrl, model, providerId,
+// groupId, bridgeProtocol, reviewBrief, reviewReport, planReview).
+struct JevConfigView {
+    enabled: bool,
+    api_key_ptr: ptr,
+    api_key_len: u64,
+    base_url_ptr: ptr,
+    base_url_len: u64,
+    model_ptr: ptr,
+    model_len: u64,
+    provider_id_ptr: ptr,
+    provider_id_len: u64,
+    provider_id_has: bool,
+    group_id_ptr: ptr,
+    group_id_len: u64,
+    group_id_has: bool,
+    bridge_protocol_ptr: ptr,
+    bridge_protocol_len: u64,
+    bridge_protocol_has: bool,
+    review_brief: bool,
+    review_report: bool,
+    plan_review_ptr: ptr,
+    plan_review_len: u64,
+}
+
+// DEFECT: window.dispatchEvent(new CustomEvent(...)) — there is
+// no DOM event bus. Handlers record the event they would have
+// dispatched in this out record instead: kind 0 = none,
+// 1 = JEV_RESULT_EVENT (verdict), 2 = JEV_ERROR_EVENT (detail).
+struct JevEmittedEvent {
+    kind: u64,
+    verdict: JevVerdict,
+    err_thread_id_ptr: ptr,
+    err_thread_id_len: u64,
+    err_turn_id_ptr: ptr,
+    err_turn_id_len: u64,
+    err_message: [u8; 1024],
+    err_message_len: u64,
+}
+
+fn emit_error(emitted: &JevEmittedEvent, thread_ptr: ptr, thread_len: u64, turn_ptr: ptr, turn_len: u64, msg_ptr: ptr, msg_len: u64) -> void {
+    emitted.kind = 2;
+    emitted.err_thread_id_ptr = thread_ptr;
+    emitted.err_thread_id_len = thread_len;
+    emitted.err_turn_id_ptr = turn_ptr;
+    emitted.err_turn_id_len = turn_len;
+    emitted.err_message_len = 0;
+    for i in 0..msg_len {
+        if emitted.err_message_len < 1024 {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, msg_ptr, i);
+            emitted.err_message[emitted.err_message_len] = b;
+            emitted.err_message_len = emitted.err_message_len + 1;
+        };
+    }
+}
+
+// TS: export interface JevAutoJudgeScope { getActiveThreadId?: () => string | null | undefined }
+// DEFECT: a function-typed field — carried as an opaque getter
+// id resolved through the declared host hook below.
+struct JevAutoJudgeScope {
+    getter_id: u64,
+    getter_has: bool,
+}
+
+// DEFECT: invoking the scope's getActiveThreadId callback has no
+// SLA counterpart yet; declared in the shape the fix phase needs.
+extern fn cxu_jev_scope_active_thread(getter_id: u64, out_ptr: &ptr, out_len: &u64, out_is_null: &bool) -> void;
+
+// TS: function jevHasCredential(config): boolean
+fn jevHasCredential(config: &JevConfigView) -> bool {
+    let t: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    trim_into(config.api_key_ptr, config.api_key_len, &t, &tl);
+    if tl > 0 { return true; };
+    if config.provider_id_has {
+        trim_into(config.provider_id_ptr, config.provider_id_len, &t, &tl);
+        if tl > 0 { return true; };
+    };
+    return false;
+}
+
+// Builds JevEvaluateParams the way all three handlers do in the
+// source (identical evaluateJev argument blocks) and calls it.
+// Returns evaluateJev's status (0 = ok).
+fn call_evaluate(detail_token_ptr: ptr, detail_token_len: u64, detail_token_is_null: bool, config: &JevConfigView, state_text_ptr: ptr, state_text_len: u64, questions_json_ptr: ptr, questions_json_len: u64, result: &JevProxySuccess, err: &JsonBuf) -> i32 {
+    let params = JevEvaluateParams {
+        session_token_ptr: detail_token_ptr, session_token_len: detail_token_len, session_token_is_null: detail_token_is_null,
+        base_url_ptr: config.base_url_ptr, base_url_len: config.base_url_len, base_url_has: true,
+        api_key_ptr: PTR_NULL(), api_key_len: 0,
+        model_ptr: config.model_ptr, model_len: config.model_len, model_has: true,
+        provider_id_ptr: PTR_NULL(), provider_id_len: 0, provider_id_has: false,
+        group_id_ptr: PTR_NULL(), group_id_len: 0, group_id_has: false,
+        bridge_protocol_ptr: PTR_NULL(), bridge_protocol_len: 0, bridge_protocol_has: false,
+        state_ptr: state_text_ptr, state_len: state_text_len,
+        questions: JevQuestionMap { json_bytes: [0u8; 16384], json_len: 0 },
+    };
+    // apiKey: config.apiKey.trim()
+    trim_into(config.api_key_ptr, config.api_key_len, &params.api_key_ptr, &params.api_key_len);
+    // providerId: config.providerId?.trim() || undefined
+    if config.provider_id_has {
+        let t: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        trim_into(config.provider_id_ptr, config.provider_id_len, &t, &tl);
+        if tl > 0 { params.provider_id_ptr = t; params.provider_id_len = tl; params.provider_id_has = true; };
+    };
+    if config.group_id_has {
+        let t2: ptr = PTR_NULL();
+        let tl2: u64 = 0;
+        trim_into(config.group_id_ptr, config.group_id_len, &t2, &tl2);
+        if tl2 > 0 { params.group_id_ptr = t2; params.group_id_len = tl2; params.group_id_has = true; };
+    };
+    // bridgeProtocol: config.bridgeProtocol || undefined (no trim)
+    if config.bridge_protocol_has && config.bridge_protocol_len > 0 {
+        params.bridge_protocol_ptr = config.bridge_protocol_ptr;
+        params.bridge_protocol_len = config.bridge_protocol_len;
+        params.bridge_protocol_has = true;
+    };
+    for i in 0..questions_json_len {
+        if params.questions.json_len < 16384 {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, questions_json_ptr, i);
+            params.questions.json_bytes[params.questions.json_len] = b;
+            params.questions.json_len = params.questions.json_len + 1;
+        };
+    }
+    return evaluateJev(&params, result, err);
+}
+
+// TS: async function handleTurnEvent(event, scope?): Promise<void>
+// DEFECT: async + DOM Event — synchronous, detail passed
+// directly, the would-be dispatched event lands in `emitted`.
+// console.warn skip lines are kept as comments (no console).
+fn handleTurnEvent(state: &JevAutoJudgeState, detail: &JevTurnEventDetail, emitted: &JevEmittedEvent) -> void {
+    emitted.kind = 0;
+    // readDetail(event): detail fields are typed strings here, so
+    // the typeof checks of the source always pass.
+    let thread_ptr = detail.snapshot.thread_id_ptr;
+    let thread_len = detail.snapshot.thread_id_len;
+    let turn_ptr = detail.snapshot.turn_id_ptr;
+    let turn_len = detail.snapshot.turn_id_len;
+    // 触发侧也必须按当前 threadId 过滤（见源注释）。
+    if state.scope_registered {
+        let scope = JevAutoJudgeScope { getter_id: state.scope_getter_id, getter_has: true };
+        if !isJevEventInScope(&scope, thread_ptr, thread_len, true) {
+            // console.warn(`[jev] skip auto-judge: thread not active (thread=${...} turn=${...})`);
+            return;
+        };
+    };
+    let config = JevConfigView { enabled: false, api_key_ptr: PTR_NULL(), api_key_len: 0, base_url_ptr: PTR_NULL(), base_url_len: 0, model_ptr: PTR_NULL(), model_len: 0, provider_id_ptr: PTR_NULL(), provider_id_len: 0, provider_id_has: false, group_id_ptr: PTR_NULL(), group_id_len: 0, group_id_has: false, bridge_protocol_ptr: PTR_NULL(), bridge_protocol_len: 0, bridge_protocol_has: false, review_brief: false, review_report: false, plan_review_ptr: PTR_NULL(), plan_review_len: 0 };
+    loadJevConfig(&config);
+    if !config.enabled {
+        // console.warn(`[jev] skip auto-judge: disabled (...)`);
+        return;
+    };
+    if !jevHasCredential(&config) {
+        // console.warn(`[jev] skip auto-judge: no credential (...)`);
+        return;
+    };
+    if set_has(&state.judged_turns, turn_ptr, turn_len) || set_has(&state.in_flight, turn_ptr, turn_len) {
+        // console.warn(`[jev] skip auto-judge: turn already judged/in-flight (...)`);
+        return;
+    };
+    set_add(&state.in_flight, turn_ptr, turn_len);
+    let state_text = StrBuf { bytes: [0u8; 65536], len: 0 };
+    buildJevState(&detail.snapshot, &state_text);
+    let questions = StrBuf { bytes: [0u8; 65536], len: 0 };
+    defaultJevQuestions(&questions);
+    let result = JevProxySuccess { data_json_bytes: [0u8; 32768], data_json_len: 0, latency_ms: 0.0, latency_ms_has: false };
+    let err = JsonBuf { bytes: [0u8; 32768], len: 0 };
+    let st_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(st_ptr, &state_text.bytes, 0);
+    let q_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(q_ptr, &questions.bytes, 0);
+    let rc = call_evaluate(detail.session_token_ptr, detail.session_token_len, detail.session_token_is_null, &config, st_ptr, state_text.len, q_ptr, questions.len, &result, &err);
+    if rc == 0 {
+        parseJevVerdict(&emitted.verdict, thread_ptr, thread_len, turn_ptr, turn_len, &result.data_json_bytes, result.data_json_len, result.latency_ms, result.latency_ms_has);
+        emitted.kind = 1;
+        set_add(&state.judged_turns, turn_ptr, turn_len);
+        if state.judged_turns.len > 500 {
+            set_evict_oldest(&state.judged_turns);
+        };
+    } else {
+        // catch: dispatch JEV_ERROR_EVENT { threadId, turnId,
+        // message: error instanceof Error ? error.message : "JEV evaluate failed" }
+        if err.len > 0 {
+            let ep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep, &err.bytes, 0);
+            emit_error(emitted, thread_ptr, thread_len, turn_ptr, turn_len, ep, err.len);
+        } else {
+            emit_error(emitted, thread_ptr, thread_len, turn_ptr, turn_len, STR_PTR("JEV evaluate failed"), STR_LEN("JEV evaluate failed"));
+        };
+    };
+    // finally: inFlight.delete(detail.turnId)
+    set_delete(&state.in_flight, turn_ptr, turn_len);
+}
+
+// TS: export function dispatchJevTurnCompleted(detail): void
+// DEFECT: window.dispatchEvent — direct handler invocation
+// (the try/catch around dispatch is a no-op here).
+fn dispatchJevTurnCompleted(state: &JevAutoJudgeState, detail: &JevTurnEventDetail, emitted: &JevEmittedEvent) -> void {
+    handleTurnEvent(state, detail, emitted);
+}
+
+// TS: async function handleSubEvent(event, scope?): Promise<void>
+// DEFECT: async + DOM Event — see handleTurnEvent.
+fn handleSubEvent(state: &JevAutoJudgeState, detail: &JevSubEventDetail, emitted: &JevEmittedEvent) -> void {
+    emitted.kind = 0;
+    let is_brief = str_eq_lit(detail.kind_ptr, detail.kind_len, STR_PTR("brief"), STR_LEN("brief"));
+    let is_report = str_eq_lit(detail.kind_ptr, detail.kind_len, STR_PTR("report"), STR_LEN("report"));
+    if !is_brief && !is_report { return; };
+    if detail.agent_id_len == 0 || detail.thread_id_len == 0 || detail.turn_id_len == 0 { return; };
+    if state.scope_registered {
+        let scope = JevAutoJudgeScope { getter_id: state.scope_getter_id, getter_has: true };
+        if !isJevEventInScope(&scope, detail.thread_id_ptr, detail.thread_id_len, true) { return; };
+    };
+    let config = JevConfigView { enabled: false, api_key_ptr: PTR_NULL(), api_key_len: 0, base_url_ptr: PTR_NULL(), base_url_len: 0, model_ptr: PTR_NULL(), model_len: 0, provider_id_ptr: PTR_NULL(), provider_id_len: 0, provider_id_has: false, group_id_ptr: PTR_NULL(), group_id_len: 0, group_id_has: false, bridge_protocol_ptr: PTR_NULL(), bridge_protocol_len: 0, bridge_protocol_has: false, review_brief: false, review_report: false, plan_review_ptr: PTR_NULL(), plan_review_len: 0 };
+    loadJevConfig(&config);
+    if !config.enabled { return; };
+    if !jevHasCredential(&config) { return; };
+    if is_brief {
+        if !config.review_brief { return; };
+        let t: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        if detail.brief_has { trim_into(detail.brief_ptr, detail.brief_len, &t, &tl); };
+        if tl == 0 { return; };
+        if set_has(&state.reviewed_briefs, detail.agent_id_ptr, detail.agent_id_len) { return; };
+        set_add(&state.reviewed_briefs, detail.agent_id_ptr, detail.agent_id_len);
+    } else {
+        if !config.review_report { return; };
+        let t2: ptr = PTR_NULL();
+        let tl2: u64 = 0;
+        if detail.report_has { trim_into(detail.report_ptr, detail.report_len, &t2, &tl2); };
+        if tl2 == 0 { return; };
+        if set_has(&state.reviewed_reports, detail.agent_id_ptr, detail.agent_id_len) { return; };
+        set_add(&state.reviewed_reports, detail.agent_id_ptr, detail.agent_id_len);
+    };
+    let state_text = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let task_ptr = detail.task_name_ptr;
+    let task_len = detail.task_name_len;
+    if !detail.task_name_has { task_len = 0; };
+    if is_brief {
+        let bp = detail.brief_ptr;
+        let bl = detail.brief_len;
+        if !detail.brief_has { bl = 0; };
+        buildJevBriefState(task_ptr, task_len, bp, bl, &state_text);
+    } else {
+        let sp = detail.status_ptr;
+        let sl = detail.status_len;
+        if !detail.status_has { sl = 0; };
+        let rp = detail.report_ptr;
+        let rl = detail.report_len;
+        if !detail.report_has { rl = 0; };
+        buildJevReportState(task_ptr, task_len, sp, sl, rp, rl, &state_text);
+    };
+    let questions = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if is_brief { defaultJevBriefQuestions(&questions); } else { defaultJevReportQuestions(&questions); };
+    let result = JevProxySuccess { data_json_bytes: [0u8; 32768], data_json_len: 0, latency_ms: 0.0, latency_ms_has: false };
+    let err = JsonBuf { bytes: [0u8; 32768], len: 0 };
+    let st_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(st_ptr, &state_text.bytes, 0);
+    let q_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(q_ptr, &questions.bytes, 0);
+    let token_is_null = true;
+    if detail.session_token_has && !detail.session_token_is_null { token_is_null = false; };
+    let rc = call_evaluate(detail.session_token_ptr, detail.session_token_len, token_is_null, &config, st_ptr, state_text.len, q_ptr, questions.len, &result, &err);
+    if rc == 0 {
+        if is_brief {
+            parseJevBriefVerdict(&emitted.verdict, detail.thread_id_ptr, detail.thread_id_len, detail.turn_id_ptr, detail.turn_id_len, detail.agent_id_ptr, detail.agent_id_len, task_ptr, task_len, &result.data_json_bytes, result.data_json_len, result.latency_ms, result.latency_ms_has);
+        } else {
+            parseJevReportVerdict(&emitted.verdict, detail.thread_id_ptr, detail.thread_id_len, detail.turn_id_ptr, detail.turn_id_len, detail.agent_id_ptr, detail.agent_id_len, task_ptr, task_len, &result.data_json_bytes, result.data_json_len, result.latency_ms, result.latency_ms_has);
+        };
+        emitted.kind = 1;
+    } else {
+        if is_brief { set_delete(&state.reviewed_briefs, detail.agent_id_ptr, detail.agent_id_len); } else { set_delete(&state.reviewed_reports, detail.agent_id_ptr, detail.agent_id_len); };
+        if err.len > 0 {
+            let ep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep, &err.bytes, 0);
+            emit_error(emitted, detail.thread_id_ptr, detail.thread_id_len, detail.turn_id_ptr, detail.turn_id_len, ep, err.len);
+        } else {
+            emit_error(emitted, detail.thread_id_ptr, detail.thread_id_len, detail.turn_id_ptr, detail.turn_id_len, STR_PTR("JEV subagent review failed"), STR_LEN("JEV subagent review failed"));
+        };
+    };
+}
+
+// TS: export function dispatchJevSubagent(detail): void
+// DEFECT: window.dispatchEvent — direct handler invocation.
+fn dispatchJevSubagent(state: &JevAutoJudgeState, detail: &JevSubEventDetail, emitted: &JevEmittedEvent) -> void {
+    handleSubEvent(state, detail, emitted);
+}
+
+// TS: async function handlePlanEvent(event, scope?): Promise<void>
+// DEFECT: async + DOM Event — see handleTurnEvent.
+fn handlePlanEvent(state: &JevAutoJudgeState, detail: &JevPlanEventDetail, emitted: &JevEmittedEvent) -> void {
+    emitted.kind = 0;
+    if state.scope_registered {
+        let scope = JevAutoJudgeScope { getter_id: state.scope_getter_id, getter_has: true };
+        if !isJevEventInScope(&scope, detail.thread_id_ptr, detail.thread_id_len, true) { return; };
+    };
+    // if (!detail.planText?.trim()) return;
+    let pt: ptr = PTR_NULL();
+    let ptl: u64 = 0;
+    if detail.plan_text_has { trim_into(detail.plan_text_ptr, detail.plan_text_len, &pt, &ptl); };
+    if ptl == 0 { return; };
+    let config = JevConfigView { enabled: false, api_key_ptr: PTR_NULL(), api_key_len: 0, base_url_ptr: PTR_NULL(), base_url_len: 0, model_ptr: PTR_NULL(), model_len: 0, provider_id_ptr: PTR_NULL(), provider_id_len: 0, provider_id_has: false, group_id_ptr: PTR_NULL(), group_id_len: 0, group_id_has: false, bridge_protocol_ptr: PTR_NULL(), bridge_protocol_len: 0, bridge_protocol_has: false, review_brief: false, review_report: false, plan_review_ptr: PTR_NULL(), plan_review_len: 0 };
+    loadJevConfig(&config);
+    if !config.enabled { return; };
+    if str_eq_lit(config.plan_review_ptr, config.plan_review_len, STR_PTR("off"), STR_LEN("off")) { return; };
+    if !jevHasCredential(&config) { return; };
+    // const planText = detail.planText.trim().slice(0, 6000);
+    let plan_text = StrBuf { bytes: [0u8; 65536], len: 0 };
+    slice_into(pt, ptl, 6000, &plan_text);
+    let pp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pp, &plan_text.bytes, 0);
+    if str_eq_lit(config.plan_review_ptr, config.plan_review_len, STR_PTR("created"), STR_LEN("created")) {
+        // Audit once per thread.
+        if set_has(&state.reviewed_plan_threads, detail.thread_id_ptr, detail.thread_id_len) { return; };
+        set_add(&state.reviewed_plan_threads, detail.thread_id_ptr, detail.thread_id_len);
+    } else {
+        // "every": skip identical repeats.
+        let prev: ptr = PTR_NULL();
+        let prev_len: u64 = 0;
+        if map_get(&state.reviewed_plan_content, detail.thread_id_ptr, detail.thread_id_len, &prev, &prev_len) {
+            if prev_len == plan_text.len {
+                let same = true;
+                for i in 0..prev_len {
+                    let b: u8 = 0;
+                    PTR_BYTE_AT(b, prev, i);
+                    if plan_text.bytes[i] != b { same = false; break; };
+                }
+                if same { return; };
+            };
+        };
+        map_set(&state.reviewed_plan_content, detail.thread_id_ptr, detail.thread_id_len, pp, plan_text.len);
+    };
+    let state_text = StrBuf { bytes: [0u8; 65536], len: 0 };
+    buildJevPlanState(pp, plan_text.len, detail.user_prompt_ptr, detail.user_prompt_len, detail.user_prompt_has, &state_text);
+    let questions = StrBuf { bytes: [0u8; 65536], len: 0 };
+    defaultJevPlanQuestions(&questions);
+    let result = JevProxySuccess { data_json_bytes: [0u8; 32768], data_json_len: 0, latency_ms: 0.0, latency_ms_has: false };
+    let err = JsonBuf { bytes: [0u8; 32768], len: 0 };
+    let st_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(st_ptr, &state_text.bytes, 0);
+    let q_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(q_ptr, &questions.bytes, 0);
+    let token_is_null = true;
+    if detail.session_token_has && !detail.session_token_is_null { token_is_null = false; };
+    let rc = call_evaluate(detail.session_token_ptr, detail.session_token_len, token_is_null, &config, st_ptr, state_text.len, q_ptr, questions.len, &result, &err);
+    if rc == 0 {
+        parseJevPlanVerdict(&emitted.verdict, detail.thread_id_ptr, detail.thread_id_len, detail.turn_id_ptr, detail.turn_id_len, &result.data_json_bytes, result.data_json_len, result.latency_ms, result.latency_ms_has);
+        emitted.kind = 1;
+    } else {
+        set_delete(&state.reviewed_plan_threads, detail.thread_id_ptr, detail.thread_id_len);
+        map_delete(&state.reviewed_plan_content, detail.thread_id_ptr, detail.thread_id_len);
+        if err.len > 0 {
+            let ep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep, &err.bytes, 0);
+            emit_error(emitted, detail.thread_id_ptr, detail.thread_id_len, detail.turn_id_ptr, detail.turn_id_len, ep, err.len);
+        } else {
+            emit_error(emitted, detail.thread_id_ptr, detail.thread_id_len, detail.turn_id_ptr, detail.turn_id_len, STR_PTR("JEV plan review failed"), STR_LEN("JEV plan review failed"));
+        };
+    };
+}
+
+// TS: export function dispatchJevPlanCreated(detail): void
+// DEFECT: window.dispatchEvent — direct handler invocation.
+fn dispatchJevPlanCreated(state: &JevAutoJudgeState, detail: &JevPlanEventDetail, emitted: &JevEmittedEvent) -> void {
+    handlePlanEvent(state, detail, emitted);
+}
+
+// TS: export function startJevAutoJudgeListener(scope?): () => void
+// DEFECT: window.addEventListener has no counterpart; the scope
+// is registered on the state and handlers consult it directly.
+// The returned id stands in for the unsubscribe closure; call
+// stopJevAutoJudgeListener to remove.
+fn startJevAutoJudgeListener(state: &JevAutoJudgeState, scope: &JevAutoJudgeScope, scope_has: bool) -> u64 {
+    if scope_has && scope.getter_has {
+        state.scope_getter_id = scope.getter_id;
+        state.scope_registered = true;
+    } else {
+        state.scope_registered = false;
+    };
+    return 1;
+}
+
+fn stopJevAutoJudgeListener(state: &JevAutoJudgeState, registration_id: u64) -> void {
+    if registration_id == 1 { state.scope_registered = false; };
+}
+
+// TS: export function resetJevAutoJudgeCache(): void
+fn resetJevAutoJudgeCache(state: &JevAutoJudgeState) -> void {
+    set_clear(&state.judged_turns);
+    set_clear(&state.reviewed_plan_threads);
+    map_clear(&state.reviewed_plan_content);
+    set_clear(&state.reviewed_briefs);
+    set_clear(&state.reviewed_reports);
+    set_clear(&state.auto_nudged_turns);
+    set_clear(&state.in_flight);
+}
+
+// TS: export function claimJevAutoNudgeTurn(turnId: string): boolean
+fn claimJevAutoNudgeTurn(state: &JevAutoJudgeState, turn_ptr: ptr, turn_len: u64) -> bool {
+    if turn_len == 0 { return false; };
+    if set_has(&state.auto_nudged_turns, turn_ptr, turn_len) { return false; };
+    set_add(&state.auto_nudged_turns, turn_ptr, turn_len);
+    if state.auto_nudged_turns.len > 500 {
+        set_evict_oldest(&state.auto_nudged_turns);
+    };
+    return true;
+}
+
+// TS: export function resetJevAutoNudgeDedup(): void
+fn resetJevAutoNudgeDedup(state: &JevAutoJudgeState) -> void {
+    set_clear(&state.auto_nudged_turns);
+}
+
+// TS: export interface JevNudgeDecision { ... }
+struct JevNudgeDecision {
+    choice_ptr: ptr,
+    choice_len: u64,
+    choice_has: bool,
+    running: bool,
+    auto_nudge: bool,
+    consecutive_failures: u64,
+    max_nudges: u64,
+}
+
+// TS: export function shouldAutoNudge(decision: JevNudgeDecision): boolean
+fn shouldAutoNudge(decision: &JevNudgeDecision) -> bool {
+    if !decision.auto_nudge || decision.running { return false; };
+    let is_failed = decision.choice_has && str_eq_lit(decision.choice_ptr, decision.choice_len, STR_PTR("failed"), STR_LEN("failed"));
+    let is_partial = decision.choice_has && str_eq_lit(decision.choice_ptr, decision.choice_len, STR_PTR("partial"), STR_LEN("partial"));
+    if !is_failed && !is_partial { return false; };
+    // consecutiveFailures < min(JEV_MAX_AUTO_NUDGES, max(1, maxNudges))
+    let cap = JEV_MAX_AUTO_NUDGES();
+    let mn = decision.max_nudges;
+    if mn < 1 { mn = 1; };
+    if mn < cap { cap = mn; };
+    return decision.consecutive_failures < cap;
+}
+
+// TS: export function shouldAcceptJevVerdictForThread(
+//   activeThreadId: string | null | undefined, verdictThreadId: unknown): boolean
+// DEFECT: `unknown` target — (ptr, len) + is_string flag.
+fn shouldAcceptJevVerdictForThread(active_ptr: ptr, active_len: u64, active_is_string: bool, target_ptr: ptr, target_len: u64, target_is_string: bool) -> bool {
+    let cur_len: u64 = 0;
+    if active_is_string { cur_len = active_len; };
+    let tgt_len: u64 = 0;
+    if target_is_string { tgt_len = target_len; };
+    if cur_len > 0 && tgt_len > 0 {
+        if cur_len != tgt_len { return false; };
+        for i in 0..cur_len {
+            let a: u8 = 0;
+            let b: u8 = 0;
+            PTR_BYTE_AT(a, active_ptr, i);
+            PTR_BYTE_AT(b, target_ptr, i);
+            if a != b { return false; };
+        }
+        return true;
+    };
+    if cur_len == 0 && tgt_len > 0 { return false; };
+    return true;
+}
+
+// TS: export function isJevEventInScope(scope, threadId): boolean
+// DEFECT: threadId is `unknown` in TS — (ptr, len) + is_string.
+fn isJevEventInScope(scope: &JevAutoJudgeScope, thread_ptr: ptr, thread_len: u64, thread_is_string: bool) -> bool {
+    if scope == 0 { return true; };
+    if !scope.getter_has { return true; };
+    let ap: ptr = PTR_NULL();
+    let al: u64 = 0;
+    let a_null = true;
+    cxu_jev_scope_active_thread(scope.getter_id, &ap, &al, &a_null);
+    let a_is_string = !a_null;
+    return shouldAcceptJevVerdictForThread(ap, al, a_is_string, thread_ptr, thread_len, thread_is_string);
+}

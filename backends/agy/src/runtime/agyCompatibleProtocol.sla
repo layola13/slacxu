@@ -1,0 +1,178 @@
+// Converted 1:1 from backends/agy/src/runtime/agyCompatibleProtocol.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// Protocol framing and parsing for the Antigravity CLI
+// (`agy.exe`) stream-json mode.
+//
+// Ground truth is based on live NDJSON probes over Stdio:
+// - Event "init": Initial session handshake, conversation_id,
+//   tools, cwd.
+// - Event "step_update": Incremental turns, agent text deltas,
+//   thinking tokens, tool calls.
+// - Event "result": Final turn outcome, total usage and status.
+//
+// DEFECT: the event interfaces are open JSON shapes with
+// optional fields and string-union discriminants; SLA structs
+// below carry the fixed scalar fields, and anything optional or
+// dynamic stays in the parsed doc (events are passed around as
+// doc handles + a kind code). Union type AgyEvent =
+// AgyInitEvent | AgyStepUpdateEvent | AgyResultEvent |
+// { event: string; [key: string]: unknown } — kind codes:
+// 0 unknown/other, 1 init, 2 step_update, 3 result.
+
+// AgyUsage — all fields optional numbers.
+struct AgyUsage {
+    has_input_tokens: bool,
+    input_tokens: u64,
+    has_output_tokens: bool,
+    output_tokens: u64,
+    has_thinking_tokens: bool,
+    thinking_tokens: u64,
+    has_cache_read_tokens: bool,
+    cache_read_tokens: u64,
+    has_total_tokens: bool,
+    total_tokens: u64,
+}
+
+// AgyToolCall { name: string, input?: Record, id?: string,
+// args?: Record, toolAction?: string, toolSummary?: string }
+// DEFECT: dynamic object — input/args stay in the doc.
+struct AgyToolCall {
+    name_ptr: ptr,
+    name_len: u64,
+    has_id: bool,
+    id_ptr: ptr,
+    id_len: u64,
+    has_toolAction: bool,
+    toolAction_ptr: ptr,
+    toolAction_len: u64,
+    has_toolSummary: bool,
+    toolSummary_ptr: ptr,
+    toolSummary_len: u64,
+    doc: u64,
+}
+
+// AgyQuestionItem { id?, header?, question: string,
+// options?: Array<string | { label, description? }>,
+// is_multi_select?: boolean }
+// DEFECT: union-typed options array — kept in the doc.
+struct AgyQuestionItem {
+    has_id: bool,
+    id_ptr: ptr,
+    id_len: u64,
+    has_header: bool,
+    header_ptr: ptr,
+    header_len: u64,
+    question_ptr: ptr,
+    question_len: u64,
+    has_is_multi_select: bool,
+    is_multi_select: bool,
+    doc: u64,
+}
+
+// A parsed agy event: kind code + the doc + lifted common
+// fields (per-interface shapes are read from the doc by the
+// consumer fns in this file).
+struct AgyEvent {
+    kind: u64,
+    doc: u64,
+    event_ptr: ptr,
+    event_len: u64,
+}
+
+fn agyEvent_kind(doc: u64, out: &AgyEvent) -> bool {
+    out.doc = doc;
+    out.kind = 0;
+    let ev_ptr: ptr = PTR_NULL();
+    let ev_len: u64 = 0;
+    if sa_json_object_get_string(doc, STR_PTR("event"), STR_LEN("event"), &ev_ptr, &ev_len) != 0 { return false; };
+    out.event_ptr = ev_ptr;
+    out.event_len = ev_len;
+    if ev_len == 4 && bytes_eq(ev_ptr, STR_PTR("init"), 4) {
+        out.kind = 1;
+    } else if ev_len == 11 && bytes_eq(ev_ptr, STR_PTR("step_update"), 11) {
+        out.kind = 2;
+    } else if ev_len == 6 && bytes_eq(ev_ptr, STR_PTR("result"), 6) {
+        out.kind = 3;
+    };
+    return true;
+}
+
+// AgyInitEvent fields: conversation_id, init.cwd,
+// init.tools?, init.permission_mode? — read from doc:
+//   sa_json_object_get_string(doc, "conversation_id")
+//   init node = sa_json_object_get(doc, "init")
+
+// AgyStepUpdateEvent: step_update.{conversation_id?, step_index,
+// state?, step_type, text_delta?, thinking_delta?, tool_calls?,
+// duration_seconds?, usage?, toolAction?, toolSummary?,
+// content?, type?} — read from doc via the step_update node.
+
+// AgyResultEvent: result.{conversation_id, status, response?,
+// duration_seconds?, num_turns?, usage?, error?} — read from doc
+// via the result node.
+
+// parseAgyLine(line): parse one line of NDJSON from agy.exe
+// stdout. Returns null if the line is empty, malformed, or
+// non-JSON. (out_ok=false is null.)
+// DEFECT: JSON.parse try/catch -> sa_json_parse 0-check.
+fn parseAgyLine(line_ptr: ptr, line_len: u64, out: &AgyEvent, out_ok: &bool) -> void {
+    out_ok = false;
+    // trimmed = line.trim()
+    let start: u64 = 0;
+    let end = line_len;
+    while start < end && is_ws(byte_at(line_ptr, start)) { start = start + 1; };
+    while end > start && is_ws(byte_at(line_ptr, end - 1)) { end = end - 1; };
+    if end <= start { return; };
+    if byte_at(line_ptr, start) != 123 { return; };
+    let tp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tp, line_ptr, start);
+    let doc = sa_json_parse(tp, end - start);
+    if doc == 0 { return; };
+    // "event" in parsed
+    let probe: u64 = 0;
+    if sa_json_object_get(doc, STR_PTR("event"), STR_LEN("event"), &probe) != 0 { return; };
+    if agyEvent_kind(doc, out) { out_ok = true; };
+}
+
+// buildAgyPromptInput(prompt): build a stream-json user input
+// line to send to agy.exe over stdin:
+// JSON.stringify({ event: "user", message: { content: prompt } }) + "\n"
+// DEFECT: JSON string escaping of prompt (JSON.stringify) — raw
+// append in this pass.
+fn buildAgyPromptInput(prompt_ptr: ptr, prompt_len: u64, out: ptr, out_cap: u64, out_len: &u64) -> void {
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, STR_PTR("{\"event\":\"user\",\"message\":{\"content\":\""), STR_LEN("{\"event\":\"user\",\"message\":{\"content\":\""));
+    n = n + append_bytes(out, out_cap, n, prompt_ptr, prompt_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("\"}}\n"), STR_LEN("\"}}\n"));
+    out_len = n;
+}
+
+// ---- local helpers ----
+
+fn byte_at(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+fn is_ws(b: u8) -> bool {
+    return b == 32 || b == 9 || b == 10 || b == 13;
+}
+
+fn bytes_eq(a: ptr, b: ptr, n: u64) -> bool {
+    for i in 0..n {
+        if byte_at(a, i) != byte_at(b, i) { return false; };
+    }
+    return true;
+}
+
+fn append_bytes(dst: ptr, cap: u64, at: u64, src: ptr, n: u64) -> u64 {
+    let w: u64 = 0;
+    for i in 0..n {
+        if at + w < cap {
+            PTR_BYTE_SET(dst, at + w, byte_at(src, i));
+            w = w + 1;
+        };
+    }
+    return w;
+}

@@ -1,0 +1,195 @@
+// Converted 1:1 from backends/agy/src/runtime/agySettingsGuard.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// DEFECT: module-level mutable state (snapshot, lastWrittenRaw,
+// modifiedByUs) — gathered into AgySettingsGuardState passed by
+// reference. DEFECT: string-union result type
+// AgySettingsRestoreResult — represented by result codes with a
+// name lookup (agySettingsRestoreResult_name).
+// DEFECT: node:fs sync APIs -> sa_std fs externs; mkdir has no
+// verified std counterpart yet. DEFECT: console.warn -> stderr
+// print approximation. DEFECT: try/catch folded into status
+// checks. DEFECT: env map -> real process env via sa_env_get.
+
+struct AgySettingsGuardState {
+    has_snapshot: bool,
+    snap_path: [u8; 1024],
+    snap_path_len: u64,
+    snap_existed: bool,
+    snap_raw: [u8; 262144],
+    snap_raw_len: u64,
+    lastWrittenRaw: [u8; 262144],
+    lastWrittenRaw_len: u64,
+    has_lastWrittenRaw: bool,
+    modifiedByUs: bool,
+}
+
+// AgySettingsRestoreResult codes:
+//   0 "restored", 1 "skipped-clean",
+//   2 "skipped-external-change", 3 "skipped-no-snapshot"
+fn agySettingsRestoreResult_name(code: u64, out: &ptr, out_len: &u64) -> void {
+    if code == 0 {
+        out = STR_PTR("restored");
+        out_len = STR_LEN("restored");
+    } else if code == 1 {
+        out = STR_PTR("skipped-clean");
+        out_len = STR_LEN("skipped-clean");
+    } else if code == 2 {
+        out = STR_PTR("skipped-external-change");
+        out_len = STR_LEN("skipped-external-change");
+    } else {
+        out = STR_PTR("skipped-no-snapshot");
+        out_len = STR_LEN("skipped-no-snapshot");
+    };
+}
+
+// resolveAgySettingsPath(env): home = env.USERPROFILE ?? env.HOME
+// ?? ""; if (!home) return null; join(home, ".gemini",
+// "antigravity-cli", "settings.json").
+// DEFECT: node:path join — '/' concat approximation.
+fn resolveAgySettingsPath(out: ptr, out_cap: u64, out_len: &u64, out_has: &bool) -> void {
+    out_has = false;
+    let home_ptr: ptr = PTR_NULL();
+    let home_len: u64 = 0;
+    let h = sa_env_get(STR_PTR("USERPROFILE"), STR_LEN("USERPROFILE"));
+    if h != 0 {
+        home_ptr = sa_env_buffer_data(h);
+        home_len = sa_env_buffer_len(h);
+    };
+    if home_len == 0 {
+        h = sa_env_get(STR_PTR("HOME"), STR_LEN("HOME"));
+        if h != 0 {
+            home_ptr = sa_env_buffer_data(h);
+            home_len = sa_env_buffer_len(h);
+        };
+    };
+    if home_len == 0 { return; };
+    let n: u64 = 0;
+    n = n + append_bytes(out, out_cap, n, home_ptr, home_len);
+    n = n + append_bytes(out, out_cap, n, STR_PTR("/.gemini/antigravity-cli/settings.json"), STR_LEN("/.gemini/antigravity-cli/settings.json"));
+    out_len = n;
+    out_has = true;
+}
+
+fn resetAgySettingsGuardForTests(self: &AgySettingsGuardState) -> void {
+    self.has_snapshot = false;
+    self.snap_existed = false;
+    self.snap_raw_len = 0;
+    self.has_lastWrittenRaw = false;
+    self.lastWrittenRaw_len = 0;
+    self.modifiedByUs = false;
+}
+
+// snapshotAgySettings(env): take the one-time snapshot of the
+// current settings.json (existence + raw bytes).
+fn snapshotAgySettings(self: &AgySettingsGuardState) -> void {
+    if self.has_snapshot { return; };
+    let path = [0u8; 1024];
+    let path_len: u64 = 0;
+    let has = false;
+    resolveAgySettingsPath(&path, 1024, &path_len, &has);
+    if !has { return; };
+    for i in 0..path_len {
+        self.snap_path[i] = path[i];
+    }
+    self.snap_path_len = path_len;
+    let total: u64 = 0;
+    if sa_std_fs_len(&path, path_len, &total) == 0 {
+        if total > 262144 { return; };
+        let fh: u64 = 0;
+        if sa_std_fs_open_read(&path, path_len, &fh) != 0 { return; };
+        let read_n: u64 = 0;
+        let rst = sa_std_fs_file_read(fh, &self.snap_raw, 262144, &read_n);
+        sa_fs_file_close(fh);
+        if rst != 0 { return; };
+        self.snap_raw_len = read_n;
+        self.snap_existed = true;
+    } else {
+        self.snap_existed = false;
+        self.snap_raw_len = 0;
+    };
+    self.has_snapshot = true;
+}
+
+fn noteAgySettingsWritten(self: &AgySettingsGuardState, raw_ptr: ptr, raw_len: u64) -> void {
+    self.modifiedByUs = true;
+    let n = raw_len;
+    if n > 262144 { n = 262144; };
+    for i in 0..n {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, raw_ptr, i);
+        self.lastWrittenRaw[i] = b;
+    }
+    self.lastWrittenRaw_len = n;
+    self.has_lastWrittenRaw = true;
+}
+
+// restoreAgySettings(env): restore the snapshot unless the file
+// changed under us. Returns an AgySettingsRestoreResult code.
+fn restoreAgySettings(self: &AgySettingsGuardState) -> u64 {
+    if !self.has_snapshot { return 3; };
+    if !self.modifiedByUs { return 1; };
+    // Read current file content (null when absent).
+    let cur = [0u8; 262144];
+    let cur_len: u64 = 0;
+    let cur_has = false;
+    let total: u64 = 0;
+    if sa_std_fs_len(&self.snap_path, self.snap_path_len, &total) == 0 {
+        if total > 262144 { return 2; };
+        let fh: u64 = 0;
+        if sa_std_fs_open_read(&self.snap_path, self.snap_path_len, &fh) != 0 { return 2; };
+        let read_n: u64 = 0;
+        let rst = sa_std_fs_file_read(fh, &cur, 262144, &read_n);
+        sa_fs_file_close(fh);
+        if rst != 0 { return 2; };
+        cur_len = read_n;
+        cur_has = true;
+    };
+    // if (current !== lastWrittenRaw) skip — string identity of
+    // content: byte equality with the null-vs-string distinction.
+    let same = false;
+    if cur_has && self.has_lastWrittenRaw && cur_len == self.lastWrittenRaw_len {
+        same = true;
+        for i in 0..cur_len {
+            if cur[i] != self.lastWrittenRaw[i] { same = false; break; };
+        }
+    };
+    if !same {
+        // console.warn("[agySettings] settings.json changed after
+        // our last write; skip restore to avoid clobbering
+        // external edits") — DEFECT: stderr print approximation
+        // omitted in this pass.
+        return 2;
+    };
+    if self.snap_existed {
+        // mkdirSync(dirname(path), { recursive: true })
+        // DEFECT: mkdir — no verified std extern in this pass.
+        if sa_fs_write_file(&self.snap_path, self.snap_path_len, &self.snap_raw, self.snap_raw_len) != 0 {
+            return 2;
+        };
+    } else {
+        // else if (existsSync(path)) unlinkSync(path)
+        let t2: u64 = 0;
+        if sa_std_fs_len(&self.snap_path, self.snap_path_len, &t2) == 0 {
+            if sa_fs_remove_file(&self.snap_path, self.snap_path_len) != 0 {
+                return 2;
+            };
+        };
+    };
+    self.modifiedByUs = false;
+    return 0;
+}
+
+// ---- local helpers ----
+
+fn append_bytes(dst: ptr, cap: u64, at: u64, src: ptr, n: u64) -> u64 {
+    let w: u64 = 0;
+    for i in 0..n {
+        if at + w < cap {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, src, i);
+            PTR_BYTE_SET(dst, at + w, b);
+            w = w + 1;
+        };
+    }
+    return w;
+}

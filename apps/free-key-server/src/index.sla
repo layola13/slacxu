@@ -1,0 +1,759 @@
+// Converted 1:1 from apps/free-key-server/src/index.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/io/print.sai"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "adminAuth.sla"
+@import "adminCaptcha.sla"
+@import "adminTotp.sla"
+@import "adminPage.sla"
+@import "config.sla"
+@import "discord.sla"
+@import "licenseStore.sla"
+
+// TS: import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+// TS: import { randomUUID } from "node:crypto";
+// TS: import QRCode from "qrcode";
+// DEFECT: node:http server + async request handler — the std HTTP server
+// (sa_http_server_* in sa_std) drives a synchronous handler here; request
+// body streaming (for await chunk iteration, 64 KiB cap) is an intent
+// extern sa_http_request_body. URL parsing is intent sa_url_parse.
+// QRCode.toDataURL is intent sa_qr_to_data_url. process.on(SIGINT/SIGTERM)
+// has no counterpart (DEFECT: signal handlers; server close on shutdown
+// is not wired). Module-level mutable Maps (loginAttempts, totpEnrollments)
+// become tables inside ServerState. TS throw/catch-all -> per-route error
+// buffer + the 400 envelope at the points where the TS throws.
+
+struct HttpRequest {
+    method: [u8; 8],
+    method_len: u64,
+    path: StrField,
+    query: StrField,
+    headers: ByteBuf,
+    body: ByteBuf,
+    remote_addr: StrField,
+}
+
+struct LoginAttempt {
+    address: StrField,
+    count: u64,
+    reset_at: u64,
+}
+
+struct TotpEnrollment {
+    id: StrField,
+    secret: StrField,
+    username: StrField,
+    address: StrField,
+    expires_at: u64,
+}
+
+struct ServerState {
+    cfg: FreeKeyServerConfig,
+    store: LicenseStore,
+    captcha: AdminCaptchaStore,
+    login_attempts: [LoginAttempt; 1024],
+    login_attempts_len: u64,
+    enrollments: [TotpEnrollment; 256],
+    enrollments_len: u64,
+}
+
+// --- response plumbing (intent extern: sa_http_respond) ---
+
+fn respond(status: u64, ctype_ptr: ptr, ctype_len: u64, has_cookie: bool, cookie_ptr: ptr, cookie_len: u64, body_ptr: ptr, body_len: u64) -> i32 {
+    // DEFECT: ServerResponse.writeHead/end with the TS header set
+    // (Content-Type, Cache-Control: no-store, X-Content-Type-Options:
+    // nosniff, optional Set-Cookie) — folded into the intent extern call.
+    return sa_http_respond(status, ctype_ptr, ctype_len, has_cookie, cookie_ptr, cookie_len, body_ptr, body_len);
+}
+
+fn send_json(status: u64, json_ptr: ptr, json_len: u64) -> i32 {
+    return respond(status, STR_PTR("application/json; charset=utf-8"), STR_LEN("application/json; charset=utf-8"), false, STR_PTR(""), 0, json_ptr, json_len);
+}
+
+fn send_error(status: u64, msg_ptr: ptr, msg_len: u64) -> i32 {
+    let body = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&body, STR_PTR("{\"error\":\""), STR_LEN("{\"error\":\""));
+    buf_append_escaped(&body, msg_ptr, msg_len);
+    buf_append_lit(&body, STR_PTR("\"}"), STR_LEN("\"}"));
+    return send_json(status, &body.bytes, body.len);
+}
+
+fn send_data(status: u64, data_ptr: ptr, data_len: u64) -> i32 {
+    let body = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&body, STR_PTR("{\"data\":"), STR_LEN("{\"data\":"));
+    buf_append_lit(&body, data_ptr, data_len);
+    buf_append_lit(&body, STR_PTR("}"), STR_LEN("}"));
+    return send_json(status, &body.bytes, body.len);
+}
+
+fn send_html(html_ptr: ptr, html_len: u64) -> i32 {
+    // DEFECT: sendHtml also sets a Content-Security-Policy header; the
+    // intent respond() has no slot for it in this pass.
+    return respond(200, STR_PTR("text/html; charset=utf-8"), STR_LEN("text/html; charset=utf-8"), false, STR_PTR(""), 0, html_ptr, html_len);
+}
+
+fn send_session_cookie(status: u64, cookie_ptr: ptr, cookie_len: u64, max_age: u64) -> i32 {
+    let hdr = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&hdr, STR_PTR("free_key_admin="), STR_LEN("free_key_admin="));
+    buf_append_lit(&hdr, cookie_ptr, cookie_len);
+    buf_append_lit(&hdr, STR_PTR("; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age="), STR_LEN("; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age="));
+    buf_append_u64(&hdr, max_age);
+    let body = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    if max_age == 0 {
+        buf_append_lit(&body, STR_PTR("{\"data\":{\"authenticated\":false}}"), STR_LEN("{\"data\":{\"authenticated\":false}}"));
+    } else {
+        buf_append_lit(&body, STR_PTR("{\"data\":{\"authenticated\":true}}"), STR_LEN("{\"data\":{\"authenticated\":true}}"));
+    };
+    return respond(status, STR_PTR("application/json; charset=utf-8"), STR_LEN("application/json; charset=utf-8"), true, &hdr.bytes, hdr.len, &body.bytes, body.len);
+}
+
+// --- request helpers ---
+
+// TS: function headerText(request, name): string | undefined
+// (node lowercases header names; lookup here is case-insensitive.)
+fn header_text(req: &HttpRequest, out: &ByteBuf, name_ptr: ptr, name_len: u64) -> bool {
+    buf_reset(out);
+    // Intent-level scan of the raw header block: "name: value" lines.
+    // DEFECT: repeated headers collapse (node joins/arrays) — first wins,
+    // except the Array.isArray -> value[0] case which matches first-wins.
+    return sa_http_header_find(&req.headers.bytes, req.headers.len, name_ptr, name_len, out) == 0;
+}
+
+// TS: function bearerToken(request): string | undefined
+fn bearer_token(req: &HttpRequest, out: &ByteBuf) -> bool {
+    let auth = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    if !header_text(req, &auth, STR_PTR("authorization"), STR_LEN("authorization")) { return false; };
+    if auth.len <= 7 { return false; };
+    if !bytes_eq_str(&auth.bytes, 7, STR_PTR("Bearer "), STR_LEN("Bearer ")) { return false; };
+    buf_reset(out);
+    for i in 7..auth.len { buf_append_byte(out, auth.bytes[i]); }
+    return true;
+}
+
+// TS: function clientAddress(request): string
+fn client_address(req: &HttpRequest, out: &ByteBuf) -> void {
+    if header_text(req, out, STR_PTR("x-real-ip"), STR_LEN("x-real-ip")) { return; };
+    buf_reset(out);
+    buf_append_lit(out, &req.remote_addr.bytes, req.remote_addr.len);
+    if out.len == 0 { buf_append_lit(out, STR_PTR("unknown"), STR_LEN("unknown")); };
+}
+
+// TS: function parseObject(body): Record<string, unknown>  (throws)
+// Returns node handle; 0 + err when invalid. Empty body -> empty object.
+fn parse_object(body_ptr: ptr, body_len: u64, err: &ByteBuf) -> u64 {
+    buf_reset(err);
+    if body_len == 0 {
+        return sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+    };
+    let doc = sa_json_parse(body_ptr, body_len);
+    if doc == 0 || sa_json_kind_of(doc) != 3 {
+        buf_append_lit(err, STR_PTR("JSON object body is required"), STR_LEN("JSON object body is required"));
+        return 0;
+    };
+    return doc;
+}
+
+// TS: function requiredText(value: unknown, name: string): string  (throws)
+// Node value -> trimmed string in out; i32 0 ok, 1 missing ("<name> is required").
+fn required_text(node: u64, has: bool, name_ptr: ptr, name_len: u64, out: &ByteBuf, err: &ByteBuf) -> i32 {
+    buf_reset(out);
+    buf_reset(err);
+    if has && node != 0 && sa_json_kind_of(node) == 1 {
+        let p: ptr = sa_json_string_ptr(node);
+        let l: u64 = sa_json_string_len(node);
+        buf_append_lit(out, p, l);
+        buf_trim(out);
+    };
+    if out.len == 0 {
+        buf_append_lit(err, name_ptr, name_len);
+        buf_append_lit(err, STR_PTR(" is required"), STR_LEN(" is required"));
+        return 1;
+    };
+    return 0;
+}
+
+fn json_field(body: u64, name_ptr: ptr, name_len: u64, out_node: &u64) -> bool {
+    return sa_json_object_get(body, name_ptr, name_len, out_node) == 0;
+}
+
+// TS: function allowLogin(address: string): boolean  (10 attempts / 15 min)
+fn allow_login(st: &ServerState, addr_ptr: ptr, addr_len: u64) -> bool {
+    let now = sa_time_now_ms();
+    for i in 0..st.login_attempts_len {
+        if st.login_attempts[i].address.len == addr_len && bytes_eq(st.login_attempts[i].address.bytes, addr_ptr, addr_len) {
+            let rec = st.login_attempts[i];
+            if rec.reset_at <= now {
+                rec.count = 1;
+                rec.reset_at = now + 15 * 60000;
+                st.login_attempts[i] = rec;
+                return true;
+            };
+            if rec.count >= 10 { return false; };
+            rec.count = rec.count + 1;
+            st.login_attempts[i] = rec;
+            return true;
+        };
+    }
+    if st.login_attempts_len < 1024 {
+        let rec = st.login_attempts[st.login_attempts_len];
+        str_field_set(&rec.address, addr_ptr, addr_len);
+        rec.count = 1;
+        rec.reset_at = now + 15 * 60000;
+        st.login_attempts[st.login_attempts_len] = rec;
+        st.login_attempts_len = st.login_attempts_len + 1;
+    };
+    return true;
+}
+
+fn login_attempts_delete(st: &ServerState, addr_ptr: ptr, addr_len: u64) -> void {
+    for i in 0..st.login_attempts_len {
+        if st.login_attempts[i].address.len == addr_len && bytes_eq(st.login_attempts[i].address.bytes, addr_ptr, addr_len) {
+            let j = i;
+            while j + 1 < st.login_attempts_len {
+                st.login_attempts[j] = st.login_attempts[j + 1];
+                j = j + 1;
+            }
+            st.login_attempts_len = st.login_attempts_len - 1;
+            return;
+        };
+    }
+}
+
+// TS: function verifyAdminPassword(username, password): boolean
+fn verify_admin_password(st: &ServerState, un_ptr: ptr, un_len: u64, pw_ptr: ptr, pw_len: u64) -> bool {
+    if !st.cfg.has_admin_username || !st.cfg.has_admin_password_hash { return false; };
+    if un_len != st.cfg.admin_username.len || !bytes_eq(st.cfg.admin_username.bytes, un_ptr, un_len) { return false; };
+    return verify_admin_password_hash(pw_ptr, pw_len, &st.cfg.admin_password_hash.bytes, st.cfg.admin_password_hash.len);
+}
+
+// TS: function readSession(request): { username: string } | null
+fn read_session(st: &ServerState, req: &HttpRequest, out: &AdminSession) -> bool {
+    out.found = false;
+    let cookie = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    if !header_text(req, &cookie, STR_PTR("cookie"), STR_LEN("cookie")) { return false; };
+    // /(?:^|;\s*)free_key_admin=([^;]+)/ — manual scan for the cookie name.
+    // DEFECT: regex match approximated by substring scan + value slice.
+    let name = "free_key_admin=";
+    let name_len: u64 = 15;
+    let pos = find_sub_buf(&cookie, STR_PTR(name), name_len);
+    if pos == 4294967295 { return false; };
+    let vstart = pos + name_len;
+    let vend = vstart;
+    while vend < cookie.len && cookie.bytes[vend] != 59 { vend = vend + 1; }
+    if !st.cfg.has_admin_session_secret { return false; };
+    read_admin_session(out, &cookie.bytes + vstart, vend - vstart, &st.cfg.admin_session_secret.bytes, st.cfg.admin_session_secret.len, sa_time_now_ms());
+    return out.found;
+}
+
+// --- JSON serializers for store result types ---
+
+fn license_status_to_json(out: &ByteBuf, s: &LicenseStatus) -> void {
+    buf_append_lit(out, STR_PTR("{\"valid\":"), STR_LEN("{\"valid\":"));
+    if s.valid { buf_append_lit(out, STR_PTR("true"), STR_LEN("true")); } else { buf_append_lit(out, STR_PTR("false"), STR_LEN("false")); };
+    buf_append_lit(out, STR_PTR(",\"reason\":\""), STR_LEN(",\"reason\":\""));
+    buf_append_lit(out, &s.reason, s.reason_len);
+    buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+    if s.has_key_preview {
+        buf_append_lit(out, STR_PTR(",\"keyPreview\":\""), STR_LEN(",\"keyPreview\":\""));
+        buf_append_escaped(out, &s.key_preview.bytes, s.key_preview.len);
+        buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+    };
+    if s.has_issued_at {
+        buf_append_lit(out, STR_PTR(",\"issuedAt\":"), STR_LEN(",\"issuedAt\":"));
+        buf_append_u64(out, s.issued_at);
+    };
+    if s.has_expires_at {
+        buf_append_lit(out, STR_PTR(",\"expiresAt\":"), STR_LEN(",\"expiresAt\":"));
+        buf_append_u64(out, s.expires_at);
+    };
+    if s.has_discord_user_id {
+        buf_append_lit(out, STR_PTR(",\"discordUserId\":\""), STR_LEN(",\"discordUserId\":\""));
+        buf_append_escaped(out, &s.discord_user_id.bytes, s.discord_user_id.len);
+        buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+    };
+    buf_append_lit(out, STR_PTR("}"), STR_LEN("}"));
+}
+
+fn campaign_json_or_null(out: &ByteBuf, has: bool, c: &Campaign) -> void {
+    if !has {
+        buf_append_lit(out, STR_PTR("null"), STR_LEN("null"));
+        return;
+    };
+    campaign_to_json(out, c);
+}
+
+fn access_status_to_json(out: &ByteBuf, s: &AccessStatus) -> void {
+    buf_append_lit(out, STR_PTR("{\"license\":"), STR_LEN("{\"license\":"));
+    license_status_to_json(out, &s.license);
+    buf_append_lit(out, STR_PTR(",\"refreshIntervalHours\":"), STR_LEN(",\"refreshIntervalHours\":"));
+    buf_append_f64(out, s.refresh_interval_hours);
+    buf_append_lit(out, STR_PTR(",\"lastRefreshedAt\":"), STR_LEN(",\"lastRefreshedAt\":"));
+    if s.has_last_refreshed_at { buf_append_u64(out, s.last_refreshed_at); } else { buf_append_lit(out, STR_PTR("null"), STR_LEN("null")); };
+    buf_append_lit(out, STR_PTR(",\"nextRequiredRefreshAt\":"), STR_LEN(",\"nextRequiredRefreshAt\":"));
+    if s.has_next_required_refresh_at { buf_append_u64(out, s.next_required_refresh_at); } else { buf_append_lit(out, STR_PTR("null"), STR_LEN("null")); };
+    buf_append_lit(out, STR_PTR(",\"refreshRequired\":"), STR_LEN(",\"refreshRequired\":"));
+    if s.refresh_required { buf_append_lit(out, STR_PTR("true"), STR_LEN("true")); } else { buf_append_lit(out, STR_PTR("false"), STR_LEN("false")); };
+    buf_append_lit(out, STR_PTR(",\"discordInviteUrl\":\""), STR_LEN(",\"discordInviteUrl\":\""));
+    buf_append_escaped(out, &s.discord_invite_url.bytes, s.discord_invite_url.len);
+    buf_append_lit(out, STR_PTR("\",\"campaign\":"), STR_LEN("\",\"campaign\":"));
+    campaign_json_or_null(out, s.has_campaign, &s.campaign);
+    buf_append_lit(out, STR_PTR("}"), STR_LEN("}"));
+}
+
+// --- the request handler (TS: createServer(async (request, response) => {...})) ---
+
+fn handle_request(st: &ServerState, req: &HttpRequest) -> i32 {
+    let err = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let is_get = req.method_len == 3 && bytes_eq_str(&req.method, req.method_len, STR_PTR("GET"), STR_LEN("GET"));
+    let is_post = req.method_len == 4 && bytes_eq_str(&req.method, req.method_len, STR_PTR("POST"), STR_LEN("POST"));
+    let is_put = req.method_len == 3 && bytes_eq_str(&req.method, req.method_len, STR_PTR("PUT"), STR_LEN("PUT"));
+    let path_ptr: ptr = &req.path.bytes;
+    let path_len = req.path.len;
+
+    // GET /health
+    if is_get && path_len == 7 && bytes_eq_str(path_ptr, path_len, STR_PTR("/health"), STR_LEN("/health")) {
+        let body = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        buf_append_lit(&body, STR_PTR("{\"ok\":true,\"service\":\"codex-ultra-free-key\",\"now\":"), STR_LEN("{\"ok\":true,\"service\":\"codex-ultra-free-key\",\"now\":"));
+        buf_append_u64(&body, sa_time_now_ms());
+        buf_append_lit(&body, STR_PTR("}"), STR_LEN("}"));
+        return send_json(200, &body.bytes, body.len);
+    };
+    // GET /admin
+    if is_get && path_len == 6 && bytes_eq_str(path_ptr, path_len, STR_PTR("/admin"), STR_LEN("/admin")) {
+        let html = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        admin_page_html(&html);
+        return send_html(&html.bytes, html.len);
+    };
+    // GET /v1/admin/captcha
+    if is_get && path_len == 17 && bytes_eq_str(path_ptr, path_len, STR_PTR("/v1/admin/captcha"), STR_LEN("/v1/admin/captcha")) {
+        let addr = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        client_address(req, &addr);
+        let challenge = CaptchaChallenge { captcha_id: [0u8; 64], captcha_id_len: 0, expires_at: 0 };
+        let img = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        admin_captcha_create(&st.captcha, &challenge, &img, &addr.bytes, addr.len, sa_time_now_ms());
+        // { data: challenge } with challenge = { captchaId, imageDataUrl, expiresAt }
+        let data = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        buf_append_lit(&data, STR_PTR("{\"captchaId\":\""), STR_LEN("{\"captchaId\":\""));
+        buf_append_lit(&data, &challenge.captcha_id, challenge.captcha_id_len);
+        buf_append_lit(&data, STR_PTR("\",\"imageDataUrl\":\""), STR_LEN("\",\"imageDataUrl\":\""));
+        buf_append_escaped(&data, &img.bytes, img.len);
+        buf_append_lit(&data, STR_PTR("\",\"expiresAt\":"), STR_LEN("\",\"expiresAt\":"));
+        buf_append_u64(&data, challenge.expires_at);
+        buf_append_lit(&data, STR_PTR("}"), STR_LEN("}"));
+        return send_data(200, &data.bytes, data.len);
+    };
+    // POST /v1/admin/login
+    if is_post && path_len == 15 && bytes_eq_str(path_ptr, path_len, STR_PTR("/v1/admin/login"), STR_LEN("/v1/admin/login")) {
+        return route_admin_login(st, req, &err);
+    };
+    // POST /v1/admin/totp/confirm
+    if is_post && path_len == 21 && bytes_eq_str(path_ptr, path_len, STR_PTR("/v1/admin/totp/confirm"), STR_LEN("/v1/admin/totp/confirm")) {
+        return route_totp_confirm(st, req, &err);
+    };
+    // POST /v1/admin/logout
+    if is_post && path_len == 16 && bytes_eq_str(path_ptr, path_len, STR_PTR("/v1/admin/logout"), STR_LEN("/v1/admin/logout")) {
+        return send_session_cookie(200, STR_PTR(""), 0, 0);
+    };
+    // /v1/admin/console* (session cookie required)
+    if starts_with(path_ptr, path_len, STR_PTR("/v1/admin/console"), STR_LEN("/v1/admin/console")) {
+        return route_admin_console(st, req, &err, is_get, is_post, is_put);
+    };
+    // POST /discord/interactions
+    if is_post && path_len == 21 && bytes_eq_str(path_ptr, path_len, STR_PTR("/discord/interactions"), STR_LEN("/discord/interactions")) {
+        if !st.cfg.has_discord_public_key {
+            return send_error(503, STR_PTR("Discord integration is not configured"), STR_LEN("Discord integration is not configured"));
+        };
+        let sig = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let has_sig = header_text(req, &sig, STR_PTR("x-signature-ed25519"), STR_LEN("x-signature-ed25519"));
+        let ts = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let has_ts = header_text(req, &ts, STR_PTR("x-signature-timestamp"), STR_LEN("x-signature-timestamp"));
+        if !has_sig || !has_ts || !verify_discord_request(&st.cfg.discord_public_key.bytes, st.cfg.discord_public_key.len, &sig.bytes, sig.len, &ts.bytes, ts.len, &req.body.bytes, req.body.len) {
+            return send_error(401, STR_PTR("Invalid Discord signature"), STR_LEN("Invalid Discord signature"));
+        };
+        let input = parse_object(&req.body.bytes, req.body.len, &err);
+        if input == 0 { return send_error(400, &err.bytes, err.len); };
+        let out = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        handle_discord_interaction(&out, input, &st.store, &st.cfg);
+        return send_json(200, &out.bytes, out.len);
+    };
+    // /v1/admin/* (bearer admin secret)
+    if starts_with(path_ptr, path_len, STR_PTR("/v1/admin/"), STR_LEN("/v1/admin/")) {
+        let tok = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let has_tok = bearer_token(req, &tok);
+        if !constant_time_secret_matches(&st.cfg.admin_secret.bytes, st.cfg.admin_secret.len, has_tok, &tok.bytes, tok.len) {
+            return send_error(401, STR_PTR("Unauthorized"), STR_LEN("Unauthorized"));
+        };
+        if is_get && path_len == 18 && bytes_eq_str(path_ptr, path_len, STR_PTR("/v1/admin/settings"), STR_LEN("/v1/admin/settings")) {
+            let data = ByteBuf { bytes: [0u8; 40960], len: 0 };
+            license_store_get_settings(&st.store, &data);
+            return send_data(200, &data.bytes, data.len);
+        };
+        if is_put && path_len == 18 && bytes_eq_str(path_ptr, path_len, STR_PTR("/v1/admin/settings"), STR_LEN("/v1/admin/settings")) {
+            let input = parse_object(&req.body.bytes, req.body.len, &err);
+            if input == 0 { return send_error(400, &err.bytes, err.len); };
+            let data = ByteBuf { bytes: [0u8; 40960], len: 0 };
+            if license_store_update_settings(&st.store, &data, &err, input) != 0 { return send_error(400, &err.bytes, err.len); };
+            return send_data(200, &data.bytes, data.len);
+        };
+        return send_error(404, STR_PTR("Not found"), STR_LEN("Not found"));
+    };
+    // /v1/* (client secret when configured; POST only)
+    if starts_with(path_ptr, path_len, STR_PTR("/v1/"), STR_LEN("/v1/")) {
+        if st.cfg.has_client_secret {
+            let tok = ByteBuf { bytes: [0u8; 40960], len: 0 };
+            let has_tok = bearer_token(req, &tok);
+            if !constant_time_secret_matches(&st.cfg.client_secret.bytes, st.cfg.client_secret.len, has_tok, &tok.bytes, tok.len) {
+                return send_error(401, STR_PTR("Unauthorized"), STR_LEN("Unauthorized"));
+            };
+        };
+        if !is_post { return send_error(405, STR_PTR("Method not allowed"), STR_LEN("Method not allowed")); };
+        return route_access(st, req, &err, path_ptr, path_len);
+    };
+    return send_error(404, STR_PTR("Not found"), STR_LEN("Not found"));
+}
+
+// POST /v1/admin/login (split out of the handler, 1:1 with the TS block)
+fn route_admin_login(st: &ServerState, req: &HttpRequest, err: &ByteBuf) -> i32 {
+    let body = parse_object(&req.body.bytes, req.body.len, err);
+    if body == 0 { return send_error(400, &err.bytes, err.len); };
+    let username = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let password = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let captcha_id = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let captcha_answer = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let node: u64 = 0;
+    let has = json_field(body, STR_PTR("username"), STR_LEN("username"), &node);
+    if required_text(node, has, STR_PTR("username"), STR_LEN("username"), &username, err) != 0 { return send_error(400, &err.bytes, err.len); };
+    has = json_field(body, STR_PTR("password"), STR_LEN("password"), &node);
+    if required_text(node, has, STR_PTR("password"), STR_LEN("password"), &password, err) != 0 { return send_error(400, &err.bytes, err.len); };
+    has = json_field(body, STR_PTR("captchaId"), STR_LEN("captchaId"), &node);
+    if required_text(node, has, STR_PTR("captchaId"), STR_LEN("captchaId"), &captcha_id, err) != 0 { return send_error(400, &err.bytes, err.len); };
+    has = json_field(body, STR_PTR("captchaAnswer"), STR_LEN("captchaAnswer"), &node);
+    if required_text(node, has, STR_PTR("captchaAnswer"), STR_LEN("captchaAnswer"), &captcha_answer, err) != 0 { return send_error(400, &err.bytes, err.len); };
+    let addr = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    client_address(req, &addr);
+    if !allow_login(st, &addr.bytes, addr.len) {
+        return send_error(429, STR_PTR("尝试次数过多，请 15 分钟后再试"), STR_LEN("尝试次数过多，请 15 分钟后再试"));
+    };
+    if !admin_captcha_consume(&st.captcha, &captcha_id.bytes, captcha_id.len, &captcha_answer.bytes, captcha_answer.len, &addr.bytes, addr.len, sa_time_now_ms()) {
+        return send_error(401, STR_PTR("验证码错误或已过期"), STR_LEN("验证码错误或已过期"));
+    };
+    if !verify_admin_password(st, &username.bytes, username.len, &password.bytes, password.len) {
+        return send_error(401, STR_PTR("用户名或密码错误"), STR_LEN("用户名或密码错误"));
+    };
+    let encrypted = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    if !license_store_admin_totp_secret(&st.store, &encrypted) {
+        // First login: start TOTP enrollment.
+        let secret = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        generate_totp_secret(&secret, 20);
+        let enrollment_id = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        sa_crypto_random_uuid(&enrollment_id.bytes, &enrollment_id.len);
+        let expires_at = sa_time_now_ms() + 10 * 60000;
+        if st.enrollments_len < 256 {
+            let rec = st.enrollments[st.enrollments_len];
+            str_field_set(&rec.id, &enrollment_id.bytes, enrollment_id.len);
+            str_field_set(&rec.secret, &secret.bytes, secret.len);
+            str_field_set(&rec.username, &username.bytes, username.len);
+            str_field_set(&rec.address, &addr.bytes, addr.len);
+            rec.expires_at = expires_at;
+            st.enrollments[st.enrollments_len] = rec;
+            st.enrollments_len = st.enrollments_len + 1;
+        };
+        // DEFECT: await QRCode.toDataURL(totpUri(...), { width: 240, margin: 1, errorCorrectionLevel: "M" })
+        let uri = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        totp_uri(&uri, &secret.bytes, secret.len, &username.bytes, username.len, STR_PTR("Codex Ultra"), STR_LEN("Codex Ultra"));
+        let qr = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        sa_qr_to_data_url(&qr, &uri.bytes, uri.len, 240, 1);
+        let data = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        buf_append_lit(&data, STR_PTR("{\"authenticated\":false,\"requiresTotpSetup\":true,\"enrollmentId\":\""), STR_LEN("{\"authenticated\":false,\"requiresTotpSetup\":true,\"enrollmentId\":\""));
+        buf_append_escaped(&data, &enrollment_id.bytes, enrollment_id.len);
+        buf_append_lit(&data, STR_PTR("\",\"qrDataUrl\":\""), STR_LEN("\",\"qrDataUrl\":\""));
+        buf_append_escaped(&data, &qr.bytes, qr.len);
+        buf_append_lit(&data, STR_PTR("\",\"secret\":\""), STR_LEN("\",\"secret\":\""));
+        buf_append_escaped(&data, &secret.bytes, secret.len);
+        buf_append_lit(&data, STR_PTR("\",\"expiresAt\":"), STR_LEN("\",\"expiresAt\":"));
+        buf_append_u64(&data, expires_at);
+        buf_append_lit(&data, STR_PTR("}"), STR_LEN("}"));
+        return send_data(200, &data.bytes, data.len);
+    };
+    let totp = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let tnode: u64 = 0;
+    let thas = json_field(body, STR_PTR("totp"), STR_LEN("totp"), &tnode);
+    if required_text(tnode, thas, STR_PTR("totp"), STR_LEN("totp"), &totp, err) != 0 { return send_error(400, &err.bytes, err.len); };
+    // decryptTotpSecret(encrypted, config.adminSessionSecret!) — TS throws
+    // on malformed input (caught as 400); secret must be configured here.
+    let plain = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    if decrypt_totp_secret(&plain, &encrypted.bytes, encrypted.len, &st.cfg.admin_session_secret.bytes, st.cfg.admin_session_secret.len) != 0 {
+        return send_error(400, STR_PTR("Invalid encrypted TOTP secret"), STR_LEN("Invalid encrypted TOTP secret"));
+    };
+    if !verify_totp(&plain.bytes, plain.len, &totp.bytes, totp.len, sa_time_now_ms()) {
+        return send_error(401, STR_PTR("动态验证码错误"), STR_LEN("动态验证码错误"));
+    };
+    login_attempts_delete(st, &addr.bytes, addr.len);
+    let cookie = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    create_admin_session(&cookie, &username.bytes, username.len, &st.cfg.admin_session_secret.bytes, st.cfg.admin_session_secret.len, sa_time_now_ms());
+    return send_session_cookie(200, &cookie.bytes, cookie.len, 28800);
+}
+
+// POST /v1/admin/totp/confirm (1:1 with the TS block)
+fn route_totp_confirm(st: &ServerState, req: &HttpRequest, err: &ByteBuf) -> i32 {
+    let body = parse_object(&req.body.bytes, req.body.len, err);
+    if body == 0 { return send_error(400, &err.bytes, err.len); };
+    let enrollment_id = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let totp = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let node: u64 = 0;
+    let has = json_field(body, STR_PTR("enrollmentId"), STR_LEN("enrollmentId"), &node);
+    if required_text(node, has, STR_PTR("enrollmentId"), STR_LEN("enrollmentId"), &enrollment_id, err) != 0 { return send_error(400, &err.bytes, err.len); };
+    has = json_field(body, STR_PTR("totp"), STR_LEN("totp"), &node);
+    if required_text(node, has, STR_PTR("totp"), STR_LEN("totp"), &totp, err) != 0 { return send_error(400, &err.bytes, err.len); };
+    // enrollment = totpEnrollments.get(id); then delete unconditionally.
+    let found: u64 = 4294967295;
+    for i in 0..st.enrollments_len {
+        if st.enrollments[i].id.len == enrollment_id.len && bytes_eq(st.enrollments[i].id.bytes, &enrollment_id.bytes, enrollment_id.len) { found = i; };
+    }
+    let rec = TotpEnrollment { id: StrField { bytes: [0u8; 512], len: 0 }, secret: StrField { bytes: [0u8; 512], len: 0 }, username: StrField { bytes: [0u8; 512], len: 0 }, address: StrField { bytes: [0u8; 512], len: 0 }, expires_at: 0 };
+    if found != 4294967295 {
+        rec = st.enrollments[found];
+        let j = found;
+        while j + 1 < st.enrollments_len {
+            st.enrollments[j] = st.enrollments[j + 1];
+            j = j + 1;
+        }
+        st.enrollments_len = st.enrollments_len - 1;
+    };
+    let addr = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    client_address(req, &addr);
+    if found == 4294967295 || rec.expires_at <= sa_time_now_ms() || rec.address.len != addr.len || !bytes_eq(rec.address.bytes, &addr.bytes, addr.len) {
+        return send_error(401, STR_PTR("绑定请求已过期，请重新登录"), STR_LEN("绑定请求已过期，请重新登录"));
+    };
+    let existing = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    if license_store_admin_totp_secret(&st.store, &existing) {
+        return send_error(409, STR_PTR("Google Authenticator 已绑定"), STR_LEN("Google Authenticator 已绑定"));
+    };
+    if !verify_totp(&rec.secret.bytes, rec.secret.len, &totp.bytes, totp.len, sa_time_now_ms()) {
+        return send_error(401, STR_PTR("动态验证码错误，请重新登录后绑定"), STR_LEN("动态验证码错误，请重新登录后绑定"));
+    };
+    let enc = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    encrypt_totp_secret(&enc, &rec.secret.bytes, rec.secret.len, &st.cfg.admin_session_secret.bytes, st.cfg.admin_session_secret.len);
+    if license_store_set_admin_totp_secret(&st.store, err, &enc.bytes, enc.len) != 0 { return send_error(400, &err.bytes, err.len); };
+    license_store_record_audit(&st.store, &rec.username.bytes, rec.username.len, STR_PTR("bind_totp"), STR_LEN("bind_totp"), STR_PTR("{}"), STR_LEN("{}"));
+    login_attempts_delete(st, &addr.bytes, addr.len);
+    let cookie = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    create_admin_session(&cookie, &rec.username.bytes, rec.username.len, &st.cfg.admin_session_secret.bytes, st.cfg.admin_session_secret.len, sa_time_now_ms());
+    return send_session_cookie(200, &cookie.bytes, cookie.len, 28800);
+}
+
+// /v1/admin/console* (1:1 with the TS block)
+fn route_admin_console(st: &ServerState, req: &HttpRequest, err: &ByteBuf, is_get: bool, is_post: bool, is_put: bool) -> i32 {
+    let session = AdminSession { found: false, username: [0u8; 256], username_len: 0 };
+    if !read_session(st, req, &session) {
+        return send_error(401, STR_PTR("Unauthorized"), STR_LEN("Unauthorized"));
+    };
+    let path_ptr: ptr = &req.path.bytes;
+    let path_len = req.path.len;
+    if is_get && path_len == 17 && bytes_eq_str(path_ptr, path_len, STR_PTR("/v1/admin/console"), STR_LEN("/v1/admin/console")) {
+        // settings + listLicenses(q, limit) — query params from req.query.
+        // DEFECT: URLSearchParams — intent parse of "q"/"limit" pairs.
+        let q = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        sa_url_query_param(&req.query.bytes, req.query.len, STR_PTR("q"), STR_LEN("q"), &q);
+        let lim = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let limit: u64 = 100;
+        if sa_url_query_param(&req.query.bytes, req.query.len, STR_PTR("limit"), STR_LEN("limit"), &lim) { limit = buf_parse_u64(&lim, 100); };
+        let data = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        buf_append_lit(&data, STR_PTR("{\"settings\":"), STR_LEN("{\"settings\":"));
+        let settings = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        license_store_get_settings(&st.store, &settings);
+        buf_append_buf(&data, &settings);
+        buf_append_lit(&data, STR_PTR(",\"licenses\":["), STR_LEN(",\"licenses\":["));
+        // Rows are serialized by the store directly (column -> JSON); the
+        // struct-shaped listLicenses conversion lives in licenseStore.sla
+        // and this JSON variant is logged as a presentation divergence.
+        license_store_list_licenses_json(&st.store, &data, &q.bytes, q.len, limit);
+        buf_append_lit(&data, STR_PTR("]}"), STR_LEN("]}"));
+        return send_data(200, &data.bytes, data.len);
+    };
+    if is_post && path_len == 23 && bytes_eq_str(path_ptr, path_len, STR_PTR("/v1/admin/console/issue"), STR_LEN("/v1/admin/console/issue")) {
+        let body = parse_object(&req.body.bytes, req.body.len, err);
+        if body == 0 { return send_error(400, &err.bytes, err.len); };
+        let mh = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let node: u64 = 0;
+        let has = json_field(body, STR_PTR("machineHash"), STR_LEN("machineHash"), &node);
+        if required_text(node, has, STR_PTR("machineHash"), STR_LEN("machineHash"), &mh, err) != 0 { return send_error(400, &err.bytes, err.len); };
+        // discordUserId: string ? value : "admin"; validityDays: number ? value : Number(value)
+        let uid = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        buf_append_lit(&uid, STR_PTR("admin"), STR_LEN("admin"));
+        let unode: u64 = 0;
+        if json_field(body, STR_PTR("discordUserId"), STR_LEN("discordUserId"), &unode) && unode != 0 && sa_json_kind_of(unode) == 1 {
+            buf_reset(&uid);
+            let up: ptr = sa_json_string_ptr(unode);
+            let ul: u64 = sa_json_string_len(unode);
+            buf_append_lit(&uid, up, ul);
+        };
+        let days: f64 = 0.0;
+        let dnode: u64 = 0;
+        if json_field(body, STR_PTR("validityDays"), STR_LEN("validityDays"), &dnode) && dnode != 0 {
+            if sa_json_kind_of(dnode) == 4 { days = sa_json_number_value(dnode); } else if sa_json_kind_of(dnode) == 1 {
+                let dp: ptr = sa_json_string_ptr(dnode);
+                let dl: u64 = sa_json_string_len(dnode);
+                days = positive_number(true, dp, dl, 0.0);
+            };
+        };
+        let lic = License { key: StrField { bytes: [0u8; 512], len: 0 }, user_id: StrField { bytes: [0u8; 512], len: 0 }, machine_hash: StrField { bytes: [0u8; 512], len: 0 }, issued_at: 0, expires_at: 0, revoked: false };
+        if license_store_issue_admin_license(&st.store, &lic, err, &mh.bytes, mh.len, &uid.bytes, uid.len, days, sa_time_now_ms()) != 0 { return send_error(400, &err.bytes, err.len); };
+        // recordAudit(session.username, "issue_license", { machineHash, expiresAt })
+        let details = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        buf_append_lit(&details, STR_PTR("{\"machineHash\":\""), STR_LEN("{\"machineHash\":\""));
+        buf_append_escaped(&details, &lic.machine_hash.bytes, lic.machine_hash.len);
+        buf_append_lit(&details, STR_PTR("\",\"expiresAt\":"), STR_LEN("\",\"expiresAt\":"));
+        buf_append_u64(&details, lic.expires_at);
+        buf_append_lit(&details, STR_PTR("}"), STR_LEN("}"));
+        license_store_record_audit(&st.store, &session.username, session.username_len, STR_PTR("issue_license"), STR_LEN("issue_license"), &details.bytes, details.len);
+        let data = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        buf_append_lit(&data, STR_PTR("{\"key\":\""), STR_LEN("{\"key\":\""));
+        buf_append_escaped(&data, &lic.key.bytes, lic.key.len);
+        buf_append_lit(&data, STR_PTR("\",\"machineHash\":\""), STR_LEN("\",\"machineHash\":\""));
+        buf_append_escaped(&data, &lic.machine_hash.bytes, lic.machine_hash.len);
+        buf_append_lit(&data, STR_PTR("\",\"issuedAt\":"), STR_LEN("\",\"issuedAt\":"));
+        buf_append_u64(&data, lic.issued_at);
+        buf_append_lit(&data, STR_PTR(",\"expiresAt\":"), STR_LEN(",\"expiresAt\":"));
+        buf_append_u64(&data, lic.expires_at);
+        buf_append_lit(&data, STR_PTR("}"), STR_LEN("}"));
+        return send_data(200, &data.bytes, data.len);
+    };
+    if is_post && path_len == 24 && bytes_eq_str(path_ptr, path_len, STR_PTR("/v1/admin/console/revoke"), STR_LEN("/v1/admin/console/revoke")) {
+        let body = parse_object(&req.body.bytes, req.body.len, err);
+        if body == 0 { return send_error(400, &err.bytes, err.len); };
+        let id = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let node: u64 = 0;
+        let has = json_field(body, STR_PTR("id"), STR_LEN("id"), &node);
+        if required_text(node, has, STR_PTR("id"), STR_LEN("id"), &id, err) != 0 { return send_error(400, &err.bytes, err.len); };
+        let revoked = license_store_revoke_license(&st.store, &id.bytes, id.len, &session.username, session.username_len, sa_time_now_ms());
+        let data = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        if revoked { buf_append_lit(&data, STR_PTR("{\"revoked\":true}"), STR_LEN("{\"revoked\":true}")); } else { buf_append_lit(&data, STR_PTR("{\"revoked\":false}"), STR_LEN("{\"revoked\":false}")); };
+        return send_data(200, &data.bytes, data.len);
+    };
+    if is_put && path_len == 25 && bytes_eq_str(path_ptr, path_len, STR_PTR("/v1/admin/console/settings"), STR_LEN("/v1/admin/console/settings")) {
+        let input = parse_object(&req.body.bytes, req.body.len, err);
+        if input == 0 { return send_error(400, &err.bytes, err.len); };
+        let data = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        if license_store_update_settings(&st.store, &data, err, input) != 0 { return send_error(400, &err.bytes, err.len); };
+        // recordAudit(session.username, "update_settings", { keys: Object.keys(settings) })
+        // DEFECT: Object.keys of the returned settings object — the key set is
+        // the fixed getSettings shape; serialized in the same order.
+        let details = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        buf_append_lit(&details, STR_PTR("{\"keys\":[\"defaultValidityDays\",\"refreshIntervalHours\",\"requiredTtlMinutes\",\"discordInviteUrl\",\"campaign\"]}"), STR_LEN("{\"keys\":[\"defaultValidityDays\",\"refreshIntervalHours\",\"requiredTtlMinutes\",\"discordInviteUrl\",\"campaign\"]}"));
+        license_store_record_audit(&st.store, &session.username, session.username_len, STR_PTR("update_settings"), STR_LEN("update_settings"), &details.bytes, details.len);
+        return send_data(200, &data.bytes, data.len);
+    };
+    return send_error(404, STR_PTR("Not found"), STR_LEN("Not found"));
+}
+
+// /v1/access/* routes (1:1 with the TS /v1 block tail)
+fn route_access(st: &ServerState, req: &HttpRequest, err: &ByteBuf, path_ptr: ptr, path_len: u64) -> i32 {
+    let body = parse_object(&req.body.bytes, req.body.len, err);
+    if body == 0 { return send_error(400, &err.bytes, err.len); };
+    let mh = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let node: u64 = 0;
+    let has = json_field(body, STR_PTR("machineHash"), STR_LEN("machineHash"), &node);
+    if required_text(node, has, STR_PTR("machineHash"), STR_LEN("machineHash"), &mh, err) != 0 { return send_error(400, &err.bytes, err.len); };
+    // key: typeof body.key === "string" ? body.key : null
+    let has_key = false;
+    let key_ptr: ptr = PTR_NULL();
+    let key_len: u64 = 0;
+    let knode: u64 = 0;
+    if json_field(body, STR_PTR("key"), STR_LEN("key"), &knode) && knode != 0 && sa_json_kind_of(knode) == 1 {
+        has_key = true;
+        key_ptr = sa_json_string_ptr(knode);
+        key_len = sa_json_string_len(knode);
+    };
+    let now = sa_time_now_ms();
+    if path_len == 17 && bytes_eq_str(path_ptr, path_len, STR_PTR("/v1/access/status"), STR_LEN("/v1/access/status")) {
+        let status = AccessStatus { license: LicenseStatus { valid: false, reason: [0u8; 20], reason_len: 0, has_key_preview: false, key_preview: StrField { bytes: [0u8; 512], len: 0 }, has_issued_at: false, issued_at: 0, has_expires_at: false, expires_at: 0, has_discord_user_id: false, discord_user_id: StrField { bytes: [0u8; 512], len: 0 } }, refresh_interval_hours: 0.0, has_last_refreshed_at: false, last_refreshed_at: 0, has_next_required_refresh_at: false, next_required_refresh_at: 0, refresh_required: false, discord_invite_url: StrField { bytes: [0u8; 512], len: 0 }, has_campaign: false, campaign: Campaign { id: StrField { bytes: [0u8; 512], len: 0 }, title: StrField { bytes: [0u8; 512], len: 0 }, message: StrField { bytes: [0u8; 512], len: 0 }, has_image_url: false, image_url: StrField { bytes: [0u8; 512], len: 0 }, has_target_url: false, target_url: StrField { bytes: [0u8; 512], len: 0 }, has_starts_at: false, starts_at: 0, has_ends_at: false, ends_at: 0 } };
+        if license_store_status(&st.store, &status, err, &mh.bytes, mh.len, has_key, key_ptr, key_len, now) != 0 { return send_error(400, &err.bytes, err.len); };
+        let data = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        access_status_to_json(&data, &status);
+        return send_data(200, &data.bytes, data.len);
+    };
+    if path_len == 22 && bytes_eq_str(path_ptr, path_len, STR_PTR("/v1/access/requirement"), STR_LEN("/v1/access/requirement")) {
+        let r = Requirement { required_code: StrField { bytes: [0u8; 512], len: 0 }, expires_at: 0 };
+        if license_store_create_requirement(&st.store, &r, err, &mh.bytes, mh.len, now) != 0 { return send_error(400, &err.bytes, err.len); };
+        let data = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        buf_append_lit(&data, STR_PTR("{\"requiredCode\":\""), STR_LEN("{\"requiredCode\":\""));
+        buf_append_escaped(&data, &r.required_code.bytes, r.required_code.len);
+        buf_append_lit(&data, STR_PTR("\",\"expiresAt\":"), STR_LEN("\",\"expiresAt\":"));
+        buf_append_u64(&data, r.expires_at);
+        buf_append_lit(&data, STR_PTR("}"), STR_LEN("}"));
+        return send_data(200, &data.bytes, data.len);
+    };
+    if path_len == 18 && bytes_eq_str(path_ptr, path_len, STR_PTR("/v1/access/prepare"), STR_LEN("/v1/access/prepare")) {
+        let pr = PrepareRefreshResult { status: AccessStatus { license: LicenseStatus { valid: false, reason: [0u8; 20], reason_len: 0, has_key_preview: false, key_preview: StrField { bytes: [0u8; 512], len: 0 }, has_issued_at: false, issued_at: 0, has_expires_at: false, expires_at: 0, has_discord_user_id: false, discord_user_id: StrField { bytes: [0u8; 512], len: 0 } }, refresh_interval_hours: 0.0, has_last_refreshed_at: false, last_refreshed_at: 0, has_next_required_refresh_at: false, next_required_refresh_at: 0, refresh_required: false, discord_invite_url: StrField { bytes: [0u8; 512], len: 0 }, has_campaign: false, campaign: Campaign { id: StrField { bytes: [0u8; 512], len: 0 }, title: StrField { bytes: [0u8; 512], len: 0 }, message: StrField { bytes: [0u8; 512], len: 0 }, has_image_url: false, image_url: StrField { bytes: [0u8; 512], len: 0 }, has_target_url: false, target_url: StrField { bytes: [0u8; 512], len: 0 }, has_starts_at: false, starts_at: 0, has_ends_at: false, ends_at: 0 } }, allowed: false, has_authorization_id: false, authorization_id: StrField { bytes: [0u8; 512], len: 0 }, has_authorization_expires_at: false, authorization_expires_at: 0, has_requirement: false, requirement: Requirement { required_code: StrField { bytes: [0u8; 512], len: 0 }, expires_at: 0 } };
+        if license_store_prepare_refresh(&st.store, &pr, err, &mh.bytes, mh.len, has_key, key_ptr, key_len, now) != 0 { return send_error(400, &err.bytes, err.len); };
+        // AccessStatus fields, then allowed/authorization*/requirement (TS spread order).
+        let data = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        access_status_to_json(&data, &pr.status);
+        // splice the extra fields before the closing brace
+        data.len = data.len - 1;
+        buf_append_lit(&data, STR_PTR(",\"allowed\":"), STR_LEN(",\"allowed\":"));
+        if pr.allowed { buf_append_lit(&data, STR_PTR("true"), STR_LEN("true")); } else { buf_append_lit(&data, STR_PTR("false"), STR_LEN("false")); };
+        if pr.has_authorization_id {
+            buf_append_lit(&data, STR_PTR(",\"authorizationId\":\""), STR_LEN(",\"authorizationId\":\""));
+            buf_append_escaped(&data, &pr.authorization_id.bytes, pr.authorization_id.len);
+            buf_append_lit(&data, STR_PTR("\""), STR_LEN("\""));
+        };
+        if pr.has_authorization_expires_at {
+            buf_append_lit(&data, STR_PTR(",\"authorizationExpiresAt\":"), STR_LEN(",\"authorizationExpiresAt\":"));
+            buf_append_u64(&data, pr.authorization_expires_at);
+        };
+        if pr.has_requirement {
+            buf_append_lit(&data, STR_PTR(",\"requirement\":{\"requiredCode\":\""), STR_LEN(",\"requirement\":{\"requiredCode\":\""));
+            buf_append_escaped(&data, &pr.requirement.required_code.bytes, pr.requirement.required_code.len);
+            buf_append_lit(&data, STR_PTR("\",\"expiresAt\":"), STR_LEN("\",\"expiresAt\":"));
+            buf_append_u64(&data, pr.requirement.expires_at);
+            buf_append_lit(&data, STR_PTR("}"), STR_LEN("}"));
+        };
+        buf_append_lit(&data, STR_PTR("}"), STR_LEN("}"));
+        return send_data(200, &data.bytes, data.len);
+    };
+    if path_len == 19 && bytes_eq_str(path_ptr, path_len, STR_PTR("/v1/access/complete"), STR_LEN("/v1/access/complete")) {
+        let auth = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let anode: u64 = 0;
+        let ahas = json_field(body, STR_PTR("authorizationId"), STR_LEN("authorizationId"), &anode);
+        if required_text(anode, ahas, STR_PTR("authorizationId"), STR_LEN("authorizationId"), &auth, err) != 0 { return send_error(400, &err.bytes, err.len); };
+        // body.success === true; importedModels: number ? value : 0
+        let success = false;
+        let snode: u64 = 0;
+        if json_field(body, STR_PTR("success"), STR_LEN("success"), &snode) && snode != 0 {
+            let sv: u64 = 0;
+            if sa_json_object_get_bool(snode, STR_PTR(""), 0, &sv) == 0 { success = sv != 0; };
+            // DEFECT: bare boolean node read — intent sa_json_bool_value.
+            success = sa_json_bool_value(snode);
+        };
+        let imported: u64 = 0;
+        let inode: u64 = 0;
+        if json_field(body, STR_PTR("importedModels"), STR_LEN("importedModels"), &inode) && inode != 0 && sa_json_kind_of(inode) == 4 {
+            imported = sa_json_number_value(inode) as u64;
+        };
+        if license_store_complete_refresh(&st.store, err, &mh.bytes, mh.len, &auth.bytes, auth.len, success, imported, now) != 0 { return send_error(400, &err.bytes, err.len); };
+        let data = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        buf_append_lit(&data, STR_PTR("{\"completed\":true}"), STR_LEN("{\"completed\":true}"));
+        return send_data(200, &data.bytes, data.len);
+    };
+    return send_error(404, STR_PTR("Not found"), STR_LEN("Not found"));
+}
+
+// TS: const config = loadConfig(); const store = new LicenseStore(config);
+// const captchaStore = new AdminCaptchaStore(); server.listen(...)
+// DEFECT: server.listen + process signal handlers — the std server entry
+// (sa_http_server_serve) owns the loop in this pass.
+fn main() -> i32 {
+    let st = ServerState { cfg: FreeKeyServerConfig { host: StrField { bytes: [0u8; 512], len: 0 }, port: 0, database_path: StrField { bytes: [0u8; 512], len: 0 }, hash_pepper: StrField { bytes: [0u8; 512], len: 0 }, has_client_secret: false, client_secret: StrField { bytes: [0u8; 512], len: 0 }, admin_secret: StrField { bytes: [0u8; 512], len: 0 }, has_admin_username: false, admin_username: StrField { bytes: [0u8; 512], len: 0 }, has_admin_password_hash: false, admin_password_hash: StrField { bytes: [0u8; 512], len: 0 }, has_admin_session_secret: false, admin_session_secret: StrField { bytes: [0u8; 512], len: 0 }, default_validity_days: 0.0, refresh_interval_hours: 0.0, required_ttl_minutes: 0.0, discord_invite_url: StrField { bytes: [0u8; 512], len: 0 }, has_discord_public_key: false, discord_public_key: StrField { bytes: [0u8; 512], len: 0 }, has_discord_channel_id: false, discord_channel_id: StrField { bytes: [0u8; 512], len: 0 } }, store: LicenseStore { db: 0, closed: false, cfg_default_validity_days: 0.0, cfg_refresh_interval_hours: 0.0, cfg_required_ttl_minutes: 0.0, cfg_hash_pepper: StrField { bytes: [0u8; 512], len: 0 }, cfg_discord_invite_url: StrField { bytes: [0u8; 512], len: 0 }, cfg_database_path: StrField { bytes: [0u8; 512], len: 0 } }, captcha: AdminCaptchaStore { records: [CaptchaRecord { id: [0u8; 64], id_len: 0, answer_hash: [0u8; 32], address: [0u8; 256], address_len: 0, expires_at: 0 }; 2000], len: 0 }, login_attempts: [LoginAttempt { address: StrField { bytes: [0u8; 512], len: 0 }, count: 0, reset_at: 0 }; 1024], login_attempts_len: 0, enrollments: [TotpEnrollment { id: StrField { bytes: [0u8; 512], len: 0 }, secret: StrField { bytes: [0u8; 512], len: 0 }, username: StrField { bytes: [0u8; 512], len: 0 }, address: StrField { bytes: [0u8; 512], len: 0 }, expires_at: 0 }; 256], enrollments_len: 0 };
+    let err = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    if load_config(&st.cfg, &err) != 0 {
+        // TS: loadConfig throws at module load — process exits.
+        return 1;
+    };
+    if license_store_new(&st.store, &st.cfg) != 0 { return 1; };
+    println("Codex Ultra free-key service listening on http://");
+    // DEFECT: host:port interpolation in the log line + server.listen —
+    // intent extern sa_http_server_serve(host, port, handler).
+    return sa_http_server_serve(&st.cfg.host.bytes, st.cfg.host.len, st.cfg.port, &st);
+}

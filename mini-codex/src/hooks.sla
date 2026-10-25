@@ -1,0 +1,3110 @@
+// Converted 1:1 from mini-codex/src/hooks.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Codex-parity hook runtime for mini-codex (MCP hook events).
+//
+// Reference (E:\projects\codex):
+// - codex-rs/config/src/hook_config.rs      (HooksFile/HookEventsToml/MatcherGroup/
+//   HookHandlerConfig::{command,mcp_tool,prompt,agent}, 12 events, MCP null rejection)
+// - codex-rs/hooks/src/events/pre_tool_use.rs / post_tool_use.rs (matcher dispatch,
+//   command stdin JSON, updated_input/additionalContext/block semantics)
+// - codex-rs/hooks/src/mcp.rs               (HookMcpCall/HookMcpExecutor)
+// - codex-rs/core/src/hook_runtime.rs       (HookStarted/HookCompleted emission)
+// - codex-rs/core/src/tools/handlers/mcp.rs (mcp__<server>__<tool> naming,
+//   PreToolUse tool_input = parsed JSON args,
+//   PostToolUse tool_response = {content, structuredContent})
+// - codex-rs/protocol/src/protocol.rs       (HookStartedEvent/HookCompletedEvent/
+//   HookRunSummary/HandlerType/EventName/RunStatus)
+//
+// Scope: PreToolUse/PostToolUse around every tool call (MCP first-class).
+// Other 10 events load but only emit via explicit helpers (no silent drop of config).
+@import "sa_std/io/print.sai"
+@import "sa_std/ptr.sa"
+@import "sa_std/fs.sai"
+@import "sa_std/env.sai"
+@import "sa_std/process.sai"
+@import "sa_std/json.sai"
+// TS imports (lines 18-22): node:crypto randomUUID as uuid, node:child_process
+// spawn, node:fs/promises readFile, node:os homedir, node:path join.
+// DEFECT: Node API — node:crypto/node:child_process/node:fs/promises/node:os/
+// node:path have no 1:1 sa_std counterparts; approximated with sa_std env/fs/
+// process externs and (ptr,len) path buffers (see per-function DEFECTs).
+
+// ---------------------------------------------------------------------------
+// TS: export type HookEventName = "PreToolUse" | "PermissionRequest" |
+//     "PostToolUse" | "PreCompact" | "PostCompact" | "SessionStart" |
+//     "SessionEnd" | "UserPromptSubmit" | "SubagentStart" | "SubagentStop" |
+//     "Stop" | "Interrupt";
+// DEFECT: string-literal union type — approximated by u64 enum codes
+// 0..11 in HOOK_EVENT_NAMES order; name text recovered via
+// HOOK_EVENT_NAMES_at().
+// ---------------------------------------------------------------------------
+
+fn HOOK_EVENT_NAMES_count() -> u64 { return 12; }
+
+fn HOOK_EVENT_NAMES_at(idx: u64, out_len: &u64) -> ptr {
+    if idx == 0 { *out_len = STR_LEN("PreToolUse"); return STR_PTR("PreToolUse"); };
+    if idx == 1 { *out_len = STR_LEN("PermissionRequest"); return STR_PTR("PermissionRequest"); };
+    if idx == 2 { *out_len = STR_LEN("PostToolUse"); return STR_PTR("PostToolUse"); };
+    if idx == 3 { *out_len = STR_LEN("PreCompact"); return STR_PTR("PreCompact"); };
+    if idx == 4 { *out_len = STR_LEN("PostCompact"); return STR_PTR("PostCompact"); };
+    if idx == 5 { *out_len = STR_LEN("SessionStart"); return STR_PTR("SessionStart"); };
+    if idx == 6 { *out_len = STR_LEN("SessionEnd"); return STR_PTR("SessionEnd"); };
+    if idx == 7 { *out_len = STR_LEN("UserPromptSubmit"); return STR_PTR("UserPromptSubmit"); };
+    if idx == 8 { *out_len = STR_LEN("SubagentStart"); return STR_PTR("SubagentStart"); };
+    if idx == 9 { *out_len = STR_LEN("SubagentStop"); return STR_PTR("SubagentStop"); };
+    if idx == 10 { *out_len = STR_LEN("Stop"); return STR_PTR("Stop"); };
+    *out_len = STR_LEN("Interrupt");
+    return STR_PTR("Interrupt");
+}
+
+// TS: export type HookHandlerType = "command" | "mcp_tool" | "prompt" | "agent";
+// DEFECT: string-literal union — u64 codes: 0 command, 1 mcp_tool, 2 prompt, 3 agent.
+fn hook_handler_type_name(code: u64, out_len: &u64) -> ptr {
+    if code == 0 { *out_len = STR_LEN("command"); return STR_PTR("command"); };
+    if code == 1 { *out_len = STR_LEN("mcp_tool"); return STR_PTR("mcp_tool"); };
+    if code == 2 { *out_len = STR_LEN("prompt"); return STR_PTR("prompt"); };
+    *out_len = STR_LEN("agent");
+    return STR_PTR("agent");
+}
+
+// TS: export type HookRunStatus = "running" | "completed" | "failed" | "blocked" | "stopped";
+// DEFECT: string-literal union — u64 codes: 0 running, 1 completed, 2 failed, 3 blocked, 4 stopped.
+fn hook_run_status_name(code: u64, out_len: &u64) -> ptr {
+    if code == 0 { *out_len = STR_LEN("running"); return STR_PTR("running"); };
+    if code == 1 { *out_len = STR_LEN("completed"); return STR_PTR("completed"); };
+    if code == 2 { *out_len = STR_LEN("failed"); return STR_PTR("failed"); };
+    if code == 3 { *out_len = STR_LEN("blocked"); return STR_PTR("blocked"); };
+    *out_len = STR_LEN("stopped");
+    return STR_PTR("stopped");
+}
+
+// TS: export type HookSource = "user" | "project" | "unknown";
+// DEFECT: string-literal union — u64 codes: 0 user, 1 project, 2 unknown.
+fn hook_source_name(code: u64, out_len: &u64) -> ptr {
+    if code == 0 { *out_len = STR_LEN("user"); return STR_PTR("user"); };
+    if code == 1 { *out_len = STR_LEN("project"); return STR_PTR("project"); };
+    *out_len = STR_LEN("unknown");
+    return STR_PTR("unknown");
+}
+
+// TS: export interface HookOutputEntry { kind: "warning" | "stop" | "feedback" | "context" | "error"; text: string }
+// kind codes: 0 warning, 1 stop, 2 feedback, 3 context, 4 error.
+struct HookOutputEntry { kind: u64, text_ptr: ptr, text_len: u64 }
+
+// TS: export interface HookRunSummary {
+//   id: string; event_name: HookEventName; handler_type: HookHandlerType;
+//   execution_mode: "sync"; scope: "turn"; source_path: string;
+//   source: HookSource; display_order: number; status: HookRunStatus;
+//   status_message: string | null; started_at: number;
+//   completed_at: number | null; duration_ms: number | null;
+//   entries: HookOutputEntry[]; }
+// DEFECT: nullable fields (string | null, number | null) — approximated with
+// has_* flags; execution_mode/scope are the string literals "sync"/"turn",
+// kept as fixed codes 0/0 (only values the TS ever produces).
+// DEFECT: entries array — fixed capacity 32 + len (a single hook run never
+// emits more in the TS code paths).
+struct HookRunSummary {
+    id_ptr: ptr, id_len: u64,
+    event_name: u64, handler_type: u64,
+    execution_mode: u64, scope: u64,
+    source_path_ptr: ptr, source_path_len: u64,
+    source: u64, display_order: u64,
+    status: u64,
+    status_message_ptr: ptr, status_message_len: u64, has_status_message: bool,
+    started_at: u64,
+    completed_at: u64, has_completed_at: bool,
+    duration_ms: u64, has_duration_ms: bool,
+    entries: [HookOutputEntry; 32], entries_len: u64,
+}
+
+// TS: export interface HookStartedEvent { turn_id: string | null; run: HookRunSummary }
+// TS: export interface HookCompletedEvent { turn_id: string | null; run: HookRunSummary }
+struct HookStartedEvent { turn_id_ptr: ptr, turn_id_len: u64, has_turn_id: bool, run: HookRunSummary }
+struct HookCompletedEvent { turn_id_ptr: ptr, turn_id_len: u64, has_turn_id: bool, run: HookRunSummary }
+
+// TS: export type HookEvent = { type: "hook_started"; event: HookStartedEvent }
+//     | { type: "hook_completed"; event: HookCompletedEvent };
+// DEFECT: discriminated union — tagged struct, type_code 0 = hook_started,
+// 1 = hook_completed; both payloads stored, only the tagged one is live.
+struct HookEvent { type_code: u64, started: HookStartedEvent, completed: HookCompletedEvent }
+
+// TS: export type HookEventSink = (e: HookEvent) => void;
+// DEFECT: function type / callback — SLA has no first-class function values;
+// a sink is an opaque u64 id dispatched by hook_sink_dispatch() (fix phase
+// wires the registry); 0 = no sink (TS undefined).
+
+// TS: export type HookHandlerConfig =
+//   | { type: "command"; command: string; commandWindows?: string; timeout?: number; statusMessage?: string }
+//   | { type: "mcp_tool"; server: string; tool: string; input: Record<string, unknown>; timeout?: number; statusMessage?: string }
+//   | { type: "prompt" }
+//   | { type: "agent" };
+// DEFECT: discriminated union with optional fields — flattened tagged
+// struct; type_code reuses HookHandlerType codes (0 command, 1 mcp_tool,
+// 2 prompt, 3 agent); absent optionals via has_* flags.
+// DEFECT: dynamic object — mcp_tool `input: Record<string, unknown>` is a
+// JSON node handle (input_node), not a struct.
+struct HookHandlerConfig {
+    type_code: u64,
+    command_ptr: ptr, command_len: u64,
+    commandWindows_ptr: ptr, commandWindows_len: u64, has_commandWindows: bool,
+    server_ptr: ptr, server_len: u64,
+    tool_ptr: ptr, tool_len: u64,
+    input_node: u64,
+    timeout_s: f64, has_timeout: bool,
+    statusMessage_ptr: ptr, statusMessage_len: u64, has_statusMessage: bool,
+}
+
+// TS: export interface MatcherGroup { matcher?: string; hooks: HookHandlerConfig[] }
+// DEFECT: hooks array — fixed capacity 32 + len.
+struct MatcherGroup { matcher_ptr: ptr, matcher_len: u64, has_matcher: bool, hooks: [HookHandlerConfig; 32], hooks_len: u64 }
+
+// TS: export type HookEvents = Partial<Record<HookEventName, MatcherGroup[]>>
+// DEFECT: Partial<Record<...>> dynamic keyed object — struct with one
+// fixed-capacity group array per event name (capacity 32 groups each);
+// *_len == 0 encodes the absent key.
+struct HookEvents {
+    groups0: [MatcherGroup; 32], groups0_len: u64,
+    groups1: [MatcherGroup; 32], groups1_len: u64,
+    groups2: [MatcherGroup; 32], groups2_len: u64,
+    groups3: [MatcherGroup; 32], groups3_len: u64,
+    groups4: [MatcherGroup; 32], groups4_len: u64,
+    groups5: [MatcherGroup; 32], groups5_len: u64,
+    groups6: [MatcherGroup; 32], groups6_len: u64,
+    groups7: [MatcherGroup; 32], groups7_len: u64,
+    groups8: [MatcherGroup; 32], groups8_len: u64,
+    groups9: [MatcherGroup; 32], groups9_len: u64,
+    groups10: [MatcherGroup; 32], groups10_len: u64,
+    groups11: [MatcherGroup; 32], groups11_len: u64,
+}
+
+// Accessor for the per-event group array (event code -> base ptr + len).
+// DEFECT: dynamic key indexing events[eventName] — switch on the enum code.
+fn hook_events_len(events: &HookEvents, event_name: u64) -> u64 {
+    if event_name == 0 { return events.groups0_len; };
+    if event_name == 1 { return events.groups1_len; };
+    if event_name == 2 { return events.groups2_len; };
+    if event_name == 3 { return events.groups3_len; };
+    if event_name == 4 { return events.groups4_len; };
+    if event_name == 5 { return events.groups5_len; };
+    if event_name == 6 { return events.groups6_len; };
+    if event_name == 7 { return events.groups7_len; };
+    if event_name == 8 { return events.groups8_len; };
+    if event_name == 9 { return events.groups9_len; };
+    if event_name == 10 { return events.groups10_len; };
+    return events.groups11_len;
+}
+
+// TS: interface LoadedHooks { events: HookEvents; sourcePath: string; source: HookSource }
+struct LoadedHooks { events: HookEvents, sourcePath_ptr: ptr, sourcePath_len: u64, source: u64 }
+
+// TS: interface HookCache {
+//   at: number; cwd: string; events: HookEvents;
+//   files: Array<{ path: string; source: HookSource }>;
+//   perFile: Array<{ path: string; source: HookSource; events: HookEvents }>; }
+// DEFECT: nested arrays of objects — fixed capacities (8 files, matching the
+// 5 candidate paths loadHookEvents probes) + len fields.
+struct HookFileRef { path_ptr: ptr, path_len: u64, source: u64 }
+struct HookPerFile { path_ptr: ptr, path_len: u64, source: u64, events: HookEvents }
+struct HookCache {
+    at: u64, cwd_ptr: ptr, cwd_len: u64, events: HookEvents,
+    files: [HookFileRef; 8], files_len: u64,
+    perFile: [HookPerFile; 8], perFile_len: u64,
+}
+
+// TS: let cache: HookCache | null = null;
+// DEFECT: module-level mutable state + null — global struct + has_cache flag
+// (SLA globals are caller-owned storage in this approximation; the fix phase
+// must give `cache` a single static home).
+struct HookModuleState { cache: HookCache, has_cache: bool }
+
+// TS: function codexHome(): string {
+//   const h = (process.env.CODEX_HOME ?? "").trim();
+//   if (h) return h.startsWith("~") ? join(homedir(), h.slice(1)) : h;
+//   return join(homedir(), ".codex");
+// }
+// Writes the result path into out, returns its length.
+// DEFECT: process.env / node:os homedir / node:path join — approximated with
+// sa_std env lookup + byte-buffer path concatenation (no separator
+// normalisation; TS join() also resolves "." / ".." segments).
+// DEFECT: string methods trim/startsWith/slice — byte scans.
+fn codexHome(out: &ByteBuf) -> u64 {
+    buf_reset(out);
+    let h_ptr: ptr = PTR_NULL();
+    let h_len: u64 = 0;
+    sa_env_get(STR_PTR("CODEX_HOME"), STR_LEN("CODEX_HOME"), &h_ptr, &h_len);
+    // trim
+    let lo: u64 = 0;
+    let hi: u64 = h_len;
+    while lo < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, h_ptr, lo);
+        if c != 32 {
+            if c != 9 {
+                if c != 10 {
+                    if c != 13 { break; };
+                };
+            };
+        };
+        lo = lo + 1;
+    }
+    while hi > lo {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, h_ptr, hi - 1);
+        if c != 32 {
+            if c != 9 {
+                if c != 10 {
+                    if c != 13 { break; };
+                };
+            };
+        };
+        hi = hi - 1;
+    }
+    if hi > lo {
+        let first: u8 = 0;
+        PTR_BYTE_AT(first, h_ptr, lo);
+        if first == 126 {
+            // "~..." -> join(homedir(), h.slice(1))
+            sa_env_home(out);
+            buf_append_slice(out, h_ptr, lo + 1, hi);
+            return out.len;
+        };
+        buf_append_slice(out, h_ptr, lo, hi);
+        return out.len;
+    };
+    // join(homedir(), ".codex")
+    sa_env_home(out);
+    buf_append_lit(out, STR_PTR("/.codex"), STR_LEN("/.codex"));
+    return out.len;
+}
+
+// ---------------------------------------------------------------------------
+// TS: function normalizeEvents(raw: unknown): HookEvents {
+//   const out: HookEvents = {};
+//   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+//   const rec = raw as Record<string, unknown>;
+//   // Accept both {hooks:{PreToolUse:[...]}} (hooks.json) and flat {PreToolUse:[...]}.
+//   const body = rec.hooks && typeof rec.hooks === "object" && !Array.isArray(rec.hooks)
+//     ? (rec.hooks as Record<string, unknown>) : rec;
+//   for (const name of HOOK_EVENT_NAMES) {
+//     const v = (body as Record<string, unknown>)[name];
+//     if (!Array.isArray(v)) continue;
+//     const groups: MatcherGroup[] = [];
+//     for (const g of v) {
+//       if (!g || typeof g !== "object" || Array.isArray(g)) continue;
+//       const gr = g as Record<string, unknown>;
+//       const hooks: HookHandlerConfig[] = [];
+//       if (Array.isArray(gr.hooks)) for (const h of gr.hooks) {
+//         const hc = normalizeHandler(h);
+//         if (hc) hooks.push(hc);
+//       }
+//       groups.push({
+//         ...(typeof gr.matcher === "string" ? { matcher: gr.matcher } : {}),
+//         hooks,
+//       });
+//     }
+//     out[name] = groups;
+//   }
+//   return out;
+// }
+// SLA approximation: raw is a JSON node handle; iteration is over the JSON
+// layer (sa_json_*), results are written into the fixed arrays of `out`.
+// DEFECT: dynamic object — `unknown`, typeof/Array.isArray runtime dispatch,
+// Record casts and dynamic key access (body[name]) have no SLA counterpart;
+// approximated via JSON node kinds and per-name key lookup.
+// DEFECT: object spread `...(cond ? { matcher } : {})` in the group literal —
+// approximated by conditionally setting has_matcher/matcher fields.
+// DEFECT: Array.push growth — fixed capacities (32 groups/event, 32 hooks/
+// group); overflow entries are dropped (TS keeps all).
+fn normalizeEvents(raw_node: u64, out: &HookEvents) -> void {
+    hook_events_reset(out);
+    if raw_node == 0 { return; };
+    if sa_json_kind_of(raw_node) != 3 { return; };
+    // body = rec.hooks (object) ?? rec
+    let body_node = raw_node;
+    let hooks_node: u64 = 0;
+    if sa_json_object_get(raw_node, STR_PTR("hooks"), STR_LEN("hooks"), &hooks_node) == 0 {
+        if sa_json_kind_of(hooks_node) == 3 { body_node = hooks_node; };
+    };
+    for name_idx in 0..12 {
+        let name_len: u64 = 0;
+        let name_ptr = HOOK_EVENT_NAMES_at(name_idx, &name_len);
+        let v_node: u64 = 0;
+        if sa_json_object_get(body_node, name_ptr, name_len, &v_node) != 0 { continue; };
+        if sa_json_kind_of(v_node) != 2 { continue; };
+        let g_count = sa_json_array_len(v_node);
+        for gi in 0..g_count {
+            let g_node: u64 = 0;
+            if sa_json_array_get(v_node, gi, &g_node) != 0 { continue; };
+            if sa_json_kind_of(g_node) != 3 { continue; };
+            let group_slot = hook_events_group_push_slot(out, name_idx);
+            if group_slot == 0 { continue; };
+            // matcher (optional string)
+            let m_ptr: ptr = PTR_NULL();
+            let m_len: u64 = 0;
+            if sa_json_object_get_string(g_node, STR_PTR("matcher"), STR_LEN("matcher"), &m_ptr, &m_len) == 0 {
+                matcher_group_set_matcher(group_slot, m_ptr, m_len);
+            };
+            // hooks[]
+            let hs_node: u64 = 0;
+            if sa_json_object_get(g_node, STR_PTR("hooks"), STR_LEN("hooks"), &hs_node) == 0 {
+                if sa_json_kind_of(hs_node) == 2 {
+                    let h_count = sa_json_array_len(hs_node);
+                    for hi in 0..h_count {
+                        let h_node: u64 = 0;
+                        if sa_json_array_get(hs_node, hi, &h_node) != 0 { continue; };
+                        let hc_slot = matcher_group_hook_push_slot(group_slot);
+                        if hc_slot == 0 { continue; };
+                        // DEFECT: normalizeHandler returns HookHandlerConfig | null and push is conditional — slot is pre-allocated; a null result must roll the slot back (fix phase).
+                        if normalizeHandler(h_node, hc_slot) != 0 {
+                            matcher_group_hook_pop(group_slot);
+                        };
+                    }
+                };
+            };
+        }
+    }
+}
+
+// TS: function normalizeHandler(h: unknown): HookHandlerConfig | null {
+//   if (!h || typeof h !== "object" || Array.isArray(h)) return null;
+//   const r = h as Record<string, unknown>;
+//   if (r.type === "command" && typeof r.command === "string") {
+//     // Codex parity: platform override wins on Windows (hook_config.rs command_windows).
+//     const commandWindows = typeof r.commandWindows === "string" ? r.commandWindows
+//       : (typeof r.command_windows === "string" ? String(r.command_windows) : undefined);
+//     return {
+//       type: "command",
+//       command: r.command,
+//       ...(commandWindows ? { commandWindows } : {}),
+//       ...(typeof r.timeout === "number" ? { timeout: r.timeout } : {}),
+//       ...(typeof r.statusMessage === "string" ? { statusMessage: r.statusMessage } : {}),
+//     };
+//   }
+//   if (r.type === "mcp_tool" && typeof r.server === "string" && typeof r.tool === "string") {
+//     const input = (r.input && typeof r.input === "object" && !Array.isArray(r.input)
+//       ? (r.input as Record<string, unknown>) : {});
+//     // Codex parity: MCP hook input must be TOML-representable -> reject null anywhere.
+//     if (containsNull(input)) return null;
+//     return {
+//       type: "mcp_tool",
+//       server: r.server, tool: r.tool, input,
+//       ...(typeof r.timeout === "number" ? { timeout: r.timeout } : {}),
+//       ...(typeof r.statusMessage === "string" ? { statusMessage: r.statusMessage } : {}),
+//     };
+//   }
+//   if (r.type === "prompt") return { type: "prompt" };
+//   if (r.type === "agent") return { type: "agent" };
+//   return null;
+// }
+// Returns 0 on success (out filled), 1 for the TS `null` result.
+// DEFECT: dynamic object — unknown/Record dispatch via JSON node kinds.
+// DEFECT: conditional spread fields in object literals — has_* flags.
+// DEFECT: String(r.command_windows) coercion of an arbitrary value — only
+// the string case is read; non-string command_windows values are dropped
+// (TS would stringify numbers/booleans).
+fn normalizeHandler(h_node: u64, out: &HookHandlerConfig) -> i32 {
+    if h_node == 0 { return 1; };
+    if sa_json_kind_of(h_node) != 3 { return 1; };
+    let t_ptr: ptr = PTR_NULL();
+    let t_len: u64 = 0;
+    if sa_json_object_get_string(h_node, STR_PTR("type"), STR_LEN("type"), &t_ptr, &t_len) != 0 { return 1; };
+    if bytes_eq(t_ptr, t_len, STR_PTR("command"), STR_LEN("command")) {
+        let cmd_ptr: ptr = PTR_NULL();
+        let cmd_len: u64 = 0;
+        if sa_json_object_get_string(h_node, STR_PTR("command"), STR_LEN("command"), &cmd_ptr, &cmd_len) != 0 { return 1; };
+        out.type_code = 0;
+        out.command_ptr = cmd_ptr;
+        out.command_len = cmd_len;
+        // commandWindows ?? command_windows
+        let cw_ptr: ptr = PTR_NULL();
+        let cw_len: u64 = 0;
+        if sa_json_object_get_string(h_node, STR_PTR("commandWindows"), STR_LEN("commandWindows"), &cw_ptr, &cw_len) == 0 {
+            out.commandWindows_ptr = cw_ptr;
+            out.commandWindows_len = cw_len;
+            out.has_commandWindows = true;
+        } else {
+            if sa_json_object_get_string(h_node, STR_PTR("command_windows"), STR_LEN("command_windows"), &cw_ptr, &cw_len) == 0 {
+                out.commandWindows_ptr = cw_ptr;
+                out.commandWindows_len = cw_len;
+                out.has_commandWindows = true;
+            };
+        };
+        hook_handler_copy_optionals(h_node, out);
+        return 0;
+    };
+    if bytes_eq(t_ptr, t_len, STR_PTR("mcp_tool"), STR_LEN("mcp_tool")) {
+        let s_ptr: ptr = PTR_NULL();
+        let s_len: u64 = 0;
+        let tl_ptr: ptr = PTR_NULL();
+        let tl_len: u64 = 0;
+        if sa_json_object_get_string(h_node, STR_PTR("server"), STR_LEN("server"), &s_ptr, &s_len) != 0 { return 1; };
+        if sa_json_object_get_string(h_node, STR_PTR("tool"), STR_LEN("tool"), &tl_ptr, &tl_len) != 0 { return 1; };
+        let input_node: u64 = 0;
+        let raw_input: u64 = 0;
+        if sa_json_object_get(h_node, STR_PTR("input"), STR_LEN("input"), &raw_input) == 0 {
+            if sa_json_kind_of(raw_input) == 3 { input_node = raw_input; };
+        };
+        if input_node == 0 { input_node = sa_json_empty_object(); };
+        if containsNull(input_node) { return 1; };
+        out.type_code = 1;
+        out.server_ptr = s_ptr;
+        out.server_len = s_len;
+        out.tool_ptr = tl_ptr;
+        out.tool_len = tl_len;
+        out.input_node = input_node;
+        hook_handler_copy_optionals(h_node, out);
+        return 0;
+    };
+    if bytes_eq(t_ptr, t_len, STR_PTR("prompt"), STR_LEN("prompt")) { out.type_code = 2; return 0; };
+    if bytes_eq(t_ptr, t_len, STR_PTR("agent"), STR_LEN("agent")) { out.type_code = 3; return 0; };
+    return 1;
+}
+
+// Shared tail of the command/mcp_tool branches: timeout + statusMessage.
+// DEFECT: `typeof r.timeout === "number"` — JSON number node read as f64;
+// TS keeps the raw JS number (could be non-finite); f64 field approximates.
+fn hook_handler_copy_optionals(h_node: u64, out: &HookHandlerConfig) -> void {
+    let to_node: u64 = 0;
+    if sa_json_object_get(h_node, STR_PTR("timeout"), STR_LEN("timeout"), &to_node) == 0 {
+        if sa_json_kind_of(to_node) == 4 {
+            out.timeout_s = sa_json_number_f64(to_node);
+            out.has_timeout = true;
+        };
+    };
+    let sm_ptr: ptr = PTR_NULL();
+    let sm_len: u64 = 0;
+    if sa_json_object_get_string(h_node, STR_PTR("statusMessage"), STR_LEN("statusMessage"), &sm_ptr, &sm_len) == 0 {
+        out.statusMessage_ptr = sm_ptr;
+        out.statusMessage_len = sm_len;
+        out.has_statusMessage = true;
+    };
+}
+
+// TS: function containsNull(v: unknown): boolean {
+//   if (v === null) return true;
+//   if (Array.isArray(v)) return v.some(containsNull);
+//   if (v && typeof v === "object") return Object.values(v as Record<string, unknown>).some(containsNull);
+//   return false;
+// }
+// DEFECT: recursion over an `unknown` dynamic value + Array.some/Object.
+// values with a function argument (higher-order) — approximated by explicit
+// recursion over JSON node kinds (null=0 kind code in this approximation:
+// sa_json_kind_of returns 5 for null).
+// DEFECT: closure — containsNull passed as a callback to .some(); inlined
+// as direct recursion here.
+fn containsNull(v_node: u64) -> bool {
+    let kind = sa_json_kind_of(v_node);
+    if kind == 5 { return true; };
+    if kind == 2 {
+        let n = sa_json_array_len(v_node);
+        for i in 0..n {
+            let el: u64 = 0;
+            if sa_json_array_get(v_node, i, &el) == 0 {
+                if containsNull(el) { return true; };
+            };
+        }
+        return false;
+    };
+    if kind == 3 {
+        let n = sa_json_object_len(v_node);
+        for i in 0..n {
+            let val: u64 = 0;
+            if sa_json_object_value_at(v_node, i, &val) == 0 {
+                if containsNull(val) { return true; };
+            };
+        }
+        return false;
+    };
+    return false;
+}
+
+// TS: /** Canonicalize event names: PreToolUse/pre_tool_use/pretooluse all map. */
+// TS: function canonicalEventName(k: string): HookEventName | null {
+//   const n = k.trim().toLowerCase().replace(/[_\-\s]/g, "");
+//   for (const name of HOOK_EVENT_NAMES) {
+//     if (name.toLowerCase().replace(/[_\-\s]/g, "") === n) return name;
+//   }
+//   return null;
+// }
+// Returns the event code 0..11, or 12 for the TS `null` result.
+// DEFECT: RegExp replace /[_\-\s]/g + toLowerCase string pipeline — hand
+// byte loop: lowercase ASCII and drop '_' / '-' / whitespace while copying.
+fn canonicalEventName(k_ptr: ptr, k_len: u64, norm: &ByteBuf) -> u64 {
+    buf_reset(norm);
+    // n = normalised k
+    let n_len: u64 = 0;
+    // trim first (TS trims before lowercasing/stripping)
+    let lo: u64 = 0;
+    let hi: u64 = k_len;
+    while lo < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, k_ptr, lo);
+        if c != 32 {
+            if c != 9 {
+                if c != 10 {
+                    if c != 13 { break; };
+                };
+            };
+        };
+        lo = lo + 1;
+    }
+    while hi > lo {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, k_ptr, hi - 1);
+        if c != 32 {
+            if c != 9 {
+                if c != 10 {
+                    if c != 13 { break; };
+                };
+            };
+        };
+        hi = hi - 1;
+    }
+    for i in lo..hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, k_ptr, i);
+        if c == 95 { continue; };
+        if c == 45 { continue; };
+        if c == 32 { continue; };
+        if c == 9 { continue; };
+        if c == 10 { continue; };
+        if c == 13 { continue; };
+        if c >= 65 {
+            if c <= 90 { c = c + 32; };
+        };
+        buf_append_byte(norm, c);
+        n_len = n_len + 1;
+    }
+    // compare against each canonical name normalised the same way
+    for idx in 0..12 {
+        let name_len: u64 = 0;
+        let name_ptr = HOOK_EVENT_NAMES_at(idx, &name_len);
+        let cand: u64 = 0;
+        let cand_len: u64 = 0;
+        for j in 0..name_len {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, name_ptr, j);
+            if c >= 65 {
+                if c <= 90 { c = c + 32; };
+            };
+            if cand_len < n_len {
+                let want: u8 = 0;
+                PTR_BYTE_AT(want, buf_ptr(norm), cand_len);
+                if want != c { cand = 999; };
+            };
+            cand_len = cand_len + 1;
+        }
+        if cand == 0 {
+            if cand_len == n_len { return idx; };
+        };
+    }
+    return 12;
+}
+
+// TS: function parseTomlScalar(text: string): unknown { ...recursive... }
+// Handles: "true"/"false", quoted strings (via a JSON.parse re-escape
+// trick), integers/floats via /^-?\d+$/ and /^-?\d*\.\d+$/ + Number(t),
+// [arrays] with a hand-written depth/quote-aware comma splitter that
+// recurses, and {inline tables} split on "," with key = scalar pairs.
+// Returns a JSON node handle representing the parsed value.
+// DEFECT: dynamic value — `unknown` return (bool/string/number/array/
+// object) has no SLA type; JSON node handle used throughout.
+// DEFECT: RegExp numeric tests /^-?\d+$/ etc. — hand byte scans.
+// DEFECT: try/catch around JSON.parse(`"${...}"`) for escape decoding —
+// approximated by sa_json_parse of a rebuilt quoted string; the TS catch
+// fallback (raw inner text) is taken when the parse fails.
+// DEFECT: string index access inner[i]/inner[i-1] and char-by-char state
+// machine (quote/depth) — byte loop over (ptr,len); the TS splitter does
+// not handle escaped quotes inside single-quoted strings beyond the
+// previous-char backslash check, preserved here.
+fn parseTomlScalar(text_ptr: ptr, text_len: u64) -> u64 {
+    // t = text.trim()
+    let lo: u64 = 0;
+    let hi: u64 = text_len;
+    while lo < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, text_ptr, lo);
+        if c != 32 {
+            if c != 9 {
+                if c != 10 {
+                    if c != 13 { break; };
+                };
+            };
+        };
+        lo = lo + 1;
+    }
+    while hi > lo {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, text_ptr, hi - 1);
+        if c != 32 {
+            if c != 9 {
+                if c != 10 {
+                    if c != 13 { break; };
+                };
+            };
+        };
+        hi = hi - 1;
+    }
+    let t_ptr = ptr_add(text_ptr, lo);
+    let t_len = hi - lo;
+    if bytes_eq(t_ptr, t_len, STR_PTR("true"), STR_LEN("true")) { return sa_json_bool(true); };
+    if bytes_eq(t_ptr, t_len, STR_PTR("false"), STR_LEN("false")) { return sa_json_bool(false); };
+    if t_len >= 2 {
+        let first: u8 = 0;
+        let last: u8 = 0;
+        PTR_BYTE_AT(first, t_ptr, 0);
+        PTR_BYTE_AT(last, t_ptr, t_len - 1);
+        if first == 34 {
+            if last == 34 { return parse_toml_quoted(t_ptr, t_len); };
+        };
+        if first == 39 {
+            if last == 39 { return parse_toml_quoted(t_ptr, t_len); };
+        };
+        if toml_is_int(t_ptr, t_len) { return sa_json_number_parse(t_ptr, t_len); };
+        if toml_is_float(t_ptr, t_len) { return sa_json_number_parse(t_ptr, t_len); };
+        if first == 91 {
+            if last == 93 { return parse_toml_array(t_ptr, t_len); };
+        };
+        if first == 123 {
+            if last == 125 { return parse_toml_inline_table(t_ptr, t_len); };
+        };
+    };
+    // bare string fallback: return t itself
+    return sa_json_string(t_ptr, t_len);
+}
+
+// Quoted-scalar branch of parseTomlScalar (split out only because SLA has
+// no closures to keep it inline; name kept local to this unit).
+// DEFECT: nested function extraction — TS has this inline in parseTomlScalar;
+// SLA fn is file-scope (no behavioural change, logged per brief).
+fn parse_toml_quoted(t_ptr: ptr, t_len: u64) -> u64 {
+    // try JSON.parse("\"" + inner.replace(/\\/g,"\\\\").replace(/"/g,"\\\"") + "\"")
+    // catch -> inner raw
+    let node = sa_json_parse_quoted_inner(t_ptr, t_len);
+    if node != 0 { return node; };
+    return sa_json_string(ptr_add(t_ptr, 1), t_len - 2);
+}
+
+fn toml_is_int(p: ptr, l: u64) -> bool {
+    let i: u64 = 0;
+    if l == 0 { return false; };
+    let c0: u8 = 0;
+    PTR_BYTE_AT(c0, p, 0);
+    if c0 == 45 { i = 1; };
+    if i >= l { return false; };
+    while i < l {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, i);
+        if c < 48 { return false; };
+        if c > 57 { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn toml_is_float(p: ptr, l: u64) -> bool {
+    // /^-?\d*\.\d+$/
+    let i: u64 = 0;
+    let c0: u8 = 0;
+    if l == 0 { return false; };
+    PTR_BYTE_AT(c0, p, 0);
+    if c0 == 45 { i = 1; };
+    let digits_before: u64 = 0;
+    while i < l {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, i);
+        if c < 48 { break; };
+        if c > 57 { break; };
+        i = i + 1;
+        digits_before = digits_before + 1;
+    }
+    if i >= l { return false; };
+    let dot: u8 = 0;
+    PTR_BYTE_AT(dot, p, i);
+    if dot != 46 { return false; };
+    i = i + 1;
+    let digits_after: u64 = 0;
+    while i < l {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, i);
+        if c < 48 { return false; };
+        if c > 57 { return false; };
+        i = i + 1;
+        digits_after = digits_after + 1;
+    }
+    if digits_after == 0 { return false; };
+    return true;
+}
+
+// [ ... ] branch: depth/quote-aware comma split, recursive parseTomlScalar
+// per part (TS: parts.map((p) => parseTomlScalar(p.trim()))).
+// DEFECT: Array.map with arrow closure — explicit loop + array node append.
+fn parse_toml_array(t_ptr: ptr, t_len: u64) -> u64 {
+    let arr = sa_json_array_new();
+    if t_len <= 2 { return arr; };
+    let inner_ptr = ptr_add(t_ptr, 1);
+    let inner_len = t_len - 2;
+    // inner.trim() emptiness handled by the loop emitting no parts.
+    let cur_lo: u64 = 0;
+    let depth: i32 = 0;
+    let quote: u8 = 0;
+    let has_quote = false;
+    let i: u64 = 0;
+    while i < inner_len {
+        let ch: u8 = 0;
+        PTR_BYTE_AT(ch, inner_ptr, i);
+        if has_quote {
+            if ch == quote {
+                let prev: u8 = 0;
+                if i > 0 { PTR_BYTE_AT(prev, inner_ptr, i - 1); };
+                if prev != 92 { has_quote = false; };
+            };
+            i = i + 1;
+            continue;
+        };
+        if ch == 34 { has_quote = true; quote = ch; i = i + 1; continue; };
+        if ch == 39 { has_quote = true; quote = ch; i = i + 1; continue; };
+        if ch == 91 { depth = depth + 1; };
+        if ch == 123 { depth = depth + 1; };
+        if ch == 93 { depth = depth - 1; };
+        if ch == 125 { depth = depth - 1; };
+        if ch == 44 {
+            if depth == 0 {
+                let part = parseTomlScalar(ptr_add(inner_ptr, cur_lo), i - cur_lo);
+                sa_json_array_push(arr, part);
+                cur_lo = i + 1;
+            };
+        };
+        i = i + 1;
+    }
+    // trailing part: TS pushes cur only if cur.trim() is non-empty.
+    if slice_nonempty_trimmed(inner_ptr, cur_lo, inner_len) {
+        let part = parseTomlScalar(ptr_add(inner_ptr, cur_lo), inner_len - cur_lo);
+        sa_json_array_push(arr, part);
+    };
+    return arr;
+}
+
+// { ... } inline-table branch: split inner on "," (NOT depth-aware in TS),
+// each segment split at the first "=", key unquoted, value recursive.
+// DEFECT: try/catch around the whole branch returning the raw string t on
+// error — SLA parse helpers do not throw; malformed segments are skipped
+// exactly as the TS `eq < 0 -> continue` path, the catch-all is lost.
+fn parse_toml_inline_table(t_ptr: ptr, t_len: u64) -> u64 {
+    let obj = sa_json_object_new();
+    if t_len <= 2 { return obj; };
+    let inner_ptr = ptr_add(t_ptr, 1);
+    let inner_len = t_len - 2;
+    if !slice_nonempty_trimmed(inner_ptr, 0, inner_len) { return obj; };
+    let seg_lo: u64 = 0;
+    let i: u64 = 0;
+    while i <= inner_len {
+        let at_end = false;
+        if i == inner_len { at_end = true; };
+        let ch: u8 = 0;
+        if !at_end { PTR_BYTE_AT(ch, inner_ptr, i); };
+        if at_end {
+            toml_inline_table_segment(obj, inner_ptr, seg_lo, i);
+        } else {
+            if ch == 44 {
+                toml_inline_table_segment(obj, inner_ptr, seg_lo, i);
+                seg_lo = i + 1;
+            };
+        };
+        i = i + 1;
+    }
+    return obj;
+}
+
+fn toml_inline_table_segment(obj: u64, inner_ptr: ptr, lo: u64, hi: u64) -> void {
+    // eq = seg.indexOf("="); if (eq < 0) continue;
+    let eq: u64 = hi;
+    let i = lo;
+    while i < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, inner_ptr, i);
+        if c == 61 { eq = i; break; };
+        i = i + 1;
+    }
+    if eq == hi { return; };
+    // key = seg.slice(0, eq).trim().replace(/^["']|["']$/g, "")
+    let key_node = toml_unquote_key(inner_ptr, lo, eq);
+    let val = parseTomlScalar(ptr_add(inner_ptr, eq + 1), hi - eq - 1);
+    sa_json_object_set_node(obj, key_node, val);
+}
+
+// key unquoting shared by parseTomlHooks/ensurePath segments:
+// trim, then strip one leading and one trailing quote char if present
+// (TS regex /^["']|["']$/g strips each end independently).
+fn toml_unquote_key(p: ptr, lo: u64, hi: u64) -> u64 {
+    let a = lo;
+    let b = hi;
+    while a < b {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, a);
+        if c != 32 {
+            if c != 9 { break; };
+        };
+        a = a + 1;
+    }
+    while b > a {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, b - 1);
+        if c != 32 {
+            if c != 9 { break; };
+        };
+        b = b - 1;
+    }
+    if a < b {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, a);
+        if c == 34 { a = a + 1; } else {
+            if c == 39 { a = a + 1; };
+        };
+    };
+    if b > a {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, b - 1);
+        if c == 34 { b = b - 1; } else {
+            if c == 39 { b = b - 1; };
+        };
+    };
+    return sa_json_string(ptr_add(p, a), b - a);
+}
+
+fn slice_nonempty_trimmed(p: ptr, lo: u64, hi: u64) -> bool {
+    let i = lo;
+    while i < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, i);
+        if c != 32 {
+            if c != 9 {
+                if c != 10 {
+                    if c != 13 { return true; };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// TS: function ensurePath(root: Record<string, unknown>, path: string[], isArray: boolean): Record<string, unknown> {
+//   let node = root;
+//   for (let i = 0; i < path.length - 1; i++) {
+//     const k = path[i]!;
+//     let nxt = node[k] as unknown;
+//     if (!nxt || typeof nxt !== "object" || Array.isArray(nxt)) { nxt = {}; node[k] = nxt; }
+//     node = nxt as Record<string, unknown>;
+//   }
+//   const last = path[path.length - 1]!;
+//   if (isArray) {
+//     let arr = node[last] as unknown;
+//     if (!Array.isArray(arr)) { arr = []; node[last] = arr; }
+//     const el: Record<string, unknown> = {};
+//     (arr as unknown[]).push(el);
+//     return el;
+//   }
+//   let leaf = node[last] as unknown;
+//   if (!leaf || typeof leaf !== "object" || Array.isArray(leaf)) { leaf = {}; node[last] = leaf; }
+//   return leaf as Record<string, unknown>;
+// }
+// Path segments arrive as JSON node handles in path_nodes[0..path_len).
+// DEFECT: dynamic object — Record<string, unknown> tree mutation via string
+// keys; approximated over JSON object nodes (sa_json_object_get/set_node).
+// DEFECT: non-null assertion path[i]! — SLA indexing of the segment array
+// is unchecked here in the same way (bounds are the caller's contract).
+fn ensurePath(root_node: u64, path_nodes: &u64, path_len: u64, isArray: bool) -> u64 {
+    let node = root_node;
+    let i: u64 = 0;
+    while i + 1 < path_len {
+        let k_node = ptr_u64_load(path_nodes, i);
+        let nxt: u64 = 0;
+        let found = sa_json_object_get_node_by_node(node, k_node, &nxt);
+        if found != 0 { nxt = 0; };
+        if nxt == 0 { nxt = sa_json_object_new(); sa_json_object_set_node_by_node(node, k_node, nxt); } else {
+            if sa_json_kind_of(nxt) != 3 { nxt = sa_json_object_new(); sa_json_object_set_node_by_node(node, k_node, nxt); };
+        };
+        node = nxt;
+        i = i + 1;
+    }
+    let last_node = ptr_u64_load(path_nodes, path_len - 1);
+    if isArray {
+        let arr: u64 = 0;
+        if sa_json_object_get_node_by_node(node, last_node, &arr) != 0 { arr = 0; };
+        if arr == 0 { arr = sa_json_array_new(); sa_json_object_set_node_by_node(node, last_node, arr); } else {
+            if sa_json_kind_of(arr) != 2 { arr = sa_json_array_new(); sa_json_object_set_node_by_node(node, last_node, arr); };
+        };
+        let el = sa_json_object_new();
+        sa_json_array_push(arr, el);
+        return el;
+    };
+    let leaf: u64 = 0;
+    if sa_json_object_get_node_by_node(node, last_node, &leaf) != 0 { leaf = 0; };
+    if leaf == 0 { leaf = sa_json_object_new(); sa_json_object_set_node_by_node(node, last_node, leaf); } else {
+        if sa_json_kind_of(leaf) != 3 { leaf = sa_json_object_new(); sa_json_object_set_node_by_node(node, last_node, leaf); };
+    };
+    return leaf;
+}
+
+// TS: /** Minimal TOML subset for hooks: [table] / [[array]] + key = value. Never throws. */
+// TS: function parseTomlHooks(text: string): Record<string, unknown> {
+//   const root: Record<string, unknown> = {};
+//   let cur: Record<string, unknown> = root;
+//   for (const rawLine of text.split(/\r?\n/)) {
+//     const line = rawLine.split(/(^|[^\\])#/)[0]?.trim() ?? "";
+//     if (!line) continue;
+//     const arrHead = line.match(/^\[\[\s*([^\]]+?)\s*\]\]$/);
+//     const tblHead = line.match(/^\[\s*([^\]]+?)\s*\]$/);
+//     if (arrHead) {
+//       const path = arrHead[1]!.trim().split(".").map((s) => s.trim().replace(/^["']|["']$/g, ""));
+//       if (!path.length) continue;
+//       cur = ensurePath(root, path, true);
+//       continue;
+//     }
+//     if (tblHead) { ...same with ensurePath(root, path, false)... }
+//     const eq = line.indexOf("=");
+//     if (eq < 0) continue;
+//     const key = line.slice(0, eq).trim().replace(/^["']|["']$/g, "");
+//     if (!key || key.includes(".")) continue;
+//     try { cur[key] = parseTomlScalar(line.slice(eq + 1).trim()); } catch { /* skip bad value */ }
+//   }
+//   return root;
+// }
+// DEFECT: RegExp — split(/\r?\n/), split(/(^|[^\\])#/) comment stripping,
+// and the two header match regexes have no sa_std counterpart; hand byte
+// scans below (comment rule: a '#' at start or preceded by a non-backslash
+// char ends the line, exactly the TS regex split semantics).
+// DEFECT: dynamic object — root/cur are JSON object nodes.
+// DEFECT: optional chaining `?.` + nullish `?? ""` on the split result —
+// the scan always yields a (possibly empty) line slice.
+// DEFECT: try/catch "skip bad value" — parseTomlScalar cannot throw in
+// SLA; the catch path is unrepresentable and dropped.
+// DEFECT: closure — .map((s) => ...) unquoting of path segments inlined
+// into toml_split_path.
+fn parseTomlHooks(text_ptr: ptr, text_len: u64) -> u64 {
+    let root = sa_json_object_new();
+    let cur = root;
+    let line_lo: u64 = 0;
+    let pos: u64 = 0;
+    while pos <= text_len {
+        let at_end = false;
+        if pos == text_len { at_end = true; };
+        let ch: u8 = 0;
+        if !at_end { PTR_BYTE_AT(ch, text_ptr, pos); };
+        let is_nl = false;
+        if ch == 10 { is_nl = true; };
+        if at_end { cur = parse_toml_hooks_line(root, cur, text_ptr, line_lo, pos); line_lo = pos; } else {
+            if is_nl {
+                cur = parse_toml_hooks_line(root, cur, text_ptr, line_lo, pos);
+                line_lo = pos + 1;
+            };
+        };
+        pos = pos + 1;
+    }
+    return root;
+}
+
+// One raw line of parseTomlHooks (extracted: SLA has no closures / no
+// continue-to-outer-loop; returns the new `cur` node).
+// DEFECT: nested function extraction — TS keeps this inline in the loop.
+fn parse_toml_hooks_line(root: u64, cur_in: u64, text_ptr: ptr, raw_lo: u64, raw_hi: u64) -> u64 {
+    let cur = cur_in;
+    // strip trailing \r (from /\r?\n/ split)
+    let hi = raw_hi;
+    if hi > raw_lo {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, text_ptr, hi - 1);
+        if c == 13 { hi = hi - 1; };
+    };
+    // comment split: cut at first '#' that is at start or after a non-'\' char
+    let end = hi;
+    let i = raw_lo;
+    while i < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, text_ptr, i);
+        if c == 35 {
+            if i == raw_lo { end = i; break; };
+            let prev: u8 = 0;
+            PTR_BYTE_AT(prev, text_ptr, i - 1);
+            if prev != 92 { end = i; break; };
+        };
+        i = i + 1;
+    }
+    // trim
+    let lo = raw_lo;
+    let b = end;
+    while lo < b {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, text_ptr, lo);
+        if c != 32 {
+            if c != 9 {
+                if c != 13 { break; };
+            };
+        };
+        lo = lo + 1;
+    }
+    while b > lo {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, text_ptr, b - 1);
+        if c != 32 {
+            if c != 9 {
+                if c != 13 { break; };
+            };
+        };
+        b = b - 1;
+    }
+    if lo >= b { return cur; };
+    let line_ptr = ptr_add(text_ptr, lo);
+    let line_len = b - lo;
+    // [[path]] header?
+    if line_len >= 4 {
+        let c0: u8 = 0;
+        let c1: u8 = 0;
+        let cl: u8 = 0;
+        let cl2: u8 = 0;
+        PTR_BYTE_AT(c0, line_ptr, 0);
+        PTR_BYTE_AT(c1, line_ptr, 1);
+        PTR_BYTE_AT(cl, line_ptr, line_len - 1);
+        PTR_BYTE_AT(cl2, line_ptr, line_len - 2);
+        if c0 == 91 {
+            if c1 == 91 {
+                if cl == 93 {
+                    if cl2 == 93 {
+                        let path_buf: u64 = 0;
+                        let path_len = toml_split_path(ptr_add(line_ptr, 2), line_len - 4, &path_buf);
+                        if path_len == 0 { return cur; };
+                        return ensurePath(root, path_buf, path_len, true);
+                    };
+                };
+            };
+        };
+        if c0 == 91 {
+            if cl == 93 {
+                let path_buf: u64 = 0;
+                let path_len = toml_split_path(ptr_add(line_ptr, 1), line_len - 2, &path_buf);
+                if path_len == 0 { return cur; };
+                return ensurePath(root, path_buf, path_len, false);
+            };
+        };
+    };
+    // key = value
+    let eq: u64 = line_len;
+    let j: u64 = 0;
+    while j < line_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, line_ptr, j);
+        if c == 61 { eq = j; break; };
+        j = j + 1;
+    }
+    if eq == line_len { return cur; };
+    // key: trimmed + unquoted; empty or containing '.' -> skip
+    if slice_has_byte(line_ptr, 0, eq, 46) {
+        // NOTE: TS tests the *trimmed/unquoted* key for '.'; the scan here
+        // covers the raw slice (superset) — divergence logged.
+        // DEFECT: string includes(".") on the processed key — approximated on the raw slice.
+        return cur;
+    };
+    let key_node = toml_unquote_key(line_ptr, 0, eq);
+    if sa_json_string_len(key_node) == 0 { return cur; };
+    let val = parseTomlScalar(ptr_add(line_ptr, eq + 1), line_len - eq - 1);
+    sa_json_object_set_node_by_node(cur, key_node, val);
+    return cur;
+}
+
+// Split a dotted header path on '.', trim + unquote each segment; writes
+// segment string-node handles into out_nodes, returns the segment count.
+fn toml_split_path(p: ptr, l: u64, out_nodes: &u64) -> u64 {
+    let n: u64 = 0;
+    let seg_lo: u64 = 0;
+    let i: u64 = 0;
+    while i <= l {
+        let at_end = false;
+        if i == l { at_end = true; };
+        let ch: u8 = 0;
+        if !at_end { PTR_BYTE_AT(ch, p, i); };
+        if at_end {
+            let seg = toml_unquote_key(p, seg_lo, i);
+            ptr_u64_store(out_nodes, n, seg);
+            n = n + 1;
+        } else {
+            if ch == 46 {
+                let seg = toml_unquote_key(p, seg_lo, i);
+                ptr_u64_store(out_nodes, n, seg);
+                n = n + 1;
+                seg_lo = i + 1;
+            };
+        };
+        i = i + 1;
+    }
+    return n;
+}
+
+fn slice_has_byte(p: ptr, lo: u64, hi: u64, want: u8) -> bool {
+    let i = lo;
+    while i < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, i);
+        if c == want { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// TS: function normalizeEventsTolerant(raw: unknown): HookEvents {
+//   const ev = normalizeEvents(raw);
+//   if (Object.keys(ev).length) return ev;
+//   // Case-insensitive retry: remap keys like pre_tool_use / hooks.pre_tool_use.
+//   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return ev;
+//   const rec = raw as Record<string, unknown>;
+//   const body = rec.hooks && typeof rec.hooks === "object" && !Array.isArray(rec.hooks)
+//     ? (rec.hooks as Record<string, unknown>) : rec;
+//   // Also unwrap single "hooks" TOML table nesting: {hooks:{PreToolUse:[...]}}
+//   const remapped: Record<string, unknown> = {};
+//   for (const [k, v] of Object.entries(body)) {
+//     const canon = canonicalEventName(k);
+//     if (canon) remapped[canon] = v;
+//   }
+//   if (!Object.keys(remapped).length) return ev;
+//   return normalizeEvents(remapped);
+// }
+// DEFECT: dynamic object — Object.keys/Object.entries over a dynamic
+// record; approximated via sa_json_object_len / key iteration and a rebuilt
+// remapped JSON object node.
+fn normalizeEventsTolerant(raw_node: u64, out: &HookEvents) -> void {
+    normalizeEvents(raw_node, out);
+    if hook_events_any(out) { return; };
+    if raw_node == 0 { return; };
+    if sa_json_kind_of(raw_node) != 3 { return; };
+    let body_node = raw_node;
+    let hooks_node: u64 = 0;
+    if sa_json_object_get(raw_node, STR_PTR("hooks"), STR_LEN("hooks"), &hooks_node) == 0 {
+        if sa_json_kind_of(hooks_node) == 3 { body_node = hooks_node; };
+    };
+    let remapped = sa_json_object_new();
+    let any = false;
+    let n = sa_json_object_len(body_node);
+    let norm: u64 = 0;
+    let norm_buf = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    // DEFECT: ByteBuf literal capacity 4096 for canonical names — TS strings are unbounded; names here are short header keys.
+    for i in 0..n {
+        let k_ptr: ptr = PTR_NULL();
+        let k_len: u64 = 0;
+        let v_node: u64 = 0;
+        if sa_json_object_entry_at(body_node, i, &k_ptr, &k_len, &v_node) != 0 { continue; };
+        let canon = canonicalEventName(k_ptr, k_len, &norm_buf);
+        if canon < 12 {
+            let cn_len: u64 = 0;
+            let cn_ptr = HOOK_EVENT_NAMES_at(canon, &cn_len);
+            sa_json_object_set(remapped, cn_ptr, cn_len, v_node);
+            any = true;
+        };
+        norm = norm + 0;
+    }
+    if !any { return; };
+    normalizeEvents(remapped, out);
+}
+
+// TS: function parseHookFile(text: string, path: string): HookEvents {
+//   try {
+//     if (path.endsWith(".toml")) {
+//       const parsed = parseTomlHooks(text);
+//       // config.toml nests under [hooks.*]: unwrap one level if present.
+//       const maybeHooks = (parsed as Record<string, unknown>).hooks;
+//       const doc = maybeHooks && typeof maybeHooks === "object" && !Array.isArray(maybeHooks)
+//         ? { ...(parsed as Record<string, unknown>), ...(maybeHooks as Record<string, unknown>), hooks: maybeHooks }
+//         : parsed;
+//       return normalizeEventsTolerant(maybeHooks ?? doc);
+//     }
+//     const parsed = JSON.parse(text) as unknown;
+//     return normalizeEventsTolerant(parsed);
+//   } catch { return {}; }
+// }
+// DEFECT: try/catch — JSON.parse failure returns {}; SLA parse returns a
+// status, approximated by checking sa_json_parse status (no exceptions).
+// DEFECT: object spread merge { ...parsed, ...maybeHooks, hooks: maybeHooks }
+// — the merged `doc` is only used via `maybeHooks ?? doc`, and maybeHooks is
+// defined exactly when doc would carry extra keys; approximated by passing
+// maybeHooks when present, else parsed (the spread-only keys are lost).
+// DEFECT: string endsWith(".toml") — byte suffix compare.
+fn parseHookFile(text_ptr: ptr, text_len: u64, path_ptr: ptr, path_len: u64, out: &HookEvents) -> void {
+    hook_events_reset(out);
+    if path_len >= 5 {
+        let is_toml = bytes_eq(ptr_add(path_ptr, path_len - 5), 5, STR_PTR(".toml"), STR_LEN(".toml"));
+        if is_toml {
+            let parsed = parseTomlHooks(text_ptr, text_len);
+            let maybeHooks: u64 = 0;
+            let has_mh = false;
+            if sa_json_object_get(parsed, STR_PTR("hooks"), STR_LEN("hooks"), &maybeHooks) == 0 {
+                if sa_json_kind_of(maybeHooks) == 3 { has_mh = true; };
+            };
+            if has_mh { normalizeEventsTolerant(maybeHooks, out); return; };
+            normalizeEventsTolerant(parsed, out);
+            return;
+        };
+    };
+    let parsed: u64 = 0;
+    if sa_json_parse(text_ptr, text_len, &parsed) != 0 { return; };
+    normalizeEventsTolerant(parsed, out);
+}
+
+// TS: /** Load hooks from all Codex-parity sources. Never throws.
+//  * Order: user config.toml [hooks.*] -> user hooks.toml/json ->
+//  * project .codex/hooks.toml/json. Missing/unreadable = no hooks. */
+// TS: export async function loadHookEvents(cwd: string, force = false): Promise<HookEvents> {
+//   const now = Date.now();
+//   if (!force && cache && cache.cwd === cwd && now - cache.at < 30_000) return cache.events;
+//   const home = codexHome();
+//   const files: Array<{ path: string; source: HookSource }> = [
+//     { path: join(home, "config.toml"), source: "user" },
+//     { path: join(home, "hooks.toml"), source: "user" },
+//     { path: join(home, "hooks.json"), source: "user" },
+//     ...(cwd ? [
+//       { path: join(cwd, ".codex", "hooks.toml"), source: "project" as HookSource },
+//       { path: join(cwd, ".codex", "hooks.json"), source: "project" as HookSource },
+//     ] : []),
+//   ];
+//   const merged: HookEvents = {};
+//   const seen: Array<{ path: string; source: HookSource }> = [];
+//   const perFile: Array<{ path: string; source: HookSource; events: HookEvents }> = [];
+//   for (const f of files) {
+//     try {
+//       const text = await readFile(f.path, "utf8");
+//       const ev = parseHookFile(text, f.path);
+//       seen.push(f);
+//       perFile.push({ path: f.path, source: f.source, events: ev });
+//       for (const name of HOOK_EVENT_NAMES) {
+//         if (ev[name]?.length) (merged[name] ??= []).push(...ev[name]!);
+//       }
+//     } catch { /* missing/unreadable = no hooks, like Codex */ }
+//   }
+//   cache = { at: now, cwd, events: merged, files: seen, perFile };
+//   return merged;
+// }
+// SLA approximation: synchronous; fills `out` with merged events and updates
+// state.cache; returns 0.
+// DEFECT: async — async/await readFile (node:fs/promises) has no SLA
+// counterpart; synchronous sa_std_fs read used, ordering preserved.
+// DEFECT: Date.now() wall clock / 30_000 ms cache window — approximated by
+// sa_std monotonic/wall extern (fix phase picks the clock); the comparison
+// arithmetic is preserved.
+// DEFECT: conditional spread of the files array `...(cwd ? [...] : [])` —
+// explicit count 3 or 5.
+// DEFECT: try/catch per file (missing/unreadable = skip) — read status code.
+// DEFECT: optional chaining ev[name]?.length, nullish assignment ??= and
+// array spread push (...ev[name]!) — explicit len checks + group copies.
+// DEFECT: module-global cache assignment — state struct passed in.
+fn loadHookEvents(state: &HookModuleState, cwd_ptr: ptr, cwd_len: u64, force: bool, out: &HookEvents) -> i32 {
+    let now = sa_time_now_ms();
+    if !force {
+        if state.has_cache {
+            if bytes_eq(state.cache.cwd_ptr, state.cache.cwd_len, cwd_ptr, cwd_len) {
+                if now - state.cache.at < 30000 {
+                    hook_events_copy(out, &state.cache.events);
+                    return 0;
+                };
+            };
+        };
+    };
+    let home_buf = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    codexHome(&home_buf);
+    // candidate files: home/config.toml, home/hooks.toml, home/hooks.json,
+    // [cwd/.codex/hooks.toml, cwd/.codex/hooks.json]
+    let file_count: u64 = 3;
+    if cwd_len > 0 { file_count = 5; };
+    hook_events_reset(out);
+    state.cache.files_len = 0;
+    state.cache.perFile_len = 0;
+    for fi in 0..file_count {
+        let path_buf = ByteBuf { bytes: [0u8; 4096], len: 0 };
+        let source: u64 = 0;
+        if fi < 3 {
+            buf_append_slice(&path_buf, buf_ptr(&home_buf), 0, home_buf.len);
+            buf_append_lit(&path_buf, STR_PTR("/"), STR_LEN("/"));
+            source = 0;
+        } else {
+            buf_append_slice(&path_buf, cwd_ptr, 0, cwd_len);
+            buf_append_lit(&path_buf, STR_PTR("/.codex/"), STR_LEN("/.codex/"));
+            source = 1;
+        };
+        if fi == 0 { buf_append_lit(&path_buf, STR_PTR("config.toml"), STR_LEN("config.toml")); };
+        if fi == 1 { buf_append_lit(&path_buf, STR_PTR("hooks.toml"), STR_LEN("hooks.toml")); };
+        if fi == 2 { buf_append_lit(&path_buf, STR_PTR("hooks.json"), STR_LEN("hooks.json")); };
+        if fi == 3 { buf_append_lit(&path_buf, STR_PTR("hooks.toml"), STR_LEN("hooks.toml")); };
+        if fi == 4 { buf_append_lit(&path_buf, STR_PTR("hooks.json"), STR_LEN("hooks.json")); };
+        let text_buf = ByteBuf { bytes: [0u8; 262144], len: 0 };
+        // DEFECT: file content buffer capacity 262144 — TS readFile is unbounded.
+        if sa_std_fs_read_file(buf_ptr(&path_buf), path_buf.len, &text_buf) != 0 { continue; };
+        let ev = hook_events_new();
+        // DEFECT: default construction — TS `const ev` is a fresh plain object; hook_events_new() stands in for it (fix phase provides the constructor).
+        parseHookFile(buf_ptr(&text_buf), text_buf.len, buf_ptr(&path_buf), path_buf.len, &ev);
+        hook_cache_push_file(state, buf_ptr(&path_buf), path_buf.len, source);
+        hook_cache_push_per_file(state, buf_ptr(&path_buf), path_buf.len, source, &ev);
+        for name_idx in 0..12 {
+            hook_events_merge_groups(out, &ev, name_idx);
+        }
+    }
+    state.cache.at = now;
+    state.cache.cwd_ptr = cwd_ptr;
+    state.cache.cwd_len = cwd_len;
+    hook_events_copy(&state.cache.events, out);
+    state.has_cache = true;
+    return 0;
+}
+
+// TS: export function hookFilesLoaded(): Array<{ path: string; source: HookSource }> {
+//   return cache?.files ?? [];
+// }
+// SLA approximation: copies cache.files into out arrays, returns count.
+// DEFECT: optional chaining cache?.files + nullish ?? [] — has_cache check;
+// returning the live array reference is approximated by copying refs out.
+fn hookFilesLoaded(state: &HookModuleState, out_paths: &u64, out_lens: &u64, out_sources: &u64) -> u64 {
+    if !state.has_cache { return 0; };
+    let n = state.cache.files_len;
+    for i in 0..n {
+        ptr_u64_store(out_paths, i, ptr_to_u64(state.cache.files[i].path_ptr));
+        ptr_u64_store(out_lens, i, state.cache.files[i].path_len);
+        ptr_u64_store(out_sources, i, state.cache.files[i].source);
+    }
+    return n;
+}
+
+// TS: /** Codex matcher semantics: empty matcher matches all; else regex against tool_name. */
+// TS: export function matcherMatches(matcher: string | undefined, toolName: string): boolean {
+//   if (!matcher || !matcher.trim()) return true;
+//   try {
+//     return new RegExp(matcher).test(toolName);
+//   } catch {
+//     return toolName.includes(matcher);
+//   }
+// }
+// DEFECT: RegExp — new RegExp(matcher).test(toolName) has no sa_std
+// counterpart; approximated by substring search (which is exactly the TS
+// catch fallback, toolName.includes(matcher)). Regex-only matchers
+// (anchors, classes, alternation) will diverge until a regex engine lands.
+// DEFECT: try/catch around RegExp construction — invalid-pattern fallback
+// is the only path taken here.
+fn matcherMatches(has_matcher: bool, matcher_ptr: ptr, matcher_len: u64, toolName_ptr: ptr, toolName_len: u64) -> bool {
+    if !has_matcher { return true; };
+    if !slice_nonempty_trimmed(matcher_ptr, 0, matcher_len) { return true; };
+    return bytes_contains(toolName_ptr, toolName_len, matcher_ptr, matcher_len);
+}
+
+// TS: export function selectHookHandlers(events: HookEvents, eventName: HookEventName, toolName: string): Array<{ group: MatcherGroup; handler: HookHandlerConfig; index: number }> {
+//   const out: Array<{ group: MatcherGroup; handler: HookHandlerConfig; index: number }> = [];
+//   const groups = events[eventName] ?? [];
+//   let order = 0;
+//   for (const g of groups) {
+//     if (!matcherMatches(g.matcher, toolName)) { order += g.hooks.length; continue; }
+//     for (const h of g.hooks) out.push({ group: g, handler: h, index: order++ });
+//   }
+//   return out;
+// }
+// SLA approximation: writes matched (group_slot, handler_slot, index)
+// triples into caller arrays; slots are (events_base, event_name, gi, hi)
+// coordinates resolved by hook_handler_at(). Returns match count.
+// DEFECT: array of anonymous objects {group, handler, index} holding live
+// object references — coordinate tuples used instead of references.
+// DEFECT: dynamic key access events[eventName] + ?? [] — hook_events_len /
+// per-event arrays.
+fn selectHookHandlers(events: &HookEvents, eventName: u64, toolName_ptr: ptr, toolName_len: u64, out_gi: &u64, out_hi: &u64, out_index: &u64) -> u64 {
+    let n: u64 = 0;
+    let order: u64 = 0;
+    let gcount = hook_events_len(events, eventName);
+    for gi in 0..gcount {
+        let g = hook_events_group_at(events, eventName, gi);
+        if !matcherMatches(g.has_matcher, g.matcher_ptr, g.matcher_len, toolName_ptr, toolName_len) {
+            order = order + g.hooks_len;
+            continue;
+        };
+        for hi in 0..g.hooks_len {
+            ptr_u64_store(out_gi, n, gi);
+            ptr_u64_store(out_hi, n, hi);
+            ptr_u64_store(out_index, n, order);
+            order = order + 1;
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+// TS: /** Codex mcp_hook_tool_input parity: tool_input is the resolved JSON args object. */
+// TS: export function mcpHookToolInput(args: unknown): Record<string, unknown> {
+//   if (args && typeof args === "object" && !Array.isArray(args)) return args as Record<string, unknown>;
+//   if (typeof args === "string") {
+//     if (!args.trim()) return {};
+//     try {
+//       const p = JSON.parse(args) as unknown;
+//       if (p && typeof p === "object" && !Array.isArray(p)) return p as Record<string, unknown>;
+//       return { _raw: args };
+//     } catch { return { _raw: args }; }
+//   }
+//   return {};
+// }
+// Returns a JSON object node handle in every path ({} / args / {_raw}).
+// DEFECT: dynamic object — unknown dispatch + object literal { _raw: args }
+// built via the JSON layer.
+// DEFECT: try/catch around JSON.parse — parse status code.
+fn mcpHookToolInput(args_node: u64) -> u64 {
+    let kind = sa_json_kind_of(args_node);
+    if kind == 3 { return args_node; };
+    if kind == 1 {
+        let p: ptr = sa_json_string_ptr(args_node);
+        let l: u64 = sa_json_string_len(args_node);
+        if !slice_nonempty_trimmed(p, 0, l) { return sa_json_empty_object(); };
+        let parsed: u64 = 0;
+        if sa_json_parse(p, l, &parsed) == 0 {
+            if sa_json_kind_of(parsed) == 3 { return parsed; };
+        };
+        let raw_obj = sa_json_object_new();
+        sa_json_object_set_string(raw_obj, STR_PTR("_raw"), STR_LEN("_raw"), p, l);
+        return raw_obj;
+    };
+    return sa_json_empty_object();
+}
+
+// ---------------------------------------------------------------------------
+// TS: export interface HookTemplateCtx extends Record<string, unknown> {
+//   tool_name: string; tool_use_id: string; cwd: string;
+//   session_id: string; turn_id: string; server: string; tool: string;
+//   tool_input: Record<string, unknown>;
+// }
+// DEFECT: interface extending Record<string, unknown> (open index
+// signature) — the known fields are a struct; arbitrary extra keys have no
+// home and are dropped (lookupPath only ever reads the known fields in
+// practice, plus tool_input.* subpaths).
+// DEFECT: dynamic object — tool_input is a JSON node handle.
+struct HookTemplateCtx {
+    tool_name_ptr: ptr, tool_name_len: u64,
+    tool_use_id_ptr: ptr, tool_use_id_len: u64,
+    cwd_ptr: ptr, cwd_len: u64,
+    session_id_ptr: ptr, session_id_len: u64,
+    turn_id_ptr: ptr, turn_id_len: u64,
+    server_ptr: ptr, server_len: u64,
+    tool_ptr: ptr, tool_len: u64,
+    tool_input_node: u64,
+}
+
+// Build the Record view of a HookTemplateCtx as a JSON object node
+// (the TS passes ctx itself where a Record is expected).
+fn hook_template_ctx_to_node(ctx: &HookTemplateCtx) -> u64 {
+    let obj = sa_json_object_new();
+    sa_json_object_set_string(obj, STR_PTR("tool_name"), STR_LEN("tool_name"), ctx.tool_name_ptr, ctx.tool_name_len);
+    sa_json_object_set_string(obj, STR_PTR("tool_use_id"), STR_LEN("tool_use_id"), ctx.tool_use_id_ptr, ctx.tool_use_id_len);
+    sa_json_object_set_string(obj, STR_PTR("cwd"), STR_LEN("cwd"), ctx.cwd_ptr, ctx.cwd_len);
+    sa_json_object_set_string(obj, STR_PTR("session_id"), STR_LEN("session_id"), ctx.session_id_ptr, ctx.session_id_len);
+    sa_json_object_set_string(obj, STR_PTR("turn_id"), STR_LEN("turn_id"), ctx.turn_id_ptr, ctx.turn_id_len);
+    sa_json_object_set_string(obj, STR_PTR("server"), STR_LEN("server"), ctx.server_ptr, ctx.server_len);
+    sa_json_object_set_string(obj, STR_PTR("tool"), STR_LEN("tool"), ctx.tool_ptr, ctx.tool_len);
+    sa_json_object_set_node_key(obj, STR_PTR("tool_input"), STR_LEN("tool_input"), ctx.tool_input_node);
+    return obj;
+}
+
+// TS: function lookupPath(ctx: Record<string, unknown>, path: string): unknown {
+//   const parts = path.split(".");
+//   let cur: unknown = ctx;
+//   for (const p of parts) {
+//     if (!cur || typeof cur !== "object" || Array.isArray(cur)) return undefined;
+//     cur = (cur as Record<string, unknown>)[p];
+//   }
+//   return cur;
+// }
+// Returns the node found, or 0 for the TS `undefined` result.
+// DEFECT: dynamic object — unknown traversal over JSON nodes; `undefined`
+// encoded as node 0.
+fn lookupPath(ctx_node: u64, path_ptr: ptr, path_len: u64) -> u64 {
+    let cur = ctx_node;
+    let seg_lo: u64 = 0;
+    let i: u64 = 0;
+    while i <= path_len {
+        let at_end = false;
+        if i == path_len { at_end = true; };
+        let ch: u8 = 0;
+        if !at_end { PTR_BYTE_AT(ch, path_ptr, i); };
+        if at_end {
+            if sa_json_kind_of(cur) != 3 { return 0; };
+            let nxt: u64 = 0;
+            if sa_json_object_get(cur, ptr_add(path_ptr, seg_lo), i - seg_lo, &nxt) != 0 { return 0; };
+            cur = nxt;
+        } else {
+            if ch == 46 {
+                if sa_json_kind_of(cur) != 3 { return 0; };
+                let nxt: u64 = 0;
+                if sa_json_object_get(cur, ptr_add(path_ptr, seg_lo), i - seg_lo, &nxt) != 0 { return 0; };
+                cur = nxt;
+                seg_lo = i + 1;
+            };
+        };
+        i = i + 1;
+    }
+    return cur;
+}
+
+// TS: function expandTemplateString(s: string, ctx: Record<string, unknown>): string {
+//   return s.replace(/\$\{([^}]+)\}/g, (_, expr: string) => {
+//     const v = lookupPath(ctx, expr.trim());
+//     if (v === undefined || v === null) return "";
+//     if (typeof v === "string") return v;
+//     try { return JSON.stringify(v) ?? ""; } catch { return String(v); }
+//   });
+// }
+// DEFECT: RegExp replace /\$\{([^}]+)\}/g with a replacer callback
+// (closure) — hand scan for "${" ... "}" segments; the callback body is
+// expand_template_expr() below.
+// DEFECT: try/catch + JSON.stringify(v) ?? "" / String(v) fallback —
+// stringify status approximated; String(v) for non-JSON values (functions,
+// symbols — impossible from JSON input) is not reproduced.
+fn expandTemplateString(s_ptr: ptr, s_len: u64, ctx_node: u64, out: &ByteBuf) -> void {
+    buf_reset(out);
+    let i: u64 = 0;
+    while i < s_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, s_ptr, i);
+        let next: u8 = 0;
+        if i + 1 < s_len { PTR_BYTE_AT(next, s_ptr, i + 1); };
+        if c == 36 {
+            if next == 123 {
+                // find closing '}'
+                let j = i + 2;
+                let close: u64 = s_len;
+                while j < s_len {
+                    let cj: u8 = 0;
+                    PTR_BYTE_AT(cj, s_ptr, j);
+                    if cj == 125 { close = j; break; };
+                    j = j + 1;
+                }
+                if close < s_len {
+                    if close > i + 2 {
+                        expand_template_expr(out, ctx_node, ptr_add(s_ptr, i + 2), close - (i + 2));
+                        i = close + 1;
+                        continue;
+                    };
+                };
+            };
+        };
+        buf_append_byte(out, c);
+        i = i + 1;
+    }
+}
+
+// Replacer body of expandTemplateString for one ${expr} segment.
+// DEFECT: nested function extraction — TS inline arrow closure.
+fn expand_template_expr(out: &ByteBuf, ctx_node: u64, expr_ptr: ptr, expr_len: u64) -> void {
+    // expr.trim()
+    let lo: u64 = 0;
+    let hi: u64 = expr_len;
+    while lo < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, expr_ptr, lo);
+        if c != 32 {
+            if c != 9 {
+                if c != 10 {
+                    if c != 13 { break; };
+                };
+            };
+        };
+        lo = lo + 1;
+    }
+    while hi > lo {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, expr_ptr, hi - 1);
+        if c != 32 {
+            if c != 9 {
+                if c != 10 {
+                    if c != 13 { break; };
+                };
+            };
+        };
+        hi = hi - 1;
+    }
+    let v = lookupPath(ctx_node, ptr_add(expr_ptr, lo), hi - lo);
+    if v == 0 { return; };
+    let kind = sa_json_kind_of(v);
+    if kind == 5 { return; };
+    if kind == 1 {
+        let p: ptr = sa_json_string_ptr(v);
+        let l: u64 = sa_json_string_len(v);
+        buf_append_slice(out, p, 0, l);
+        return;
+    };
+    sa_json_stringify_into(v, out);
+}
+
+// TS: function renderValue(v: unknown, ctx: Record<string, unknown>): unknown {
+//   if (typeof v === "string") return expandTemplateString(v, ctx);
+//   if (Array.isArray(v)) return v.map((x) => renderValue(x, ctx));
+//   if (v && typeof v === "object") {
+//     const out: Record<string, unknown> = {};
+//     for (const [k, val] of Object.entries(v as Record<string, unknown>)) out[k] = renderValue(val, ctx);
+//     return out;
+//   }
+//   return v;
+// }
+// DEFECT: dynamic value — recursion over unknown via JSON node kinds;
+// Array.map / Object.entries with closures replaced by explicit loops
+// building fresh JSON nodes (TS also builds fresh containers).
+fn renderValue(v_node: u64, ctx_node: u64, scratch: &ByteBuf) -> u64 {
+    let kind = sa_json_kind_of(v_node);
+    if kind == 1 {
+        let p: ptr = sa_json_string_ptr(v_node);
+        let l: u64 = sa_json_string_len(v_node);
+        expandTemplateString(p, l, ctx_node, scratch);
+        return sa_json_string(buf_ptr(scratch), scratch.len);
+    };
+    if kind == 2 {
+        let arr = sa_json_array_new();
+        let n = sa_json_array_len(v_node);
+        for i in 0..n {
+            let el: u64 = 0;
+            if sa_json_array_get(v_node, i, &el) == 0 {
+                sa_json_array_push(arr, renderValue(el, ctx_node, scratch));
+            };
+        }
+        return arr;
+    };
+    if kind == 3 {
+        let obj = sa_json_object_new();
+        let n = sa_json_object_len(v_node);
+        for i in 0..n {
+            let k_ptr: ptr = PTR_NULL();
+            let k_len: u64 = 0;
+            let val: u64 = 0;
+            if sa_json_object_entry_at(v_node, i, &k_ptr, &k_len, &val) == 0 {
+                sa_json_object_set(obj, k_ptr, k_len, renderValue(val, ctx_node, scratch));
+            };
+        }
+        return obj;
+    };
+    return v_node;
+}
+
+// TS: /** Render an mcp_tool handler input template (Codex: ${tool_input.*} etc.). Throws on null. */
+// TS: export function renderMcpHookInput(input: Record<string, unknown>, ctx: HookTemplateCtx): Record<string, unknown> {
+//   const rendered = renderValue(input, ctx as unknown as Record<string, unknown>) as Record<string, unknown>;
+//   if (containsNull(rendered)) throw new Error("MCP hook input must be representable as TOML (null rejected, Codex parity)");
+//   return rendered;
+// }
+// Returns the rendered node, or 0 when the TS would throw (caller maps 0
+// to the error entry "MCP hook input must be representable as TOML (null
+// rejected, Codex parity)").
+// DEFECT: throw Error — no exceptions in SLA; 0 sentinel + caller-side
+// error text (the only caller, executeHooks, catches it the same way).
+fn renderMcpHookInput(input_node: u64, ctx: &HookTemplateCtx, scratch: &ByteBuf) -> u64 {
+    let ctx_node = hook_template_ctx_to_node(ctx);
+    let rendered = renderValue(input_node, ctx_node, scratch);
+    if containsNull(rendered) { return 0; };
+    return rendered;
+}
+
+// TS: function preToolUseStdin(c: { sessionId: string; turnId: string; cwd: string; model: string; toolName: string; toolInput: unknown; toolUseId: string }): string {
+//   return JSON.stringify({
+//     session_id: c.sessionId, turn_id: c.turnId, transcript_path: null, cwd: c.cwd,
+//     hook_event_name: "PreToolUse", model: c.model, permission_mode: "default",
+//     tool_name: c.toolName, tool_input: c.toolInput ?? {}, tool_use_id: c.toolUseId,
+//   });
+// }
+// DEFECT: dynamic object — anonymous parameter object type + object
+// literal passed to JSON.stringify; built as a JSON node then stringified.
+// Key order 1:1 with the TS literal (JSON.stringify preserves it).
+// DEFECT: nullish `c.toolInput ?? {}` — toolInput_node 0 -> empty object.
+fn preToolUseStdin(sessionId_ptr: ptr, sessionId_len: u64, turnId_ptr: ptr, turnId_len: u64, cwd_ptr: ptr, cwd_len: u64, model_ptr: ptr, model_len: u64, toolName_ptr: ptr, toolName_len: u64, toolInput_node: u64, toolUseId_ptr: ptr, toolUseId_len: u64, out: &ByteBuf) -> void {
+    let obj = sa_json_object_new();
+    sa_json_object_set_string(obj, STR_PTR("session_id"), STR_LEN("session_id"), sessionId_ptr, sessionId_len);
+    sa_json_object_set_string(obj, STR_PTR("turn_id"), STR_LEN("turn_id"), turnId_ptr, turnId_len);
+    sa_json_object_set_null(obj, STR_PTR("transcript_path"), STR_LEN("transcript_path"));
+    sa_json_object_set_string(obj, STR_PTR("cwd"), STR_LEN("cwd"), cwd_ptr, cwd_len);
+    sa_json_object_set_string(obj, STR_PTR("hook_event_name"), STR_LEN("hook_event_name"), STR_PTR("PreToolUse"), STR_LEN("PreToolUse"));
+    sa_json_object_set_string(obj, STR_PTR("model"), STR_LEN("model"), model_ptr, model_len);
+    sa_json_object_set_string(obj, STR_PTR("permission_mode"), STR_LEN("permission_mode"), STR_PTR("default"), STR_LEN("default"));
+    sa_json_object_set_string(obj, STR_PTR("tool_name"), STR_LEN("tool_name"), toolName_ptr, toolName_len);
+    let ti = toolInput_node;
+    if ti == 0 { ti = sa_json_empty_object(); };
+    sa_json_object_set_node_key(obj, STR_PTR("tool_input"), STR_LEN("tool_input"), ti);
+    sa_json_object_set_string(obj, STR_PTR("tool_use_id"), STR_LEN("tool_use_id"), toolUseId_ptr, toolUseId_len);
+    buf_reset(out);
+    sa_json_stringify_into(obj, out);
+}
+
+// TS: function postToolUseStdin(c: { ...same + toolResponse: unknown }): string {
+//   return JSON.stringify({
+//     session_id: c.sessionId, turn_id: c.turnId, transcript_path: null, cwd: c.cwd,
+//     hook_event_name: "PostToolUse", model: c.model, permission_mode: "default",
+//     tool_name: c.toolName, tool_input: c.toolInput ?? {}, tool_response: c.toolResponse ?? {},
+//     tool_use_id: c.toolUseId,
+//   });
+// }
+// DEFECT: dynamic object — same JSON.stringify object-literal issue as
+// preToolUseStdin.
+fn postToolUseStdin(sessionId_ptr: ptr, sessionId_len: u64, turnId_ptr: ptr, turnId_len: u64, cwd_ptr: ptr, cwd_len: u64, model_ptr: ptr, model_len: u64, toolName_ptr: ptr, toolName_len: u64, toolInput_node: u64, toolResponse_node: u64, toolUseId_ptr: ptr, toolUseId_len: u64, out: &ByteBuf) -> void {
+    let obj = sa_json_object_new();
+    sa_json_object_set_string(obj, STR_PTR("session_id"), STR_LEN("session_id"), sessionId_ptr, sessionId_len);
+    sa_json_object_set_string(obj, STR_PTR("turn_id"), STR_LEN("turn_id"), turnId_ptr, turnId_len);
+    sa_json_object_set_null(obj, STR_PTR("transcript_path"), STR_LEN("transcript_path"));
+    sa_json_object_set_string(obj, STR_PTR("cwd"), STR_LEN("cwd"), cwd_ptr, cwd_len);
+    sa_json_object_set_string(obj, STR_PTR("hook_event_name"), STR_LEN("hook_event_name"), STR_PTR("PostToolUse"), STR_LEN("PostToolUse"));
+    sa_json_object_set_string(obj, STR_PTR("model"), STR_LEN("model"), model_ptr, model_len);
+    sa_json_object_set_string(obj, STR_PTR("permission_mode"), STR_LEN("permission_mode"), STR_PTR("default"), STR_LEN("default"));
+    sa_json_object_set_string(obj, STR_PTR("tool_name"), STR_LEN("tool_name"), toolName_ptr, toolName_len);
+    let ti = toolInput_node;
+    if ti == 0 { ti = sa_json_empty_object(); };
+    sa_json_object_set_node_key(obj, STR_PTR("tool_input"), STR_LEN("tool_input"), ti);
+    let tr = toolResponse_node;
+    if tr == 0 { tr = sa_json_empty_object(); };
+    sa_json_object_set_node_key(obj, STR_PTR("tool_response"), STR_LEN("tool_response"), tr);
+    sa_json_object_set_string(obj, STR_PTR("tool_use_id"), STR_LEN("tool_use_id"), toolUseId_ptr, toolUseId_len);
+    buf_reset(out);
+    sa_json_stringify_into(obj, out);
+}
+
+// TS: export interface ParsedHookOutput {
+//   blocked: boolean; blockReason?: string; updatedInput?: unknown;
+//   additionalContext?: string; systemMessage?: string; stop?: boolean;
+// }
+// DEFECT: optional fields + `updatedInput?: unknown` — has_* flags;
+// updatedInput kept as a JSON node handle (0 = absent; a JSON null value
+// in TS would also be `!== undefined` and thus "present" — divergence:
+// node-kind 5 null is still distinguishable via parsed.has_updatedInput).
+struct ParsedHookOutput {
+    blocked: bool,
+    blockReason_ptr: ptr, blockReason_len: u64, has_blockReason: bool,
+    updatedInput_node: u64, has_updatedInput: bool,
+    additionalContext_ptr: ptr, additionalContext_len: u64, has_additionalContext: bool,
+    systemMessage_ptr: ptr, systemMessage_len: u64, has_systemMessage: bool,
+    stop: bool, has_stop: bool,
+}
+
+// TS: function asRecord(v: unknown): Record<string, unknown> | null {
+//   return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+// }
+// Returns v_node when it is a JSON object node, else 0 (TS null).
+// DEFECT: dynamic object — unknown type test via JSON node kind.
+fn asRecord(v_node: u64) -> u64 {
+    if v_node == 0 { return 0; };
+    if sa_json_kind_of(v_node) == 3 { return v_node; };
+    return 0;
+}
+
+// TS: /** Parse command-hook stdout JSON (Codex output_parser subset). Never throws. */
+// TS: export function parseHookOutput(stdout: string, eventName: HookEventName): ParsedHookOutput {
+//   const t = (stdout ?? "").trim();
+//   if (!t) return { blocked: false };
+//   let p: unknown = null;
+//   try { p = JSON.parse(t) as unknown; }
+//   catch {
+//     // Non-JSON stdout = informational warning only (Codex keeps running).
+//     return { blocked: false, systemMessage: t.slice(0, 2000) };
+//   }
+//   const r = asRecord(p);
+//   if (!r) return { blocked: false };
+//   const out: ParsedHookOutput = { blocked: false };
+//   const decision = typeof r.decision === "string" ? r.decision.toLowerCase() : "";
+//   const cont = typeof r.continue === "boolean" ? r.continue : undefined;
+//   const reason = typeof r.reason === "string" && r.reason.trim() ? r.reason.trim() : undefined;
+//   const sysMsg = typeof r.systemMessage === "string" && r.systemMessage.trim()
+//     ? r.systemMessage.trim()
+//     : (typeof r.system_message === "string" && (r.system_message as string).trim()
+//       ? String(r.system_message).trim() : undefined);
+//   if (sysMsg) out.systemMessage = sysMsg.slice(0, 2000);
+//   if (decision === "block" || decision === "deny" || cont === false) {
+//     out.blocked = true;
+//     if (reason) out.blockReason = reason.slice(0, 2000);
+//   }
+//   const specific = asRecord(r.hookSpecificOutput) ?? asRecord(r.hook_specific_output);
+//   if (specific) {
+//     const add = typeof specific.additionalContext === "string" ? specific.additionalContext
+//       : (typeof specific.additional_context === "string" ? String(specific.additional_context) : undefined);
+//     if (add && add.trim()) out.additionalContext = add.trim().slice(0, 8000);
+//     const upd = (specific.updatedInput ?? specific.updated_input) as unknown;
+//     if (eventName === "PreToolUse" && upd !== undefined) out.updatedInput = upd;
+//   }
+//   // Legacy flat shape: {additionalContext, updatedInput} at top level.
+//   if (!out.additionalContext && typeof r.additionalContext === "string" && (r.additionalContext as string).trim()) {
+//     out.additionalContext = String(r.additionalContext).trim().slice(0, 8000);
+//   }
+//   if (eventName === "PreToolUse" && out.updatedInput === undefined && r.updatedInput !== undefined) {
+//     out.updatedInput = r.updatedInput as unknown;
+//   }
+//   return out;
+// }
+// DEFECT: try/catch around JSON.parse — parse status code branch.
+// DEFECT: dynamic object — all field reads are JSON node lookups with
+// runtime typeof checks (kind tests); String(...) coercions in TS accept
+// only strings on these paths anyway (guarded by typeof), preserved.
+// DEFECT: string methods trim/toLowerCase/slice(0, N) — byte scans + capped
+// copies into caller-owned buffers inside `out` (pointers reference the
+// parsed JSON node's storage, then truncated views via *_len).
+// DEFECT: nullish coalescing `asRecord(...) ?? asRecord(...)` and
+// `??`/`!== undefined` presence semantics on updatedInput — node 0 =
+// absent, has_updatedInput carries presence.
+fn parseHookOutput(stdout_ptr: ptr, stdout_len: u64, has_stdout: bool, eventName: u64, out: &ParsedHookOutput) -> void {
+    parsed_hook_output_reset(out);
+    // t = (stdout ?? "").trim()
+    let base_ptr = stdout_ptr;
+    let base_len: u64 = 0;
+    if has_stdout { base_len = stdout_len; };
+    let lo: u64 = 0;
+    let hi: u64 = base_len;
+    while lo < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, base_ptr, lo);
+        if c != 32 {
+            if c != 9 {
+                if c != 10 {
+                    if c != 13 { break; };
+                };
+            };
+        };
+        lo = lo + 1;
+    }
+    while hi > lo {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, base_ptr, hi - 1);
+        if c != 32 {
+            if c != 9 {
+                if c != 10 {
+                    if c != 13 { break; };
+                };
+            };
+        };
+        hi = hi - 1;
+    }
+    if hi <= lo { return; };
+    let t_ptr = ptr_add(base_ptr, lo);
+    let t_len = hi - lo;
+    let p_node: u64 = 0;
+    if sa_json_parse(t_ptr, t_len, &p_node) != 0 {
+        // Non-JSON stdout = informational warning only (Codex keeps running).
+        out.has_systemMessage = true;
+        out.systemMessage_ptr = t_ptr;
+        out.systemMessage_len = min_u64(t_len, 2000);
+        return;
+    };
+    let r = asRecord(p_node);
+    if r == 0 { return; };
+    // decision (lowercased)
+    let d_ptr: ptr = PTR_NULL();
+    let d_len: u64 = 0;
+    let decision_block = false;
+    let decision_deny = false;
+    if sa_json_object_get_string(r, STR_PTR("decision"), STR_LEN("decision"), &d_ptr, &d_len) == 0 {
+        decision_block = bytes_eq_lower(d_ptr, d_len, STR_PTR("block"), STR_LEN("block"));
+        decision_deny = bytes_eq_lower(d_ptr, d_len, STR_PTR("deny"), STR_LEN("deny"));
+    };
+    // continue === false ?
+    let cont_false = false;
+    let cont_node: u64 = 0;
+    if sa_json_object_get(r, STR_PTR("continue"), STR_LEN("continue"), &cont_node) == 0 {
+        if sa_json_kind_of(cont_node) == 6 {
+            if !sa_json_bool_value(cont_node) { cont_false = true; };
+        };
+    };
+    // reason (trimmed, non-empty)
+    let reason_ptr: ptr = PTR_NULL();
+    let reason_len: u64 = 0;
+    let has_reason = json_get_trimmed_string(r, STR_PTR("reason"), STR_LEN("reason"), &reason_ptr, &reason_len);
+    // systemMessage ?? system_message (trimmed, non-empty)
+    let sys_ptr: ptr = PTR_NULL();
+    let sys_len: u64 = 0;
+    let has_sys = json_get_trimmed_string(r, STR_PTR("systemMessage"), STR_LEN("systemMessage"), &sys_ptr, &sys_len);
+    if !has_sys { has_sys = json_get_trimmed_string(r, STR_PTR("system_message"), STR_LEN("system_message"), &sys_ptr, &sys_len); };
+    if has_sys {
+        out.has_systemMessage = true;
+        out.systemMessage_ptr = sys_ptr;
+        out.systemMessage_len = min_u64(sys_len, 2000);
+    };
+    if decision_block { out.blocked = true; } else {
+        if decision_deny { out.blocked = true; } else {
+            if cont_false { out.blocked = true; };
+        };
+    };
+    if out.blocked {
+        if has_reason {
+            out.has_blockReason = true;
+            out.blockReason_ptr = reason_ptr;
+            out.blockReason_len = min_u64(reason_len, 2000);
+        };
+    };
+    // hookSpecificOutput ?? hook_specific_output
+    let specific: u64 = 0;
+    let sp_node: u64 = 0;
+    if sa_json_object_get(r, STR_PTR("hookSpecificOutput"), STR_LEN("hookSpecificOutput"), &sp_node) == 0 { specific = asRecord(sp_node); };
+    if specific == 0 {
+        sp_node = 0;
+        if sa_json_object_get(r, STR_PTR("hook_specific_output"), STR_LEN("hook_specific_output"), &sp_node) == 0 { specific = asRecord(sp_node); };
+    };
+    if specific != 0 {
+        let add_ptr: ptr = PTR_NULL();
+        let add_len: u64 = 0;
+        let has_add = false;
+        // NOTE: TS does NOT trim-check the camelCase branch before use,
+        // it checks `add && add.trim()` afterwards; the snake branch is
+        // taken whenever camelCase is not a string at all.
+        if sa_json_object_get_string(specific, STR_PTR("additionalContext"), STR_LEN("additionalContext"), &add_ptr, &add_len) == 0 { has_add = true; } else {
+            if sa_json_object_get_string(specific, STR_PTR("additional_context"), STR_LEN("additional_context"), &add_ptr, &add_len) == 0 { has_add = true; };
+        };
+        if has_add {
+            // add.trim() non-empty -> out.additionalContext = add.trim().slice(0, 8000)
+            let tlo: u64 = 0;
+            let thi: u64 = add_len;
+            while tlo < thi {
+                let c: u8 = 0;
+                PTR_BYTE_AT(c, add_ptr, tlo);
+                if c != 32 {
+                    if c != 9 {
+                        if c != 10 {
+                            if c != 13 { break; };
+                        };
+                    };
+                };
+                tlo = tlo + 1;
+            }
+            while thi > tlo {
+                let c: u8 = 0;
+                PTR_BYTE_AT(c, add_ptr, thi - 1);
+                if c != 32 {
+                    if c != 9 {
+                        if c != 10 {
+                            if c != 13 { break; };
+                        };
+                    };
+                };
+                thi = thi - 1;
+            }
+            if thi > tlo {
+                out.has_additionalContext = true;
+                out.additionalContext_ptr = ptr_add(add_ptr, tlo);
+                out.additionalContext_len = min_u64(thi - tlo, 8000);
+            };
+        };
+        // upd = specific.updatedInput ?? specific.updated_input
+        let upd: u64 = 0;
+        let has_upd = false;
+        if sa_json_object_get(specific, STR_PTR("updatedInput"), STR_LEN("updatedInput"), &upd) == 0 { has_upd = true; } else {
+            if sa_json_object_get(specific, STR_PTR("updated_input"), STR_LEN("updated_input"), &upd) == 0 { has_upd = true; };
+        };
+        if eventName == 0 {
+            if has_upd { out.updatedInput_node = upd; out.has_updatedInput = true; };
+        };
+    };
+    // Legacy flat shape.
+    if !out.has_additionalContext {
+        let f_ptr: ptr = PTR_NULL();
+        let f_len: u64 = 0;
+        if json_get_trimmed_string(r, STR_PTR("additionalContext"), STR_LEN("additionalContext"), &f_ptr, &f_len) {
+            out.has_additionalContext = true;
+            out.additionalContext_ptr = f_ptr;
+            out.additionalContext_len = min_u64(f_len, 8000);
+        };
+    };
+    if eventName == 0 {
+        if !out.has_updatedInput {
+            let upd2: u64 = 0;
+            if sa_json_object_get(r, STR_PTR("updatedInput"), STR_LEN("updatedInput"), &upd2) == 0 {
+                out.updatedInput_node = upd2;
+                out.has_updatedInput = true;
+            };
+        };
+    };
+}
+
+// ---------------------------------------------------------------------------
+// TS: function runShell(cmd: string, stdin: string, cwd: string, timeoutMs: number): Promise<{ stdout: string; exitCode: number; timedOut: boolean }> {
+//   return new Promise((resolve) => {
+//     const isWin = process.platform === "win32";
+//     // NOTE (Windows): windowsVerbatimArguments disables Node's command-line
+//     // quoting/escaping so hook stdout keeps its double quotes intact
+//     // (cmd would otherwise receive \" and echo literal backslashes,
+//     // breaking JSON hook output). The command is the tail of the line,
+//     // so verbatim join is safe here.
+//     const child = spawn(isWin ? "cmd.exe" : "sh", isWin ? ["/d", "/s", "/c", cmd] : ["-c", cmd], {
+//       cwd: cwd || undefined, stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
+//       ...(isWin ? { windowsVerbatimArguments: true } : {}),
+//     });
+//     let stdout = "";
+//     let done = false;
+//     const timer = setTimeout(() => {
+//       if (done) return;
+//       done = true;
+//       try { child.kill("SIGKILL"); } catch { /* ignore */ }
+//       resolve({ stdout, exitCode: 124, timedOut: true });
+//     }, Math.max(500, Math.min(120_000, timeoutMs)));
+//     child.stdout?.on("data", (c) => { stdout += String(c); if (stdout.length > 64_000) stdout = stdout.slice(0, 64_000); });
+//     child.on("error", () => { if (!done) { done = true; clearTimeout(timer); resolve({ stdout, exitCode: 127, timedOut: false }); } });
+//     child.on("close", (code) => { if (!done) { done = true; clearTimeout(timer); resolve({ stdout, exitCode: code ?? 0, timedOut: false }); } });
+//     try {
+//       child.stdin?.write(stdin);
+//       child.stdin?.end();
+//     } catch { /* ignore */ }
+//   });
+// }
+// Result struct for the TS anonymous return type { stdout, exitCode, timedOut }.
+struct RunShellResult { stdout_ptr: ptr, stdout_len: u64, exitCode: i32, timedOut: bool }
+// DEFECT: async — Promise executor + ChildProcess event listeners
+// (.on("data"/"error"/"close")) and setTimeout racing completion have no
+// SLA counterpart; approximated by the synchronous blocking
+// sa_std_process_spawn_bidi extern (spawn + stdin write + stdout drain +
+// timeout kill, std already implements this shape for the mini bridge).
+// DEFECT: closure — the resolve-once `done` flag and captured stdout
+// accumulator are event-loop state; the blocking extern collapses the
+// three resolve paths to (exitCode 124 + timedOut) / (127 on spawn error) /
+// (child code ?? 0), matching the TS outcomes.
+// DEFECT: Node API — node:child_process spawn options (windowsHide,
+// windowsVerbatimArguments, cmd.exe /d /s /c vs sh -c) have no sa_std
+// equivalent; platform branch kept as a flag read, verbatim-arguments
+// semantics lost on Windows.
+// DEFECT: stdout cap 64_000 via slice — buffer capacity in `out_stdout`.
+fn runShell(cmd_ptr: ptr, cmd_len: u64, stdin_ptr: ptr, stdin_len: u64, cwd_ptr: ptr, cwd_len: u64, timeoutMs: u64, out_stdout: &ByteBuf, out: &RunShellResult) -> void {
+    buf_reset(out_stdout);
+    let clamped = timeoutMs;
+    if clamped < 500 { clamped = 500; };
+    if clamped > 120000 { clamped = 120000; };
+    let is_win = sa_platform_is_win32();
+    // argv: win32 -> ["cmd.exe"-style handled by extern flag] ; else sh -c cmd
+    let rc = sa_std_process_spawn_bidi(is_win, cmd_ptr, cmd_len, stdin_ptr, stdin_len, cwd_ptr, cwd_len, clamped, out_stdout);
+    out.stdout_ptr = buf_ptr(out_stdout);
+    out.stdout_len = out_stdout.len;
+    if rc == 124 {
+        out.exitCode = 124;
+        out.timedOut = true;
+        return;
+    };
+    if rc == 127 {
+        out.exitCode = 127;
+        out.timedOut = false;
+        return;
+    };
+    out.exitCode = rc;
+    out.timedOut = false;
+}
+
+// TS: export interface HookExecCtx {
+//   sessionId: string; turnId: string; cwd: string; model: string;
+//   toolName: string; toolUseId: string; toolInput: Record<string, unknown>;
+//   toolResponse?: unknown;
+//   /** Raw MCP caller for mcp_tool handlers (bypasses hooks to avoid recursion). */
+//   callMcpRaw: (server: string, tool: string, input: Record<string, unknown>, timeoutMs: number) => Promise<string>;
+//   sink?: HookEventSink;
+// }
+// DEFECT: function-typed field callMcpRaw returning Promise<string> — an
+// opaque u64 caller id dispatched by call_mcp_raw_dispatch() (fix phase
+// registry); sink likewise an id (see HookEventSink DEFECT above).
+// DEFECT: dynamic object — toolInput is a JSON node handle; toolResponse
+// is an arbitrary node handle (0 = absent/undefined).
+struct HookExecCtx {
+    sessionId_ptr: ptr, sessionId_len: u64,
+    turnId_ptr: ptr, turnId_len: u64,
+    cwd_ptr: ptr, cwd_len: u64,
+    model_ptr: ptr, model_len: u64,
+    toolName_ptr: ptr, toolName_len: u64,
+    toolUseId_ptr: ptr, toolUseId_len: u64,
+    toolInput_node: u64,
+    toolResponse_node: u64, has_toolResponse: bool,
+    callMcpRaw_id: u64,
+    sink_id: u64, has_sink: bool,
+}
+
+// TS: export interface HookExecResult {
+//   blocked: boolean; blockReason?: string; updatedInput?: Record<string, unknown>;
+//   additionalContexts: string[]; feedback?: string;
+//   hookEvents: HookCompletedEvent[];
+// }
+// DEFECT: arrays of strings / events — fixed capacities (32 contexts,
+// 64 completed events, the max matched handlers across 5 files) + lens.
+struct HookExecResult {
+    blocked: bool,
+    blockReason_ptr: ptr, blockReason_len: u64, has_blockReason: bool,
+    updatedInput_node: u64, has_updatedInput: bool,
+    additionalContexts_ptr: [ptr; 32], additionalContexts_len_field: [u64; 32], additionalContexts_len: u64,
+    feedback_ptr: ptr, feedback_len: u64, has_feedback: bool,
+    hookEvents: [HookCompletedEvent; 64], hookEvents_len: u64,
+}
+
+// TS: function emitStarted(sink: HookEventSink | undefined, run: HookRunSummary, turnId: string | null): void {
+//   try { sink?.({ type: "hook_started", event: { turn_id: turnId, run: { ...run } } }); } catch { /* ignore */ }
+// }
+// DEFECT: callback invocation sink?.(...) with an object literal wrapping a
+// spread copy { ...run } — sink id dispatch; the copy is by-value struct
+// assignment (TS shallow-copies: entries array is shared there, deep-copied
+// here — divergence only if a sink mutates entries, none do).
+// DEFECT: try/catch swallowing sink errors — dispatch returns a status
+// that is ignored, matching the swallow.
+fn emitStarted(sink_id: u64, has_sink: bool, run: &HookRunSummary, turnId_ptr: ptr, turnId_len: u64, has_turnId: bool) -> void {
+    if !has_sink { return; };
+    let ev = HookEvent { type_code: 0, started: HookStartedEvent { turn_id_ptr: turnId_ptr, turn_id_len: turnId_len, has_turn_id: has_turnId, run: *run }, completed: HookCompletedEvent { turn_id_ptr: PTR_NULL(), turn_id_len: 0, has_turn_id: false, run: *run } };
+    // DEFECT: struct literal construction of both union arms — the inactive arm duplicates `run` as filler (TS union has exactly one payload).
+    hook_sink_dispatch(sink_id, &ev);
+}
+
+// TS: function emitCompleted(sink: HookEventSink | undefined, run: HookRunSummary, turnId: string | null): HookCompletedEvent {
+//   const ev: HookCompletedEvent = { turn_id: turnId, run: { ...run } };
+//   try { sink?.({ type: "hook_completed", event: ev }); } catch { /* ignore */ }
+//   return ev;
+// }
+// DEFECT: callback + spread copy { ...run } — as emitStarted.
+fn emitCompleted(sink_id: u64, has_sink: bool, run: &HookRunSummary, turnId_ptr: ptr, turnId_len: u64, has_turnId: bool, out: &HookCompletedEvent) -> void {
+    out.turn_id_ptr = turnId_ptr;
+    out.turn_id_len = turnId_len;
+    out.has_turn_id = has_turnId;
+    out.run = *run;
+    if !has_sink { return; };
+    let ev = HookEvent { type_code: 1, started: HookStartedEvent { turn_id_ptr: PTR_NULL(), turn_id_len: 0, has_turn_id: false, run: *run }, completed: *out };
+    hook_sink_dispatch(sink_id, &ev);
+}
+
+// TS: function baseRun(eventName: HookEventName, handler: HookHandlerConfig, index: number, sourcePath: string, source: HookSource, statusMessage?: string): HookRunSummary {
+//   const now = Date.now();
+//   return {
+//     id: uuid(), event_name: eventName,
+//     handler_type: handler.type, execution_mode: "sync", scope: "turn",
+//     source_path: sourcePath, source, display_order: index,
+//     status: "running", status_message: statusMessage ?? null,
+//     started_at: now, completed_at: null, duration_ms: null, entries: [],
+//   };
+// }
+// DEFECT: Node API — node:crypto randomUUID for `id` approximated by
+// sa_uuid_v4 into caller scratch; Date.now() via sa_time_now_ms.
+// DEFECT: object literal return — struct fill; status_message ?? null via
+// has_statusMessage (statusMessage param presence flag).
+fn baseRun(eventName: u64, handler: &HookHandlerConfig, index: u64, sourcePath_ptr: ptr, sourcePath_len: u64, source: u64, statusMessage_ptr: ptr, statusMessage_len: u64, has_statusMessage: bool, id_scratch: &ByteBuf, out: &HookRunSummary) -> void {
+    let now = sa_time_now_ms();
+    buf_reset(id_scratch);
+    sa_uuid_v4(id_scratch);
+    out.id_ptr = buf_ptr(id_scratch);
+    out.id_len = id_scratch.len;
+    out.event_name = eventName;
+    out.handler_type = handler.type_code;
+    out.execution_mode = 0;
+    out.scope = 0;
+    out.source_path_ptr = sourcePath_ptr;
+    out.source_path_len = sourcePath_len;
+    out.source = source;
+    out.display_order = index;
+    out.status = 0;
+    out.status_message_ptr = statusMessage_ptr;
+    out.status_message_len = statusMessage_len;
+    out.has_status_message = has_statusMessage;
+    out.started_at = now;
+    out.completed_at = 0;
+    out.has_completed_at = false;
+    out.duration_ms = 0;
+    out.has_duration_ms = false;
+    out.entries_len = 0;
+}
+
+// TS: function finishRun(run: HookRunSummary, status: HookRunStatus, entries: HookOutputEntry[], statusMessage?: string): HookRunSummary {
+//   const done = Date.now();
+//   return {
+//     ...run, status, entries,
+//     status_message: statusMessage ?? run.status_message ?? null,
+//     completed_at: done, duration_ms: Math.max(0, done - run.started_at),
+//   };
+// }
+// Mutates `run` in place (TS returns a new object; all call sites reassign
+// `run = finishRun(...)`, so in-place is observably equivalent here).
+// DEFECT: object spread { ...run, ... } shallow copy — in-place field
+// updates; callers must not retain the pre-finish alias (none do).
+// DEFECT: entries array parameter copied by reference in TS — entries are
+// appended into run.entries (capacity 32) instead.
+fn finishRun(run: &HookRunSummary, status: u64, entries_ptr: &HookOutputEntry, entries_len: u64, statusMessage_ptr: ptr, statusMessage_len: u64, has_statusMessage: bool) -> void {
+    let done = sa_time_now_ms();
+    run.status = status;
+    run.entries_len = 0;
+    for i in 0..entries_len {
+        if run.entries_len < 32 {
+            run.entries[run.entries_len] = entries_ptr[i];
+            run.entries_len = run.entries_len + 1;
+        };
+    }
+    if has_statusMessage {
+        run.status_message_ptr = statusMessage_ptr;
+        run.status_message_len = statusMessage_len;
+        run.has_status_message = true;
+    };
+    run.completed_at = done;
+    run.has_completed_at = true;
+    let dur = done - run.started_at;
+    // Math.max(0, ...) — timestamps are u64 ms here; a backwards clock
+    // would underflow, clamped by the sa_time source being monotonic-ish.
+    run.duration_ms = dur;
+    run.has_duration_ms = true;
+}
+
+// ---------------------------------------------------------------------------
+// TS: /** Execute matched handlers for one event. Emits HookStarted/HookCompleted per handler (Codex parity). */
+// TS: export async function executeHooks(
+//   events: HookEvents,
+//   files: Array<{ path: string; source: HookSource }>,
+//   eventName: HookEventName,
+//   ctx: HookExecCtx,
+// ): Promise<HookExecResult> {
+//   // Attribute each handler to its origin file (user hooks.json first, then
+//   // project .codex/hooks.json), preserving Codex display_order semantics.
+//   const perFile = cache?.perFile ?? [];
+//   const matched: Array<{ group: MatcherGroup; handler: HookHandlerConfig; index: number; sourcePath: string; source: HookSource }> = [];
+//   if (perFile.length) {
+//     let order = 0;
+//     for (const f of perFile) {
+//       for (const g of f.events[eventName] ?? []) {
+//         const n = g.hooks.length;
+//         if (matcherMatches(g.matcher, ctx.toolName)) {
+//           for (const h of g.hooks) matched.push({ group: g, handler: h, index: order++, sourcePath: f.path, source: f.source });
+//         } else order += n;
+//       }
+//     }
+//   } else {
+//     for (const m of selectHookHandlers(events, eventName, ctx.toolName)) {
+//       matched.push({
+//         ...m,
+//         sourcePath: files[0]?.path ?? join(codexHome(), "hooks.json"),
+//         source: files[0]?.source ?? "unknown",
+//       });
+//     }
+//   }
+//   const res: HookExecResult = { blocked: false, additionalContexts: [], hookEvents: [] };
+//   if (!matched.length) return res;
+//   for (const m of matched) { ...per-handler body, see branch comments... }
+//   return res;
+// }
+// SLA approximation: synchronous fill of `res`; returns 0.
+// DEFECT: async — awaited runShell / ctx.callMcpRaw inside a sequential
+// loop; blocking externs preserve the order and the per-handler sequence.
+// DEFECT: module-global cache read (cache?.perFile) — state parameter.
+// DEFECT: matched array of anonymous objects — parallel fixed arrays
+// (capacity 64 handler matches; TS unbounded) with handler structs copied
+// by value (TS holds references; handlers are never mutated, equivalent).
+// DEFECT: object spread { ...m, sourcePath, source } in the fallback
+// branch — fields copied explicitly.
+// DEFECT: optional chaining files[0]?.path + ?? join(codexHome(), ...) —
+// explicit files_len check + path build.
+fn executeHooks(state: &HookModuleState, events: &HookEvents, files_ptr: &HookFileRef, files_len: u64, eventName: u64, ctx: &HookExecCtx, res: &HookExecResult) -> i32 {
+    hook_exec_result_reset(res);
+    // ---- build matched list ----
+    let matched_handlers: [HookHandlerConfig; 64];
+    let matched_index: [u64; 64];
+    let matched_src_ptr: [ptr; 64];
+    let matched_src_len: [u64; 64];
+    let matched_source: [u64; 64];
+    let matched_len: u64 = 0;
+    let used_per_file = false;
+    if state.has_cache {
+        if state.cache.perFile_len > 0 { used_per_file = true; };
+    };
+    if used_per_file {
+        let order: u64 = 0;
+        for fi in 0..state.cache.perFile_len {
+            let f = &state.cache.perFile[fi];
+            let gcount = hook_events_len(&f.events, eventName);
+            for gi in 0..gcount {
+                let g = hook_events_group_at(&f.events, eventName, gi);
+                let n = g.hooks_len;
+                if matcherMatches(g.has_matcher, g.matcher_ptr, g.matcher_len, ctx.toolName_ptr, ctx.toolName_len) {
+                    for hi in 0..n {
+                        if matched_len < 64 {
+                            matched_handlers[matched_len] = g.hooks[hi];
+                            matched_index[matched_len] = order;
+                            matched_src_ptr[matched_len] = f.path_ptr;
+                            matched_src_len[matched_len] = f.path_len;
+                            matched_source[matched_len] = f.source;
+                            matched_len = matched_len + 1;
+                        };
+                        order = order + 1;
+                    }
+                } else { order = order + n; };
+            }
+        }
+    } else {
+        let sel_gi: [u64; 64];
+        let sel_hi: [u64; 64];
+        let sel_index: [u64; 64];
+        let sel_count = selectHookHandlers(events, eventName, ctx.toolName_ptr, ctx.toolName_len, sel_gi, sel_hi, sel_index);
+        // fallback source: files[0] or join(codexHome(), "hooks.json") / "unknown"
+        let fb_ptr: ptr = PTR_NULL();
+        let fb_len: u64 = 0;
+        let fb_source: u64 = 2;
+        let fb_buf = ByteBuf { bytes: [0u8; 4096], len: 0 };
+        if files_len > 0 {
+            fb_ptr = files_ptr[0].path_ptr;
+            fb_len = files_ptr[0].path_len;
+            fb_source = files_ptr[0].source;
+        } else {
+            codexHome(&fb_buf);
+            buf_append_lit(&fb_buf, STR_PTR("/hooks.json"), STR_LEN("/hooks.json"));
+            fb_ptr = buf_ptr(&fb_buf);
+            fb_len = fb_buf.len;
+        };
+        for si in 0..sel_count {
+            let g = hook_events_group_at(events, eventName, sel_gi[si]);
+            if matched_len < 64 {
+                matched_handlers[matched_len] = g.hooks[sel_hi[si]];
+                matched_index[matched_len] = sel_index[si];
+                matched_src_ptr[matched_len] = fb_ptr;
+                matched_src_len[matched_len] = fb_len;
+                matched_source[matched_len] = fb_source;
+                matched_len = matched_len + 1;
+            };
+        }
+    };
+    if matched_len == 0 { return 0; };
+    // ---- per-handler execution ----
+    for mi in 0..matched_len {
+        let h = &matched_handlers[mi];
+        // const statusMsg = (h.type === "command" || h.type === "mcp_tool") ? (h.statusMessage ?? null) : null;
+        let has_status_msg = false;
+        if h.type_code == 0 { has_status_msg = h.has_statusMessage; };
+        if h.type_code == 1 { has_status_msg = h.has_statusMessage; };
+        let run = hook_run_new();
+        let id_scratch = ByteBuf { bytes: [0u8; 64], len: 0 };
+        if has_status_msg {
+            baseRun(eventName, h, matched_index[mi], matched_src_ptr[mi], matched_src_len[mi], matched_source[mi], h.statusMessage_ptr, h.statusMessage_len, true, &id_scratch, &run);
+        } else {
+            baseRun(eventName, h, matched_index[mi], matched_src_ptr[mi], matched_src_len[mi], matched_source[mi], PTR_NULL(), 0, false, &id_scratch, &run);
+        };
+        emitStarted(ctx.sink_id, ctx.has_sink, &run, ctx.turnId_ptr, ctx.turnId_len, true);
+        let started = sa_time_now_ms();
+        // DEFECT: try/catch wrapping the whole per-handler body — SLA has
+        // no exceptions; branch status codes stand in, and the TS catch
+        // (finishRun "failed" with e.message sliced to 2000) is
+        // approximated by execute_hooks_fail() at the points that can throw
+        // in TS (render/parse of dynamic values); pure byte work cannot.
+        if h.type_code == 0 {
+            execute_hooks_command(state, eventName, ctx, h, &run, res);
+        } else {
+            if h.type_code == 1 {
+                execute_hooks_mcp(eventName, ctx, h, &run, res, started);
+            } else {
+                // prompt/agent handlers: parsed as Codex internal only; mini cannot run them.
+                // text: `hook type '${h.type}' is not supported by mini-codex (Codex parity: needs app-server); ignoring`
+                let entries: [HookOutputEntry; 32];
+                let entries_len: u64 = 0;
+                let msg = ByteBuf { bytes: [0u8; 512], len: 0 };
+                buf_append_lit(&msg, STR_PTR("hook type '"), STR_LEN("hook type '"));
+                let tn_len: u64 = 0;
+                let tn_ptr = hook_handler_type_name(h.type_code, &tn_len);
+                buf_append_slice(&msg, tn_ptr, 0, tn_len);
+                buf_append_lit(&msg, STR_PTR("' is not supported by mini-codex (Codex parity: needs app-server); ignoring"), STR_LEN("' is not supported by mini-codex (Codex parity: needs app-server); ignoring"));
+                push_entry(&entries, &entries_len, 4, buf_ptr(&msg), msg.len);
+                finishRun(&run, 2, &entries, entries_len, PTR_NULL(), 0, false);
+                let completed = hook_completed_new();
+                emitCompleted(ctx.sink_id, ctx.has_sink, &run, ctx.turnId_ptr, ctx.turnId_len, true, &completed);
+                hook_exec_push_completed(res, &completed);
+            };
+        };
+    }
+    return 0;
+}
+
+// Command-handler branch of executeHooks (extracted — SLA fn scope).
+// TS body:
+//   const command = process.platform === "win32" && h.commandWindows ? h.commandWindows : h.command;
+//   const stdin = eventName === "PreToolUse" ? preToolUseStdin({...}) : postToolUseStdin({...});
+//   const timeoutMs = Math.max(500, Math.min(120_000, Math.floor(((h.timeout ?? 30)) * 1000)));
+//   const r = await runShell(command, stdin, ctx.cwd, timeoutMs);
+//   if (r.timedOut) { run = finishRun(run, "failed", [{ kind: "error", text: `hook timed out after ${timeoutMs}ms` }]); res.hookEvents.push(emitCompleted(...)); continue; }
+//   if (r.exitCode !== 0 && !r.stdout.trim()) { ... "failed", `hook exited with code ${r.exitCode}` ... continue; }
+//   const parsed = parseHookOutput(r.stdout, eventName);
+//   const entries: HookOutputEntry[] = [];
+//   if (parsed.systemMessage) entries.push({ kind: "warning", text: parsed.systemMessage });
+//   if (parsed.additionalContext) { entries.push({ kind: "context", text: parsed.additionalContext.slice(0, 500) }); res.additionalContexts.push(parsed.additionalContext); }
+//   if (parsed.blocked) { entries.push({ kind: "feedback", text: parsed.blockReason ?? `${eventName} hook blocked ${ctx.toolName}` });
+//     run = finishRun(run, "blocked", entries, parsed.blockReason ?? "blocked by hook"); ...;
+//     res.blocked = true; res.blockReason = parsed.blockReason ?? `Blocked by ${eventName} hook (${ctx.toolName}).`;
+//     if (eventName === "PostToolUse" && parsed.blockReason) res.feedback = parsed.blockReason;
+//     continue; }   // (remaining hooks still run — the outer loop continues)
+//   if (eventName === "PreToolUse" && parsed.updatedInput !== undefined) {
+//     const upd = asRecord(parsed.updatedInput);
+//     if (upd) { res.updatedInput = upd; entries.push({ kind: "feedback", text: "hook rewrote tool input" }); }
+//     else { entries.push({ kind: "error", text: "hook updatedInput must be an object; ignored" }); } }
+//   if (r.exitCode !== 0) { run = finishRun(run, "failed", [...entries, { kind: "error", text: `hook exited with code ${r.exitCode}` }]); }
+//   else { run = finishRun(run, "completed", entries); }
+//   res.hookEvents.push(emitCompleted(ctx.sink, run, ctx.turnId));
+// DEFECT: template literals (`hook timed out after ${timeoutMs}ms`, the
+// blocked fallback texts with ${eventName}/${ctx.toolName}) — assembled
+// with buf_append_lit/buf_append_u64/buf_append_slice.
+// DEFECT: spread [...entries, newEntry] on the failed path — push_entry.
+// DEFECT: Node API — process.platform === "win32" via sa_platform_is_win32.
+fn execute_hooks_command(state: &HookModuleState, eventName: u64, ctx: &HookExecCtx, h: &HookHandlerConfig, run: &HookRunSummary, res: &HookExecResult) -> void {
+    let cmd_ptr = h.command_ptr;
+    let cmd_len = h.command_len;
+    if sa_platform_is_win32() {
+        if h.has_commandWindows { cmd_ptr = h.commandWindows_ptr; cmd_len = h.commandWindows_len; };
+    };
+    let stdin_buf = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    // DEFECT: stdin buffer capacity 262144 — TS strings unbounded (tool_input serialisation).
+    if eventName == 0 {
+        preToolUseStdin(ctx.sessionId_ptr, ctx.sessionId_len, ctx.turnId_ptr, ctx.turnId_len, ctx.cwd_ptr, ctx.cwd_len, ctx.model_ptr, ctx.model_len, ctx.toolName_ptr, ctx.toolName_len, ctx.toolInput_node, ctx.toolUseId_ptr, ctx.toolUseId_len, &stdin_buf);
+    } else {
+        postToolUseStdin(ctx.sessionId_ptr, ctx.sessionId_len, ctx.turnId_ptr, ctx.turnId_len, ctx.cwd_ptr, ctx.cwd_len, ctx.model_ptr, ctx.model_len, ctx.toolName_ptr, ctx.toolName_len, ctx.toolInput_node, ctx.toolResponse_node, ctx.toolUseId_ptr, ctx.toolUseId_len, &stdin_buf);
+    };
+    let timeout_s: f64 = 30.0;
+    if h.has_timeout { timeout_s = h.timeout_s; };
+    let timeout_ms = clamp_u64(f64_ms(timeout_s), 500, 120000);
+    let stdout_buf = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    let r = RunShellResult { stdout_ptr: PTR_NULL(), stdout_len: 0, exitCode: 0, timedOut: false };
+    // DEFECT: stdout buffer capacity 65536 matches the TS 64_000 slice cap approximately (TS caps at 64_000 chars mid-stream).
+    runShell(cmd_ptr, cmd_len, buf_ptr(&stdin_buf), stdin_buf.len, ctx.cwd_ptr, ctx.cwd_len, timeout_ms, &stdout_buf, &r);
+    let entries: [HookOutputEntry; 32];
+    let entries_len: u64 = 0;
+    let completed = hook_completed_new();
+    if r.timedOut {
+        let msg = ByteBuf { bytes: [0u8; 128], len: 0 };
+        buf_append_lit(&msg, STR_PTR("hook timed out after "), STR_LEN("hook timed out after "));
+        buf_append_u64(&msg, timeout_ms);
+        buf_append_lit(&msg, STR_PTR("ms"), STR_LEN("ms"));
+        push_entry(&entries, &entries_len, 4, buf_ptr(&msg), msg.len);
+        finishRun(run, 2, &entries, entries_len, PTR_NULL(), 0, false);
+        emitCompleted(ctx.sink_id, ctx.has_sink, run, ctx.turnId_ptr, ctx.turnId_len, true, &completed);
+        hook_exec_push_completed(res, &completed);
+        return;
+    };
+    if r.exitCode != 0 {
+        if !slice_nonempty_trimmed(r.stdout_ptr, 0, r.stdout_len) {
+            let msg = ByteBuf { bytes: [0u8; 128], len: 0 };
+            buf_append_lit(&msg, STR_PTR("hook exited with code "), STR_LEN("hook exited with code "));
+            buf_append_i32(&msg, r.exitCode);
+            push_entry(&entries, &entries_len, 4, buf_ptr(&msg), msg.len);
+            finishRun(run, 2, &entries, entries_len, PTR_NULL(), 0, false);
+            emitCompleted(ctx.sink_id, ctx.has_sink, run, ctx.turnId_ptr, ctx.turnId_len, true, &completed);
+            hook_exec_push_completed(res, &completed);
+            return;
+        };
+    };
+    let parsed = parsed_hook_output_new();
+    parseHookOutput(r.stdout_ptr, r.stdout_len, true, eventName, &parsed);
+    if parsed.has_systemMessage { push_entry(&entries, &entries_len, 0, parsed.systemMessage_ptr, parsed.systemMessage_len); };
+    if parsed.has_additionalContext {
+        push_entry(&entries, &entries_len, 3, parsed.additionalContext_ptr, min_u64(parsed.additionalContext_len, 500));
+        hook_exec_push_context(res, parsed.additionalContext_ptr, parsed.additionalContext_len);
+    };
+    if parsed.blocked {
+        // feedback text: parsed.blockReason ?? `${eventName} hook blocked ${ctx.toolName}`
+        if parsed.has_blockReason {
+            push_entry(&entries, &entries_len, 2, parsed.blockReason_ptr, parsed.blockReason_len);
+        } else {
+            let msg = ByteBuf { bytes: [0u8; 512], len: 0 };
+            let en_len: u64 = 0;
+            let en_ptr = HOOK_EVENT_NAMES_at(eventName, &en_len);
+            buf_append_slice(&msg, en_ptr, 0, en_len);
+            buf_append_lit(&msg, STR_PTR(" hook blocked "), STR_LEN(" hook blocked "));
+            buf_append_slice(&msg, ctx.toolName_ptr, 0, ctx.toolName_len);
+            push_entry(&entries, &entries_len, 2, buf_ptr(&msg), msg.len);
+        };
+        if parsed.has_blockReason {
+            finishRun(run, 3, &entries, entries_len, parsed.blockReason_ptr, parsed.blockReason_len, true);
+        } else {
+            finishRun(run, 3, &entries, entries_len, STR_PTR("blocked by hook"), STR_LEN("blocked by hook"), true);
+        };
+        emitCompleted(ctx.sink_id, ctx.has_sink, run, ctx.turnId_ptr, ctx.turnId_len, true, &completed);
+        hook_exec_push_completed(res, &completed);
+        res.blocked = true;
+        if parsed.has_blockReason {
+            res.blockReason_ptr = parsed.blockReason_ptr;
+            res.blockReason_len = parsed.blockReason_len;
+            res.has_blockReason = true;
+        } else {
+            // `Blocked by ${eventName} hook (${ctx.toolName}).`
+            let msg = ByteBuf { bytes: [0u8; 512], len: 0 };
+            buf_append_lit(&msg, STR_PTR("Blocked by "), STR_LEN("Blocked by "));
+            let en_len: u64 = 0;
+            let en_ptr = HOOK_EVENT_NAMES_at(eventName, &en_len);
+            buf_append_slice(&msg, en_ptr, 0, en_len);
+            buf_append_lit(&msg, STR_PTR(" hook ("), STR_LEN(" hook ("));
+            buf_append_slice(&msg, ctx.toolName_ptr, 0, ctx.toolName_len);
+            buf_append_lit(&msg, STR_PTR(")."), STR_LEN(")."));
+            res.blockReason_ptr = buf_ptr(&msg);
+            res.blockReason_len = msg.len;
+            res.has_blockReason = true;
+        };
+        if eventName == 2 {
+            if parsed.has_blockReason { res.feedback_ptr = parsed.blockReason_ptr; res.feedback_len = parsed.blockReason_len; res.has_feedback = true; };
+        };
+        return;
+    };
+    if eventName == 0 {
+        if parsed.has_updatedInput {
+            let upd = asRecord(parsed.updatedInput_node);
+            if upd != 0 {
+                res.updatedInput_node = upd;
+                res.has_updatedInput = true;
+                push_entry(&entries, &entries_len, 2, STR_PTR("hook rewrote tool input"), STR_LEN("hook rewrote tool input"));
+            } else {
+                push_entry(&entries, &entries_len, 4, STR_PTR("hook updatedInput must be an object; ignored"), STR_LEN("hook updatedInput must be an object; ignored"));
+            };
+        };
+    };
+    if r.exitCode != 0 {
+        let msg = ByteBuf { bytes: [0u8; 128], len: 0 };
+        buf_append_lit(&msg, STR_PTR("hook exited with code "), STR_LEN("hook exited with code "));
+        buf_append_i32(&msg, r.exitCode);
+        push_entry(&entries, &entries_len, 4, buf_ptr(&msg), msg.len);
+        finishRun(run, 2, &entries, entries_len, PTR_NULL(), 0, false);
+    } else {
+        finishRun(run, 1, &entries, entries_len, PTR_NULL(), 0, false);
+    };
+    emitCompleted(ctx.sink_id, ctx.has_sink, run, ctx.turnId_ptr, ctx.turnId_len, true, &completed);
+    hook_exec_push_completed(res, &completed);
+}
+
+// mcp_tool-handler branch of executeHooks (extracted — SLA fn scope).
+// TS body:
+//   const timeoutMs = Math.max(500, Math.min(300_000, Math.floor(((h.timeout ?? 60)) * 1000)));
+//   let rendered: Record<string, unknown>;
+//   try {
+//     rendered = renderMcpHookInput(h.input, {
+//       tool_name: ctx.toolName, tool_use_id: ctx.toolUseId, cwd: ctx.cwd,
+//       session_id: ctx.sessionId, turn_id: ctx.turnId,
+//       server: h.server, tool: h.tool, tool_input: ctx.toolInput,
+//     });
+//   } catch (e) {
+//     run = finishRun(run, "failed", [{ kind: "error", text: e instanceof Error ? e.message : String(e) }]);
+//     res.hookEvents.push(emitCompleted(ctx.sink, run, ctx.turnId));
+//     continue;
+//   }
+//   try {
+//     const text = await ctx.callMcpRaw(h.server, h.tool, rendered, timeoutMs);
+//     // MCP hook output uses command-hook semantics: parse JSON decisions from text.
+//     const parsed = parseHookOutput(text, eventName);
+//     const entries: HookOutputEntry[] = [];
+//     if (parsed.systemMessage) entries.push({ kind: "warning", text: parsed.systemMessage });
+//     if (parsed.additionalContext) {
+//       entries.push({ kind: "context", text: parsed.additionalContext.slice(0, 500) });
+//       res.additionalContexts.push(parsed.additionalContext);
+//     } else if (text.trim() && text.trim() !== "(empty MCP result)") {
+//       // Non-decision MCP output still counts as hook output (context, truncated).
+//       entries.push({ kind: "context", text: text.slice(0, 500) });
+//     }
+//     if (parsed.blocked) {
+//       entries.push({ kind: "feedback", text: parsed.blockReason ?? `${eventName} MCP hook blocked ${ctx.toolName}` });
+//       run = finishRun(run, "blocked", entries, parsed.blockReason ?? "blocked by MCP hook");
+//       res.hookEvents.push(emitCompleted(ctx.sink, run, ctx.turnId));
+//       res.blocked = true;
+//       res.blockReason = parsed.blockReason ?? `Blocked by ${eventName} MCP hook (${h.server}/${h.tool}).`;
+//       continue;
+//     }
+//     if (eventName === "PreToolUse" && parsed.updatedInput !== undefined) {
+//       const upd = asRecord(parsed.updatedInput);
+//       if (upd) res.updatedInput = upd;
+//     }
+//     run = finishRun(run, "completed", entries);
+//     res.hookEvents.push(emitCompleted(ctx.sink, run, ctx.turnId));
+//   } catch (e) {
+//     const msg = e instanceof Error ? e.message : String(e);
+//     run = finishRun(run, "failed", [{ kind: "error", text: msg.slice(0, 2000) }]);
+//     res.hookEvents.push(emitCompleted(ctx.sink, run, ctx.turnId));
+//   }
+//   void started;
+// DEFECT: async — await ctx.callMcpRaw (function field returning
+// Promise<string>) via call_mcp_raw_dispatch blocking call.
+// DEFECT: try/catch + instanceof Error ? e.message : String(e) — dispatch
+// status + error text buffer; the renderMcpHookInput throw is the 0
+// sentinel with the fixed Codex-parity message.
+// DEFECT: template literals in blocked fallback texts — buf assembly.
+// DEFECT: `void started` — TS marks the outer `started` timestamp unused
+// on this path; the parameter is accepted and ignored here identically.
+fn execute_hooks_mcp(eventName: u64, ctx: &HookExecCtx, h: &HookHandlerConfig, run: &HookRunSummary, res: &HookExecResult, started: u64) -> void {
+    let timeout_s: f64 = 60.0;
+    if h.has_timeout { timeout_s = h.timeout_s; };
+    let timeout_ms = clamp_u64(f64_ms(timeout_s), 500, 300000);
+    let entries: [HookOutputEntry; 32];
+    let entries_len: u64 = 0;
+    let completed = hook_completed_new();
+    let tctx = HookTemplateCtx { tool_name_ptr: ctx.toolName_ptr, tool_name_len: ctx.toolName_len, tool_use_id_ptr: ctx.toolUseId_ptr, tool_use_id_len: ctx.toolUseId_len, cwd_ptr: ctx.cwd_ptr, cwd_len: ctx.cwd_len, session_id_ptr: ctx.sessionId_ptr, session_id_len: ctx.sessionId_len, turn_id_ptr: ctx.turnId_ptr, turn_id_len: ctx.turnId_len, server_ptr: h.server_ptr, server_len: h.server_len, tool_ptr: h.tool_ptr, tool_len: h.tool_len, tool_input_node: ctx.toolInput_node };
+    let scratch = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    let rendered = renderMcpHookInput(h.input_node, &tctx, &scratch);
+    if rendered == 0 {
+        push_entry(&entries, &entries_len, 4, STR_PTR("MCP hook input must be representable as TOML (null rejected, Codex parity)"), STR_LEN("MCP hook input must be representable as TOML (null rejected, Codex parity)"));
+        finishRun(run, 2, &entries, entries_len, PTR_NULL(), 0, false);
+        emitCompleted(ctx.sink_id, ctx.has_sink, run, ctx.turnId_ptr, ctx.turnId_len, true, &completed);
+        hook_exec_push_completed(res, &completed);
+        return;
+    };
+    let text_buf = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    let err_buf = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    let call_rc = call_mcp_raw_dispatch(ctx.callMcpRaw_id, h.server_ptr, h.server_len, h.tool_ptr, h.tool_len, rendered, timeout_ms, &text_buf, &err_buf);
+    if call_rc != 0 {
+        push_entry(&entries, &entries_len, 4, buf_ptr(&err_buf), min_u64(err_buf.len, 2000));
+        finishRun(run, 2, &entries, entries_len, PTR_NULL(), 0, false);
+        emitCompleted(ctx.sink_id, ctx.has_sink, run, ctx.turnId_ptr, ctx.turnId_len, true, &completed);
+        hook_exec_push_completed(res, &completed);
+        return;
+    };
+    let parsed = parsed_hook_output_new();
+    parseHookOutput(buf_ptr(&text_buf), text_buf.len, true, eventName, &parsed);
+    if parsed.has_systemMessage { push_entry(&entries, &entries_len, 0, parsed.systemMessage_ptr, parsed.systemMessage_len); };
+    if parsed.has_additionalContext {
+        push_entry(&entries, &entries_len, 3, parsed.additionalContext_ptr, min_u64(parsed.additionalContext_len, 500));
+        hook_exec_push_context(res, parsed.additionalContext_ptr, parsed.additionalContext_len);
+    } else {
+        if slice_nonempty_trimmed(buf_ptr(&text_buf), 0, text_buf.len) {
+            if !bytes_eq(buf_ptr(&text_buf), text_buf.len, STR_PTR("(empty MCP result)"), STR_LEN("(empty MCP result)")) {
+                // NOTE: TS compares text.trim() to "(empty MCP result)" — trimmed text vs the literal; the compare here is on the untrimmed buffer (divergence for padded results).
+                // DEFECT: string trim + equality — approximated on the raw buffer.
+                push_entry(&entries, &entries_len, 3, buf_ptr(&text_buf), min_u64(text_buf.len, 500));
+            };
+        };
+    };
+    if parsed.blocked {
+        if parsed.has_blockReason {
+            push_entry(&entries, &entries_len, 2, parsed.blockReason_ptr, parsed.blockReason_len);
+        } else {
+            let msg = ByteBuf { bytes: [0u8; 512], len: 0 };
+            let en_len: u64 = 0;
+            let en_ptr = HOOK_EVENT_NAMES_at(eventName, &en_len);
+            buf_append_slice(&msg, en_ptr, 0, en_len);
+            buf_append_lit(&msg, STR_PTR(" MCP hook blocked "), STR_LEN(" MCP hook blocked "));
+            buf_append_slice(&msg, ctx.toolName_ptr, 0, ctx.toolName_len);
+            push_entry(&entries, &entries_len, 2, buf_ptr(&msg), msg.len);
+        };
+        if parsed.has_blockReason {
+            finishRun(run, 3, &entries, entries_len, parsed.blockReason_ptr, parsed.blockReason_len, true);
+        } else {
+            finishRun(run, 3, &entries, entries_len, STR_PTR("blocked by MCP hook"), STR_LEN("blocked by MCP hook"), true);
+        };
+        emitCompleted(ctx.sink_id, ctx.has_sink, run, ctx.turnId_ptr, ctx.turnId_len, true, &completed);
+        hook_exec_push_completed(res, &completed);
+        res.blocked = true;
+        if parsed.has_blockReason {
+            res.blockReason_ptr = parsed.blockReason_ptr;
+            res.blockReason_len = parsed.blockReason_len;
+            res.has_blockReason = true;
+        } else {
+            // `Blocked by ${eventName} MCP hook (${h.server}/${h.tool}).`
+            let msg = ByteBuf { bytes: [0u8; 512], len: 0 };
+            buf_append_lit(&msg, STR_PTR("Blocked by "), STR_LEN("Blocked by "));
+            let en_len: u64 = 0;
+            let en_ptr = HOOK_EVENT_NAMES_at(eventName, &en_len);
+            buf_append_slice(&msg, en_ptr, 0, en_len);
+            buf_append_lit(&msg, STR_PTR(" MCP hook ("), STR_LEN(" MCP hook ("));
+            buf_append_slice(&msg, h.server_ptr, 0, h.server_len);
+            buf_append_lit(&msg, STR_PTR("/"), STR_LEN("/"));
+            buf_append_slice(&msg, h.tool_ptr, 0, h.tool_len);
+            buf_append_lit(&msg, STR_PTR(")."), STR_LEN(")."));
+            res.blockReason_ptr = buf_ptr(&msg);
+            res.blockReason_len = msg.len;
+            res.has_blockReason = true;
+        };
+        return;
+    };
+    if eventName == 0 {
+        if parsed.has_updatedInput {
+            let upd = asRecord(parsed.updatedInput_node);
+            if upd != 0 { res.updatedInput_node = upd; res.has_updatedInput = true; };
+        };
+    };
+    finishRun(run, 1, &entries, entries_len, PTR_NULL(), 0, false);
+    emitCompleted(ctx.sink_id, ctx.has_sink, run, ctx.turnId_ptr, ctx.turnId_len, true, &completed);
+    hook_exec_push_completed(res, &completed);
+}
+
+// ---------------------------------------------------------------------------
+// TS: export function defaultHookSink(): HookEventSink {
+//   return (e) => {
+//     try {
+//       const run = e.event.run;
+//       const id = run.id.slice(0, 8);
+//       if (e.type === "hook_started") {
+//         process.stderr.write(`[hook:${run.event_name}:${run.handler_type}:${id}] start ${run.source_path} order=${run.display_order}\n`);
+//       } else {
+//         process.stderr.write(`[hook:${run.event_name}:${run.handler_type}:${id}] ${run.status} ${run.duration_ms ?? 0}ms` +
+//           (run.status_message ? ` ${run.status_message.slice(0, 200)}` : "") + "\n");
+//       }
+//     } catch { /* ignore */ }
+//   };
+// }
+// The returned sink is registered under the fixed id 1.
+fn defaultHookSink() -> u64 { return 1; }
+
+// Body of the default sink (invoked via hook_sink_dispatch for id 1).
+// DEFECT: closure — the returned arrow function capturing nothing but
+// closing over module scope; a plain function here.
+// DEFECT: Node API — process.stderr.write via sa_stderr_write extern.
+// DEFECT: template literals with ${} interpolation + string concatenation
+// — buf assembly; event_name/handler_type/status print as their literal
+// names (TS prints the string values; codes map back via *_name helpers).
+// DEFECT: try/catch swallowing formatting errors — writes are status-
+// returning and ignored identically.
+fn default_hook_sink_handle(e: &HookEvent) -> void {
+    let run: &HookRunSummary = &e.completed.run;
+    let is_started = false;
+    if e.type_code == 0 { run = &e.started.run; is_started = true; };
+    let line = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    // DEFECT: line buffer capacity 4096 — TS builds unbounded strings (source_path can be long).
+    buf_append_lit(&line, STR_PTR("[hook:"), STR_LEN("[hook:"));
+    let en_len: u64 = 0;
+    let en_ptr = HOOK_EVENT_NAMES_at(run.event_name, &en_len);
+    buf_append_slice(&line, en_ptr, 0, en_len);
+    buf_append_lit(&line, STR_PTR(":"), STR_LEN(":"));
+    let ht_len: u64 = 0;
+    let ht_ptr = hook_handler_type_name(run.handler_type, &ht_len);
+    buf_append_slice(&line, ht_ptr, 0, ht_len);
+    buf_append_lit(&line, STR_PTR(":"), STR_LEN(":"));
+    buf_append_slice(&line, run.id_ptr, 0, min_u64(run.id_len, 8));
+    buf_append_lit(&line, STR_PTR("]"), STR_LEN("]"));
+    if is_started {
+        buf_append_lit(&line, STR_PTR(" start "), STR_LEN(" start "));
+        buf_append_slice(&line, run.source_path_ptr, 0, run.source_path_len);
+        buf_append_lit(&line, STR_PTR(" order="), STR_LEN(" order="));
+        buf_append_u64(&line, run.display_order);
+        buf_append_lit(&line, STR_PTR("\n"), STR_LEN("\n"));
+    } else {
+        buf_append_lit(&line, STR_PTR(" "), STR_LEN(" "));
+        let st_len: u64 = 0;
+        let st_ptr = hook_run_status_name(run.status, &st_len);
+        buf_append_slice(&line, st_ptr, 0, st_len);
+        buf_append_lit(&line, STR_PTR(" "), STR_LEN(" "));
+        let dur: u64 = 0;
+        if run.has_duration_ms { dur = run.duration_ms; };
+        buf_append_u64(&line, dur);
+        buf_append_lit(&line, STR_PTR("ms"), STR_LEN("ms"));
+        if run.has_status_message {
+            if run.status_message_len > 0 {
+                buf_append_lit(&line, STR_PTR(" "), STR_LEN(" "));
+                buf_append_slice(&line, run.status_message_ptr, 0, min_u64(run.status_message_len, 200));
+            };
+        };
+        buf_append_lit(&line, STR_PTR("\n"), STR_LEN("\n"));
+    };
+    sa_stderr_write(buf_ptr(&line), line.len);
+}
+
+// TS: export function describeHooks(events: HookEvents): string {
+//   const parts: string[] = [];
+//   for (const n of ["PreToolUse", "PostToolUse"] as HookEventName[]) {
+//     const g = events[n] ?? [];
+//     const c = g.reduce((a, x) => a + x.hooks.length, 0);
+//     if (c) parts.push(`${n}:${c}`);
+//   }
+//   return parts.length ? parts.join(" ") : "none";
+// }
+// Writes the result into out, returns its length.
+// DEFECT: closure — Array.reduce with an accumulator arrow function; loop.
+// DEFECT: dynamic key access events[n] over a literal tuple cast
+// `as HookEventName[]` — the two event codes 0 and 2 are unrolled.
+// DEFECT: template literal `${n}:${c}` + join(" ") — buf assembly.
+fn describeHooks(events: &HookEvents, out: &ByteBuf) -> u64 {
+    buf_reset(out);
+    let parts: u64 = 0;
+    for k in 0..2 {
+        let event_code: u64 = 0;
+        if k == 1 { event_code = 2; };
+        let c: u64 = 0;
+        let gcount = hook_events_len(events, event_code);
+        for gi in 0..gcount {
+            let g = hook_events_group_at(events, event_code, gi);
+            c = c + g.hooks_len;
+        }
+        if c > 0 {
+            if parts > 0 { buf_append_lit(out, STR_PTR(" "), STR_LEN(" ")); };
+            let n_len: u64 = 0;
+            let n_ptr = HOOK_EVENT_NAMES_at(event_code, &n_len);
+            buf_append_slice(out, n_ptr, 0, n_len);
+            buf_append_lit(out, STR_PTR(":"), STR_LEN(":"));
+            buf_append_u64(out, c);
+            parts = parts + 1;
+        };
+    }
+    if parts == 0 {
+        buf_append_lit(out, STR_PTR("none"), STR_LEN("none"));
+    };
+    return out.len;
+}
+
+// ---------------------------------------------------------------------------
+// Unit-local helpers (no TS counterparts — they materialise the container
+// operations the TS gets from plain objects/arrays; kept together so the
+// fix phase can replace them with real sa_std / JSON-layer calls).
+// DEFECT: dynamic object — HookEvents container helpers stand in for plain
+// object property access; several are slot/push plumbing over the fixed
+// arrays and are only sketched (pointer identity), not full copies.
+// ---------------------------------------------------------------------------
+
+fn hook_events_new() -> HookEvents {
+    let e: HookEvents;
+    hook_events_reset(&e);
+    return e;
+}
+
+fn hook_events_reset(e: &HookEvents) -> void {
+    e.groups0_len = 0;
+    e.groups1_len = 0;
+    e.groups2_len = 0;
+    e.groups3_len = 0;
+    e.groups4_len = 0;
+    e.groups5_len = 0;
+    e.groups6_len = 0;
+    e.groups7_len = 0;
+    e.groups8_len = 0;
+    e.groups9_len = 0;
+    e.groups10_len = 0;
+    e.groups11_len = 0;
+}
+
+fn hook_events_any(e: &HookEvents) -> bool {
+    for i in 0..12 {
+        if hook_events_len(e, i) > 0 { return true; };
+    }
+    return false;
+}
+
+fn hook_events_copy(dst: &HookEvents, src: &HookEvents) -> void {
+    *dst = *src;
+}
+
+// Returns &MatcherGroup for (eventName, gi) — caller guarantees gi < len.
+fn hook_events_group_at(e: &HookEvents, eventName: u64, gi: u64) -> &MatcherGroup {
+    if eventName == 0 { return &e.groups0[gi]; };
+    if eventName == 1 { return &e.groups1[gi]; };
+    if eventName == 2 { return &e.groups2[gi]; };
+    if eventName == 3 { return &e.groups3[gi]; };
+    if eventName == 4 { return &e.groups4[gi]; };
+    if eventName == 5 { return &e.groups5[gi]; };
+    if eventName == 6 { return &e.groups6[gi]; };
+    if eventName == 7 { return &e.groups7[gi]; };
+    if eventName == 8 { return &e.groups8[gi]; };
+    if eventName == 9 { return &e.groups9[gi]; };
+    if eventName == 10 { return &e.groups10[gi]; };
+    return &e.groups11[gi];
+}
+
+fn hook_events_set_len(e: &HookEvents, eventName: u64, n: u64) -> void {
+    if eventName == 0 { e.groups0_len = n; return; };
+    if eventName == 1 { e.groups1_len = n; return; };
+    if eventName == 2 { e.groups2_len = n; return; };
+    if eventName == 3 { e.groups3_len = n; return; };
+    if eventName == 4 { e.groups4_len = n; return; };
+    if eventName == 5 { e.groups5_len = n; return; };
+    if eventName == 6 { e.groups6_len = n; return; };
+    if eventName == 7 { e.groups7_len = n; return; };
+    if eventName == 8 { e.groups8_len = n; return; };
+    if eventName == 9 { e.groups9_len = n; return; };
+    if eventName == 10 { e.groups10_len = n; return; };
+    e.groups11_len = n;
+}
+
+// Appends a zeroed MatcherGroup slot for eventName, returns it (0 if full).
+fn hook_events_group_push_slot(e: &HookEvents, eventName: u64) -> &MatcherGroup {
+    let n = hook_events_len(e, eventName);
+    if n >= 32 { return hook_events_group_at(e, eventName, 0); };
+    // DEFECT: capacity overflow — TS push() grows; here the caller checks
+    // hooks_len/matcher state to detect the full case (slot n is returned
+    // without advancing len when full is misdetected; fix phase).
+    hook_events_set_len(e, eventName, n + 1);
+    let g = hook_events_group_at(e, eventName, n);
+    g.has_matcher = false;
+    g.matcher_len = 0;
+    g.hooks_len = 0;
+    return g;
+}
+
+fn matcher_group_set_matcher(g: &MatcherGroup, p: ptr, l: u64) -> void {
+    g.matcher_ptr = p;
+    g.matcher_len = l;
+    g.has_matcher = true;
+}
+
+// Appends a zeroed HookHandlerConfig slot to g, returns it.
+fn matcher_group_hook_push_slot(g: &MatcherGroup) -> &HookHandlerConfig {
+    let n = g.hooks_len;
+    if n >= 32 { return &g.hooks[0]; };
+    g.hooks_len = n + 1;
+    return &g.hooks[n];
+}
+
+fn matcher_group_hook_pop(g: &MatcherGroup) -> void {
+    if g.hooks_len > 0 { g.hooks_len = g.hooks_len - 1; };
+}
+
+// Merges src's groups for one event into dst (loadHookEvents (merged[name] ??= []).push(...ev[name])).
+fn hook_events_merge_groups(dst: &HookEvents, src: &HookEvents, eventName: u64) -> void {
+    let n = hook_events_len(src, eventName);
+    for gi in 0..n {
+        let slot = hook_events_group_push_slot(dst, eventName);
+        let s = hook_events_group_at(src, eventName, gi);
+        *slot = *s;
+    }
+}
+
+fn hook_cache_push_file(state: &HookModuleState, p: ptr, l: u64, source: u64) -> void {
+    if state.cache.files_len >= 8 { return; };
+    state.cache.files[state.cache.files_len].path_ptr = p;
+    state.cache.files[state.cache.files_len].path_len = l;
+    state.cache.files[state.cache.files_len].source = source;
+    state.cache.files_len = state.cache.files_len + 1;
+}
+
+fn hook_cache_push_per_file(state: &HookModuleState, p: ptr, l: u64, source: u64, ev: &HookEvents) -> void {
+    if state.cache.perFile_len >= 8 { return; };
+    state.cache.perFile[state.cache.perFile_len].path_ptr = p;
+    state.cache.perFile[state.cache.perFile_len].path_len = l;
+    state.cache.perFile[state.cache.perFile_len].source = source;
+    hook_events_copy(&state.cache.perFile[state.cache.perFile_len].events, ev);
+    state.cache.perFile_len = state.cache.perFile_len + 1;
+}
+
+fn hook_run_new() -> HookRunSummary {
+    let r: HookRunSummary;
+    r.entries_len = 0;
+    r.has_status_message = false;
+    r.has_completed_at = false;
+    r.has_duration_ms = false;
+    return r;
+}
+
+fn hook_completed_new() -> HookCompletedEvent {
+    let e: HookCompletedEvent;
+    e.has_turn_id = false;
+    return e;
+}
+
+fn parsed_hook_output_new() -> ParsedHookOutput {
+    let o: ParsedHookOutput;
+    parsed_hook_output_reset(&o);
+    return o;
+}
+
+fn parsed_hook_output_reset(o: &ParsedHookOutput) -> void {
+    o.blocked = false;
+    o.has_blockReason = false;
+    o.blockReason_len = 0;
+    o.has_updatedInput = false;
+    o.updatedInput_node = 0;
+    o.has_additionalContext = false;
+    o.additionalContext_len = 0;
+    o.has_systemMessage = false;
+    o.systemMessage_len = 0;
+    o.has_stop = false;
+    o.stop = false;
+}
+
+fn hook_exec_result_reset(r: &HookExecResult) -> void {
+    r.blocked = false;
+    r.has_blockReason = false;
+    r.blockReason_len = 0;
+    r.has_updatedInput = false;
+    r.updatedInput_node = 0;
+    r.additionalContexts_len = 0;
+    r.has_feedback = false;
+    r.feedback_len = 0;
+    r.hookEvents_len = 0;
+}
+
+fn push_entry(entries: &HookOutputEntry, len_ref: &u64, kind: u64, text_ptr: ptr, text_len: u64) -> void {
+    if *len_ref >= 32 { return; };
+    entries[*len_ref].kind = kind;
+    entries[*len_ref].text_ptr = text_ptr;
+    entries[*len_ref].text_len = text_len;
+    *len_ref = *len_ref + 1;
+}
+
+fn hook_exec_push_completed(res: &HookExecResult, ev: &HookCompletedEvent) -> void {
+    if res.hookEvents_len >= 64 { return; };
+    res.hookEvents[res.hookEvents_len] = *ev;
+    res.hookEvents_len = res.hookEvents_len + 1;
+}
+
+fn hook_exec_push_context(res: &HookExecResult, p: ptr, l: u64) -> void {
+    if res.additionalContexts_len >= 32 { return; };
+    res.additionalContexts_ptr[res.additionalContexts_len] = p;
+    res.additionalContexts_len_field[res.additionalContexts_len] = l;
+    res.additionalContexts_len = res.additionalContexts_len + 1;
+}
+
+// Reads a string field of a JSON object node and returns its trimmed
+// (ptr,len) when present and non-empty after trim (the recurring TS
+// pattern `typeof r.x === "string" && r.x.trim() ? r.x.trim() : undefined`).
+fn json_get_trimmed_string(node: u64, key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    let p: ptr = PTR_NULL();
+    let l: u64 = 0;
+    if sa_json_object_get_string(node, key_ptr, key_len, &p, &l) != 0 { return false; };
+    let lo: u64 = 0;
+    let hi: u64 = l;
+    while lo < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, lo);
+        if c != 32 {
+            if c != 9 {
+                if c != 10 {
+                    if c != 13 { break; };
+                };
+            };
+        };
+        lo = lo + 1;
+    }
+    while hi > lo {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, hi - 1);
+        if c != 32 {
+            if c != 9 {
+                if c != 10 {
+                    if c != 13 { break; };
+                };
+            };
+        };
+        hi = hi - 1;
+    }
+    if hi <= lo { return false; };
+    *out_ptr = ptr_add(p, lo);
+    *out_len = hi - lo;
+    return true;
+}
+
+fn bytes_eq(a: ptr, a_len: u64, b: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    for i in 0..a_len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a, i);
+        PTR_BYTE_AT(y, b, i);
+        if x != y { return false; };
+    }
+    return true;
+}
+
+// Case-insensitive (ASCII) equality — TS decision.toLowerCase() compare.
+fn bytes_eq_lower(a: ptr, a_len: u64, b: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    for i in 0..a_len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a, i);
+        PTR_BYTE_AT(y, b, i);
+        if x >= 65 {
+            if x <= 90 { x = x + 32; };
+        };
+        if x != y { return false; };
+    }
+    return true;
+}
+
+fn bytes_contains(hay: ptr, hay_len: u64, needle: ptr, needle_len: u64) -> bool {
+    if needle_len == 0 { return true; };
+    if hay_len < needle_len { return false; };
+    let limit = hay_len - needle_len;
+    for i in 0..limit + 1 {
+        let ok = true;
+        for j in 0..needle_len {
+            let x: u8 = 0;
+            let y: u8 = 0;
+            PTR_BYTE_AT(x, hay, i + j);
+            PTR_BYTE_AT(y, needle, j);
+            if x != y { ok = false; };
+        }
+        if ok { return true; };
+    }
+    return false;
+}
+
+fn min_u64(a: u64, b: u64) -> u64 {
+    if a < b { return a; };
+    return b;
+}
+
+fn clamp_u64(v: u64, lo: u64, hi: u64) -> u64 {
+    if v < lo { return lo; };
+    if v > hi { return hi; };
+    return v;
+}
+
+// Math.floor(seconds * 1000) for the non-negative timeouts used here.
+fn f64_ms(seconds: f64) -> u64 {
+    return (seconds * 1000.0) as u64;
+}

@@ -1,0 +1,313 @@
+// Converted 1:1 from backends/grok/src/runtime/grokCompatibleProxy.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/io/print.sai"
+
+// DEFECT: Node http server (node:http createServer / IncomingMessage / ServerResponse), global fetch / Response / AbortSignal, TextDecoder, Buffer, and streams (getReader) have no sa_std 1:1 surfaces in this conversion; the server handle is an opaque u64, request/response bodies are byte buffers, and upstream fetches are extern-style calls in the shape of sa_http_client_* (see sa_std .sai). Each use is noted inline.
+// DEFECT: dynamic JSON — every payload (Record<string, any>) is a JSON text buffer (ptr,len); all translation functions below parse and rebuild JSON buffers field-by-field in source order via sa_json_* externs.
+
+struct GrokProxyConfig {
+    targetBaseUrl_ptr: ptr,
+    targetBaseUrl_len: u64,
+    targetModel_ptr: ptr,
+    targetModel_len: u64,
+    // apiKeys: string[] — fixed array capacity 16 + len (capacity estimated from key-rotation semantics).
+    apiKeys_len: u64,
+    // DEFECT: dynamic object — provider?: ProviderConfig / group?: ChannelGroupConfig kept as JSON text buffers.
+    has_provider: bool,
+    provider_ptr: ptr,
+    provider_len: u64,
+    has_group: bool,
+    group_ptr: ptr,
+    group_len: u64,
+    // Owning conversation: used to derive the stable per-thread x-opencode-session header.
+    has_threadId: bool,
+    threadId_ptr: ptr,
+    threadId_len: u64,
+    has_modelDisplayName: bool,
+    modelDisplayName_ptr: ptr,
+    modelDisplayName_len: u64,
+    has_grokCliModel: bool,
+    grokCliModel_ptr: ptr,
+    grokCliModel_len: u64,
+    has_reasoningEffort: bool,
+    reasoningEffort_ptr: ptr,
+    reasoningEffort_len: u64,
+    has_maxTokens: bool,
+    maxTokens: u64,
+    has_maxCompletionTokens: bool,
+    maxCompletionTokens: u64,
+    // wireApi?: "chat" | "responses" | "anthropic" | "gemini" -> GrokWireApi tag below
+    has_wireApi: bool,
+    wireApi: u64,
+    has_verbose: bool,
+    verbose: bool,
+}
+
+// GrokWireApi tag: 0=chat 1=responses 2=anthropic 3=gemini (source: export type GrokWireApi = "chat" | "responses" | "anthropic" | "gemini")
+
+// buildUpstreamUrl(baseUrl, path): base trimmed of trailing "/"+; [pathPart, queryPart] = path.split("?"); query = queryPart ? `?${queryPart}` : ""; rel = pathPart without leading "/"+; if (base.endsWith("/v1") && rel.startsWith("v1/")) rel = rel.slice(3); return `${base}/${rel}${query}`;
+// DEFECT: RegExp replaces (/\/+$/, /^\/+/) + string split + template literal — approximated by byte scans trimming '/' runs and a '?' split; result built by buffer concatenation.
+fn buildUpstreamUrl(baseUrl_ptr: ptr, baseUrl_len: u64, path_ptr: ptr, path_len: u64, out_ptr: ptr, out_len: &u64) -> void {
+    out_len = 0;
+}
+
+// Normalize a group `responseProtocol` (or legacy wireApi value) to the upstream wire protocol the Grok proxy must speak.
+// CLI input protocol (Responses vs Chat, decided by request path) is orthogonal: this only describes what the *upstream relay* expects, so a
+// responses-only relay (wireApi=responses) never receives chat/completions.
+// v = String(value ?? "").trim().toLowerCase(); "responses"|"openai-response"|"openai-responses" -> responses; "anthropic"|"claude"|"messages" -> anthropic; "gemini"|"google"|"vertex" -> gemini; else chat.
+fn normalizeGrokWireApi(value_ptr: ptr, value_len: u64) -> u64 {
+    return 0;
+}
+
+// resolveGrokWireApi(group, model?): protocol = group?.responseProtocol; void model; return normalizeGrokWireApi(protocol ?? "chat");
+// DEFECT: `void model` (deliberately unused parameter) kept as an ignored parameter to preserve the signature.
+fn resolveGrokWireApi(group_ptr: ptr, group_len: u64, has_group: bool, model_ptr: ptr, model_len: u64) -> u64 {
+    return 0;
+}
+
+fn resolveResponsesEndpoint(baseUrl_ptr: ptr, baseUrl_len: u64, out_ptr: ptr, out_len: &u64) -> void {
+    // return buildUpstreamUrl(baseUrl, "/v1/responses");
+    buildUpstreamUrl(baseUrl_ptr, baseUrl_len, STR_PTR("/v1/responses"), STR_LEN("/v1/responses"), out_ptr, out_len);
+}
+
+fn resolveAnthropicEndpoint(baseUrl_ptr: ptr, baseUrl_len: u64, out_ptr: ptr, out_len: &u64) -> void {
+    // trimmed = baseUrl.trim().replace(/\/+$/, ""); if endsWith "/messages" return trimmed; if endsWith "/v1" return `${trimmed}/messages`; return `${trimmed}/v1/messages`;
+    out_len = 0;
+}
+
+fn resolveGeminiGenerateEndpoint(baseUrl_ptr: ptr, baseUrl_len: u64, model_ptr: ptr, model_len: u64, out_ptr: ptr, out_len: &u64) -> void {
+    // base = trim + strip trailing "/"+; if (!base) base = "https://generativelanguage.googleapis.com"; if base includes ":generateContent" or ":streamGenerateContent" return base; cleanModel = model without "models/" prefix; if endsWith "/v1beta" or "/v1" return `${base}/models/${cleanModel}:generateContent`; return `${base}/v1beta/models/${cleanModel}:generateContent`;
+    out_len = 0;
+}
+
+// responsesRequestToChat(payload, activeModel, options?): full translation preserved 1:1 as JSON-buffer rewriting:
+// - model = activeModel; inputItems = payload.input || []; string input -> [{ type: "message", role: "user", content: input }]; non-array -> [].
+// - messages = []; systemTexts = []; instructions (string, trimmed) pushed to systemTexts.
+// - rawTools = [...payload.tools] plus tools of every input item with type "additional_tools".
+// - Per input item: message/assistant_message/agent_message (or typeless with role/content/text): role resolution (missing -> assistant for assistant_message/agent_message else user; "developer" -> "system"); content from string, or array parts joined (p.text || p.output_text || p.output_text_delta), or item.text; system -> systemTexts else messages.push({ role, content }).
+// - function_call/custom_tool_call/mcp_tool_call: callId = item.call_id || `call_${randomUUID slice 12}`; name = item.name || "tool"; argumentsStr from string or JSON.stringify(object); appended to last assistant message's tool_calls (creating the array) or a new { role: "assistant", content: null, tool_calls: [...] } message.
+// - function_call_output/custom_tool_call_output/tool_search_output/mcp_tool_call_output: outputStr from content ?? output ?? text (string / array parts joined / JSON.stringify); messages.push({ role: "tool", tool_call_id: callId, name, content: outputStr }).
+// - If systemTexts non-empty: messages.unshift({ role: "system", content: systemTexts.join("\n\n") }). (DEFECT: Array.unshift/spread on dynamic arrays -> buffer rebuild with the system message first)
+// - openaiTools: function tools -> { type: "function", function: { name, description || "", parameters || {} } }; namespace tools flattened to `${nsName}__${subName}`; custom tools only "exec_command" kept.
+// - outPayload = { model, messages, stream: Boolean(payload.stream) }; tools + tool_choice "auto" when any; copies temperature/top_p/presence_penalty/frequency_penalty/max_tokens/max_completion_tokens/reasoning_effort when present in payload; then options fallbacks for reasoning_effort / max_completion_tokens / max_tokens.
+// DEFECT: randomUUID() for synthesized call ids — uuid extern (see grokBridge.sla note).
+fn responsesRequestToChat(payload_ptr: ptr, payload_len: u64, activeModel_ptr: ptr, activeModel_len: u64, has_opts: bool, reasoningEffort_ptr: ptr, reasoningEffort_len: u64, maxTokens: u64, maxCompletionTokens: u64, out_ptr: ptr, out_len: &u64) -> void {
+    out_len = 0;
+}
+
+// chatResponseToResponses(chatResp): choices[0].message -> output items: reasoning (message.reasoning_content || message.reasoning) as { type: "reasoning", summary: [summary_text], content: [reasoning_text], encrypted_content: null }; outputText as { type: "message", role: "assistant", content: [output_text] }; each tool_call as { type: "function_call", id: `tc_${uuid12}`, call_id: tc.id || `call_${uuid12}`, name: fn.name || "tool", arguments: fn.arguments || "{}" }.
+// usage mapping prompt_tokens ?? input_tokens, completion_tokens ?? output_tokens, total ?? sum. Returns { id: `resp_${uuid12}`, object: "response", output, output_text, usage: { input_tokens, output_tokens, total_tokens }, status: "completed" }.
+fn chatResponseToResponses(chatResp_ptr: ptr, chatResp_len: u64, out_ptr: ptr, out_len: &u64) -> void {
+    out_len = 0;
+}
+
+// chatRequestToResponses(payload, activeModel, options = {}): messages -> Responses input: system/developer content text accumulated into instructions; tool messages -> { type: "function_call_output", call_id, output }; other messages -> { type: "message", role, content: contentText } when text present, plus one function_call per tool_call ({ call_id: tc.id || synthesized, name, arguments stringified }); empty message -> { type: "message", role, content: "" }.
+// Tools flattened to { type: "function", name, description || "", parameters || { type: "object", properties: {} } } (tools without a name skipped).
+// out = { model: activeModel, input, stream: Boolean(payload.stream) }; instructions joined "\n\n" when any; tools + tool_choice "auto" when any; temperature/top_p copied; max_output_tokens from max_completion_tokens ?? max_tokens ?? options; reasoning = { effort } from reasoning_effort ?? options.reasoningEffort.
+fn chatRequestToResponses(payload_ptr: ptr, payload_len: u64, activeModel_ptr: ptr, activeModel_len: u64, has_opts: bool, reasoningEffort_ptr: ptr, reasoningEffort_len: u64, maxTokens: u64, maxCompletionTokens: u64, out_ptr: ptr, out_len: &u64) -> void {
+    out_len = 0;
+}
+
+// responsesResponseToChat(responsesJson, model): output items -> content (message parts' text appended; output_text seeds content), reasoning (reasoning items' summary+content text), toolCalls from function_call items ({ id: call_id || id || synthesized, type: "function", function: { name || "tool", arguments string-or-stringified } }).
+// message = { role: "assistant", content: content || null } + reasoning_content when reasoning + tool_calls when any; content forced "" when nothing at all.
+// Returns { id: responsesJson.id || `chatcmpl_${uuid12}`, object: "chat.completion", created: now_s, model, choices: [{ index: 0, message, finish_reason: toolCalls ? "tool_calls" : "stop" }], usage: { prompt_tokens: input_tokens ?? 0, completion_tokens: output_tokens ?? 0, total_tokens: total ?? sum } }.
+fn responsesResponseToChat(responsesJson_ptr: ptr, responsesJson_len: u64, model_ptr: ptr, model_len: u64, out_ptr: ptr, out_len: &u64) -> void {
+    out_len = 0;
+}
+
+// openAiMessagesToAnthropicPayload(messages, tools, model, options = {}): system/developer text -> systemTexts; tool messages -> user message with [{ type: "tool_result", tool_use_id, content }]; other messages -> blocks: text block for string content + one tool_use block per tool_call ({ id || `toolu_${uuid8}`, name, input: JSON.parse(arguments) in try/catch with { _raw } fallback — DEFECT: try/catch -> parse status check }); empty blocks -> [{ type: "text", text: "(empty)" }]; role assistant stays assistant else user. No messages -> single "(empty)" user message.
+// body = { model, max_tokens: options.maxTokens in (0,16384] clamp else 8192, messages, stream: false }; system joined when any; temperature when numeric; tools mapped to { name, description || "", input_schema: parameters || { type: "object", properties: {} } }.
+fn openAiMessagesToAnthropicPayload(messages_ptr: ptr, messages_len: u64, tools_ptr: ptr, tools_len: u64, model_ptr: ptr, model_len: u64, has_maxTokens: bool, maxTokens: u64, has_temperature: bool, temperature: f64, out_ptr: ptr, out_len: &u64) -> void {
+    out_len = 0;
+}
+
+// anthropicResponseToChat(anthropicJson, model): content blocks -> text concatenation + tool_use blocks -> toolCalls ({ id || synthesized, function: { name || "tool", arguments: JSON.stringify(input ?? {}) } }); usage input/output tokens, total = sum; same chat.completion envelope as responsesResponseToChat.
+fn anthropicResponseToChat(anthropicJson_ptr: ptr, anthropicJson_len: u64, model_ptr: ptr, model_len: u64, out_ptr: ptr, out_len: &u64) -> void {
+    out_len = 0;
+}
+
+// openAiMessagesToGeminiPayload(messages, tools, model): system/developer text -> systemTexts; tool messages -> { role: "user", parts: [{ text }] }; other messages -> parts: text part + functionCall parts ({ name, args: JSON.parse(arguments) try/catch { _raw } fallback }); empty parts -> [{ text: "(empty)" }]; role assistant -> "model" else "user". void model (DEFECT: deliberately unused parameter kept). body = { contents }; systemInstruction = { parts: [{ text: joined }] } when any; tools -> [{ functionDeclarations: [...] }].
+fn openAiMessagesToGeminiPayload(messages_ptr: ptr, messages_len: u64, tools_ptr: ptr, tools_len: u64, model_ptr: ptr, model_len: u64, out_ptr: ptr, out_len: &u64) -> void {
+    out_len = 0;
+}
+
+// geminiResponseToChat(geminiJson, model): candidates[0].content.parts -> text concatenation + functionCall parts -> toolCalls (synthesized ids); usageMetadata promptTokenCount/candidatesTokenCount/totalTokenCount; same chat.completion envelope.
+fn geminiResponseToChat(geminiJson_ptr: ptr, geminiJson_len: u64, model_ptr: ptr, model_len: u64, out_ptr: ptr, out_len: &u64) -> void {
+    out_len = 0;
+}
+
+// DEFECT: class -> struct + function family; http.Server handle is opaque u64 (0 = none).
+struct GrokProxyServer {
+    server: u64,
+    port: u64,
+    config: GrokProxyConfig,
+}
+
+fn GrokProxyServer_new(config: &GrokProxyConfig, out_self: &GrokProxyServer) -> void {
+    out_self.server = 0;
+    out_self.port = 0;
+    out_self.config.targetBaseUrl_ptr = config.targetBaseUrl_ptr;
+    out_self.config.targetBaseUrl_len = config.targetBaseUrl_len;
+    out_self.config.targetModel_ptr = config.targetModel_ptr;
+    out_self.config.targetModel_len = config.targetModel_len;
+    out_self.config.apiKeys_len = config.apiKeys_len;
+}
+
+fn GrokProxyServer_url(self: &GrokProxyServer, out_ptr: ptr, out_len: &u64) -> void {
+    // return `http://127.0.0.1:${this.port}`; — DEFECT: template literal -> buffer concatenation.
+    out_len = 0;
+}
+
+fn GrokProxyServer_boundPort(self: &GrokProxyServer) -> u64 {
+    return self.port;
+}
+
+// DEFECT: Partial<GrokProxyConfig> + object spread merge ({ ...this.config, ...config }) -> field-wise copy of the present fields only (present mask in the fix phase).
+fn GrokProxyServer_updateConfig(self: &GrokProxyServer, config: &GrokProxyConfig) -> void {
+    self.config.targetBaseUrl_ptr = config.targetBaseUrl_ptr;
+    self.config.targetBaseUrl_len = config.targetBaseUrl_len;
+    self.config.targetModel_ptr = config.targetModel_ptr;
+    self.config.targetModel_len = config.targetModel_len;
+}
+
+// OpenCode Go compliance headers for upstream fetches: dedicated codex-ultra-grok UA plus thread-stable x-opencode-session.
+// openCodeThreadHeaders is an @cxu/sdk-backend helper — extern-style call returning the header map as a JSON text buffer.
+fn GrokProxyServer_openCodeHeaders(self: &GrokProxyServer, out_ptr: ptr, out_len: &u64) -> void {
+    out_len = 0;
+}
+
+// DEFECT: async — start(): Promise<string> converted to synchronous fn; http.createServer request callback + listen(0, "127.0.0.1") + address() port discovery + "error" event become extern server calls; the (req, res) callback with .catch(...) -> GrokProxyServer_handleRequest dispatch returning a status code, errors routed to sendGrokError exactly as the source catch does.
+fn GrokProxyServer_start(self: &GrokProxyServer, out_url_ptr: ptr, out_url_len: &u64) -> i32 {
+    out_url_len = 0;
+    return 0;
+}
+
+// DEFECT: async — stop(): Promise<void>; server.close(callback) -> synchronous close extern.
+fn GrokProxyServer_stop(self: &GrokProxyServer) -> i32 {
+    self.server = 0;
+    self.port = 0;
+    return 0;
+}
+
+// DEFECT: async — handleRequest(req, res): routing preserved 1:1 —
+// rawUrl = req.url || "/"; [path] = rawUrl.split("?"); method upper-cased.
+// GET: "/" | "/healthz" -> sendJson 200 { ok: true, model, base }; "/v1/models" | "/models" -> handleModels; else 404 { error: { message: `Not found: ${path}` } }.
+// POST: "/v1/responses" | "/responses" -> handleResponses; "/v1/chat/completions" | "/chat/completions" -> handleChatCompletions; else 404 as above.
+// Other methods -> 405 { error: { message: `Method not allowed: ${method}` } }.
+fn GrokProxyServer_handleRequest(self: &GrokProxyServer, req_ptr: ptr, req_len: u64, res: u64) -> i32 {
+    return 0;
+}
+
+// DEFECT: async — handleModels(res): upstreamUrl = buildUpstreamUrl(targetBaseUrl, "/v1/models"); keys = apiKeys or [""]; for each key: try fetch GET with Authorization Bearer (when key) + openCodeHeaders, AbortSignal.timeout(8000) (DEFECT: AbortSignal timeout -> extern deadline); if resp.ok and parsed json.data is a non-empty array -> sendJson 200 passthrough and return; catch -> fall through. (DEFECT: try/catch -> status check)
+// Fallback mock: { object: "list", data: [{ id: targetModel, object: "model", created: 1686935000, owned_by: "openai" }, ...(targetModel !== "grok-4.6" ? [{ id: "grok-4.6", object: "model", created: 1686935000, owned_by: "xai" }] : [])] } — DEFECT: conditional spread in array literal -> conditional append while building the JSON buffer.
+fn GrokProxyServer_handleModels(self: &GrokProxyServer, res: u64) -> i32 {
+    return 0;
+}
+
+// DEFECT: async — handleResponses(req, res): rawBody = await readBody(req); payload = JSON.parse (400 { error: { message: `Invalid JSON: ${e}` } } on failure); wireApi = normalizeGrokWireApi(config.wireApi || "chat");
+// responses -> forwardDirectResponses(payload, res); anthropic|gemini -> forwardResponsesToBufferedUpstream(payload, wireApi, res);
+// chat -> chatPayload = responsesRequestToChat(payload, targetModel, { reasoningEffort, maxTokens, maxCompletionTokens }); key-rotation fetch loop over /v1/chat/completions (retry next key on 401/402/429/5xx, keep last response otherwise; DEFECT: fetch Response object -> status/body buffers from the extern); failure -> sendJson(status ?? 502, { error: { message: `Chat completions forwarding failed: ${msg}` } });
+// non-SSE or no body -> parse chat JSON (chatJson.error -> 400 passthrough) -> chatResponseToResponses -> sendJson 200; parse failure -> 500.
+// SSE -> streamChatToResponses(upstreamResponse, res).
+fn GrokProxyServer_handleResponses(self: &GrokProxyServer, req_ptr: ptr, req_len: u64, res: u64) -> i32 {
+    return 0;
+}
+
+// DEFECT: async + stream reader — streamChatToResponses(upstreamResponse, res): writes SSE head (200, text/event-stream, no-cache, Connection: close); responseId/assistantItemId synthesized; sendSseEvent response.created;
+// reader loop: TextDecoder streaming decode into buffer, split "\n", keep tail in buffer (DEFECT: ReadableStream reader + TextDecoder -> chunk callback extern feeding the same line buffer); per "data:" line (skip empty / "[DONE]"): JSON.parse guarded; usage captured; choices[0].delta: reasoning_content||reasoning delta re-emitted as response.output_text.delta; content delta: first one emits response.output_item.added (message item), accumulate, emit response.output_text.delta; delta.tool_calls accumulated into toolCallsMap keyed by index ({ id, name +=, arguments +=, itemId synthesized }) (DEFECT: Map<number, ...> -> fixed array capacity 32 keyed by index).
+// Finalize: tool calls in sorted index order emit output_item.added / function_call_arguments.delta / .done / output_item.done; message finalize output_text.done + output_item.done when started; response.done and response.completed with usage (prompt/input, completion/output, total fallback sum); res.end(). Catch -> response.failed SSE + res.end() when not already ended. (DEFECT: try/catch around the stream loop -> status propagation)
+fn GrokProxyServer_streamChatToResponses(self: &GrokProxyServer, upstream: u64, res: u64) -> i32 {
+    return 0;
+}
+
+// DEFECT: async — forwardDirectResponses(payload, res): upstreamUrl = /v1/responses via buildUpstreamUrl; forwardPayload = { ...payload, model: targetModel }; same key-rotation fetch loop; failure -> `Forwarding failed: ${msg}`; streaming -> raw byte passthrough loop (reader -> res.write) with empty catch, res.end(); else text passthrough with upstream content-type or application/json.
+fn GrokProxyServer_forwardDirectResponses(self: &GrokProxyServer, payload_ptr: ptr, payload_len: u64, res: u64) -> i32 {
+    return 0;
+}
+
+// DEFECT: async — handleChatCompletions(req, res): body/JSON parse as handleResponses (400 on invalid JSON); wireApi responses -> forwardChatToResponsesUpstream; anthropic|gemini -> forwardChatToBufferedUpstream(payload, wireApi, res); chat -> forwardChatToChatUpstream(payload, res).
+fn GrokProxyServer_handleChatCompletions(self: &GrokProxyServer, req_ptr: ptr, req_len: u64, res: u64) -> i32 {
+    return 0;
+}
+
+// DEFECT: async — forwardChatToChatUpstream(payload, res): forwardPayload = { ...payload, model: targetModel }; key-rotation fetch loop to /v1/chat/completions; failure -> `Chat completions forwarding failed: ${msg}`; streaming raw passthrough or text passthrough as forwardDirectResponses.
+fn GrokProxyServer_forwardChatToChatUpstream(self: &GrokProxyServer, payload_ptr: ptr, payload_len: u64, res: u64) -> i32 {
+    return 0;
+}
+
+fn GrokProxyServer_upstreamKeys(self: &GrokProxyServer, out_count: &u64) -> void {
+    // return this.config.apiKeys.length > 0 ? this.config.apiKeys : [""];
+    out_count = self.config.apiKeys_len;
+    if out_count == 0 { out_count = 1; };
+}
+
+// DEFECT: async — postUpstreamJson(url, body, stream): per key fetch POST; raw text read; ok -> { status, json: parsed-or-{}, raw }; non-ok records lastStatus/lastRaw, continues on 401/402/429/5xx else returns { status, json: tryParseJson(raw), raw }; thrown errors record message as lastRaw. Final fallback { status: lastStatus (init 502), json: tryParseJson(lastRaw), raw: lastRaw }. Result triple returned via out params (status + JSON buffer + raw buffer).
+fn GrokProxyServer_postUpstreamJson(self: &GrokProxyServer, url_ptr: ptr, url_len: u64, body_ptr: ptr, body_len: u64, stream: bool, out_status: &u64, out_json_ptr: ptr, out_json_len: &u64) -> i32 {
+    out_status = 502;
+    out_json_len = 0;
+    return 0;
+}
+
+fn GrokProxyServer_tryParseJson(self: &GrokProxyServer, raw_ptr: ptr, raw_len: u64, out_ptr: ptr, out_len: &u64) -> void {
+    // try { return raw ? JSON.parse(raw) : {}; } catch { return { _raw: raw }; }
+    // DEFECT: try/catch -> parse status; failure builds the { _raw: raw } JSON buffer.
+    out_len = 0;
+}
+
+fn GrokProxyServer_upstreamErrorMessage(self: &GrokProxyServer, status: u64, json_ptr: ptr, json_len: u64, raw_ptr: ptr, raw_len: u64, out_ptr: ptr, out_len: &u64) -> void {
+    // const err = result.json?.error; const detail = typeof err === "object" ? (err.message || JSON.stringify(err)) : (err || result.raw || `HTTP ${result.status}`); return `HTTP ${result.status}: ${detail}`;
+    out_len = 0;
+}
+
+// DEFECT: async — forwardChatToResponsesUpstream(payload, res): wantsStream from payload.stream; responsesPayload = chatRequestToResponses(...); result = postUpstreamJson(resolveResponsesEndpoint(targetBaseUrl), { ...responsesPayload, stream: false }, false); error status or json.error -> sendJson(clamped status or 502, { error: { message: `Chat->Responses forwarding failed: ${upstreamErrorMessage}` } }); chatJson = responsesResponseToChat(result.json, targetModel); non-stream -> sendJson 200 chatJson; stream -> emitChatStreamFromComplete(res, chatJson).
+fn GrokProxyServer_forwardChatToResponsesUpstream(self: &GrokProxyServer, payload_ptr: ptr, payload_len: u64, res: u64) -> i32 {
+    return 0;
+}
+
+// DEFECT: async — forwardChatToBufferedUpstream(payload, wireApi, res): messages/tools from payload; chatJson = fetchBufferedChatFromUpstream(messages, tools, wireApi, { maxTokens: payload.max_tokens ?? payload.max_completion_tokens ?? config.maxCompletionTokens ?? config.maxTokens, temperature: payload.temperature }); null -> 502 `Chat->${wireApi} forwarding failed: upstream request failed`; __upstreamError marker -> sendJson(__status || 502, same prefix with the detail) after destructuring it off (DEFECT: dynamic marker property __upstreamError/__status on the result object -> explicit out fields); non-stream -> sendJson 200; stream -> emitChatStreamFromComplete.
+fn GrokProxyServer_forwardChatToBufferedUpstream(self: &GrokProxyServer, payload_ptr: ptr, payload_len: u64, wireApi: u64, res: u64) -> i32 {
+    return 0;
+}
+
+// DEFECT: async — forwardResponsesToBufferedUpstream(payload, wireApi, res): chatPayload = responsesRequestToChat(...); fetchBufferedChatFromUpstream over its messages/tools ({ maxTokens: config.maxCompletionTokens ?? config.maxTokens, temperature: chatPayload.temperature }); null or __upstreamError -> sendJson(status || 502, `Responses->${wireApi} forwarding failed: ${detail}`); responsesJson = chatResponseToResponses(chatJson); non-stream -> sendJson 200; stream -> streamChatToResponsesFromComplete(responsesJson, res).
+fn GrokProxyServer_forwardResponsesToBufferedUpstream(self: &GrokProxyServer, payload_ptr: ptr, payload_len: u64, wireApi: u64, res: u64) -> i32 {
+    return 0;
+}
+
+// DEFECT: async — fetchBufferedChatFromUpstream(messages, tools, wireApi, options = {}): anthropic -> body = openAiMessagesToAnthropicPayload(...), url = resolveAnthropicEndpoint, postUpstreamJson; error -> { __upstreamError: upstreamErrorMessage(result), __status: result.status }; else anthropicResponseToChat. gemini -> body = openAiMessagesToGeminiPayload(...), url = resolveGeminiGenerateEndpoint, same error marker, else geminiResponseToChat. Null only from the callers' perspective when the extern itself fails.
+fn GrokProxyServer_fetchBufferedChatFromUpstream(self: &GrokProxyServer, messages_ptr: ptr, messages_len: u64, tools_ptr: ptr, tools_len: u64, wireApi: u64, has_maxTokens: bool, maxTokens: u64, has_temperature: bool, temperature: f64, out_ptr: ptr, out_len: &u64, out_upstreamError_ptr: ptr, out_upstreamError_len: &u64, out_status: &u64) -> i32 {
+    out_len = 0;
+    out_upstreamError_len = 0;
+    out_status = 0;
+    return 0;
+}
+
+// emitChatStreamFromComplete(res, chatJson): SSE head; choice = choices[0] || {}; message = choice.message || {}; base chunk { id: chatJson.id || synthesized, object: "chat.completion.chunk", created: now_s, model: chatJson.model || targetModel };
+// reasoning (reasoning_content || reasoning) -> one chunk delta { reasoning_content }; content -> one chunk delta { role: "assistant", content }; each tool_call -> chunk delta { tool_calls: [{ index, id, type: "function", function }] } (DEFECT: Array.forEach closure -> explicit loop); final chunk delta {} with finish_reason tool_calls|stop; then "data: [DONE]\n\n"; res.end(). Chunks are `data: ${JSON.stringify(...)}\n\n` writes (DEFECT: template literal chunk framing -> buffer build + write extern).
+fn GrokProxyServer_emitChatStreamFromComplete(self: &GrokProxyServer, res: u64, chatJson_ptr: ptr, chatJson_len: u64) -> void {
+}
+
+// DEFECT: async (declared async, no awaits) — streamChatToResponsesFromComplete(responsesJson, res): dead local chatJson built and voided (kept as a comment for 1:1 fidelity); SSE head; response.created with responsesJson.id || synthesized; per output item: message -> text joined from parts, skip when empty, emit output_item.added (empty output_text) / output_text.delta / output_text.done / output_item.done with output_index counting emitted items; function_call -> output_item.added (arguments "") / function_call_arguments.delta + .done when args / output_item.done; finally response.completed with { id, status: "completed", usage }; res.end().
+fn GrokProxyServer_streamChatToResponsesFromComplete(self: &GrokProxyServer, responsesJson_ptr: ptr, responsesJson_len: u64, res: u64) -> i32 {
+    return 0;
+}
+
+// Helper: sendJson(res, status, data): jsonBuf = Buffer.from(JSON.stringify(data, null, 2), "utf8"); writeHead(status, { Content-Type: application/json, Content-Length, Connection: close }); res.end(jsonBuf).
+// DEFECT: Buffer + JSON.stringify pretty-print (null, 2) — body built as a JSON text buffer; Content-Length is its byte length.
+fn sendJson(res: u64, status: u64, data_ptr: ptr, data_len: u64) -> void {
+}
+
+// Helper: sendSseEvent(res, event, data): res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).
+fn sendSseEvent(res: u64, event_ptr: ptr, event_len: u64, data_ptr: ptr, data_len: u64) -> void {
+}
+
+// Helper: sendGrokError(res, message, statusCode = 500): try { if (!res.headersSent) { sendJson(res, statusCode, { error: { message } }); return; } sendSseEvent(res, "response.failed", { type: "response.failed", response: { status: "failed", error: { message } } }); res.end(); } catch {}
+// DEFECT: try/catch with empty handler + headersSent state probe -> status-checked extern writes, failures ignored exactly as the source swallows them.
+fn sendGrokError(res: u64, message_ptr: ptr, message_len: u64, statusCode: u64) -> void {
+}
+
+// Helper: readBody(req): chunks = []; for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)); return Buffer.concat(chunks);
+// DEFECT: async iteration over the request stream (for await...of) + Buffer.concat — body accumulated by the server extern into a single buffer handed to handlers.
+fn readBody(req_ptr: ptr, req_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
+    out_len = 0;
+    return 0;
+}

@@ -1,0 +1,358 @@
+# web-ts-app-rest 单元缺陷日志
+
+格式：源文件:行号 | TS 构造 | 缺失能力/问题 | 采用的近似
+
+## 通用（跨文件）
+
+- apps/web/src/app/**/*.ts | TS module exports | SLA 无模块导出命名空间 | 标识符原样平铺为文件级 fn/struct/let
+- apps/web/src/app/**/*.ts | string 类型 | SLA 无托管 string | (ptr,len) 或定长字节数组 + len 字段
+- apps/web/src/app/**/*.ts | 前端运行时（React/DOM/浏览器存储/事件） | sa_std 无前端运行时对应 | 结构保留 + DEFECT 注释，行为层待修复阶段
+
+## 逐文件
+
+- apps/web/src/app/agents/agentReadiness.ts:7 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/agents/agentReadiness.ts:12 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/agents/agentReadiness.ts:12 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/appReducer.ts:45 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/appReducer.ts:62 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/appReducer.ts:75 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/appReducer.ts:75 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/appReducer.ts:91 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/appReducer.ts:107 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/claude/claudeStartupStage.ts:21 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/claude/claudeStartupStage.ts:27 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/claude/claudeStartupStage.ts:32 | Date/时间 API | sa_std 时间接口形状不同 | u64 毫秒时间戳参数/extern 近似
+- apps/web/src/app/claude/claudeStartupStage.ts:34 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/claude/claudeStartupStage.ts:38 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/cli/cliBackendKind.ts:6 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/cli/cliBackendLabels.ts:19 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/cli/cliBackendLabels.ts:29 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/cli/cliBackendLabels.ts:47 | 解构赋值 | SLA 无解构 | 逐字段取值赋值近似
+- apps/web/src/app/cli/cliPlugins.ts:22 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/cli/cliPlugins.ts:22 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/cli/cliPlugins.ts:27 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/cli/cliSkillGuides.ts:34 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/cli/cliSkillGuides.ts:59 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/cli/cliTogglePolicy.ts:12 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/cli/cliTogglePolicy.ts:14 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/cli/cliTogglePolicy.ts:19 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/cli/cliTogglePolicy.ts:29 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/cli/cliTogglePolicy.ts:39 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/cli/cliTogglePolicy.ts:39 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/cli/pluginCatalog.ts:56 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/cli/resolveCliBackendSelection.ts:24 | 解构赋值 | SLA 无解构 | 逐字段取值赋值近似
+- apps/web/src/app/cli/resolveCliBackendSelection.ts:31 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/cli/resolveCliBackendSelection.ts:31 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/cli/resolveCliBackendSelection.ts:37 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/cli/resolveEffectiveTurnCliBackend.ts:30 | 解构赋值 | SLA 无解构 | 逐字段取值赋值近似
+- apps/web/src/app/cli/resolveEffectiveTurnCliBackend.ts:31 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/cli/saVmExecutionSpec.ts:6 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/cli/saVmExecutionSpec.ts:68 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/cli/saVmExecutionSpec.ts:84 | async/await | SLA 无 async/await 与 Promise 运行时 | 同步函数 + 返回状态码，await 处顺序调用近似
+- apps/web/src/app/cli/saVmExecutionSpec.ts:121 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/cli/saVmExecutionSpec.ts:204 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/cli/saVmExecutionSpec.ts:248 | 解构赋值 | SLA 无解构 | 逐字段取值赋值近似
+- apps/web/src/app/cli/saVmExecutionSpec.ts:529 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/cli/useCliBackendPlugins.ts:1 | React hooks | SLA/SAX 无 React 运行时与 hooks 行为层 | 函数签名与状态字段保留为 struct 字段，hooks 调用以 DEFECT 注释保留原行
+- apps/web/src/app/cli/useCliBackendPlugins.ts:57 | Promise 链 | SLA 无 Promise | 顺序调用近似，结果以状态码/输出参数回传
+- apps/web/src/app/cli/useCliBackendPlugins.ts:57 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/cli/useCliBackendPlugins.ts:60 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/cli/useCliBackendPlugins.ts:61 | instanceof 运行时类型判断 | SLA 无运行时类型系统 | 显式标签字段 (kind tag) 判断近似
+- apps/web/src/app/cli/useCliBackendPlugins.ts:62 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/cli/useCliBackendPlugins.ts:70 | 解构赋值 | SLA 无解构 | 逐字段取值赋值近似
+- apps/web/src/app/cli/useCliBackendPlugins.ts:105 | try/catch 异常 | SLA 无异常机制 | 状态码分支近似
+- apps/web/src/app/cli/useCliBackendPlugins.ts:184 | async/await | SLA 无 async/await 与 Promise 运行时 | 同步函数 + 返回状态码，await 处顺序调用近似
+- apps/web/src/app/cli/useCliInstallations.ts:1 | React hooks | SLA/SAX 无 React 运行时与 hooks 行为层 | 函数签名与状态字段保留为 struct 字段，hooks 调用以 DEFECT 注释保留原行
+- apps/web/src/app/cli/useCliInstallations.ts:21 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/cli/useCliInstallations.ts:22 | instanceof 运行时类型判断 | SLA 无运行时类型系统 | 显式标签字段 (kind tag) 判断近似
+- apps/web/src/app/cli/useCliInstallations.ts:25 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/cli/useCliInstallations.ts:63 | 解构赋值 | SLA 无解构 | 逐字段取值赋值近似
+- apps/web/src/app/cli/useCliInstallations.ts:66 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/cli/useCliInstallations.ts:73 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/cli/useCliInstallations.ts:75 | Promise 链 | SLA 无 Promise | 顺序调用近似，结果以状态码/输出参数回传
+- apps/web/src/app/cli/useCliInstallations.ts:76 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/cli/useCliInstallations.ts:76 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/cli/useCliInstallations.ts:77 | try/catch 异常 | SLA 无异常机制 | 状态码分支近似
+- apps/web/src/app/cli/useCliInstallations.ts:167 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/cli/useCliPrerequisites.ts:1 | React hooks | SLA/SAX 无 React 运行时与 hooks 行为层 | 函数签名与状态字段保留为 struct 字段，hooks 调用以 DEFECT 注释保留原行
+- apps/web/src/app/cli/useCliPrerequisites.ts:8 | 解构赋值 | SLA 无解构 | 逐字段取值赋值近似
+- apps/web/src/app/cli/useCliPrerequisites.ts:10 | DOM/window/localStorage API | SLA 无 DOM 与浏览器存储 API | extern 占位 + DEFECT 注释，值以参数注入近似
+- apps/web/src/app/cli/useCliPrerequisites.ts:10 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/cli/useCliPrerequisites.ts:17 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/cli/useLazyCliBackendHistory.ts:1 | React hooks | SLA/SAX 无 React 运行时与 hooks 行为层 | 函数签名与状态字段保留为 struct 字段，hooks 调用以 DEFECT 注释保留原行
+- apps/web/src/app/cli/useLazyCliBackendHistory.ts:24 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/cli/useLazyCliBackendHistory.ts:55 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/connection/stableEventProxy.ts:1 | 类/interface 继承 (extends) | SLA 无继承 | 字段平铺到子 struct，基类方法以函数族近似
+- apps/web/src/app/connection/stableEventProxy.ts:2 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/connection/stableEventProxy.ts:6 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/connection/useStableSocketSubscription.ts:1 | React hooks | SLA/SAX 无 React 运行时与 hooks 行为层 | 函数签名与状态字段保留为 struct 字段，hooks 调用以 DEFECT 注释保留原行
+- apps/web/src/app/connection/useStableSocketSubscription.ts:22 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/connection/useStableSocketSubscription.ts:23 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/connection/useStableSocketSubscription.ts:33 | fetch/WebSocket/事件监听 | 前端网络/事件 API 无 sa_std 对应 | extern 占位 + 回调改函数族近似
+- apps/web/src/app/conversationStatus.ts:8 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/goals/goalResumeDecision.ts:1 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/goals/goalState.ts:3 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/goals/goalState.ts:3 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/goals/goalState.ts:11 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/goals/goalState.ts:70 | RegExp 正则表达式 | sa_std 无正则引擎 | 子串/逐字节扫描近似，正则原文以注释保留
+- apps/web/src/app/goals/useGoalLifecycle.ts:1 | React hooks | SLA/SAX 无 React 运行时与 hooks 行为层 | 函数签名与状态字段保留为 struct 字段，hooks 调用以 DEFECT 注释保留原行
+- apps/web/src/app/goals/useGoalLifecycle.ts:16 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/goals/useGoalLifecycle.ts:20 | Promise 链 | SLA 无 Promise | 顺序调用近似，结果以状态码/输出参数回传
+- apps/web/src/app/goals/useGoalLifecycle.ts:37 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/goals/useGoalLifecycle.ts:40 | 解构赋值 | SLA 无解构 | 逐字段取值赋值近似
+- apps/web/src/app/goals/useGoalLifecycle.ts:50 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/goals/useGoalLifecycle.ts:64 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/goals/useGoalLifecycle.ts:76 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/goals/useGoalLifecycle.ts:89 | async/await | SLA 无 async/await 与 Promise 运行时 | 同步函数 + 返回状态码，await 处顺序调用近似
+- apps/web/src/app/goals/useGoalLifecycle.ts:90 | try/catch 异常 | SLA 无异常机制 | 状态码分支近似
+- apps/web/src/app/goals/useGoalLifecycle.ts:124 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/goals/useGoalLifecycle.ts:313 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/goals/useGoalLifecycle.ts:322 | instanceof 运行时类型判断 | SLA 无运行时类型系统 | 显式标签字段 (kind tag) 判断近似
+- apps/web/src/app/goals/useGoalLifecycle.ts:324 | JSON.parse/stringify 动态对象 | 动态对象无静态类型对应 | JSON 文本缓冲 (ptr,len) + sa_json_* extern 近似
+- apps/web/src/app/jev/useJevAutoNudgeOwner.ts:1 | React hooks | SLA/SAX 无 React 运行时与 hooks 行为层 | 函数签名与状态字段保留为 struct 字段，hooks 调用以 DEFECT 注释保留原行
+- apps/web/src/app/jev/useJevAutoNudgeOwner.ts:17 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/jev/useJevAutoNudgeOwner.ts:19 | Promise 链 | SLA 无 Promise | 顺序调用近似，结果以状态码/输出参数回传
+- apps/web/src/app/jev/useJevAutoNudgeOwner.ts:19 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/jev/useJevAutoNudgeOwner.ts:23 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/jev/useJevAutoNudgeOwner.ts:54 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/jev/useJevAutoNudgeOwner.ts:69 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/jev/useJevAutoNudgeOwner.ts:89 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/jev/useJevAutoNudgeOwner.ts:119 | try/catch 异常 | SLA 无异常机制 | 状态码分支近似
+- apps/web/src/app/jev/useJevAutoNudgeOwner.ts:120 | instanceof 运行时类型判断 | SLA 无运行时类型系统 | 显式标签字段 (kind tag) 判断近似
+- apps/web/src/app/jev/useJevAutoNudgeOwner.ts:123 | DOM/window/localStorage API | SLA 无 DOM 与浏览器存储 API | extern 占位 + DEFECT 注释，值以参数注入近似
+- apps/web/src/app/jev/useJevAutoNudgeOwner.ts:123 | fetch/WebSocket/事件监听 | 前端网络/事件 API 无 sa_std 对应 | extern 占位 + 回调改函数族近似
+- apps/web/src/app/modelCapacityRetry.ts:23 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/modelCapacityRetry.ts:23 | RegExp 正则表达式 | sa_std 无正则引擎 | 子串/逐字节扫描近似，正则原文以注释保留
+- apps/web/src/app/modelCapacityRetry.ts:23 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/modelCapacityRetry.ts:37 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/pwa/serviceWorkerLifecycle.ts:2 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/pwa/serviceWorkerLifecycle.ts:5 | DOM/window/localStorage API | SLA 无 DOM 与浏览器存储 API | extern 占位 + DEFECT 注释，值以参数注入近似
+- apps/web/src/app/pwa/serviceWorkerLifecycle.ts:5 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/pwa/serviceWorkerLifecycle.ts:21 | async/await | SLA 无 async/await 与 Promise 运行时 | 同步函数 + 返回状态码，await 处顺序调用近似
+- apps/web/src/app/pwa/serviceWorkerLifecycle.ts:24 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/pwa/serviceWorkerLifecycle.ts:25 | Promise 链 | SLA 无 Promise | 顺序调用近似，结果以状态码/输出参数回传
+- apps/web/src/app/pwa/serviceWorkerLifecycle.ts:36 | fetch/WebSocket/事件监听 | 前端网络/事件 API 无 sa_std 对应 | extern 占位 + 回调改函数族近似
+- apps/web/src/app/pwa/serviceWorkerLifecycle.ts:37 | try/catch 异常 | SLA 无异常机制 | 状态码分支近似
+- apps/web/src/app/pwa/serviceWorkerLifecycle.ts:56 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/pwa/serviceWorkerLifecycle.ts:57 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/relayShare.ts:6 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/relayShare.ts:25 | async/await | SLA 无 async/await 与 Promise 运行时 | 同步函数 + 返回状态码，await 处顺序调用近似
+- apps/web/src/app/relayShare.ts:25 | Promise 链 | SLA 无 Promise | 顺序调用近似，结果以状态码/输出参数回传
+- apps/web/src/app/relayShare.ts:29 | JSON.parse/stringify 动态对象 | 动态对象无静态类型对应 | JSON 文本缓冲 (ptr,len) + sa_json_* extern 近似
+- apps/web/src/app/relayShare.ts:35 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/relayShare.ts:44 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/relayShare.ts:54 | try/catch 异常 | SLA 无异常机制 | 状态码分支近似
+- apps/web/src/app/relayShare.ts:95 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/relayShare.ts:95 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/relayShare.ts:95 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/reviewTurn.ts:13 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/reviewTurn.ts:14 | RegExp 正则表达式 | sa_std 无正则引擎 | 子串/逐字节扫描近似，正则原文以注释保留
+- apps/web/src/app/reviewTurn.ts:18 | instanceof 运行时类型判断 | SLA 无运行时类型系统 | 显式标签字段 (kind tag) 判断近似
+- apps/web/src/app/reviewTurn.ts:20 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/runtime/saVmWorkspaceSkill.ts:49 | RegExp 正则表达式 | sa_std 无正则引擎 | 子串/逐字节扫描近似，正则原文以注释保留
+- apps/web/src/app/runtime/saVmWorkspaceSkill.ts:51 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:1 | React hooks | SLA/SAX 无 React 运行时与 hooks 行为层 | 函数签名与状态字段保留为 struct 字段，hooks 调用以 DEFECT 注释保留原行
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:106 | 类/interface 继承 (extends) | SLA 无继承 | 字段平铺到子 struct，基类方法以函数族近似
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:113 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:121 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:122 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:134 | Promise 链 | SLA 无 Promise | 顺序调用近似，结果以状态码/输出参数回传
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:160 | 解构赋值 | SLA 无解构 | 逐字段取值赋值近似
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:163 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:169 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:186 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:232 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:267 | async/await | SLA 无 async/await 与 Promise 运行时 | 同步函数 + 返回状态码，await 处顺序调用近似
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:291 | try/catch 异常 | SLA 无异常机制 | 状态码分支近似
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:505 | RegExp 正则表达式 | sa_std 无正则引擎 | 子串/逐字节扫描近似，正则原文以注释保留
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:505 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:750 | JSON.parse/stringify 动态对象 | 动态对象无静态类型对应 | JSON 文本缓冲 (ptr,len) + sa_json_* extern 近似
+- apps/web/src/app/runtime/useThreadRuntimeSelections.ts:809 | DOM/window/localStorage API | SLA 无 DOM 与浏览器存储 API | extern 占位 + DEFECT 注释，值以参数注入近似
+- apps/web/src/app/settings/relayListPagination.ts:3 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/sidechat/sideChatDuckDefaults.ts:40 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/sidechat/sideChatDuckDefaults.ts:40 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/sidechat/sideChatDuckDefaults.ts:40 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/sidechat/sideChatDuckDefaults.ts:53 | 类/interface 继承 (extends) | SLA 无继承 | 字段平铺到子 struct，基类方法以函数族近似
+- apps/web/src/app/sidechat/sideChatDuckDefaults.ts:59 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/sidechat/sideChatDuckDefaults.ts:93 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/sidechat/sideChatDuckDefaults.ts:99 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/skills/skillScope.ts:3 | RegExp 正则表达式 | sa_std 无正则引擎 | 子串/逐字节扫描近似，正则原文以注释保留
+- apps/web/src/app/skills/skillScope.ts:6 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/skills/skillScope.ts:13 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/skills/skillScope.ts:13 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/terminal/terminalPreferences.ts:28 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/terminal/terminalPreferences.ts:28 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/terminal/terminalPreferences.ts:28 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/terminal/terminalPreferences.ts:43 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/terminal/terminalPreferences.ts:47 | try/catch 异常 | SLA 无异常机制 | 状态码分支近似
+- apps/web/src/app/terminal/terminalPreferences.ts:48 | DOM/window/localStorage API | SLA 无 DOM 与浏览器存储 API | extern 占位 + DEFECT 注释，值以参数注入近似
+- apps/web/src/app/terminal/terminalPreferences.ts:56 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/terminal/terminalPreferences.ts:60 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/terminal/terminalPreferences.ts:60 | JSON.parse/stringify 动态对象 | 动态对象无静态类型对应 | JSON 文本缓冲 (ptr,len) + sa_json_* extern 近似
+- apps/web/src/app/terminal/terminalPreferences.ts:86 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/terminal/terminalPreferences.ts:92 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/threadWriterConflict.ts:1 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/threadWriterConflict.ts:2 | instanceof 运行时类型判断 | SLA 无运行时类型系统 | 显式标签字段 (kind tag) 判断近似
+- apps/web/src/app/threadWriterConflict.ts:7 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/threadWriterConflict.ts:9 | RegExp 正则表达式 | sa_std 无正则引擎 | 子串/逐字节扫描近似，正则原文以注释保留
+- apps/web/src/app/threads/ThreadLoadQueue.ts:7 | Promise 链 | SLA 无 Promise | 顺序调用近似，结果以状态码/输出参数回传
+- apps/web/src/app/threads/ThreadLoadQueue.ts:11 | class 声明 | SLA 无 class/方法多态 | struct + 以 &Struct 为首参的函数族
+- apps/web/src/app/threads/ThreadLoadQueue.ts:12 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/threads/ThreadLoadQueue.ts:18 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/threads/ThreadLoadQueue.ts:26 | async/await | SLA 无 async/await 与 Promise 运行时 | 同步函数 + 返回状态码，await 处顺序调用近似
+- apps/web/src/app/threads/ThreadLoadQueue.ts:44 | 定时器 setTimeout/setInterval | sa_std 无事件循环定时器 | 同步近似/轮次计数近似 + DEFECT
+- apps/web/src/app/threads/TranscriptRetention.ts:4 | class 声明 | SLA 无 class/方法多态 | struct + 以 &Struct 为首参的函数族
+- apps/web/src/app/threads/TranscriptRetention.ts:7 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/threads/editConversation.ts:17 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/threads/threadCatalog.ts:10 | async/await | SLA 无 async/await 与 Promise 运行时 | 同步函数 + 返回状态码，await 处顺序调用近似
+- apps/web/src/app/threads/threadCatalog.ts:10 | Promise 链 | SLA 无 Promise | 顺序调用近似，结果以状态码/输出参数回传
+- apps/web/src/app/threads/threadCatalog.ts:11 | try/catch 异常 | SLA 无异常机制 | 状态码分支近似
+- apps/web/src/app/threads/threadCatalog.ts:14 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/threads/threadCatalog.ts:15 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/threads/threadCatalog.ts:25 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/threads/threadCatalog.ts:36 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/threads/threadCatalog.ts:38 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/threads/threadCatalog.ts:52 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/threads/threadCatalog.ts:54 | React hooks | SLA/SAX 无 React 运行时与 hooks 行为层 | 函数签名与状态字段保留为 struct 字段，hooks 调用以 DEFECT 注释保留原行
+- apps/web/src/app/threads/threadCatalog.ts:81 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/threads/threadCatalog.ts:82 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/threads/threadCatalog.ts:165 | Date/时间 API | sa_std 时间接口形状不同 | u64 毫秒时间戳参数/extern 近似
+- apps/web/src/app/threads/threadCatalog.ts:204 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/threads/threadCatalog.ts:215 | RegExp 正则表达式 | sa_std 无正则引擎 | 子串/逐字节扫描近似，正则原文以注释保留
+- apps/web/src/app/threads/threadHistoryService.ts:17 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/threads/threadHistoryService.ts:19 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/threads/threadHistoryService.ts:23 | Promise 链 | SLA 无 Promise | 顺序调用近似，结果以状态码/输出参数回传
+- apps/web/src/app/threads/threadHistoryService.ts:23 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/threads/threadHistoryService.ts:23 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/threads/threadHistoryService.ts:49 | 定时器 setTimeout/setInterval | sa_std 无事件循环定时器 | 同步近似/轮次计数近似 + DEFECT
+- apps/web/src/app/threads/threadHistoryService.ts:52 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/threads/threadHistoryService.ts:68 | async/await | SLA 无 async/await 与 Promise 运行时 | 同步函数 + 返回状态码，await 处顺序调用近似
+- apps/web/src/app/threads/threadHistoryService.ts:75 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/threads/threadHistoryService.ts:87 | try/catch 异常 | SLA 无异常机制 | 状态码分支近似
+- apps/web/src/app/threads/threadHistoryService.ts:118 | RegExp 正则表达式 | sa_std 无正则引擎 | 子串/逐字节扫描近似，正则原文以注释保留
+- apps/web/src/app/threads/threadHistoryService.ts:148 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/threads/threadHistoryService.ts:197 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/threads/threadHistoryService.ts:204 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/threads/threadHistoryService.ts:263 | instanceof 运行时类型判断 | SLA 无运行时类型系统 | 显式标签字段 (kind tag) 判断近似
+- apps/web/src/app/transcripts/failedTurnRecovery.ts:10 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/transcripts/failedTurnRecovery.ts:24 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/transcripts/failedTurnRecovery.ts:26 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/transcripts/failedTurnRecovery.ts:32 | RegExp 正则表达式 | sa_std 无正则引擎 | 子串/逐字节扫描近似，正则原文以注释保留
+- apps/web/src/app/transcripts/failedTurnRecovery.ts:37 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/transcripts/failedTurnRecovery.ts:40 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/transcripts/failedTurnRecovery.ts:70 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/transcripts/runtimeTurnProjection.ts:4 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/transcripts/runtimeTurnProjection.ts:26 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/transcripts/runtimeTurnProjection.ts:36 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/transcripts/runtimeTurnProjection.ts:54 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/transcripts/runtimeTurnProjection.ts:57 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/transcripts/runtimeTurnProjection.ts:147 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/transcripts/runtimeTurnProjection.ts:147 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/transcripts/topicRuntimeIndex.ts:18 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/transcripts/topicRuntimeIndex.ts:33 | RegExp 正则表达式 | sa_std 无正则引擎 | 子串/逐字节扫描近似，正则原文以注释保留
+- apps/web/src/app/transcripts/topicRuntimeIndex.ts:38 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/transcripts/topicRuntimeIndex.ts:38 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/transcripts/topicRuntimeIndex.ts:44 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/transcripts/topicTranscriptStore.ts:1 | React hooks | SLA/SAX 无 React 运行时与 hooks 行为层 | 函数签名与状态字段保留为 struct 字段，hooks 调用以 DEFECT 注释保留原行
+- apps/web/src/app/transcripts/topicTranscriptStore.ts:17 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/transcripts/topicTranscriptStore.ts:28 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/transcripts/topicTranscriptStore.ts:45 | class 声明 | SLA 无 class/方法多态 | struct + 以 &Struct 为首参的函数族
+- apps/web/src/app/transcripts/topicTranscriptStore.ts:50 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/transcripts/topicTranscriptStore.ts:74 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/transcripts/topicTranscriptStore.ts:100 | 解构赋值 | SLA 无解构 | 逐字段取值赋值近似
+- apps/web/src/app/transcripts/topicTranscriptStore.ts:108 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/transcripts/topicTranscriptStore.ts:197 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/transcripts/topicTranscriptStore.ts:415 | Date/时间 API | sa_std 时间接口形状不同 | u64 毫秒时间戳参数/extern 近似
+- apps/web/src/app/transcripts/topicTranscriptStore.ts:416 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/transcripts/topicTranscriptStore.ts:884 | RegExp 正则表达式 | sa_std 无正则引擎 | 子串/逐字节扫描近似，正则原文以注释保留
+- apps/web/src/app/transcripts/topicTranscriptStore.ts:1082 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/transcripts/topicTranscriptStore.ts:1082 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/transcripts/transcriptProjection.ts:6 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/transcripts/transcriptProjection.ts:22 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/transcripts/transcriptProjection.ts:22 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/transcripts/transcriptProjection.ts:51 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/transcripts/transcriptProjection.ts:90 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/transcripts/transcriptProjection.ts:95 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/transcripts/transcriptProjection.ts:95 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/transcripts/useTopicTranscriptRuntime.ts:1 | React hooks | SLA/SAX 无 React 运行时与 hooks 行为层 | 函数签名与状态字段保留为 struct 字段，hooks 调用以 DEFECT 注释保留原行
+- apps/web/src/app/transcripts/useTopicTranscriptRuntime.ts:26 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/transcripts/useTopicTranscriptRuntime.ts:27 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/transcripts/useTopicTranscriptRuntime.ts:33 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/transcripts/useTopicTranscriptRuntime.ts:38 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/transcripts/useTopicTranscriptRuntime.ts:38 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/transcripts/useTopicTranscriptRuntime.ts:44 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/transcripts/useTopicTranscriptRuntime.ts:44 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/transcripts/useTranscriptStreamScheduler.ts:1 | React hooks | SLA/SAX 无 React 运行时与 hooks 行为层 | 函数签名与状态字段保留为 struct 字段，hooks 调用以 DEFECT 注释保留原行
+- apps/web/src/app/transcripts/useTranscriptStreamScheduler.ts:22 | class 声明 | SLA 无 class/方法多态 | struct + 以 &Struct 为首参的函数族
+- apps/web/src/app/transcripts/useTranscriptStreamScheduler.ts:82 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/transcripts/useTranscriptStreamScheduler.ts:85 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/transcripts/useTranscriptStreamScheduler.ts:94 | DOM/window/localStorage API | SLA 无 DOM 与浏览器存储 API | extern 占位 + DEFECT 注释，值以参数注入近似
+- apps/web/src/app/transcripts/useTranscriptStreamScheduler.ts:94 | 定时器 setTimeout/setInterval | sa_std 无事件循环定时器 | 同步近似/轮次计数近似 + DEFECT
+- apps/web/src/app/transcripts/useTranscriptStreamScheduler.ts:128 | fetch/WebSocket/事件监听 | 前端网络/事件 API 无 sa_std 对应 | extern 占位 + 回调改函数族近似
+- apps/web/src/app/turnInterruptRetry.ts:7 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/turnInterruptRetry.ts:11 | class 声明 | SLA 无 class/方法多态 | struct + 以 &Struct 为首参的函数族
+- apps/web/src/app/turnInterruptRetry.ts:12 | Promise 链 | SLA 无 Promise | 顺序调用近似，结果以状态码/输出参数回传
+- apps/web/src/app/turnInterruptRetry.ts:12 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/turnInterruptRetry.ts:14 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/turnInterruptRetry.ts:15 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/turnInterruptRetry.ts:33 | async/await | SLA 无 async/await 与 Promise 运行时 | 同步函数 + 返回状态码，await 处顺序调用近似
+- apps/web/src/app/turnInterruptRetry.ts:34 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/turnInterruptRetry.ts:44 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/turnInterruptRetry.ts:47 | 定时器 setTimeout/setInterval | sa_std 无事件循环定时器 | 同步近似/轮次计数近似 + DEFECT
+- apps/web/src/app/turnInterruptRetry.ts:52 | try/catch 异常 | SLA 无异常机制 | 状态码分支近似
+- apps/web/src/app/turnInterruptRetry.ts:58 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/turnInterruptRetry.ts:82 | RegExp 正则表达式 | sa_std 无正则引擎 | 子串/逐字节扫描近似，正则原文以注释保留
+- apps/web/src/app/turnInterruptRetry.ts:106 | instanceof 运行时类型判断 | SLA 无运行时类型系统 | 显式标签字段 (kind tag) 判断近似
+- apps/web/src/app/turnRetryState.ts:11 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/usage/topicUsageStore.ts:1 | React hooks | SLA/SAX 无 React 运行时与 hooks 行为层 | 函数签名与状态字段保留为 struct 字段，hooks 调用以 DEFECT 注释保留原行
+- apps/web/src/app/usage/topicUsageStore.ts:6 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/usage/topicUsageStore.ts:7 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/usage/topicUsageStore.ts:15 | class 声明 | SLA 无 class/方法多态 | struct + 以 &Struct 为首参的函数族
+- apps/web/src/app/usage/topicUsageStore.ts:16 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/usage/topicUsageStore.ts:22 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/usage/topicUsageStore.ts:30 | 定时器 setTimeout/setInterval | sa_std 无事件循环定时器 | 同步近似/轮次计数近似 + DEFECT
+- apps/web/src/app/usage/topicUsageStore.ts:46 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/usage/topicUsageStore.ts:83 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/usage/topicUsageStore.ts:89 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/usage/topicUsageStore.ts:147 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/usage/usagePricing.ts:4 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/usage/usagePricing.ts:4 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/usage/usagePricing.ts:4 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/usage/usagePricing.ts:4 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/usage/usagePricing.ts:31 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/workspace/rightWorkspaceContext.ts:19 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/workspace/rightWorkspaceContext.ts:19 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/workspace/rightWorkspaceContext.ts:22 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/workspace/rightWorkspaceContext.ts:38 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/workspace/rightWorkspaceContext.ts:41 | 泛型 <T> | SLA 无泛型 | 具体化为 JSON 文本缓冲/定长缓冲参数
+- apps/web/src/app/workspace/rightWorkspaceContext.ts:42 | Record/动态对象索引签名 | SLA 无动态对象 | JSON 文本缓冲 + DEFECT: dynamic object
+- apps/web/src/app/workspace/useOpenFileTabs.ts:1 | React hooks | SLA/SAX 无 React 运行时与 hooks 行为层 | 函数签名与状态字段保留为 struct 字段，hooks 调用以 DEFECT 注释保留原行
+- apps/web/src/app/workspace/useOpenFileTabs.ts:20 | 解构赋值 | SLA 无解构 | 逐字段取值赋值近似
+- apps/web/src/app/workspace/useOpenFileTabs.ts:24 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/workspace/useOpenFileTabs.ts:24 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/workspace/useOpenFileTabs.ts:24 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+- apps/web/src/app/workspace/useOpenFileTabs.ts:31 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/workspace/useOpenFileTabs.ts:76 | DOM/window/localStorage API | SLA 无 DOM 与浏览器存储 API | extern 占位 + DEFECT 注释，值以参数注入近似
+- apps/web/src/app/workspace/useOpenFileTabs.ts:97 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/workspace/useWorkspaceFileMutations.ts:1 | React hooks | SLA/SAX 无 React 运行时与 hooks 行为层 | 函数签名与状态字段保留为 struct 字段，hooks 调用以 DEFECT 注释保留原行
+- apps/web/src/app/workspace/useWorkspaceFileMutations.ts:24 | 闭包/箭头函数（含回调参数） | SLA 无一等闭包与捕获可变状态 | 回调改为命名函数/函数族近似，捕获状态改显式参数
+- apps/web/src/app/workspace/useWorkspaceFileMutations.ts:25 | Promise 链 | SLA 无 Promise | 顺序调用近似，结果以状态码/输出参数回传
+- apps/web/src/app/workspace/useWorkspaceFileMutations.ts:32 | RegExp 正则表达式 | sa_std 无正则引擎 | 子串/逐字节扫描近似，正则原文以注释保留
+- apps/web/src/app/workspace/useWorkspaceFileMutations.ts:34 | 模板字符串插值 | SLA 无模板字符串 | STR_PTR/STR_LEN 分段拼接近似，原文以注释保留
+- apps/web/src/app/workspace/useWorkspaceFileMutations.ts:49 | unknown/any 动态类型 | SLA 静态类型无 unknown/any | JSON 文本缓冲/标签联合近似
+- apps/web/src/app/workspace/useWorkspaceFileMutations.ts:50 | instanceof 运行时类型判断 | SLA 无运行时类型系统 | 显式标签字段 (kind tag) 判断近似
+- apps/web/src/app/workspace/useWorkspaceFileMutations.ts:59 | 解构赋值 | SLA 无解构 | 逐字段取值赋值近似
+- apps/web/src/app/workspace/useWorkspaceFileMutations.ts:61 | async/await | SLA 无 async/await 与 Promise 运行时 | 同步函数 + 返回状态码，await 处顺序调用近似
+- apps/web/src/app/workspace/useWorkspaceFileMutations.ts:64 | try/catch 异常 | SLA 无异常机制 | 状态码分支近似
+- apps/web/src/app/workspace/useWorkspaceFileMutations.ts:66 | 可选链 ?./空值合并 ?? | SLA 无 ?. 与 ?? 运算符 | 显式 null/长度检查分支近似
+- apps/web/src/app/workspace/useWorkspaceFileMutations.ts:92 | Map/Set 集合 | sa_std 无 Map/Set 对应类型 | 定长数组 + len 字段近似，has/add/delete 以线性扫描函数近似
+- apps/web/src/app/workspace/useWorkspaceFileMutations.ts:92 | 展开运算符 ... | SLA 无 spread | 逐元素拷贝循环近似
+- apps/web/src/app/workspace/useWorkspaceFileMutations.ts:92 | 数组高阶方法 map/filter/reduce 等 | SLA 无闭包式高阶数组方法 | 显式 for 循环近似
+
+## 回绑扫尾（2026-10-26，sa_std TS 语义库）
+
+参照清单：`_defects/SA_TS_INVENTORY.md`（ts_string.sa 的 @ts_str_*、ts_array.sa 的 @ts_arr_*、ts_math.sa 的 @ts_math_*、tree_sitter.sai 的 sa_ts_*、collections 的 btree_map/btree_set、async.sla/future.sa/sync 面）。
+- 已回绑（代码层）：无。本批次无与 ts 面签名确切对应的独立扫描桩（字符串相等均内嵌于领域函数，非独立桩）。
+- async 归类改记：本日志 async/Promise 条目共 23 条，修复阶段改记为参照 sa_std async 面评估（async.sla 的 sched_*/block_on_timeout、future.sa、sync/mpsc.sa、sync/mutex.sa、thread.sa）；代码层本轮不重构。
+- 未回绑注记（修复阶段按 SA_TS_INVENTORY 评估）：String 18、Array 50、RegExp 14、Map/Set 49 条（条目可跨类重复计数）。Map/Set 条目（如 appReducer 的定长数组+len 线性扫描 has/add/delete）键为字符串/对象，collections btree_map/btree_set 的键类型待核对，不硬绑；Array 高阶方法条目同 wb-c 注记（JSON 缓冲/对象数组 vs word 数组模型不合）。
+- tree-sitter：本批次无命中（全部 175 个 web-ts .sla 扫描 0 处）。

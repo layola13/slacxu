@@ -1,0 +1,1648 @@
+// Converted 1:1 from sdk-backend/src/claudeSkillInventory.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+
+@import "sa_std/ptr.sa"
+@import "dataDir.sla"
+
+// DEFECT: fs/promises (readdir with Dirent, readFile) + async
+// class methods + Promise.all -> synchronous functions over the
+// sa_std fs surface (read_dir_json gives entry names only, so
+// Dirent.isDirectory() is probed by attempting the SKILL.md
+// reads; isFile() by the .md suffix). Error discrimination:
+// every fs failure is treated as ENOENT (the TS code checks
+// error.code !== "ENOENT" and records other errors; those error
+// records are therefore under-produced -- logged).
+// DEFECT: Set/Map -> flat tables. RegExp (frontmatter fence,
+// key lines, name pattern, slash/$ matchers) -> hand scanners.
+// DEFECT: homedir() -> HOME env; resolve() -> verbatim/PWD-join
+// approximation (see dataDir.sla). throw -> status codes.
+
+struct BigBuf {
+    bytes: [u8; 131072],
+    len: u64,
+}
+
+fn bb_append(b: &BigBuf, src_ptr: ptr, src_len: u64) -> void {
+    for i in 0..src_len {
+        if b.len < 131072 {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, src_ptr, i);
+            b.bytes[b.len] = c;
+            b.len = b.len + 1;
+        };
+    }
+}
+
+fn bb_append_escaped(b: &BigBuf, src_ptr: ptr, src_len: u64) -> void {
+    for i in 0..src_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, src_ptr, i);
+        if c == 34 || c == 92 {
+            if b.len < 131072 {
+                b.bytes[b.len] = 92;
+                b.len = b.len + 1;
+            };
+        };
+        if b.len < 131072 {
+            b.bytes[b.len] = c;
+            b.len = b.len + 1;
+        };
+    }
+}
+
+fn read_text_file(path_ptr: ptr, path_len: u64, out: &BigBuf) -> i32 {
+    let total: u64 = 0;
+    if sa_std_fs_len(path_ptr, path_len, &total) != 0 { return 6; };
+    if total > 131072 { return 6; };
+    let fh: u64 = 0;
+    if sa_std_fs_open_read(path_ptr, path_len, &fh) != 0 { return 6; };
+    out.len = 0;
+    let chunk = [0u8; 4096];
+    let guard: u64 = 0;
+    while guard < 64 {
+        let read_n: u64 = 0;
+        let rst = sa_std_fs_file_read(fh, &chunk, 4096, &read_n);
+        if rst != 0 {
+            sa_fs_file_close(fh);
+            return 6;
+        };
+        if read_n == 0 { break; };
+        for ci in 0..read_n {
+            if out.len < 131072 {
+                out.bytes[out.len] = chunk[ci];
+                out.len = out.len + 1;
+            };
+        }
+        guard = guard + 1;
+    }
+    sa_fs_file_close(fh);
+    return 0;
+}
+
+fn bytes_eq_range(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    for i in 0..a_len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a_ptr, i);
+        PTR_BYTE_AT(y, b_ptr, i);
+        if x != y { return false; };
+    }
+    return true;
+}
+
+fn lower_copy(dst: &BigBuf, src_ptr: ptr, src_len: u64) -> void {
+    dst.len = 0;
+    for i in 0..src_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src_ptr, i);
+        if b >= 65 && b <= 90 { b = b + 32; };
+        if dst.len < 131072 {
+            dst.bytes[dst.len] = b;
+            dst.len = dst.len + 1;
+        };
+    }
+}
+
+// normalizePath(path) = resolve(path).replace(/\\/g, "/").toLowerCase()
+// DEFECT: resolve() approximated (absolute paths verbatim;
+// relative paths joined onto PWD without normalization).
+fn normalizePath(path_ptr: ptr, path_len: u64, out: &BigBuf) -> void {
+    let abs = BigBuf { bytes: [0u8; 131072], len: 0 };
+    let first: u8 = 0;
+    if path_len > 0 { PTR_BYTE_AT(first, path_ptr, 0); };
+    if first != 47 {
+        let e_pwd = sa_env_get(STR_PTR("PWD"), STR_LEN("PWD"));
+        if e_pwd != 0 {
+            let pp: ptr = sa_env_buffer_data(e_pwd);
+            let pl = sa_env_buffer_len(e_pwd);
+            bb_append(&abs, pp, pl);
+            bb_append(&abs, STR_PTR("/"), STR_LEN("/"));
+        };
+    };
+    bb_append(&abs, path_ptr, path_len);
+    out.len = 0;
+    let ap: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ap, &abs.bytes, 0);
+    for i in 0..abs.len {
+        let b = abs.bytes[i];
+        if b == 92 { b = 47; };
+        if b >= 65 && b <= 90 { b = b + 32; };
+        if out.len < 131072 {
+            out.bytes[out.len] = b;
+            out.len = out.len + 1;
+        };
+    }
+}
+
+struct PathTable {
+    items: [BigBuf; 64],
+    count: u64,
+}
+
+fn uniquePaths(input: &PathTable, out: &PathTable) -> void {
+    out.count = 0;
+    for i in 0..input.count {
+        let raw = BigBuf { bytes: [0u8; 131072], len: 0 };
+        // resolve(path.trim()) -- trim then normalize-for-compare
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, &input.items[i].bytes, 0);
+        let s: u64 = 0;
+        let e: u64 = input.items[i].len;
+        while s < e && input.items[i].bytes[s] == 32 { s = s + 1; };
+        while e > s && input.items[i].bytes[e - 1] == 32 { e = e - 1; };
+        if e <= s { continue; };
+        let slice_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(slice_ptr, sp, s);
+        normalizePath(slice_ptr, e - s, &raw);
+        let dup = false;
+        for j in 0..out.count {
+            let op: ptr = PTR_NULL();
+            PTR_BYTE_ADD(op, &out.items[j].bytes, 0);
+            let rp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(rp, &raw.bytes, 0);
+            // compare on normalized forms of both sides
+            let on = BigBuf { bytes: [0u8; 131072], len: 0 };
+            normalizePath(op, out.items[j].len, &on);
+            let onp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(onp, &on.bytes, 0);
+            if bytes_eq_range(onp, on.len, rp, raw.len) { dup = true; break; };
+        }
+        if !dup && out.count < 64 {
+            out.items[out.count].len = 0;
+            let rp2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(rp2, sp, s);
+            bb_append(&out.items[out.count], rp2, e - s);
+            out.count = out.count + 1;
+        };
+    }
+}
+
+// scope tags: 0 = "project", 1 = "user", 2 = "extra"
+struct ClaudeSkillEntry {
+    name: [u8; 256],
+    name_len: u64,
+    description: [u8; 4096],
+    description_len: u64,
+    path: [u8; 4096],
+    path_len: u64,
+    scope: u64,
+    enabled: bool,
+}
+
+struct SkillError {
+    path: [u8; 4096],
+    path_len: u64,
+    message: [u8; 1024],
+    message_len: u64,
+}
+
+struct ClaudeSkillGroup {
+    cwd: [u8; 4096],
+    cwd_len: u64,
+    skills: [ClaudeSkillEntry; 256],
+    skills_count: u64,
+    errors: [SkillError; 64],
+    errors_count: u64,
+}
+
+struct ClaudeSkillGroupSet {
+    items: [ClaudeSkillGroup; 64],
+    count: u64,
+}
+
+fn entry_set_str(dst: &[u8; 256], dst_len: &u64, src_ptr: ptr, src_len: u64) -> void {
+    dst_len = 0;
+    for i in 0..src_len {
+        if dst_len < 256 {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, src_ptr, i);
+            dst[dst_len] = b;
+            dst_len = dst_len + 1;
+        };
+    }
+}
+
+fn entry_set_big(dst: &[u8; 4096], dst_len: &u64, src_ptr: ptr, src_len: u64) -> void {
+    dst_len = 0;
+    for i in 0..src_len {
+        if dst_len < 4096 {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, src_ptr, i);
+            dst[dst_len] = b;
+            dst_len = dst_len + 1;
+        };
+    }
+}
+
+// parseSkillFrontmatter: finds the leading --- fence and reads
+// name:/description: keys with continuation lines.
+// Outputs into name/desc buffers with has_ flags.
+fn parseSkillFrontmatter(md_ptr: ptr, md_len: u64, name: &BigBuf, has_name: &bool, desc: &BigBuf, has_desc: &bool) -> void {
+    has_name = false;
+    has_desc = false;
+    name.len = 0;
+    desc.len = 0;
+    let inner_s: u64 = 0;
+    let inner_e: u64 = 0;
+    if !frontmatter_span(md_ptr, md_len, &inner_s, &inner_e) { return; };
+    // current key: 0 none, 1 name, 2 description; value parts are
+    // accumulated space-joined in `acc`.
+    let acc = BigBuf { bytes: [0u8; 131072], len: 0 };
+    let cur: u64 = 0;
+    let pos = inner_s;
+    while pos <= inner_e {
+        // line = [pos, next \n or inner_e), \r stripped
+        let le = pos;
+        while le < inner_e {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, md_ptr, le);
+            if b == 10 { break; };
+            le = le + 1;
+        }
+        let lend = le;
+        if lend > pos {
+            let lb: u8 = 0;
+            PTR_BYTE_AT(lb, md_ptr, lend - 1);
+            if lb == 13 { lend = lend - 1; };
+        };
+        let lp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(lp, md_ptr, pos);
+        let llen = lend - pos;
+        // keyMatch: ^\s*(name|description)\s*:\s*(.*)$
+        let ks: u64 = 0;
+        while ks < llen {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, lp, ks);
+            if b != 32 && b != 9 { break; };
+            ks = ks + 1;
+        }
+        let key: u64 = 0;
+        let after_key: u64 = 0;
+        if match_key(lp, llen, ks, STR_PTR("name"), STR_LEN("name"), &after_key) { key = 1; };
+        if key == 0 && match_key(lp, llen, ks, STR_PTR("description"), STR_LEN("description"), &after_key) { key = 2; };
+        if key != 0 {
+            flush_key(cur, &acc, name, has_name, desc, has_desc);
+            cur = key;
+            acc.len = 0;
+            // rest = after_key trimmed
+            let rs = after_key;
+            let re = llen;
+            while rs < re {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, lp, rs);
+                if b != 32 && b != 9 { break; };
+                rs = rs + 1;
+            }
+            while re > rs {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, lp, re - 1);
+                if b != 32 && b != 9 { break; };
+                re = re - 1;
+            }
+            if re > rs {
+                let rp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(rp, lp, rs);
+                bb_append(&acc, rp, re - rs);
+            };
+        } else if cur != 0 && llen > 0 {
+            let b0: u8 = 0;
+            PTR_BYTE_AT(b0, lp, 0);
+            if b0 == 32 || b0 == 9 {
+                // continuation: push line.trim()
+                let ts: u64 = 0;
+                let te: u64 = llen;
+                while ts < te {
+                    let b: u8 = 0;
+                    PTR_BYTE_AT(b, lp, ts);
+                    if b != 32 && b != 9 { break; };
+                    ts = ts + 1;
+                }
+                while te > ts {
+                    let b: u8 = 0;
+                    PTR_BYTE_AT(b, lp, te - 1);
+                    if b != 32 && b != 9 { break; };
+                    te = te - 1;
+                }
+                if te > ts {
+                    if acc.len > 0 { bb_append(&acc, STR_PTR(" "), STR_LEN(" ")); };
+                    let tp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(tp, lp, ts);
+                    bb_append(&acc, tp, te - ts);
+                };
+            } else {
+                flush_key(cur, &acc, name, has_name, desc, has_desc);
+                cur = 0;
+                acc.len = 0;
+            };
+        } else {
+            flush_key(cur, &acc, name, has_name, desc, has_desc);
+            cur = 0;
+            acc.len = 0;
+        };
+        if le >= inner_e { break; };
+        pos = le + 1;
+    }
+    flush_key(cur, &acc, name, has_name, desc, has_desc);
+}
+
+fn match_key(lp: ptr, llen: u64, ks: u64, key_ptr: ptr, key_len: u64, after: &u64) -> bool {
+    if ks + key_len > llen { return false; };
+    for i in 0..key_len {
+        let a: u8 = 0;
+        let b: u8 = 0;
+        PTR_BYTE_AT(a, lp, ks + i);
+        PTR_BYTE_AT(b, key_ptr, i);
+        if a != b { return false; };
+    }
+    let p = ks + key_len;
+    while p < llen {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, lp, p);
+        if b != 32 && b != 9 { break; };
+        p = p + 1;
+    }
+    if p >= llen { return false; };
+    let c: u8 = 0;
+    PTR_BYTE_AT(c, lp, p);
+    if c != 58 { return false; };
+    after = p + 1;
+    return true;
+}
+
+fn flush_key(cur: u64, acc: &BigBuf, name: &BigBuf, has_name: &bool, desc: &BigBuf, has_desc: &bool) -> void {
+    if cur == 0 { return; };
+    // combined = acc.join(" ") with \s+ collapsed (acc is already
+    // space-joined single-spaced parts), trimmed; strip a leading
+    // block scalar marker ([>|][-+0-9]? + ws); strip surrounding
+    // quote pair.
+    let tmp = BigBuf { bytes: [0u8; 131072], len: 0 };
+    let ap: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ap, &acc.bytes, 0);
+    let s: u64 = 0;
+    let e: u64 = acc.len;
+    while s < e && acc.bytes[s] == 32 { s = s + 1; };
+    while e > s && acc.bytes[e - 1] == 32 { e = e - 1; };
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, ap, s);
+    bb_append(&tmp, sp, e - s);
+    // block marker strip
+    if tmp.len >= 1 && (tmp.bytes[0] == 62 || tmp.bytes[0] == 124) {
+        let cut: u64 = 1;
+        if tmp.len >= 2 {
+            let b1 = tmp.bytes[1];
+            if b1 == 43 || b1 == 45 || (b1 >= 48 && b1 <= 57) { cut = 2; };
+        };
+        while cut < tmp.len && (tmp.bytes[cut] == 32 || tmp.bytes[cut] == 9) { cut = cut + 1; };
+        let shifted = BigBuf { bytes: [0u8; 131072], len: 0 };
+        let tp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp, &tmp.bytes, 0);
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, tp, cut);
+        bb_append(&shifted, cp, tmp.len - cut);
+        tmp.len = 0;
+        let shp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(shp, &shifted.bytes, 0);
+        bb_append(&tmp, shp, shifted.len);
+    };
+    // quote pair strip
+    if tmp.len >= 2 {
+        let f = tmp.bytes[0];
+        let l = tmp.bytes[tmp.len - 1];
+        if (f == 34 && l == 34) || (f == 39 && l == 39) {
+            let inner = BigBuf { bytes: [0u8; 131072], len: 0 };
+            let tp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(tp, &tmp.bytes, 1);
+            bb_append(&inner, tp, tmp.len - 2);
+            tmp.len = 0;
+            let ip: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ip, &inner.bytes, 0);
+            bb_append(&tmp, ip, inner.len);
+        };
+    };
+    if cur == 1 {
+        name.len = 0;
+        let tp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp, &tmp.bytes, 0);
+        bb_append(name, tp, tmp.len);
+        has_name = true;
+    } else {
+        desc.len = 0;
+        let tp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp, &tmp.bytes, 0);
+        bb_append(desc, tp, tmp.len);
+        has_desc = true;
+    };
+}
+
+// Locates the frontmatter block: ^---\s*\r?\n ... \r?\n---(\r?\n|$)
+// Returns inner span [s, e) of the YAML text.
+fn frontmatter_span(md_ptr: ptr, md_len: u64, out_s: &u64, out_e: &u64) -> bool {
+    if md_len < 4 { return false; };
+    let b0: u8 = 0;
+    let b1: u8 = 0;
+    let b2: u8 = 0;
+    PTR_BYTE_AT(b0, md_ptr, 0);
+    PTR_BYTE_AT(b1, md_ptr, 1);
+    PTR_BYTE_AT(b2, md_ptr, 2);
+    if b0 != 45 || b1 != 45 || b2 != 45 { return false; };
+    let p: u64 = 3;
+    while p < md_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, md_ptr, p);
+        if b == 32 || b == 9 { p = p + 1; } else { break; };
+    }
+    if p < md_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, md_ptr, p);
+        if b == 13 { p = p + 1; };
+    };
+    if p >= md_len { return false; };
+    let nb: u8 = 0;
+    PTR_BYTE_AT(nb, md_ptr, p);
+    if nb != 10 { return false; };
+    let start = p + 1;
+    // find "\n---" at a line start from start
+    let i = start;
+    while i + 3 < md_len {
+        let a: u8 = 0;
+        PTR_BYTE_AT(a, md_ptr, i);
+        if a == 10 {
+            let c1: u8 = 0;
+            let c2: u8 = 0;
+            let c3: u8 = 0;
+            PTR_BYTE_AT(c1, md_ptr, i + 1);
+            PTR_BYTE_AT(c2, md_ptr, i + 2);
+            PTR_BYTE_AT(c3, md_ptr, i + 3);
+            if c1 == 45 && c2 == 45 && c3 == 45 {
+                out_s = start;
+                // inner ends before the \r? of "\r\n---"
+                let e = i;
+                if e > start {
+                    let pb: u8 = 0;
+                    PTR_BYTE_AT(pb, md_ptr, e - 1);
+                    // the regex keeps \r?\n---: inner excludes the
+                    // line break; a trailing \r belongs to it.
+                    if pb == 13 { e = e - 1; };
+                };
+                out_e = e;
+                return true;
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn normalizeSkillName(value_ptr: ptr, value_len: u64, out: &BigBuf) -> void {
+    out.len = 0;
+    // trim + lowercase + '_' -> '-'
+    let s: u64 = 0;
+    let e: u64 = value_len;
+    while s < e {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, value_ptr, s);
+        if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+        s = s + 1;
+    }
+    while e > s {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, value_ptr, e - 1);
+        if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+        e = e - 1;
+    }
+    for i in s..e {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, value_ptr, i);
+        if b >= 65 && b <= 90 { b = b + 32; };
+        if b == 95 { b = 45; };
+        if out.len < 131072 {
+            out.bytes[out.len] = b;
+            out.len = out.len + 1;
+        };
+    }
+    // validate ^[a-z0-9]+(?:-[a-z0-9]+)*$
+    if out.len == 0 { return; };
+    let ok = true;
+    let seg: u64 = 0;
+    for i in 0..out.len {
+        let b = out.bytes[i];
+        if b == 45 {
+            if seg == 0 { ok = false; break; };
+            seg = 0;
+        } else if (b >= 97 && b <= 122) || (b >= 48 && b <= 57) {
+            seg = seg + 1;
+        } else {
+            ok = false;
+            break;
+        };
+    }
+    if seg == 0 { ok = false; };
+    if !ok { out.len = 0; };
+}
+
+fn firstMarkdownParagraph(md_ptr: ptr, md_len: u64, out: &BigBuf) -> void {
+    out.len = 0;
+    let s: u64 = 0;
+    let fs: u64 = 0;
+    let fe: u64 = 0;
+    if frontmatter_span(md_ptr, md_len, &fs, &fe) {
+        // skip past the closing fence line
+        let p = fe;
+        // fe points at inner end; the fence begins after the \n
+        // that follows; approximate: advance to just after the
+        // next "\n---" line end.
+        let i = fs;
+        // find the closing fence start (same scan as span finder)
+        let j = fs;
+        let found = false;
+        while j + 3 < md_len {
+            let a: u8 = 0;
+            PTR_BYTE_AT(a, md_ptr, j);
+            if a == 10 {
+                let c1: u8 = 0;
+                let c2: u8 = 0;
+                let c3: u8 = 0;
+                PTR_BYTE_AT(c1, md_ptr, j + 1);
+                PTR_BYTE_AT(c2, md_ptr, j + 2);
+                PTR_BYTE_AT(c3, md_ptr, j + 3);
+                if c1 == 45 && c2 == 45 && c3 == 45 {
+                    let k = j + 4;
+                    while k < md_len {
+                        let b: u8 = 0;
+                        PTR_BYTE_AT(b, md_ptr, k);
+                        if b == 10 { break; };
+                        k = k + 1;
+                    }
+                    if k < md_len { s = k + 1; } else { s = md_len; };
+                    found = true;
+                    break;
+                };
+            };
+            j = j + 1;
+        }
+        if !found { s = 0; };
+    };
+    // paragraphs split on blank lines; take the first non-empty,
+    // strip leading #'s per line, trim, cap 500 bytes.
+    // DEFECT: split/find semantics approximated with a single
+    // pass collecting the first paragraph's text.
+    let pos = s;
+    let started = false;
+    while pos < md_len {
+        // read one line
+        let le = pos;
+        while le < md_len {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, md_ptr, le);
+            if b == 10 { break; };
+            le = le + 1;
+        }
+        let lend = le;
+        if lend > pos {
+            let lb: u8 = 0;
+            PTR_BYTE_AT(lb, md_ptr, lend - 1);
+            if lb == 13 { lend = lend - 1; };
+        };
+        // blank line?
+        let blank = true;
+        for i in pos..lend {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, md_ptr, i);
+            if b != 32 && b != 9 { blank = false; break; };
+        }
+        if blank {
+            if started { break; };
+        } else {
+            started = true;
+            // strip ^#+\s*
+            let ls = pos;
+            while ls < lend {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, md_ptr, ls);
+                if b != 35 { break; };
+                ls = ls + 1;
+            }
+            if ls > pos {
+                while ls < lend {
+                    let b: u8 = 0;
+                    PTR_BYTE_AT(b, md_ptr, ls);
+                    if b != 32 && b != 9 { break; };
+                    ls = ls + 1;
+                }
+            };
+            if out.len > 0 { bb_append(out, STR_PTR("\n"), STR_LEN("\n")); };
+            let lp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(lp, md_ptr, ls);
+            bb_append(out, lp, lend - ls);
+        };
+        if le >= md_len { break; };
+        pos = le + 1;
+    }
+    // trim
+    let ts: u64 = 0;
+    let te: u64 = out.len;
+    while ts < te && (out.bytes[ts] == 32 || out.bytes[ts] == 9 || out.bytes[ts] == 10 || out.bytes[ts] == 13) { ts = ts + 1; };
+    while te > ts && (out.bytes[te - 1] == 32 || out.bytes[te - 1] == 9 || out.bytes[te - 1] == 10 || out.bytes[te - 1] == 13) { te = te - 1; };
+    if ts > 0 {
+        for i in ts..te {
+            out.bytes[i - ts] = out.bytes[i];
+        };
+    };
+    out.len = te - ts;
+    if out.len > 500 { out.len = 500; };
+}
+
+fn dedupeSkills(input: &[ClaudeSkillEntry; 256], input_count: u64, out: &[ClaudeSkillEntry; 256], out_count: &u64) -> void {
+    out_count = 0;
+    for i in 0..input_count {
+        let cand = &input[i];
+        let found: u64 = 4294967295;
+        for j in 0..out_count {
+            let ex = &out[j];
+            let ep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep, &ex.name, 0);
+            let cp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(cp, &cand.name, 0);
+            if bytes_eq_range(ep, ex.name_len, cp, cand.name_len) { found = j; break; };
+        }
+        if found == 4294967295 {
+            if out_count < 256 {
+                copy_entry(&out[out_count], cand);
+                out_count = out_count + 1;
+            };
+        } else if out[found].scope == 1 && cand.scope != 1 {
+            copy_entry(&out[found], cand);
+        };
+    }
+    // sort by name (localeCompare approximated by byte order)
+    let n = out_count;
+    let i: u64 = 0;
+    while i < n {
+        let j: u64 = 0;
+        while j + 1 < n - i {
+            let a = &out[j];
+            let b = &out[j + 1];
+            let ap: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ap, &a.name, 0);
+            let bp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(bp, &b.name, 0);
+            if bytes_cmp(ap, a.name_len, bp, b.name_len) > 0 {
+                let tmp = ClaudeSkillEntry { name: [0u8; 256], name_len: 0, description: [0u8; 4096], description_len: 0, path: [0u8; 4096], path_len: 0, scope: 0, enabled: false };
+                copy_entry(&tmp, a);
+                copy_entry(&out[j], b);
+                copy_entry(&out[j + 1], &tmp);
+            };
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn bytes_cmp(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> i32 {
+    let n = a_len;
+    if b_len < n { n = b_len; };
+    for i in 0..n {
+        let a: u8 = 0;
+        let b: u8 = 0;
+        PTR_BYTE_AT(a, a_ptr, i);
+        PTR_BYTE_AT(b, b_ptr, i);
+        if a != b {
+            if a < b { return -1; };
+            return 1;
+        };
+    }
+    if a_len == b_len { return 0; };
+    if a_len < b_len { return -1; };
+    return 1;
+}
+
+fn copy_entry(dst: &ClaudeSkillEntry, src: &ClaudeSkillEntry) -> void {
+    dst.name_len = 0;
+    for i in 0..src.name_len { dst.name[dst.name_len] = src.name[i]; dst.name_len = dst.name_len + 1; };
+    dst.description_len = 0;
+    for i in 0..src.description_len { dst.description[dst.description_len] = src.description[i]; dst.description_len = dst.description_len + 1; };
+    dst.path_len = 0;
+    for i in 0..src.path_len { dst.path[dst.path_len] = src.path[i]; dst.path_len = dst.path_len + 1; };
+    dst.scope = src.scope;
+    dst.enabled = src.enabled;
+}
+
+// errorMessage(error) in TS formats Error.message / String(error);
+// here error text is produced at call sites, so this is identity.
+fn errorMessage(msg_ptr: ptr, msg_len: u64, out: &BigBuf) -> void {
+    out.len = 0;
+    bb_append(out, msg_ptr, msg_len);
+}
+
+struct ClaudeSkillInventory {
+    has_configDir: bool,
+    configDir: [u8; 4096],
+    configDir_len: u64,
+    scanUserSkills: bool,
+    extraRoots: PathTable,
+    // disabledPaths: Set<string> of normalizePath() keys
+    disabledPaths: PathTable,
+}
+
+fn join_into(out: &BigBuf, a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> void {
+    out.len = 0;
+    bb_append(out, a_ptr, a_len);
+    bb_append(out, STR_PTR("/"), STR_LEN("/"));
+    bb_append(out, b_ptr, b_len);
+}
+
+fn inventory_is_disabled(inv: &ClaudeSkillInventory, path_ptr: ptr, path_len: u64) -> bool {
+    let key = BigBuf { bytes: [0u8; 131072], len: 0 };
+    normalizePath(path_ptr, path_len, &key);
+    for i in 0..inv.disabledPaths.count {
+        let ep: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ep, &inv.disabledPaths.items[i].bytes, 0);
+        let kp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(kp, &key.bytes, 0);
+        if bytes_eq_range(ep, inv.disabledPaths.items[i].len, kp, key.len) { return true; };
+    }
+    return false;
+}
+
+fn claudeSkillInventory_setExtraRoots(inv: &ClaudeSkillInventory, roots: &PathTable) -> void {
+    let uniq = PathTable { items: [BigBuf { bytes: [0u8; 131072], len: 0 }; 64], count: 0 };
+    uniquePaths(roots, &uniq);
+    inv.extraRoots.count = 0;
+    for i in 0..uniq.count {
+        if inv.extraRoots.count < 64 {
+            inv.extraRoots.items[inv.extraRoots.count].len = 0;
+            let sp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(sp, &uniq.items[i].bytes, 0);
+            bb_append(&inv.extraRoots.items[inv.extraRoots.count], sp, uniq.items[i].len);
+            inv.extraRoots.count = inv.extraRoots.count + 1;
+        };
+    }
+}
+
+fn claudeSkillInventory_getExtraRoots(inv: &ClaudeSkillInventory, out: &PathTable) -> void {
+    out.count = 0;
+    for i in 0..inv.extraRoots.count {
+        if out.count < 64 {
+            out.items[out.count].len = 0;
+            let sp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(sp, &inv.extraRoots.items[i].bytes, 0);
+            bb_append(&out.items[out.count], sp, inv.extraRoots.items[i].len);
+            out.count = out.count + 1;
+        };
+    }
+}
+
+fn claudeSkillInventory_setEnabled(inv: &ClaudeSkillInventory, path_ptr: ptr, path_len: u64, enabled: bool) -> void {
+    let key = BigBuf { bytes: [0u8; 131072], len: 0 };
+    normalizePath(path_ptr, path_len, &key);
+    let kp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(kp, &key.bytes, 0);
+    if enabled {
+        // delete from the set (compact)
+        let w: u64 = 0;
+        for i in 0..inv.disabledPaths.count {
+            let ep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep, &inv.disabledPaths.items[i].bytes, 0);
+            if bytes_eq_range(ep, inv.disabledPaths.items[i].len, kp, key.len) { continue; };
+            if w != i {
+                inv.disabledPaths.items[w].len = 0;
+                bb_append(&inv.disabledPaths.items[w], ep, inv.disabledPaths.items[i].len);
+            };
+            w = w + 1;
+        }
+        inv.disabledPaths.count = w;
+    } else {
+        if !inventory_is_disabled(inv, path_ptr, path_len) && inv.disabledPaths.count < 64 {
+            inv.disabledPaths.items[inv.disabledPaths.count].len = 0;
+            bb_append(&inv.disabledPaths.items[inv.disabledPaths.count], kp, key.len);
+            inv.disabledPaths.count = inv.disabledPaths.count + 1;
+        };
+    }
+}
+
+fn scanSkillDirectory(inv: &ClaudeSkillInventory, cwd_ptr: ptr, cwd_len: u64, dir_ptr: ptr, dir_len: u64, scope: u64, out: &ClaudeSkillGroup) -> void {
+    out.cwd_len = 0;
+    entry_set_big(&out.cwd, &out.cwd_len, cwd_ptr, cwd_len);
+    out.skills_count = 0;
+    out.errors_count = 0;
+    let dh: u64 = 0;
+    if sa_std_fs_read_dir_json(dir_ptr, dir_len, &dh) != 0 { return; };
+    let listing_ptr: ptr = sa_fs_dir_buffer_data(dh);
+    let listing_len = sa_fs_dir_buffer_len(dh);
+    let listing = sa_json_parse(listing_ptr, listing_len);
+    if listing == 0 { return; };
+    let ei: u64 = 0;
+    while ei < 4096 {
+        let entry_node: u64 = 0;
+        if sa_json_array_get(listing, ei, &entry_node) != 0 { break; };
+        ei = ei + 1;
+        let name_ptr: ptr = sa_json_string_ptr(entry_node);
+        let name_len = sa_json_string_len(entry_node);
+        if name_len == 0 { continue; };
+        // 1. Directory style: <entry>/SKILL.md | skill.md | Skill.md
+        let resolved = BigBuf { bytes: [0u8; 131072], len: 0 };
+        let markdown = BigBuf { bytes: [0u8; 131072], len: 0 };
+        let found = false;
+        let fnames = ["SKILL.md", "skill.md", "Skill.md"];
+        let fi: u64 = 0;
+        while fi < 3 {
+            let sub = BigBuf { bytes: [0u8; 131072], len: 0 };
+            join_into(&sub, dir_ptr, dir_len, name_ptr, name_len);
+            let sub2 = BigBuf { bytes: [0u8; 131072], len: 0 };
+            let sp2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(sp2, &sub.bytes, 0);
+            join_into(&sub2, sp2, sub.len, STR_PTR(fnames[fi]), STR_LEN(fnames[fi]));
+            let p2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(p2, &sub2.bytes, 0);
+            if read_text_file(p2, sub2.len, &markdown) == 0 {
+                resolved.len = 0;
+                bb_append(&resolved, p2, sub2.len);
+                found = true;
+                break;
+            };
+            fi = fi + 1;
+        }
+        if found {
+            let md_ptr: ptr = PTR_NULL();
+            PTR_BYTE_ADD(md_ptr, &markdown.bytes, 0);
+            let mname = BigBuf { bytes: [0u8; 131072], len: 0 };
+            let has_mname = false;
+            let mdesc = BigBuf { bytes: [0u8; 131072], len: 0 };
+            let has_mdesc = false;
+            parseSkillFrontmatter(md_ptr, markdown.len, &mname, &has_mname, &mdesc, &has_mdesc);
+            let raw_name = BigBuf { bytes: [0u8; 131072], len: 0 };
+            if has_mname && mname.len > 0 {
+                let mp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(mp, &mname.bytes, 0);
+                bb_append(&raw_name, mp, mname.len);
+            } else {
+                bb_append(&raw_name, name_ptr, name_len);
+            };
+            let norm = BigBuf { bytes: [0u8; 131072], len: 0 };
+            let np0: ptr = PTR_NULL();
+            PTR_BYTE_ADD(np0, &raw_name.bytes, 0);
+            normalizeSkillName(np0, raw_name.len, &norm);
+            if norm.len == 0 {
+                if out.errors_count < 64 {
+                    let er = &out.errors[out.errors_count];
+                    let rp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(rp, &resolved.bytes, 0);
+                    entry_set_big(&er.path, &er.path_len, rp, resolved.len);
+                    entry_set_big(&er.message, &er.message_len, STR_PTR("Skill name must use letters, numbers, and hyphens"), STR_LEN("Skill name must use letters, numbers, and hyphens"));
+                    // DEFECT: entry_set_big caps at 4096/1024 via
+                    // the shared setter shapes; message fits.
+                    out.errors_count = out.errors_count + 1;
+                };
+                continue;
+            };
+            if out.skills_count < 256 {
+                let sk = &out.skills[out.skills_count];
+                let np: ptr = PTR_NULL();
+                PTR_BYTE_ADD(np, &norm.bytes, 0);
+                entry_set_str(&sk.name, &sk.name_len, np, norm.len);
+                if has_mdesc && mdesc.len > 0 {
+                    let dp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(dp, &mdesc.bytes, 0);
+                    entry_set_big(&sk.description, &sk.description_len, dp, mdesc.len);
+                } else {
+                    let para = BigBuf { bytes: [0u8; 131072], len: 0 };
+                    firstMarkdownParagraph(md_ptr, markdown.len, &para);
+                    let pp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(pp, &para.bytes, 0);
+                    entry_set_big(&sk.description, &sk.description_len, pp, para.len);
+                };
+                let rp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(rp, &resolved.bytes, 0);
+                entry_set_big(&sk.path, &sk.path_len, rp, resolved.len);
+                sk.scope = scope;
+                sk.enabled = !inventory_is_disabled(inv, rp, resolved.len);
+                out.skills_count = out.skills_count + 1;
+            };
+            continue;
+        };
+        // 2. Single-file style: <directory>/<name>.md
+        if name_len > 3 && name_ptr_byte(name_ptr, name_len - 3) == 46 && name_ptr_byte(name_ptr, name_len - 2) == 109 && name_ptr_byte(name_ptr, name_len - 1) == 100 {
+            let first_b = name_ptr_byte(name_ptr, 0);
+            if first_b == 46 { continue; };
+            let base_len = name_len - 3;
+            let lower = BigBuf { bytes: [0u8; 131072], len: 0 };
+            lower_copy(&lower, name_ptr, base_len);
+            let lp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(lp, &lower.bytes, 0);
+            if bytes_eq_range(lp, lower.len, STR_PTR("readme"), STR_LEN("readme")) { continue; };
+            if bytes_eq_range(lp, lower.len, STR_PTR("index"), STR_LEN("index")) { continue; };
+            if bytes_eq_range(lp, lower.len, STR_PTR("license"), STR_LEN("license")) { continue; };
+            if bytes_eq_range(lp, lower.len, STR_PTR("changelog"), STR_LEN("changelog")) { continue; };
+            let file = BigBuf { bytes: [0u8; 131072], len: 0 };
+            join_into(&file, dir_ptr, dir_len, name_ptr, name_len);
+            let fp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp, &file.bytes, 0);
+            let md2 = BigBuf { bytes: [0u8; 131072], len: 0 };
+            if read_text_file(fp, file.len, &md2) != 0 { continue; };
+            let md2_ptr: ptr = PTR_NULL();
+            PTR_BYTE_ADD(md2_ptr, &md2.bytes, 0);
+            let mname2 = BigBuf { bytes: [0u8; 131072], len: 0 };
+            let has_mname2 = false;
+            let mdesc2 = BigBuf { bytes: [0u8; 131072], len: 0 };
+            let has_mdesc2 = false;
+            parseSkillFrontmatter(md2_ptr, md2.len, &mname2, &has_mname2, &mdesc2, &has_mdesc2);
+            let raw2 = BigBuf { bytes: [0u8; 131072], len: 0 };
+            if has_mname2 && mname2.len > 0 {
+                let mp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(mp, &mname2.bytes, 0);
+                bb_append(&raw2, mp, mname2.len);
+            } else {
+                bb_append(&raw2, name_ptr, base_len);
+            };
+            let norm2 = BigBuf { bytes: [0u8; 131072], len: 0 };
+            let np2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(np2, &raw2.bytes, 0);
+            normalizeSkillName(np2, raw2.len, &norm2);
+            if norm2.len == 0 { continue; };
+            if out.skills_count < 256 {
+                let sk = &out.skills[out.skills_count];
+                let np: ptr = PTR_NULL();
+                PTR_BYTE_ADD(np, &norm2.bytes, 0);
+                entry_set_str(&sk.name, &sk.name_len, np, norm2.len);
+                if has_mdesc2 && mdesc2.len > 0 {
+                    let dp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(dp, &mdesc2.bytes, 0);
+                    entry_set_big(&sk.description, &sk.description_len, dp, mdesc2.len);
+                } else {
+                    let para = BigBuf { bytes: [0u8; 131072], len: 0 };
+                    firstMarkdownParagraph(md2_ptr, md2.len, &para);
+                    let pp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(pp, &para.bytes, 0);
+                    entry_set_big(&sk.description, &sk.description_len, pp, para.len);
+                };
+                entry_set_big(&sk.path, &sk.path_len, fp, file.len);
+                sk.scope = scope;
+                sk.enabled = !inventory_is_disabled(inv, fp, file.len);
+                out.skills_count = out.skills_count + 1;
+            };
+        };
+    }
+}
+
+fn name_ptr_byte(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+fn scanWorkspace(inv: &ClaudeSkillInventory, cwd_ptr: ptr, cwd_len: u64, scope: u64, out: &ClaudeSkillGroup) -> void {
+    out.cwd_len = 0;
+    entry_set_big(&out.cwd, &out.cwd_len, cwd_ptr, cwd_len);
+    out.skills_count = 0;
+    out.errors_count = 0;
+    let suffixes = ["/.mini-agent/skills", "/.mini/skills", "/skills", "/.skills", "/.agents/skills", "/.opencode/skills", "/.claude/skills", "/.codex/skills", "/.gemini/skills", "/.cursor/skills", "/.vscode/skills"];
+    let all_skills = [ClaudeSkillEntry { name: [0u8; 256], name_len: 0, description: [0u8; 4096], description_len: 0, path: [0u8; 4096], path_len: 0, scope: 0, enabled: false }; 256];
+    let all_count: u64 = 0;
+    let si: u64 = 0;
+    while si < 11 {
+        let dir = BigBuf { bytes: [0u8; 131072], len: 0 };
+        bb_append(&dir, cwd_ptr, cwd_len);
+        bb_append(&dir, STR_PTR(suffixes[si]), STR_LEN(suffixes[si]));
+        let dp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp, &dir.bytes, 0);
+        let g = ClaudeSkillGroup { cwd: [0u8; 4096], cwd_len: 0, skills: [ClaudeSkillEntry { name: [0u8; 256], name_len: 0, description: [0u8; 4096], description_len: 0, path: [0u8; 4096], path_len: 0, scope: 0, enabled: false }; 256], skills_count: 0, errors: [SkillError { path: [0u8; 4096], path_len: 0, message: [0u8; 1024], message_len: 0 }; 64], errors_count: 0 };
+        scanSkillDirectory(inv, cwd_ptr, cwd_len, dp, dir.len, scope, &g);
+        for k in 0..g.skills_count {
+            if all_count < 256 {
+                copy_entry(&all_skills[all_count], &g.skills[k]);
+                all_count = all_count + 1;
+            };
+        }
+        for k2 in 0..g.errors_count {
+            if out.errors_count < 64 {
+                let dst = &out.errors[out.errors_count];
+                let src = &g.errors[k2];
+                dst.path_len = 0;
+                for b in 0..src.path_len { dst.path[dst.path_len] = src.path[b]; dst.path_len = dst.path_len + 1; };
+                dst.message_len = 0;
+                for b2 in 0..src.message_len { dst.message[dst.message_len] = src.message[b2]; dst.message_len = dst.message_len + 1; };
+                out.errors_count = out.errors_count + 1;
+            };
+        }
+        si = si + 1;
+    }
+    dedupeSkills(&all_skills, all_count, &out.skills, &out.skills_count);
+}
+
+fn getUserSkillRoots(inv: &ClaudeSkillInventory, out: &PathTable) -> void {
+    let raw = PathTable { items: [BigBuf { bytes: [0u8; 131072], len: 0 }; 64], count: 0 };
+    if inv.has_configDir {
+        let p = BigBuf { bytes: [0u8; 131072], len: 0 };
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, &inv.configDir, 0);
+        join_into(&p, cp, inv.configDir_len, STR_PTR("skills"), STR_LEN("skills"));
+        table_push(&raw, &p);
+    };
+    let home = BigBuf { bytes: [0u8; 131072], len: 0 };
+    let e_home = sa_env_get(STR_PTR("HOME"), STR_LEN("HOME"));
+    if e_home != 0 {
+        let hp: ptr = sa_env_buffer_data(e_home);
+        let hl = sa_env_buffer_len(e_home);
+        bb_append(&home, hp, hl);
+    };
+    let hp2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(hp2, &home.bytes, 0);
+    let suffixes = ["/.mini-agent/skills", "/.mini/skills", "/.config/opencode/skills", "/.opencode/skills", "/.claude/skills", "/.config/claude/skills", "/.agents/skills", "/.codex/skills", "/.gemini/skills", "/.gemini/antigravity-cli/skills"];
+    for i in 0..10 {
+        let p = BigBuf { bytes: [0u8; 131072], len: 0 };
+        bb_append(&p, hp2, home.len);
+        bb_append(&p, STR_PTR(suffixes[i]), STR_LEN(suffixes[i]));
+        table_push(&raw, &p);
+    }
+    uniquePaths(&raw, out);
+}
+
+fn table_push(t: &PathTable, p: &BigBuf) -> void {
+    if t.count < 64 {
+        t.items[t.count].len = 0;
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, &p.bytes, 0);
+        bb_append(&t.items[t.count], sp, p.len);
+        t.count = t.count + 1;
+    };
+}
+
+fn claudeSkillInventory_list(inv: &ClaudeSkillInventory, cwds: &PathTable, out: &ClaudeSkillGroupSet) -> void {
+    out.count = 0;
+    // roots = uniquePaths([...cwds, ...extraRoots])
+    let combined = PathTable { items: [BigBuf { bytes: [0u8; 131072], len: 0 }; 64], count: 0 };
+    for i in 0..cwds.count {
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, &cwds.items[i].bytes, 0);
+        let b = BigBuf { bytes: [0u8; 131072], len: 0 };
+        bb_append(&b, sp, cwds.items[i].len);
+        table_push(&combined, &b);
+    }
+    for i2 in 0..inv.extraRoots.count {
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, &inv.extraRoots.items[i2].bytes, 0);
+        let b = BigBuf { bytes: [0u8; 131072], len: 0 };
+        bb_append(&b, sp, inv.extraRoots.items[i2].len);
+        table_push(&combined, &b);
+    }
+    let roots = PathTable { items: [BigBuf { bytes: [0u8; 131072], len: 0 }; 64], count: 0 };
+    uniquePaths(&combined, &roots);
+    for ri in 0..roots.count {
+        let rp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp, &roots.items[ri].bytes, 0);
+        // scope: "extra" if the cwd is one of the extraRoots
+        let scope: u64 = 0;
+        let rn = BigBuf { bytes: [0u8; 131072], len: 0 };
+        normalizePath(rp, roots.items[ri].len, &rn);
+        for ei in 0..inv.extraRoots.count {
+            let ep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep, &inv.extraRoots.items[ei].bytes, 0);
+            let en = BigBuf { bytes: [0u8; 131072], len: 0 };
+            normalizePath(ep, inv.extraRoots.items[ei].len, &en);
+            let rnp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(rnp, &rn.bytes, 0);
+            let enp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(enp, &en.bytes, 0);
+            if bytes_eq_range(rnp, rn.len, enp, en.len) { scope = 2; break; };
+        }
+        if out.count < 64 {
+            scanWorkspace(inv, rp, roots.items[ri].len, scope, &out.items[out.count]);
+            out.count = out.count + 1;
+        };
+    }
+    if inv.has_configDir {
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, &inv.configDir, 0);
+        let dir = BigBuf { bytes: [0u8; 131072], len: 0 };
+        join_into(&dir, cp, inv.configDir_len, STR_PTR("skills"), STR_LEN("skills"));
+        let dp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp, &dir.bytes, 0);
+        let g = ClaudeSkillGroup { cwd: [0u8; 4096], cwd_len: 0, skills: [ClaudeSkillEntry { name: [0u8; 256], name_len: 0, description: [0u8; 4096], description_len: 0, path: [0u8; 4096], path_len: 0, scope: 0, enabled: false }; 256], skills_count: 0, errors: [SkillError { path: [0u8; 4096], path_len: 0, message: [0u8; 1024], message_len: 0 }; 64], errors_count: 0 };
+        scanSkillDirectory(inv, cp, inv.configDir_len, dp, dir.len, 1, &g);
+        if (g.skills_count > 0 || g.errors_count > 0) && out.count < 64 {
+            copy_group(&out.items[out.count], &g);
+            out.count = out.count + 1;
+        };
+    };
+    if inv.scanUserSkills {
+        let uroots = PathTable { items: [BigBuf { bytes: [0u8; 131072], len: 0 }; 64], count: 0 };
+        getUserSkillRoots(inv, &uroots);
+        for ui in 0..uroots.count {
+            let up: ptr = PTR_NULL();
+            PTR_BYTE_ADD(up, &uroots.items[ui].bytes, 0);
+            let g = ClaudeSkillGroup { cwd: [0u8; 4096], cwd_len: 0, skills: [ClaudeSkillEntry { name: [0u8; 256], name_len: 0, description: [0u8; 4096], description_len: 0, path: [0u8; 4096], path_len: 0, scope: 0, enabled: false }; 256], skills_count: 0, errors: [SkillError { path: [0u8; 4096], path_len: 0, message: [0u8; 1024], message_len: 0 }; 64], errors_count: 0 };
+            scanSkillDirectory(inv, up, uroots.items[ui].len, up, uroots.items[ui].len, 1, &g);
+            if (g.skills_count > 0 || g.errors_count > 0) && out.count < 64 {
+                copy_group(&out.items[out.count], &g);
+                out.count = out.count + 1;
+            };
+        }
+    };
+    // final filter: groups with skills or errors
+    let w: u64 = 0;
+    for i in 0..out.count {
+        if out.items[i].skills_count > 0 || out.items[i].errors_count > 0 {
+            if w != i { copy_group(&out.items[w], &out.items[i]); };
+            w = w + 1;
+        };
+    }
+    out.count = w;
+}
+
+fn copy_group(dst: &ClaudeSkillGroup, src: &ClaudeSkillGroup) -> void {
+    dst.cwd_len = 0;
+    for i in 0..src.cwd_len { dst.cwd[dst.cwd_len] = src.cwd[i]; dst.cwd_len = dst.cwd_len + 1; };
+    dst.skills_count = 0;
+    for i in 0..src.skills_count {
+        copy_entry(&dst.skills[dst.skills_count], &src.skills[i]);
+        dst.skills_count = dst.skills_count + 1;
+    }
+    dst.errors_count = 0;
+    for i in 0..src.errors_count {
+        let d = &dst.errors[dst.errors_count];
+        let s = &src.errors[i];
+        d.path_len = 0;
+        for b in 0..s.path_len { d.path[d.path_len] = s.path[b]; d.path_len = d.path_len + 1; };
+        d.message_len = 0;
+        for b2 in 0..s.message_len { d.message[d.message_len] = s.message[b2]; d.message_len = d.message_len + 1; };
+        dst.errors_count = dst.errors_count + 1;
+    }
+}
+
+fn renderSkillPrompt(skill: &ClaudeSkillEntry, out: &BigBuf) -> i32 {
+    let content = BigBuf { bytes: [0u8; 131072], len: 0 };
+    let pp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pp, &skill.path, 0);
+    if read_text_file(pp, skill.path_len, &content) != 0 { return 6; };
+    out.len = 0;
+    bb_append(out, STR_PTR("<claude-skill name=\""), STR_LEN("<claude-skill name=\""));
+    let np: ptr = PTR_NULL();
+    PTR_BYTE_ADD(np, &skill.name, 0);
+    bb_append(out, np, skill.name_len);
+    bb_append(out, STR_PTR("\" source=\""), STR_LEN("\" source=\""));
+    bb_append(out, pp, skill.path_len);
+    bb_append(out, STR_PTR("\">\n"), STR_LEN("\">\n"));
+    let cp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cp, &content.bytes, 0);
+    bb_append(out, cp, content.len);
+    bb_append(out, STR_PTR("\n</claude-skill>"), STR_LEN("\n</claude-skill>"));
+    return 0;
+}
+
+fn collect_enabled(groups: &ClaudeSkillGroupSet, out: &[ClaudeSkillEntry; 256], out_count: &u64) -> void {
+    out_count = 0;
+    for gi in 0..groups.count {
+        for si in 0..groups.items[gi].skills_count {
+            let e = &groups.items[gi].skills[si];
+            if e.enabled && out_count < 256 {
+                copy_entry(&out[out_count], e);
+                out_count = out_count + 1;
+            };
+        }
+    }
+}
+
+fn find_skill_by_name(skills: &[ClaudeSkillEntry; 256], count: u64, name_ptr: ptr, name_len: u64, out: &ClaudeSkillEntry) -> bool {
+    for i in 0..count {
+        let e = &skills[i];
+        if e.name_len == name_len {
+            let same = true;
+            for j in 0..name_len {
+                let a = e.name[j];
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, name_ptr, j);
+                if a >= 65 && a <= 90 { a = a + 32; };
+                if b >= 65 && b <= 90 { b = b + 32; };
+                if a != b { same = false; break; };
+            }
+            if same {
+                copy_entry(out, e);
+                return true;
+            };
+        };
+    }
+    return false;
+}
+
+fn claudeSkillInventory_expandInvocation(inv: &ClaudeSkillInventory, text_ptr: ptr, text_len: u64, has_cwd: bool, cwd_ptr: ptr, cwd_len: u64, out: &BigBuf) -> i32 {
+    let cwds = PathTable { items: [BigBuf { bytes: [0u8; 131072], len: 0 }; 64], count: 0 };
+    if has_cwd {
+        let b = BigBuf { bytes: [0u8; 131072], len: 0 };
+        bb_append(&b, cwd_ptr, cwd_len);
+        table_push(&cwds, &b);
+    };
+    let groups = ClaudeSkillGroupSet { items: [ClaudeSkillGroup { cwd: [0u8; 4096], cwd_len: 0, skills: [ClaudeSkillEntry { name: [0u8; 256], name_len: 0, description: [0u8; 4096], description_len: 0, path: [0u8; 4096], path_len: 0, scope: 0, enabled: false }; 256], skills_count: 0, errors: [SkillError { path: [0u8; 4096], path_len: 0, message: [0u8; 1024], message_len: 0 }; 64], errors_count: 0 }; 64], count: 0 };
+    claudeSkillInventory_list(inv, &cwds, &groups);
+    let skills = [ClaudeSkillEntry { name: [0u8; 256], name_len: 0, description: [0u8; 4096], description_len: 0, path: [0u8; 4096], path_len: 0, scope: 0, enabled: false }; 256];
+    let skills_count: u64 = 0;
+    collect_enabled(&groups, &skills, &skills_count);
+    out.len = 0;
+    // slash form: ^\s*\/([a-zA-Z][\w-]*)(?:\s+([\s\S]*))?$
+    let p: u64 = 0;
+    while p < text_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, text_ptr, p);
+        if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+        p = p + 1;
+    }
+    if p < text_len {
+        let sl: u8 = 0;
+        PTR_BYTE_AT(sl, text_ptr, p);
+        if sl == 47 {
+            let ns = p + 1;
+            if ns < text_len {
+                let f: u8 = 0;
+                PTR_BYTE_AT(f, text_ptr, ns);
+                if (f >= 65 && f <= 90) || (f >= 97 && f <= 122) {
+                    let ne = ns + 1;
+                    while ne < text_len {
+                        let b: u8 = 0;
+                        PTR_BYTE_AT(b, text_ptr, ne);
+                        if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95 || b == 45 { ne = ne + 1; } else { break; };
+                    }
+                    // rest must be empty or ws + args
+                    let valid = true;
+                    let args_s = ne;
+                    let args_e = text_len;
+                    if ne < text_len {
+                        let b: u8 = 0;
+                        PTR_BYTE_AT(b, text_ptr, ne);
+                        if b != 32 && b != 9 && b != 10 && b != 13 { valid = false; };
+                    };
+                    if valid {
+                        let skill = ClaudeSkillEntry { name: [0u8; 256], name_len: 0, description: [0u8; 4096], description_len: 0, path: [0u8; 4096], path_len: 0, scope: 0, enabled: false };
+                        let np: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(np, text_ptr, ns);
+                        if !find_skill_by_name(&skills, skills_count, np, ne - ns, &skill) {
+                            bb_append(out, text_ptr, text_len);
+                            return 0;
+                        };
+                        let prompt = BigBuf { bytes: [0u8; 131072], len: 0 };
+                        renderSkillPrompt(&skill, &prompt);
+                        let pp: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(pp, &prompt.bytes, 0);
+                        bb_append(out, pp, prompt.len);
+                        bb_append(out, STR_PTR("\n\n"), STR_LEN("\n\n"));
+                        // args = rest.trim()
+                        while args_s < args_e {
+                            let b: u8 = 0;
+                            PTR_BYTE_AT(b, text_ptr, args_s);
+                            if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+                            args_s = args_s + 1;
+                        }
+                        while args_e > args_s {
+                            let b: u8 = 0;
+                            PTR_BYTE_AT(b, text_ptr, args_e - 1);
+                            if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+                            args_e = args_e - 1;
+                        }
+                        if args_e > args_s {
+                            bb_append(out, STR_PTR("Execute this skill with the following arguments:\n"), STR_LEN("Execute this skill with the following arguments:\n"));
+                            let ap: ptr = PTR_NULL();
+                            PTR_BYTE_ADD(ap, text_ptr, args_s);
+                            bb_append(out, ap, args_e - args_s);
+                        } else {
+                            bb_append(out, STR_PTR("Execute this skill now."), STR_LEN("Execute this skill now."));
+                        };
+                        return 0;
+                    };
+                };
+            };
+        };
+    };
+    // $name matches: (^|\s)\$([a-zA-Z][\w-]*)\b -- collect spans
+    let m_start = [0u64; 64];
+    let m_end = [0u64; 64];
+    let m_name_s = [0u64; 64];
+    let m_name_e = [0u64; 64];
+    let m_count: u64 = 0;
+    let i: u64 = 0;
+    while i < text_len {
+        let at_boundary = i == 0;
+        if i > 0 {
+            let pb: u8 = 0;
+            PTR_BYTE_AT(pb, text_ptr, i - 1);
+            if pb == 32 || pb == 9 || pb == 10 || pb == 13 { at_boundary = true; };
+        };
+        if at_boundary {
+            let d: u8 = 0;
+            PTR_BYTE_AT(d, text_ptr, i);
+            if d == 36 && i + 1 < text_len {
+                let f: u8 = 0;
+                PTR_BYTE_AT(f, text_ptr, i + 1);
+                if (f >= 65 && f <= 90) || (f >= 97 && f <= 122) {
+                    let ne = i + 2;
+                    while ne < text_len {
+                        let b: u8 = 0;
+                        PTR_BYTE_AT(b, text_ptr, ne);
+                        if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95 || b == 45 { ne = ne + 1; } else { break; };
+                    }
+                    if m_count < 64 {
+                        m_start[m_count] = i;
+                        m_end[m_count] = ne;
+                        m_name_s[m_count] = i + 1;
+                        m_name_e[m_count] = ne;
+                        m_count = m_count + 1;
+                    };
+                    i = ne;
+                    continue;
+                };
+            };
+        };
+        i = i + 1;
+    }
+    if m_count == 0 {
+        bb_append(out, text_ptr, text_len);
+        return 0;
+    };
+    // work on a mutable copy, replacing from the last match back
+    let work = BigBuf { bytes: [0u8; 131072], len: 0 };
+    bb_append(&work, text_ptr, text_len);
+    let matched = false;
+    let mi = m_count;
+    while mi > 0 {
+        mi = mi - 1;
+        let skill = ClaudeSkillEntry { name: [0u8; 256], name_len: 0, description: [0u8; 4096], description_len: 0, path: [0u8; 4096], path_len: 0, scope: 0, enabled: false };
+        let np: ptr = PTR_NULL();
+        PTR_BYTE_ADD(np, text_ptr, m_name_s[mi]);
+        if find_skill_by_name(&skills, skills_count, np, m_name_e[mi] - m_name_s[mi], &skill) {
+            let prompt = BigBuf { bytes: [0u8; 131072], len: 0 };
+            renderSkillPrompt(&skill, &prompt);
+            // splice work = work[..start] + prompt + work[end..]
+            let next = BigBuf { bytes: [0u8; 131072], len: 0 };
+            let wp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(wp, &work.bytes, 0);
+            bb_append(&next, wp, m_start[mi]);
+            let pp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(pp, &prompt.bytes, 0);
+            bb_append(&next, pp, prompt.len);
+            if m_end[mi] < work.len {
+                let tail_ptr: ptr = PTR_NULL();
+                PTR_BYTE_ADD(tail_ptr, wp, m_end[mi]);
+                bb_append(&next, tail_ptr, work.len - m_end[mi]);
+            };
+            work.len = 0;
+            let npp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(npp, &next.bytes, 0);
+            bb_append(&work, npp, next.len);
+            matched = true;
+        };
+    }
+    if matched {
+        let wp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(wp, &work.bytes, 0);
+        bb_append(out, wp, work.len);
+    } else {
+        bb_append(out, text_ptr, text_len);
+    };
+    return 0;
+}
+
+fn claudeSkillInventory_isSkillPath(inv: &ClaudeSkillInventory, path_ptr: ptr, path_len: u64, cwds: &PathTable) -> bool {
+    let groups = ClaudeSkillGroupSet { items: [ClaudeSkillGroup { cwd: [0u8; 4096], cwd_len: 0, skills: [ClaudeSkillEntry { name: [0u8; 256], name_len: 0, description: [0u8; 4096], description_len: 0, path: [0u8; 4096], path_len: 0, scope: 0, enabled: false }; 256], skills_count: 0, errors: [SkillError { path: [0u8; 4096], path_len: 0, message: [0u8; 1024], message_len: 0 }; 64], errors_count: 0 }; 64], count: 0 };
+    claudeSkillInventory_list(inv, cwds, &groups);
+    let req = BigBuf { bytes: [0u8; 131072], len: 0 };
+    normalizePath(path_ptr, path_len, &req);
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &req.bytes, 0);
+    for gi in 0..groups.count {
+        for si in 0..groups.items[gi].skills_count {
+            let e = &groups.items[gi].skills[si];
+            let ep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep, &e.path, 0);
+            let en = BigBuf { bytes: [0u8; 131072], len: 0 };
+            normalizePath(ep, e.path_len, &en);
+            let enp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(enp, &en.bytes, 0);
+            if bytes_eq_range(rp, req.len, enp, en.len) { return true; };
+        }
+    }
+    return false;
+}
+
+let SKILL_NOT_IN_INVENTORY_ERROR = "Skill path is not present in this Claude thread inventory";
+
+fn claudeSkillInventory_readSkill(inv: &ClaudeSkillInventory, path_ptr: ptr, path_len: u64, cwds: &PathTable, out: &BigBuf) -> i32 {
+    let groups = ClaudeSkillGroupSet { items: [ClaudeSkillGroup { cwd: [0u8; 4096], cwd_len: 0, skills: [ClaudeSkillEntry { name: [0u8; 256], name_len: 0, description: [0u8; 4096], description_len: 0, path: [0u8; 4096], path_len: 0, scope: 0, enabled: false }; 256], skills_count: 0, errors: [SkillError { path: [0u8; 4096], path_len: 0, message: [0u8; 1024], message_len: 0 }; 64], errors_count: 0 }; 64], count: 0 };
+    claudeSkillInventory_list(inv, cwds, &groups);
+    let req = BigBuf { bytes: [0u8; 131072], len: 0 };
+    normalizePath(path_ptr, path_len, &req);
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &req.bytes, 0);
+    for gi in 0..groups.count {
+        for si in 0..groups.items[gi].skills_count {
+            let e = &groups.items[gi].skills[si];
+            let ep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep, &e.path, 0);
+            let en = BigBuf { bytes: [0u8; 131072], len: 0 };
+            normalizePath(ep, e.path_len, &en);
+            let enp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(enp, &en.bytes, 0);
+            if bytes_eq_range(rp, req.len, enp, en.len) {
+                return read_text_file(ep, e.path_len, out);
+            };
+        }
+    }
+    return 3;
+}
+
+fn skillGroupsJson(groups: &ClaudeSkillGroupSet, out: &BigBuf) -> void {
+    out.len = 0;
+    bb_append(out, STR_PTR("{\"data\":["), STR_LEN("{\"data\":["));
+    for gi in 0..groups.count {
+        let g = &groups.items[gi];
+        if gi > 0 { bb_append(out, STR_PTR(","), STR_LEN(",")); };
+        bb_append(out, STR_PTR("{\"cwd\":\""), STR_LEN("{\"cwd\":\""));
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, &g.cwd, 0);
+        bb_append_escaped(out, cp, g.cwd_len);
+        bb_append(out, STR_PTR("\",\"skills\":["), STR_LEN("\",\"skills\":["));
+        for si in 0..g.skills_count {
+            let sk = &g.skills[si];
+            if si > 0 { bb_append(out, STR_PTR(","), STR_LEN(",")); };
+            bb_append(out, STR_PTR("{\"name\":\""), STR_LEN("{\"name\":\""));
+            let np: ptr = PTR_NULL();
+            PTR_BYTE_ADD(np, &sk.name, 0);
+            bb_append_escaped(out, np, sk.name_len);
+            bb_append(out, STR_PTR("\",\"description\":\""), STR_LEN("\",\"description\":\""));
+            let dp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(dp, &sk.description, 0);
+            bb_append_escaped(out, dp, sk.description_len);
+            bb_append(out, STR_PTR("\",\"shortDescription\":\""), STR_LEN("\",\"shortDescription\":\""));
+            bb_append_escaped(out, dp, sk.description_len);
+            bb_append(out, STR_PTR("\",\"path\":\""), STR_LEN("\",\"path\":\""));
+            let pp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(pp, &sk.path, 0);
+            bb_append_escaped(out, pp, sk.path_len);
+            bb_append(out, STR_PTR("\",\"scope\":\""), STR_LEN("\",\"scope\":\""));
+            if sk.scope == 0 { bb_append(out, STR_PTR("project"), STR_LEN("project")); };
+            if sk.scope == 1 { bb_append(out, STR_PTR("user"), STR_LEN("user")); };
+            if sk.scope == 2 { bb_append(out, STR_PTR("extra"), STR_LEN("extra")); };
+            bb_append(out, STR_PTR("\",\"enabled\":"), STR_LEN("\",\"enabled\":"));
+            if sk.enabled { bb_append(out, STR_PTR("true"), STR_LEN("true")); } else { bb_append(out, STR_PTR("false"), STR_LEN("false")); };
+            bb_append(out, STR_PTR(",\"interface\":{\"displayName\":\""), STR_LEN(",\"interface\":{\"displayName\":\""));
+            bb_append_escaped(out, np, sk.name_len);
+            bb_append(out, STR_PTR("\",\"shortDescription\":\""), STR_LEN("\",\"shortDescription\":\""));
+            bb_append_escaped(out, dp, sk.description_len);
+            bb_append(out, STR_PTR("\"}}"), STR_LEN("\"}}"));
+        }
+        bb_append(out, STR_PTR("],\"errors\":["), STR_LEN("],\"errors\":["));
+        for ei in 0..g.errors_count {
+            let er = &g.errors[ei];
+            if ei > 0 { bb_append(out, STR_PTR(","), STR_LEN(",")); };
+            bb_append(out, STR_PTR("{\"path\":\""), STR_LEN("{\"path\":\""));
+            let ep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep, &er.path, 0);
+            bb_append_escaped(out, ep, er.path_len);
+            bb_append(out, STR_PTR("\",\"message\":\""), STR_LEN("\",\"message\":\""));
+            let mp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(mp, &er.message, 0);
+            bb_append_escaped(out, mp, er.message_len);
+            bb_append(out, STR_PTR("\"}"), STR_LEN("\"}"));
+        }
+        bb_append(out, STR_PTR("]}"), STR_LEN("]}"));
+    }
+    bb_append(out, STR_PTR("]}"), STR_LEN("]}"));
+}
+
+// expandClaudeSkillInput(inventory, input, cwd)
+// DEFECT: JsonValue input/output -> JSON text; the caller tags
+// the input kind (0 undefined, 1 string, 2 array, 3 other).
+// Output: JSON text of the resulting value + matched flag.
+// DEFECT: the {...block, text: expanded} spread rebuild keeps
+// only type/text for rewritten blocks (other block fields are
+// dropped in the bulk pass); non-text blocks pass through via
+// stringify.
+fn expandClaudeSkillInput(inv: &ClaudeSkillInventory, input_ptr: ptr, input_len: u64, input_kind: u64, has_cwd: bool, cwd_ptr: ptr, cwd_len: u64, out: &BigBuf, matched_out: &bool) -> i32 {
+    matched_out = false;
+    out.len = 0;
+    if input_kind == 1 {
+        // input is the raw string value itself
+        let expanded = BigBuf { bytes: [0u8; 131072], len: 0 };
+        claudeSkillInventory_expandInvocation(inv, input_ptr, input_len, has_cwd, cwd_ptr, cwd_len, &expanded);
+        let ep: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ep, &expanded.bytes, 0);
+        matched_out = !bytes_eq_range(ep, expanded.len, input_ptr, input_len);
+        // output as a JSON string literal
+        bb_append(out, STR_PTR("\""), STR_LEN("\""));
+        bb_append_escaped(out, ep, expanded.len);
+        bb_append(out, STR_PTR("\""), STR_LEN("\""));
+        return 0;
+    };
+    if input_kind != 2 {
+        // undefined / other: returned unchanged
+        bb_append(out, input_ptr, input_len);
+        return 0;
+    };
+    let doc = sa_json_parse(input_ptr, input_len);
+    if doc == 0 {
+        bb_append(out, input_ptr, input_len);
+        return 0;
+    };
+    // First pass: expand text blocks, remember per-element results.
+    let results = BigBuf { bytes: [0u8; 131072], len: 0 };
+    bb_append(&results, STR_PTR("["), STR_LEN("["));
+    let matched = false;
+    let ei: u64 = 0;
+    let first = true;
+    while ei < 100000 {
+        let el: u64 = 0;
+        if sa_json_array_get(doc, ei, &el) != 0 { break; };
+        ei = ei + 1;
+        if !first { bb_append(&results, STR_PTR(","), STR_LEN(",")); };
+        first = false;
+        // jsonRecord(el): object or {}
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        let txp: ptr = PTR_NULL();
+        let txl: u64 = 0;
+        let is_text_block = false;
+        if sa_json_object_get_string(el, STR_PTR("type"), STR_LEN("type"), &tp, &tl) == 0 && sa_json_object_get_string(el, STR_PTR("text"), STR_LEN("text"), &txp, &txl) == 0 {
+            if tl == 4 {
+                let want = "text";
+                let same = true;
+                for j in 0..4 {
+                    let a: u8 = 0;
+                    let b: u8 = 0;
+                    PTR_BYTE_AT(a, tp, j);
+                    PTR_BYTE_AT(b, STR_PTR(want), j);
+                    if a != b { same = false; break; };
+                }
+                is_text_block = same;
+            };
+        };
+        if is_text_block {
+            let expanded = BigBuf { bytes: [0u8; 131072], len: 0 };
+            claudeSkillInventory_expandInvocation(inv, txp, txl, has_cwd, cwd_ptr, cwd_len, &expanded);
+            let ep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep, &expanded.bytes, 0);
+            if bytes_eq_range(ep, expanded.len, txp, txl) {
+                append_node_json(&results, el);
+            } else {
+                matched = true;
+                bb_append(&results, STR_PTR("{\"type\":\"text\",\"text\":\""), STR_LEN("{\"type\":\"text\",\"text\":\""));
+                bb_append_escaped(&results, ep, expanded.len);
+                bb_append(&results, STR_PTR("\"}"), STR_LEN("\"}"));
+            };
+        } else {
+            append_node_json(&results, el);
+        };
+    }
+    bb_append(&results, STR_PTR("]"), STR_LEN("]"));
+    if !matched {
+        bb_append(out, input_ptr, input_len);
+        matched_out = false;
+        return 0;
+    };
+    matched_out = true;
+    if !matched {
+        return 0;
+    };
+    // matched: filter out blocks whose type is "skill"
+    // DEFECT: filtering re-parses the rebuilt array text.
+    let doc2 = sa_json_parse(results_ptr(&results), results.len);
+    bb_append(out, STR_PTR("["), STR_LEN("["));
+    let first2 = true;
+    let fi: u64 = 0;
+    while fi < 100000 {
+        let el: u64 = 0;
+        if sa_json_array_get(doc2, fi, &el) != 0 { break; };
+        fi = fi + 1;
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        let is_skill = false;
+        if sa_json_object_get_string(el, STR_PTR("type"), STR_LEN("type"), &tp, &tl) == 0 && tl == 5 {
+            let want = "skill";
+            let same = true;
+            for j in 0..5 {
+                let a: u8 = 0;
+                let b: u8 = 0;
+                PTR_BYTE_AT(a, tp, j);
+                PTR_BYTE_AT(b, STR_PTR(want), j);
+                if a != b { same = false; break; };
+            }
+            is_skill = same;
+        };
+        if is_skill { continue; };
+        if !first2 { bb_append(out, STR_PTR(","), STR_LEN(",")); };
+        first2 = false;
+        append_node_json(out, el);
+    }
+    bb_append(out, STR_PTR("]"), STR_LEN("]"));
+    return 0;
+}
+
+fn results_ptr(b: &BigBuf) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &b.bytes, 0);
+    return p;
+}
+
+fn append_node_json(out: &BigBuf, node: u64) -> void {
+    let sh: u64 = 0;
+    if sa_json_stringify(node, &sh) == 0 {
+        let sp: ptr = sa_json_buffer_data(sh);
+        let sl = sa_json_buffer_len(sh);
+        bb_append(out, sp, sl);
+    };
+}

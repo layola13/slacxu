@@ -1,0 +1,1205 @@
+// Converted 1:1 from backends/jev/src/jev/jevOpenAiBridge.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// JEV <-> OpenAI bridge converter.
+//
+// Lets any existing OpenAI-compatible relay (chat/completions or responses)
+// serve JEV evaluations. JEV native shape:
+//   in:  { state: string, model: string, questions: { [qid]: { type, instructions, criteria } } }
+//   out: { answers: { [qid]: { choice?, score?, noul?, confidence?, reason? } }, model?, usage? }
+// Bridge keeps that shape and adds a `reason` string per answer (user request).
+//
+// Conversion scaffolding (shared with saVmJev.sla): strings are
+// (ptr, len) or ByteBuf; dynamic JSON values travel as JSON text and
+// are inspected through sa_json_* node handles (u64). sa_json_* are
+// intent-level externs — see the defect log.
+// DEFECT: dynamic object — TS `unknown` / Record<string, unknown>
+// values have no SLA counterpart; they are passed as JSON text
+// (ptr, len) plus a kind tag where the TS code branches on typeof.
+
+@import "sa_std/io/print.sai"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+
+// Generic byte buffer for string / JSON text building.
+struct ByteBuf {
+    bytes: [0u8; 65536],
+    len: u64,
+}
+
+fn buf_reset(out: &ByteBuf) -> void {
+    out.len = 0;
+}
+
+// Append raw bytes to a ByteBuf (truncates at capacity).
+fn buf_append(out: &ByteBuf, src_ptr: ptr, src_len: u64) -> void {
+    let i: u64 = 0;
+    while i < src_len {
+        if out.len >= 65536 { return; };
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src_ptr, i);
+        out.bytes[out.len] = b;
+        out.len = out.len + 1;
+        i = i + 1;
+    }
+}
+
+fn buf_append_lit(out: &ByteBuf, lit_ptr: ptr, lit_len: u64) -> void {
+    buf_append(out, lit_ptr, lit_len);
+}
+
+fn buf_append_buf(out: &ByteBuf, src: &ByteBuf) -> void {
+    let src_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(src_ptr, &src.bytes, 0);
+    buf_append(out, src_ptr, src.len);
+}
+
+// Append a string as a JSON string literal (quoted + escaped).
+// DEFECT: JSON string escaping is approximated byte-wise; TS relies
+// on JSON.stringify for output and JSON.parse for input.
+fn buf_append_json_str(out: &ByteBuf, src_ptr: ptr, src_len: u64) -> void {
+    buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+    let i: u64 = 0;
+    while i < src_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src_ptr, i);
+        if b == 34 {
+            buf_append_lit(out, STR_PTR("\\\""), STR_LEN("\\\""));
+        } else {
+            if b == 92 {
+                buf_append_lit(out, STR_PTR("\\\\"), STR_LEN("\\\\"));
+            } else {
+                if b == 10 {
+                    buf_append_lit(out, STR_PTR("\\n"), STR_LEN("\\n"));
+                } else {
+                    if out.len < 65536 {
+                        out.bytes[out.len] = b;
+                        out.len = out.len + 1;
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+}
+
+// Append the decimal form of an unsigned integer.
+fn buf_append_u64(out: &ByteBuf, v: u64) -> void {
+    if v >= 10 {
+        buf_append_u64(out, v / 10);
+    };
+    if out.len < 65536 {
+        out.bytes[out.len] = 48 + (v % 10) as u8;
+        out.len = out.len + 1;
+    };
+}
+
+// Append an f64 in shortest round-trip-ish form.
+// DEFECT: number formatting — TS uses JS Number#toString /
+// JSON.stringify semantics; this prints an integer part plus up to
+// 6 fractional digits, trimmed.
+fn buf_append_f64(out: &ByteBuf, v: f64) -> void {
+    if v < 0.0 {
+        buf_append_lit(out, STR_PTR("-"), STR_LEN("-"));
+        buf_append_f64(out, 0.0 - v);
+        return;
+    };
+    let whole: u64 = v as u64;
+    buf_append_u64(out, whole);
+    let frac = v - (whole as f64);
+    if frac > 0.0000005 {
+        buf_append_lit(out, STR_PTR("."), STR_LEN("."));
+        let scale: u64 = 100000;
+        let digits: u64 = (frac * 1000000.0 + 0.5) as u64;
+        let started = false;
+        while scale > 0 {
+            let d = (digits / scale) % 10;
+            if d != 0 || started || scale == 1 {
+                started = true;
+                if out.len < 65536 {
+                    out.bytes[out.len] = 48 + d as u8;
+                    out.len = out.len + 1;
+                };
+            };
+            scale = scale / 10;
+        }
+    };
+}
+
+// Case-insensitive substring test (ASCII letters only).
+fn str_contains_ci(hay_ptr: ptr, hay_len: u64, nd_ptr: ptr, nd_len: u64) -> bool {
+    if nd_len == 0 { return true; };
+    if hay_len < nd_len { return false; };
+    let last = hay_len - nd_len;
+    let i: u64 = 0;
+    while i <= last {
+        let ok = true;
+        let j: u64 = 0;
+        while j < nd_len {
+            let a: u8 = 0;
+            let b: u8 = 0;
+            PTR_BYTE_AT(a, hay_ptr, i + j);
+            PTR_BYTE_AT(b, nd_ptr, j);
+            if a >= 65 && a <= 90 { a = a + 32; };
+            if b >= 65 && b <= 90 { b = b + 32; };
+            if a != b { ok = false; break; };
+            j = j + 1;
+        }
+        if ok { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn str_eq(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    let i: u64 = 0;
+    while i < a_len {
+        let a: u8 = 0;
+        let b: u8 = 0;
+        PTR_BYTE_AT(a, a_ptr, i);
+        PTR_BYTE_AT(b, b_ptr, i);
+        if a != b { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// Copy src into out lowercased (ASCII) and trimmed of ASCII whitespace.
+fn str_trim_lower_into(out: &ByteBuf, src_ptr: ptr, src_len: u64) -> void {
+    buf_reset(out);
+    let start: u64 = 0;
+    while start < src_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src_ptr, start);
+        if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+        start = start + 1;
+    }
+    let end = src_len;
+    while end > start {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src_ptr, end - 1);
+        if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+        end = end - 1;
+    }
+    let i = start;
+    while i < end {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src_ptr, i);
+        if b >= 65 && b <= 90 { b = b + 32; };
+        if out.len < 65536 {
+            out.bytes[out.len] = b;
+            out.len = out.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+// export type JevBridgeProtocol = "openai-chat" | "openai-responses";
+// A string union in TS; kept as the literal (ptr, len) values
+// "openai-chat" / "openai-responses".
+fn jev_bridge_protocol_is_responses(p_ptr: ptr, p_len: u64) -> bool {
+    return str_eq(p_ptr, p_len, STR_PTR("openai-responses"), STR_LEN("openai-responses"));
+}
+
+// export type JevBridgeQuestion = {
+//   type?: string;
+//   instructions?: string;
+//   criteria?: unknown;
+// };
+// Optional fields become has_* flags; criteria stays JSON text.
+// DEFECT: dynamic object — criteria?: unknown kept as JSON text.
+struct JevBridgeQuestion {
+    type_bytes: [0u8; 256],
+    type_len: u64,
+    has_type: bool,
+    instructions_bytes: [0u8; 8192],
+    instructions_len: u64,
+    has_instructions: bool,
+    criteria_bytes: [0u8; 16384],
+    criteria_len: u64,
+    has_criteria: bool,
+    // Kind tag for criteria: 0 = absent/null, 1 = string, 2 = array,
+    // 3 = object, 4 = other (number/boolean).
+    criteria_kind: u64,
+}
+
+// TS: export function normalizeBridgeProtocol(raw: unknown): JevBridgeProtocol
+// raw arrives as (ptr, len) of String(raw ?? ""); out receives the
+// normalized protocol literal. Returns void in TS terms (the string
+// is the return value, delivered through out).
+fn normalizeBridgeProtocol(raw_ptr: ptr, raw_len: u64, out: &ByteBuf) -> void {
+    let v = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    str_trim_lower_into(&v, raw_ptr, raw_len);
+    let v_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(v_ptr, &v.bytes, 0);
+    buf_reset(out);
+    if str_eq(v_ptr, v.len, STR_PTR("openai-responses"), STR_LEN("openai-responses"))
+        || str_eq(v_ptr, v.len, STR_PTR("responses"), STR_LEN("responses"))
+        || str_eq(v_ptr, v.len, STR_PTR("response"), STR_LEN("response")) {
+        buf_append_lit(out, STR_PTR("openai-responses"), STR_LEN("openai-responses"));
+        return;
+    };
+    buf_append_lit(out, STR_PTR("openai-chat"), STR_LEN("openai-chat"));
+}
+
+// TS: export function isNativeJevUpstream(baseUrl: string): boolean
+fn isNativeJevUpstream(baseUrl_ptr: ptr, baseUrl_len: u64) -> bool {
+    if str_contains_ci(baseUrl_ptr, baseUrl_len, STR_PTR("systemone"), STR_LEN("systemone")) { return true; };
+    if str_contains_ci(baseUrl_ptr, baseUrl_len, STR_PTR("typesafe.ai"), STR_LEN("typesafe.ai")) { return true; };
+    return false;
+}
+
+// TS: function stringifyCriteria(criteria: unknown): string
+// criteria arrives as JSON text + kind tag (see JevBridgeQuestion).
+fn stringifyCriteria(criteria_ptr: ptr, criteria_len: u64, criteria_kind: u64, out: &ByteBuf) -> void {
+    buf_reset(out);
+    if criteria_kind == 0 {
+        buf_append_lit(out, STR_PTR("(no criteria)"), STR_LEN("(no criteria)"));
+        return;
+    };
+    if criteria_kind == 1 {
+        // typeof criteria === "string": the JSON text is the string
+        // content itself in this conversion.
+        buf_append(out, criteria_ptr, criteria_len);
+        return;
+    };
+    if criteria_kind == 2 {
+        // Array.isArray(criteria): criteria.map((c, i) => `${i}: ${String(c)}`).join("\n")
+        // DEFECT: dynamic object — array elements are read back
+        // through sa_json node handles; String(c) stringification of
+        // arbitrary elements is approximated by their JSON text.
+        let doc = sa_json_parse(criteria_ptr, criteria_len);
+        let n = sa_json_array_len(doc);
+        let i: u64 = 0;
+        for i in 0..n {
+            if i > 0 {
+                buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+            };
+            buf_append_u64(out, i);
+            buf_append_lit(out, STR_PTR(": "), STR_LEN(": "));
+            let elem: u64 = 0;
+            sa_json_array_get(doc, i, &elem);
+            let e_ptr: ptr = PTR_NULL();
+            let e_len: u64 = 0;
+            sa_json_node_string(elem, &e_ptr, &e_len);
+            buf_append(out, e_ptr, e_len);
+        }
+        return;
+    };
+    if criteria_kind == 3 {
+        // Object.entries(criteria).map(([k, v]) => `"${k}": ${String(v)}`).join("\n")
+        // DEFECT: dynamic object — entries are enumerated through
+        // sa_json_object_key_at / value handles; String(v) is
+        // approximated by the value's JSON text.
+        let doc = sa_json_parse(criteria_ptr, criteria_len);
+        let n = sa_json_object_len(doc);
+        let i: u64 = 0;
+        for i in 0..n {
+            if i > 0 {
+                buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+            };
+            let k_ptr: ptr = PTR_NULL();
+            let k_len: u64 = 0;
+            sa_json_object_key_at(doc, i, &k_ptr, &k_len);
+            buf_append_lit(out, STR_PTR("\""), STR_LEN("\""));
+            buf_append(out, k_ptr, k_len);
+            buf_append_lit(out, STR_PTR("\": "), STR_LEN("\": "));
+            let val: u64 = 0;
+            sa_json_object_value_at(doc, i, &val);
+            let v_ptr: ptr = PTR_NULL();
+            let v_len: u64 = 0;
+            sa_json_node_string(val, &v_ptr, &v_len);
+            buf_append(out, v_ptr, v_len);
+        }
+        return;
+    };
+    // return String(criteria);
+    buf_append(out, criteria_ptr, criteria_len);
+}
+
+// TS: export function buildJevBridgeSystemPrompt(): string
+fn buildJevBridgeSystemPrompt(out: &ByteBuf) -> void {
+    buf_reset(out);
+    buf_append_lit(out, STR_PTR("You are a strict JEV (TypeSafe SystemOne) evaluation engine."), STR_LEN("You are a strict JEV (TypeSafe SystemOne) evaluation engine."));
+    buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    buf_append_lit(out, STR_PTR("You receive a STATE and a set of QUESTIONS. Answer every question."), STR_LEN("You receive a STATE and a set of QUESTIONS. Answer every question."));
+    buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    buf_append_lit(out, STR_PTR("Return ONLY a single JSON object, no markdown, no prose:"), STR_LEN("Return ONLY a single JSON object, no markdown, no prose:"));
+    buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    buf_append_lit(out, STR_PTR("{\"answers\": {\"<qid>\": {\"choice\"|\"score\"|\"noul\": ..., \"confidence\": 0..1, \"reason\": \"...\"}}}"), STR_LEN("{\"answers\": {\"<qid>\": {\"choice\"|\"score\"|\"noul\": ..., \"confidence\": 0..1, \"reason\": \"...\"}}}"));
+    buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    buf_append_lit(out, STR_PTR("Rules:"), STR_LEN("Rules:"));
+    buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    buf_append_lit(out, STR_PTR("- For type \"choice\": output {\"choice\": \"<exact criteria key>\", \"confidence\": 0..1, \"reason\": \"<one sentence why>\"}. The choice MUST be one of the listed criteria keys."), STR_LEN("- For type \"choice\": output {\"choice\": \"<exact criteria key>\", \"confidence\": 0..1, \"reason\": \"<one sentence why>\"}. The choice MUST be one of the listed criteria keys."));
+    buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    buf_append_lit(out, STR_PTR("- For type \"score\": output {\"score\": <number>, \"confidence\": 0..1, \"reason\": \"...\"}. If criteria is a list, score is the 0-based index into it; otherwise score 0..10."), STR_LEN("- For type \"score\": output {\"score\": <number>, \"confidence\": 0..1, \"reason\": \"...\"}. If criteria is a list, score is the 0-based index into it; otherwise score 0..10."));
+    buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    buf_append_lit(out, STR_PTR("- For type \"noul\" (or unknown type): output {\"noul\": <0..1 risk/presence value>, \"confidence\": 0..1, \"reason\": \"...\"}."), STR_LEN("- For type \"noul\" (or unknown type): output {\"noul\": <0..1 risk/presence value>, \"confidence\": 0..1, \"reason\": \"...\"}."));
+    buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    buf_append_lit(out, STR_PTR("- Always include a short reason (<=140 chars) for every answer."), STR_LEN("- Always include a short reason (<=140 chars) for every answer."));
+    buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    buf_append_lit(out, STR_PTR("- Confidence is 0..1. If unsure, use 0.5."), STR_LEN("- Confidence is 0..1. If unsure, use 0.5."));
+}
+
+// TS: export function buildJevBridgeUserPrompt(
+//   state: string,
+//   questions: Record<string, JevBridgeQuestion>,
+// ): string
+// questions arrives as JSON text of the questions object; entries
+// are enumerated in insertion order through sa_json node handles.
+// DEFECT: dynamic object — Record iteration order and per-question
+// optional fields are read through the JSON text approximation.
+fn buildJevBridgeUserPrompt(state_ptr: ptr, state_len: u64, questions_ptr: ptr, questions_len: u64, out: &ByteBuf) -> void {
+    buf_reset(out);
+    buf_append_lit(out, STR_PTR("[STATE]"), STR_LEN("[STATE]"));
+    buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    // (state || "").slice(0, 8000) || "(empty)"
+    let s_len = state_len;
+    if s_len > 8000 { s_len = 8000; };
+    if s_len == 0 {
+        buf_append_lit(out, STR_PTR("(empty)"), STR_LEN("(empty)"));
+    } else {
+        buf_append(out, state_ptr, s_len);
+    };
+    buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    buf_append_lit(out, STR_PTR(""), STR_LEN(""));
+    buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    buf_append_lit(out, STR_PTR("[QUESTIONS] (answer ALL, keep qids exact)"), STR_LEN("[QUESTIONS] (answer ALL, keep qids exact)"));
+    let doc = sa_json_parse(questions_ptr, questions_len);
+    let n = sa_json_object_len(doc);
+    let i: u64 = 0;
+    for i in 0..n {
+        let qid_ptr: ptr = PTR_NULL();
+        let qid_len: u64 = 0;
+        sa_json_object_key_at(doc, i, &qid_ptr, &qid_len);
+        let q_node: u64 = 0;
+        sa_json_object_value_at(doc, i, &q_node);
+        // const type = (q?.type || "choice").toString();
+        let type_buf = ByteBuf { bytes: [0u8; 65536], len: 0 };
+        let t_node: u64 = 0;
+        if sa_json_object_get(q_node, STR_PTR("type"), STR_LEN("type"), &t_node) == 0 {
+            let tp: ptr = PTR_NULL();
+            let tl: u64 = 0;
+            sa_json_node_string(t_node, &tp, &tl);
+            buf_append(&type_buf, tp, tl);
+        };
+        if type_buf.len == 0 {
+            buf_append_lit(&type_buf, STR_PTR("choice"), STR_LEN("choice"));
+        };
+        buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+        buf_append_lit(out, STR_PTR("--- qid: \""), STR_LEN("--- qid: \""));
+        buf_append(out, qid_ptr, qid_len);
+        buf_append_lit(out, STR_PTR("\" | type: "), STR_LEN("\" | type: "));
+        buf_append_buf(out, &type_buf);
+        buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+        // instructions: (q?.instructions || "").toString().slice(0, 2000)
+        buf_append_lit(out, STR_PTR("instructions: "), STR_LEN("instructions: "));
+        let ins_node: u64 = 0;
+        if sa_json_object_get(q_node, STR_PTR("instructions"), STR_LEN("instructions"), &ins_node) == 0 {
+            let ip: ptr = PTR_NULL();
+            let il: u64 = 0;
+            sa_json_node_string(ins_node, &ip, &il);
+            if il > 2000 { il = 2000; };
+            buf_append(out, ip, il);
+        };
+        buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+        // criteria:\n${stringifyCriteria(q?.criteria).slice(0, 3000)}
+        buf_append_lit(out, STR_PTR("criteria:\n"), STR_LEN("criteria:\n"));
+        let crit_buf = ByteBuf { bytes: [0u8; 65536], len: 0 };
+        let c_node: u64 = 0;
+        let c_kind: u64 = 0;
+        let c_ptr: ptr = PTR_NULL();
+        let c_len: u64 = 0;
+        if sa_json_object_get(q_node, STR_PTR("criteria"), STR_LEN("criteria"), &c_node) == 0 {
+            c_kind = sa_json_node_kind(c_node);
+            sa_json_node_json_text(c_node, &c_ptr, &c_len);
+            if c_kind == 1 {
+                // String criteria travel as their raw text.
+                sa_json_node_string(c_node, &c_ptr, &c_len);
+            };
+        };
+        stringifyCriteria(c_ptr, c_len, c_kind, &crit_buf);
+        let cl = crit_buf.len;
+        if cl > 3000 { cl = 3000; };
+        let crit_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(crit_ptr, &crit_buf.bytes, 0);
+        buf_append(out, crit_ptr, cl);
+    }
+    buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    buf_append_lit(out, STR_PTR(""), STR_LEN(""));
+    buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    buf_append_lit(out, STR_PTR("Respond with JSON only: {\"answers\": {...}}"), STR_LEN("Respond with JSON only: {\"answers\": {...}}"));
+}
+
+// TS: export function buildJevBridgeChatBody(
+//   model: string,
+//   state: string,
+//   questions: Record<string, JevBridgeQuestion>,
+// ): Record<string, unknown>
+// The returned Record is built as JSON text in out, keys in the
+// same order as the TS object literal.
+// DEFECT: dynamic object — Record<string, unknown> return kept as
+// JSON text buffer.
+fn buildJevBridgeChatBody(model_ptr: ptr, model_len: u64, state_ptr: ptr, state_len: u64, questions_ptr: ptr, questions_len: u64, out: &ByteBuf) -> void {
+    let system_buf = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    buildJevBridgeSystemPrompt(&system_buf);
+    let user_buf = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    buildJevBridgeUserPrompt(state_ptr, state_len, questions_ptr, questions_len, &user_buf);
+    buf_reset(out);
+    buf_append_lit(out, STR_PTR("{\"model\":"), STR_LEN("{\"model\":"));
+    buf_append_json_str(out, model_ptr, model_len);
+    buf_append_lit(out, STR_PTR(",\"temperature\":0,\"response_format\":{\"type\":\"json_object\"},\"messages\":[{\"role\":\"system\",\"content\":"), STR_LEN(",\"temperature\":0,\"response_format\":{\"type\":\"json_object\"},\"messages\":[{\"role\":\"system\",\"content\":"));
+    let sys_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sys_ptr, &system_buf.bytes, 0);
+    buf_append_json_str(out, sys_ptr, system_buf.len);
+    buf_append_lit(out, STR_PTR("},{\"role\":\"user\",\"content\":"), STR_LEN("},{\"role\":\"user\",\"content\":"));
+    let usr_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(usr_ptr, &user_buf.bytes, 0);
+    buf_append_json_str(out, usr_ptr, user_buf.len);
+    buf_append_lit(out, STR_PTR("}]}"), STR_LEN("}]}"));
+}
+
+// TS: export function buildJevBridgeResponsesBody(
+//   model: string,
+//   state: string,
+//   questions: Record<string, JevBridgeQuestion>,
+// ): Record<string, unknown>
+// DEFECT: dynamic object — Record<string, unknown> return kept as
+// JSON text buffer.
+fn buildJevBridgeResponsesBody(model_ptr: ptr, model_len: u64, state_ptr: ptr, state_len: u64, questions_ptr: ptr, questions_len: u64, out: &ByteBuf) -> void {
+    let system_buf = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    buildJevBridgeSystemPrompt(&system_buf);
+    let user_buf = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    buildJevBridgeUserPrompt(state_ptr, state_len, questions_ptr, questions_len, &user_buf);
+    buf_reset(out);
+    buf_append_lit(out, STR_PTR("{\"model\":"), STR_LEN("{\"model\":"));
+    buf_append_json_str(out, model_ptr, model_len);
+    buf_append_lit(out, STR_PTR(",\"temperature\":0,\"instructions\":"), STR_LEN(",\"temperature\":0,\"instructions\":"));
+    let sys_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sys_ptr, &system_buf.bytes, 0);
+    buf_append_json_str(out, sys_ptr, system_buf.len);
+    buf_append_lit(out, STR_PTR(",\"input\":"), STR_LEN(",\"input\":"));
+    let usr_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(usr_ptr, &user_buf.bytes, 0);
+    buf_append_json_str(out, usr_ptr, user_buf.len);
+    buf_append_lit(out, STR_PTR(",\"text\":{\"format\":{\"type\":\"json_object\"}}}"), STR_LEN(",\"text\":{\"format\":{\"type\":\"json_object\"}}}"));
+}
+
+// TS: function extractJsonObject(text: string): unknown | null
+// On success returns true and out holds the parsed JSON text; on
+// failure returns false (TS null).
+// DEFECT: regex — the code-fence strip uses a RegExp match
+// (/```(?:json)?\s*([\s\S]*?)\s*```/i); approximated by a manual scan
+// for ``` fences. JSON.parse failure handling is preserved by
+// re-parsing through sa_json_parse.
+fn extractJsonObject(text_ptr: ptr, text_len: u64, out: &ByteBuf) -> bool {
+    buf_reset(out);
+    // const trimmed = (text || "").trim();
+    let start: u64 = 0;
+    while start < text_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, text_ptr, start);
+        if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+        start = start + 1;
+    }
+    let end = text_len;
+    while end > start {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, text_ptr, end - 1);
+        if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+        end = end - 1;
+    }
+    if end <= start { return false; };
+    // Strip code fences: find the first ``` and the last ``` after it.
+    let cand_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cand_ptr, text_ptr, start);
+    let cand_len = end - start;
+    let fence_open: u64 = 0;
+    let has_fence = false;
+    let scan: u64 = 0;
+    while scan + 3 <= cand_len {
+        let b0: u8 = 0;
+        let b1: u8 = 0;
+        let b2: u8 = 0;
+        PTR_BYTE_AT(b0, cand_ptr, scan);
+        PTR_BYTE_AT(b1, cand_ptr, scan + 1);
+        PTR_BYTE_AT(b2, cand_ptr, scan + 2);
+        if b0 == 96 && b1 == 96 && b2 == 96 {
+            has_fence = true;
+            fence_open = scan;
+            break;
+        };
+        scan = scan + 1;
+    }
+    let body_ptr: ptr = PTR_NULL();
+    let body_len: u64 = 0;
+    if has_fence {
+        // Skip the opening fence line (``` plus optional "json" tag
+        // and whitespace, per the regex's \s* after the tag).
+        let p = fence_open + 3;
+        // Skip the optional language tag (letters).
+        while p < cand_len {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, cand_ptr, p);
+            if (b >= 97 && b <= 122) || (b >= 65 && b <= 90) { p = p + 1; } else { break; };
+        }
+        while p < cand_len {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, cand_ptr, p);
+            if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+            p = p + 1;
+        };
+        // Find the closing fence.
+        let close: u64 = 0;
+        let has_close = false;
+        let q = cand_len;
+        while q >= p + 3 {
+            let b0: u8 = 0;
+            let b1: u8 = 0;
+            let b2: u8 = 0;
+            PTR_BYTE_AT(b0, cand_ptr, q - 3);
+            PTR_BYTE_AT(b1, cand_ptr, q - 2);
+            PTR_BYTE_AT(b2, cand_ptr, q - 1);
+            if b0 == 96 && b1 == 96 && b2 == 96 {
+                has_close = true;
+                close = q - 3;
+                break;
+            };
+            q = q - 1;
+        }
+        if has_close && close > p {
+            PTR_BYTE_ADD(body_ptr, cand_ptr, p);
+            body_len = close - p;
+            // Trim trailing whitespace before the closing fence.
+            while body_len > 0 {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, body_ptr, body_len - 1);
+                if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+                body_len = body_len - 1;
+            }
+        } else {
+            body_ptr = cand_ptr;
+            body_len = cand_len;
+        };
+    } else {
+        body_ptr = cand_ptr;
+        body_len = cand_len;
+    };
+    // try { return JSON.parse(candidate); }
+    if sa_json_parse(body_ptr, body_len) != 0 {
+        buf_append(out, body_ptr, body_len);
+        return true;
+    };
+    // Fall back to largest {...} substring.
+    let first: i64 = -1;
+    let last: i64 = -1;
+    let i: u64 = 0;
+    while i < body_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, body_ptr, i);
+        if b == 123 && first < 0 { first = i as i64; };
+        if b == 125 { last = i as i64; };
+        i = i + 1;
+    }
+    if first >= 0 && last > first {
+        let sub_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sub_ptr, body_ptr, first as u64);
+        let sub_len = (last - first + 1) as u64;
+        if sa_json_parse(sub_ptr, sub_len) != 0 {
+            buf_append(out, sub_ptr, sub_len);
+            return true;
+        };
+        return false;
+    };
+    return false;
+}
+
+// TS: function clamp01(v: unknown, fallback = 0.5): number
+// v arrives pre-converted: has_num says whether Number(v) produced a
+// value (TS: typeof v === "number" ? v : Number(v)); non-finite or
+// missing values fall back.
+// DEFECT: dynamic typing — unknown -> Number() coercion is done by
+// the caller through sa_json node kinds; NaN/Infinity checks map to
+// the has_num flag.
+fn clamp01(v: f64, has_num: bool, fallback: f64) -> f64 {
+    if !has_num { return fallback; };
+    if v < 0.0 { return 0.0; };
+    if v > 1.0 { return 1.0; };
+    return v;
+}
+
+// TS: function clampReason(v: unknown): string
+// v arrives as (ptr, len) of String(v) (or "" when v == null), plus
+// has_v for the null case.
+fn clampReason(v_ptr: ptr, v_len: u64, has_v: bool, out: &ByteBuf) -> void {
+    buf_reset(out);
+    if !has_v { return; };
+    // s.trim().slice(0, 300)
+    let start: u64 = 0;
+    while start < v_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, v_ptr, start);
+        if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+        start = start + 1;
+    }
+    let end = v_len;
+    while end > start {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, v_ptr, end - 1);
+        if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+        end = end - 1;
+    }
+    let n = end - start;
+    if n > 300 { n = 300; };
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, v_ptr, start);
+    buf_append(out, p, n);
+}
+
+// TS: function normalizeChoiceAnswer(
+//   raw: Record<string, unknown>,
+//   criteriaKeys: string[],
+// ): { choice: string; confidence: number; reason: string }
+// raw arrives as JSON text; criteriaKeys as a JSON array text.
+// Results are delivered through out_choice / out_reason / the f64
+// return value (confidence).
+// DEFECT: dynamic object — Record/array parameters kept as JSON
+// text and read through sa_json node handles.
+fn normalizeChoiceAnswer(raw_ptr: ptr, raw_len: u64, keys_ptr: ptr, keys_len: u64, out_choice: &ByteBuf, out_reason: &ByteBuf) -> f64 {
+    let doc = sa_json_parse(raw_ptr, raw_len);
+    // const rawChoice = typeof raw.choice === "string" ? raw.choice.trim() : "";
+    let choice = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    let ch_node: u64 = 0;
+    if sa_json_object_get(doc, STR_PTR("choice"), STR_LEN("choice"), &ch_node) == 0 && sa_json_node_kind(ch_node) == 1 {
+        let cp: ptr = PTR_NULL();
+        let cl: u64 = 0;
+        sa_json_node_string(ch_node, &cp, &cl);
+        // trim
+        let s: u64 = 0;
+        while s < cl {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, cp, s);
+            if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+            s = s + 1;
+        }
+        let e = cl;
+        while e > s {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, cp, e - 1);
+            if b != 32 && b != 9 && b != 10 && b != 13 { break; };
+            e = e - 1;
+        }
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, cp, s);
+        buf_append(&choice, p, e - s);
+    };
+    let keys_doc = sa_json_parse(keys_ptr, keys_len);
+    let n_keys = sa_json_array_len(keys_doc);
+    buf_reset(out_choice);
+    if n_keys > 0 {
+        // const lower = rawChoice.toLowerCase();
+        let lower = ByteBuf { bytes: [0u8; 65536], len: 0 };
+        str_trim_lower_into(&lower, choice_ptr_of(&choice), choice.len);
+        // criteriaKeys.find((k) => k === rawChoice) ?? find(lower)
+        // DEFECT: closure — Array.find with a predicate closure has
+        // no SLA counterpart; inlined as two sequential scans.
+        let found = ByteBuf { bytes: [0u8; 65536], len: 0 };
+        let has_found = false;
+        let i: u64 = 0;
+        for i in 0..n_keys {
+            let k_node: u64 = 0;
+            sa_json_array_get(keys_doc, i, &k_node);
+            let kp: ptr = PTR_NULL();
+            let kl: u64 = 0;
+            sa_json_node_string(k_node, &kp, &kl);
+            if str_eq(kp, kl, choice_ptr_of(&choice), choice.len) {
+                buf_append(&found, kp, kl);
+                has_found = true;
+                break;
+            };
+        }
+        if !has_found {
+            let j: u64 = 0;
+            for j in 0..n_keys {
+                let k_node: u64 = 0;
+                sa_json_array_get(keys_doc, j, &k_node);
+                let kp: ptr = PTR_NULL();
+                let kl: u64 = 0;
+                sa_json_node_string(k_node, &kp, &kl);
+                let k_lower = ByteBuf { bytes: [0u8; 65536], len: 0 };
+                str_trim_lower_into(&k_lower, kp, kl);
+                // NOTE: k is only lowercased in TS, not trimmed;
+                // str_trim_lower_into also trims — kept as the
+                // closest available helper approximation.
+                if str_eq(choice_ptr_of(&k_lower), k_lower.len, choice_ptr_of(&lower), lower.len) {
+                    buf_append(&found, kp, kl);
+                    has_found = true;
+                    break;
+                };
+            }
+        };
+        if has_found {
+            buf_append_buf(out_choice, &found);
+        } else {
+            if choice.len > 0 {
+                buf_append_buf(out_choice, &choice);
+            } else {
+                // criteriaKeys[0]!
+                let k0: u64 = 0;
+                sa_json_array_get(keys_doc, 0, &k0);
+                let kp: ptr = PTR_NULL();
+                let kl: u64 = 0;
+                sa_json_node_string(k0, &kp, &kl);
+                buf_append(out_choice, kp, kl);
+            };
+        };
+    } else {
+        buf_append_buf(out_choice, &choice);
+    };
+    // reason: clampReason(raw.reason ?? raw.why ?? raw.explanation)
+    let r_ptr: ptr = PTR_NULL();
+    let r_len: u64 = 0;
+    let has_r = false;
+    let r_node: u64 = 0;
+    if sa_json_object_get(doc, STR_PTR("reason"), STR_LEN("reason"), &r_node) == 0 {
+        has_r = true;
+        sa_json_node_string(r_node, &r_ptr, &r_len);
+    } else {
+        if sa_json_object_get(doc, STR_PTR("why"), STR_LEN("why"), &r_node) == 0 {
+            has_r = true;
+            sa_json_node_string(r_node, &r_ptr, &r_len);
+        } else {
+            if sa_json_object_get(doc, STR_PTR("explanation"), STR_LEN("explanation"), &r_node) == 0 {
+                has_r = true;
+                sa_json_node_string(r_node, &r_ptr, &r_len);
+            };
+        };
+    };
+    clampReason(r_ptr, r_len, has_r, out_reason);
+    // confidence: clamp01(raw.confidence, 0.5)
+    let conf: f64 = 0.0;
+    let has_conf = false;
+    let cf_node: u64 = 0;
+    if sa_json_object_get(doc, STR_PTR("confidence"), STR_LEN("confidence"), &cf_node) == 0 {
+        has_conf = sa_json_node_number(cf_node, &conf) == 0;
+    };
+    return clamp01(conf, has_conf, 0.5);
+}
+
+// Helper: pointer to a ByteBuf's bytes (conversion scaffolding).
+fn choice_ptr_of(b: &ByteBuf) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &b.bytes, 0);
+    return p;
+}
+
+// TS: export function extractChatText(payload: unknown): string
+// payload arrives as JSON text.
+// DEFECT: dynamic object — the payload shape is probed through
+// sa_json node handles instead of TS structural casts.
+fn extractChatText(payload_ptr: ptr, payload_len: u64, out: &ByteBuf) -> void {
+    buf_reset(out);
+    let root = sa_json_parse(payload_ptr, payload_len);
+    // const choices = Array.isArray(root.choices) ? root.choices : [];
+    let choices: u64 = 0;
+    let has_choices = false;
+    if sa_json_object_get(root, STR_PTR("choices"), STR_LEN("choices"), &choices) == 0 && sa_json_node_kind(choices) == 2 {
+        has_choices = true;
+    };
+    let first: u64 = 0;
+    let has_first = false;
+    if has_choices && sa_json_array_len(choices) > 0 {
+        sa_json_array_get(choices, 0, &first);
+        has_first = true;
+    };
+    // const message = (first.message ?? {}) ...
+    let content: u64 = 0;
+    let has_content = false;
+    if has_first {
+        let message: u64 = 0;
+        if sa_json_object_get(first, STR_PTR("message"), STR_LEN("message"), &message) == 0 {
+            if sa_json_object_get(message, STR_PTR("content"), STR_LEN("content"), &content) == 0 {
+                has_content = true;
+            };
+        };
+    };
+    if has_content && sa_json_node_kind(content) == 1 {
+        let cp: ptr = PTR_NULL();
+        let cl: u64 = 0;
+        sa_json_node_string(content, &cp, &cl);
+        buf_append(out, cp, cl);
+        return;
+    };
+    if has_content && sa_json_node_kind(content) == 2 {
+        // content.map((part) => ...).join("")
+        // DEFECT: closure — Array.map callback inlined as a loop.
+        let n = sa_json_array_len(content);
+        let i: u64 = 0;
+        for i in 0..n {
+            let part: u64 = 0;
+            sa_json_array_get(content, i, &part);
+            let t_node: u64 = 0;
+            if sa_json_object_get(part, STR_PTR("text"), STR_LEN("text"), &t_node) == 0 && sa_json_node_kind(t_node) == 1 {
+                let tp: ptr = PTR_NULL();
+                let tl: u64 = 0;
+                sa_json_node_string(t_node, &tp, &tl);
+                buf_append(out, tp, tl);
+            } else {
+                let c_node: u64 = 0;
+                if sa_json_object_get(part, STR_PTR("content"), STR_LEN("content"), &c_node) == 0 && sa_json_node_kind(c_node) == 1 {
+                    let cp2: ptr = PTR_NULL();
+                    let cl2: u64 = 0;
+                    sa_json_node_string(c_node, &cp2, &cl2);
+                    buf_append(out, cp2, cl2);
+                };
+            };
+        }
+        return;
+    };
+    if has_first {
+        let t_node: u64 = 0;
+        if sa_json_object_get(first, STR_PTR("text"), STR_LEN("text"), &t_node) == 0 && sa_json_node_kind(t_node) == 1 {
+            let tp: ptr = PTR_NULL();
+            let tl: u64 = 0;
+            sa_json_node_string(t_node, &tp, &tl);
+            buf_append(out, tp, tl);
+            return;
+        };
+    };
+    // return "";
+}
+
+// TS: export function extractResponsesText(payload: unknown): string
+// payload arrives as JSON text.
+// DEFECT: dynamic object — see extractChatText.
+fn extractResponsesText(payload_ptr: ptr, payload_len: u64, out: &ByteBuf) -> void {
+    buf_reset(out);
+    let root = sa_json_parse(payload_ptr, payload_len);
+    // if (typeof root.output_text === "string" && root.output_text) return root.output_text;
+    let ot: u64 = 0;
+    if sa_json_object_get(root, STR_PTR("output_text"), STR_LEN("output_text"), &ot) == 0 && sa_json_node_kind(ot) == 1 {
+        let op: ptr = PTR_NULL();
+        let ol: u64 = 0;
+        sa_json_node_string(ot, &op, &ol);
+        if ol > 0 {
+            buf_append(out, op, ol);
+            return;
+        };
+    };
+    // const output = Array.isArray(root.output) ? root.output : [];
+    let output: u64 = 0;
+    let chunks = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    if sa_json_object_get(root, STR_PTR("output"), STR_LEN("output"), &output) == 0 && sa_json_node_kind(output) == 2 {
+        let n = sa_json_array_len(output);
+        let i: u64 = 0;
+        for i in 0..n {
+            let entry: u64 = 0;
+            sa_json_array_get(output, i, &entry);
+            let content: u64 = 0;
+            if sa_json_object_get(entry, STR_PTR("content"), STR_LEN("content"), &content) == 0 && sa_json_node_kind(content) == 2 {
+                let m = sa_json_array_len(content);
+                let j: u64 = 0;
+                for j in 0..m {
+                    let part: u64 = 0;
+                    sa_json_array_get(content, j, &part);
+                    let t_node: u64 = 0;
+                    if sa_json_object_get(part, STR_PTR("text"), STR_LEN("text"), &t_node) == 0 && sa_json_node_kind(t_node) == 1 {
+                        let tp: ptr = PTR_NULL();
+                        let tl: u64 = 0;
+                        sa_json_node_string(t_node, &tp, &tl);
+                        buf_append(&chunks, tp, tl);
+                    } else {
+                        let o_node: u64 = 0;
+                        if sa_json_object_get(part, STR_PTR("output_text"), STR_LEN("output_text"), &o_node) == 0 && sa_json_node_kind(o_node) == 1 {
+                            let op2: ptr = PTR_NULL();
+                            let ol2: u64 = 0;
+                            sa_json_node_string(o_node, &op2, &ol2);
+                            buf_append(&chunks, op2, ol2);
+                        };
+                    };
+                }
+            };
+            let e_node: u64 = 0;
+            if sa_json_object_get(entry, STR_PTR("text"), STR_LEN("text"), &e_node) == 0 && sa_json_node_kind(e_node) == 1 {
+                let ep: ptr = PTR_NULL();
+                let el: u64 = 0;
+                sa_json_node_string(e_node, &ep, &el);
+                buf_append(&chunks, ep, el);
+            };
+        }
+    };
+    if chunks.len > 0 {
+        buf_append_buf(out, &chunks);
+        return;
+    };
+    // return extractChatText(payload);
+    extractChatText(payload_ptr, payload_len, out);
+}
+
+// TS: export function bridgeTextToJevData(
+//   text: string,
+//   questions: Record<string, JevBridgeQuestion>,
+//   model: string,
+// ): { answers: Record<string, Record<string, unknown>>; model: string }
+// Convert a bridge LLM text answer back to native JEV data.
+// Output shape matches native JEV: { answers, model } plus
+// per-answer reason. The result Record is built as JSON text in out.
+// DEFECT: dynamic object — questions / answers Records kept as JSON
+// text and read through sa_json node handles.
+fn bridgeTextToJevData(text_ptr: ptr, text_len: u64, questions_ptr: ptr, questions_len: u64, model_ptr: ptr, model_len: u64, out: &ByteBuf) -> void {
+    // const parsed = extractJsonObject(text) as ... | null;
+    let parsed_buf = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    let has_parsed = extractJsonObject(text_ptr, text_len, &parsed_buf);
+    let parsed_doc: u64 = 0;
+    if has_parsed {
+        parsed_doc = sa_json_parse(choice_ptr_of(&parsed_buf), parsed_buf.len);
+    };
+    // const rawAnswers = ((parsed?.answers ?? parsed) ?? {}) ...
+    let raw_answers: u64 = 0;
+    let has_raw_answers = false;
+    if has_parsed {
+        let a_node: u64 = 0;
+        if sa_json_object_get(parsed_doc, STR_PTR("answers"), STR_LEN("answers"), &a_node) == 0 {
+            raw_answers = a_node;
+            has_raw_answers = true;
+        } else {
+            raw_answers = parsed_doc;
+            has_raw_answers = true;
+        };
+    };
+    let q_doc = sa_json_parse(questions_ptr, questions_len);
+    let n_q = sa_json_object_len(q_doc);
+    buf_reset(out);
+    buf_append_lit(out, STR_PTR("{\"answers\":{"), STR_LEN("{\"answers\":{"));
+    let qi: u64 = 0;
+    for qi in 0..n_q {
+        let qid_ptr: ptr = PTR_NULL();
+        let qid_len: u64 = 0;
+        sa_json_object_key_at(q_doc, qi, &qid_ptr, &qid_len);
+        let q_node: u64 = 0;
+        sa_json_object_value_at(q_doc, qi, &q_node);
+        if qi > 0 {
+            buf_append_lit(out, STR_PTR(","), STR_LEN(","));
+        };
+        buf_append_json_str(out, qid_ptr, qid_len);
+        buf_append_lit(out, STR_PTR(":"), STR_LEN(":"));
+        // const type = String(q.type ?? "choice").toLowerCase();
+        let type_buf = ByteBuf { bytes: [0u8; 65536], len: 0 };
+        let t_node: u64 = 0;
+        if sa_json_object_get(q_node, STR_PTR("type"), STR_LEN("type"), &t_node) == 0 {
+            let tp: ptr = PTR_NULL();
+            let tl: u64 = 0;
+            sa_json_node_string(t_node, &tp, &tl);
+            str_trim_lower_into(&type_buf, tp, tl);
+        } else {
+            buf_append_lit(&type_buf, STR_PTR("choice"), STR_LEN("choice"));
+        };
+        // const raw = ((rawAnswers[qid] ?? {}) ...) ?? {};
+        let raw_node: u64 = 0;
+        let has_raw = false;
+        if has_raw_answers {
+            if sa_json_object_get(raw_answers, qid_ptr, qid_len, &raw_node) == 0 {
+                has_raw = true;
+            };
+        };
+        // const reason = clampReason(raw.reason ?? raw.why ?? raw.explanation);
+        let reason_buf = ByteBuf { bytes: [0u8; 65536], len: 0 };
+        if has_raw {
+            let r_ptr: ptr = PTR_NULL();
+            let r_len: u64 = 0;
+            let has_r = false;
+            let r_node: u64 = 0;
+            if sa_json_object_get(raw_node, STR_PTR("reason"), STR_LEN("reason"), &r_node) == 0 {
+                has_r = true;
+                sa_json_node_string(r_node, &r_ptr, &r_len);
+            } else {
+                if sa_json_object_get(raw_node, STR_PTR("why"), STR_LEN("why"), &r_node) == 0 {
+                    has_r = true;
+                    sa_json_node_string(r_node, &r_ptr, &r_len);
+                } else {
+                    if sa_json_object_get(raw_node, STR_PTR("explanation"), STR_LEN("explanation"), &r_node) == 0 {
+                        has_r = true;
+                        sa_json_node_string(r_node, &r_ptr, &r_len);
+                    };
+                };
+            };
+            clampReason(r_ptr, r_len, has_r, &reason_buf);
+        } else {
+            clampReason(STR_PTR(""), 0, false, &reason_buf);
+        };
+        // confidence shared by all three branches: clamp01(raw.confidence, 0.5)
+        let conf: f64 = 0.0;
+        let has_conf = false;
+        if has_raw {
+            let cf_node: u64 = 0;
+            if sa_json_object_get(raw_node, STR_PTR("confidence"), STR_LEN("confidence"), &cf_node) == 0 {
+                has_conf = sa_json_node_number(cf_node, &conf) == 0;
+            };
+        };
+        let confidence = clamp01(conf, has_conf, 0.5);
+        let type_ptr: ptr = PTR_NULL();
+        PTR_BYTE_ADD(type_ptr, &type_buf.bytes, 0);
+        if str_eq(type_ptr, type_buf.len, STR_PTR("score"), STR_LEN("score")) {
+            // ---- score branch ----
+            let score: f64 = 0.0;
+            let decided = false;
+            if has_raw {
+                let s_node: u64 = 0;
+                if sa_json_object_get(raw_node, STR_PTR("score"), STR_LEN("score"), &s_node) == 0 && sa_json_node_kind(s_node) == 4 {
+                    // typeof raw.score === "number" && Number.isFinite(raw.score)
+                    let sv: f64 = 0.0;
+                    if sa_json_node_number(s_node, &sv) == 0 {
+                        score = sv;
+                        decided = true;
+                    };
+                };
+                if !decided {
+                    // typeof raw.choice === "string" && Array.isArray(criteria)
+                    let ch_node: u64 = 0;
+                    let crit_node: u64 = 0;
+                    if sa_json_object_get(raw_node, STR_PTR("choice"), STR_LEN("choice"), &ch_node) == 0 && sa_json_node_kind(ch_node) == 1
+                        && sa_json_object_get(q_node, STR_PTR("criteria"), STR_LEN("criteria"), &crit_node) == 0 && sa_json_node_kind(crit_node) == 2 {
+                        let cp: ptr = PTR_NULL();
+                        let cl: u64 = 0;
+                        sa_json_node_string(ch_node, &cp, &cl);
+                        // (criteria as unknown[]).findIndex((c) => String(c) === raw.choice)
+                        // DEFECT: closure — findIndex predicate inlined as a loop.
+                        let idx: i64 = -1;
+                        let m = sa_json_array_len(crit_node);
+                        let j: u64 = 0;
+                        for j in 0..m {
+                            let c_elem: u64 = 0;
+                            sa_json_array_get(crit_node, j, &c_elem);
+                            let ep: ptr = PTR_NULL();
+                            let el: u64 = 0;
+                            sa_json_node_string(c_elem, &ep, &el);
+                            if str_eq(ep, el, cp, cl) {
+                                idx = j as i64;
+                                break;
+                            };
+                        }
+                        score = 0.0;
+                        if idx >= 0 { score = idx as f64; };
+                        decided = true;
+                    };
+                };
+                if !decided {
+                    // score = Number(raw.score ?? raw.noul ?? 0); if (!Number.isFinite(score)) score = 0;
+                    let v_node: u64 = 0;
+                    let got = false;
+                    if sa_json_object_get(raw_node, STR_PTR("score"), STR_LEN("score"), &v_node) == 0 {
+                        got = sa_json_node_number(v_node, &score) == 0;
+                    } else {
+                        if sa_json_object_get(raw_node, STR_PTR("noul"), STR_LEN("noul"), &v_node) == 0 {
+                            got = sa_json_node_number(v_node, &score) == 0;
+                        } else {
+                            score = 0.0;
+                            got = true;
+                        };
+                    };
+                    if !got { score = 0.0; };
+                };
+            };
+            buf_append_lit(out, STR_PTR("{\"score\":"), STR_LEN("{\"score\":"));
+            buf_append_f64(out, score);
+            buf_append_lit(out, STR_PTR(",\"confidence\":"), STR_LEN(",\"confidence\":"));
+            buf_append_f64(out, confidence);
+            buf_append_lit(out, STR_PTR(",\"reason\":"), STR_LEN(",\"reason\":"));
+            buf_append_json_str(out, choice_ptr_of(&reason_buf), reason_buf.len);
+            buf_append_lit(out, STR_PTR("}"), STR_LEN("}"));
+            continue;
+        };
+        // ---- noul branch condition ----
+        // type === "noul" || type === "noul_number" ||
+        //   (!raw.choice && (typeof raw.noul === "number" || typeof raw.noul === "string"))
+        let is_noul = str_eq(type_ptr, type_buf.len, STR_PTR("noul"), STR_LEN("noul"))
+            || str_eq(type_ptr, type_buf.len, STR_PTR("noul_number"), STR_LEN("noul_number"));
+        if !is_noul && has_raw {
+            let ch_node: u64 = 0;
+            let has_choice = sa_json_object_get(raw_node, STR_PTR("choice"), STR_LEN("choice"), &ch_node) == 0;
+            let nl_node: u64 = 0;
+            if sa_json_object_get(raw_node, STR_PTR("noul"), STR_LEN("noul"), &nl_node) == 0 {
+                let k = sa_json_node_kind(nl_node);
+                if !has_choice && (k == 4 || k == 1) {
+                    is_noul = true;
+                };
+            };
+        };
+        if is_noul {
+            // const noulRaw = Number(raw.noul ?? raw.score ?? 0);
+            let noul_raw: f64 = 0.0;
+            let got = false;
+            if has_raw {
+                let v_node: u64 = 0;
+                if sa_json_object_get(raw_node, STR_PTR("noul"), STR_LEN("noul"), &v_node) == 0 {
+                    got = sa_json_node_number(v_node, &noul_raw) == 0;
+                } else {
+                    if sa_json_object_get(raw_node, STR_PTR("score"), STR_LEN("score"), &v_node) == 0 {
+                        got = sa_json_node_number(v_node, &noul_raw) == 0;
+                    } else {
+                        noul_raw = 0.0;
+                        got = true;
+                    };
+                };
+            };
+            // noul: Number.isFinite(noulRaw) ? Math.min(1, Math.max(0, noulRaw)) : 0
+            let noul: f64 = 0.0;
+            if got {
+                noul = noul_raw;
+                if noul < 0.0 { noul = 0.0; };
+                if noul > 1.0 { noul = 1.0; };
+            };
+            buf_append_lit(out, STR_PTR("{\"noul\":"), STR_LEN("{\"noul\":"));
+            buf_append_f64(out, noul);
+            buf_append_lit(out, STR_PTR(",\"confidence\":"), STR_LEN(",\"confidence\":"));
+            buf_append_f64(out, confidence);
+            buf_append_lit(out, STR_PTR(",\"reason\":"), STR_LEN(",\"reason\":"));
+            buf_append_json_str(out, choice_ptr_of(&reason_buf), reason_buf.len);
+            buf_append_lit(out, STR_PTR("}"), STR_LEN("}"));
+            continue;
+        };
+        // ---- choice branch ----
+        // const criteriaKeys = q.criteria && typeof q.criteria === "object"
+        //   && !Array.isArray(q.criteria) ? Object.keys(q.criteria ...) : [];
+        let keys_buf = ByteBuf { bytes: [0u8; 65536], len: 0 };
+        buf_append_lit(&keys_buf, STR_PTR("["), STR_LEN("["));
+        let crit_node2: u64 = 0;
+        if sa_json_object_get(q_node, STR_PTR("criteria"), STR_LEN("criteria"), &crit_node2) == 0 && sa_json_node_kind(crit_node2) == 3 {
+            let nk = sa_json_object_len(crit_node2);
+            let j: u64 = 0;
+            for j in 0..nk {
+                let kp: ptr = PTR_NULL();
+                let kl: u64 = 0;
+                sa_json_object_key_at(crit_node2, j, &kp, &kl);
+                if j > 0 {
+                    buf_append_lit(&keys_buf, STR_PTR(","), STR_LEN(","));
+                };
+                buf_append_json_str(&keys_buf, kp, kl);
+            }
+        };
+        buf_append_lit(&keys_buf, STR_PTR("]"), STR_LEN("]"));
+        // answers[qid] = normalizeChoiceAnswer(raw, criteriaKeys);
+        let ans_choice = ByteBuf { bytes: [0u8; 65536], len: 0 };
+        let ans_reason = ByteBuf { bytes: [0u8; 65536], len: 0 };
+        let raw_json_ptr: ptr = PTR_NULL();
+        let raw_json_len: u64 = 0;
+        if has_raw {
+            sa_json_node_json_text(raw_node, &raw_json_ptr, &raw_json_len);
+        } else {
+            raw_json_ptr = STR_PTR("{}");
+            raw_json_len = STR_LEN("{}");
+        };
+        let ans_conf = normalizeChoiceAnswer(raw_json_ptr, raw_json_len, choice_ptr_of(&keys_buf), keys_buf.len, &ans_choice, &ans_reason);
+        buf_append_lit(out, STR_PTR("{\"choice\":"), STR_LEN("{\"choice\":"));
+        buf_append_json_str(out, choice_ptr_of(&ans_choice), ans_choice.len);
+        buf_append_lit(out, STR_PTR(",\"confidence\":"), STR_LEN(",\"confidence\":"));
+        buf_append_f64(out, ans_conf);
+        buf_append_lit(out, STR_PTR(",\"reason\":"), STR_LEN(",\"reason\":"));
+        buf_append_json_str(out, choice_ptr_of(&ans_reason), ans_reason.len);
+        buf_append_lit(out, STR_PTR("}"), STR_LEN("}"));
+    }
+    buf_append_lit(out, STR_PTR("},\"model\":"), STR_LEN("},\"model\":"));
+    buf_append_json_str(out, model_ptr, model_len);
+    buf_append_lit(out, STR_PTR("}"), STR_LEN("}"));
+}

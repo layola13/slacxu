@@ -1,0 +1,644 @@
+// Converted 1:1 from backends/claude/src/runtime/claudeDesktopInjection.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/json.sai"
+@import "sa_std/fs.sai"
+@import "claudeCompatibleProbe.sla"
+
+// DEFECT: node:fs/promises (access/readFile/readdir/rename/writeFile) and
+// node:crypto randomUUID have no direct sa_std counterparts; sa_std_fs_*
+// placeholder externs + host_random_uuid are used. All async functions are
+// converted to synchronous ones returning status codes (throw -> err buffer).
+// DEFECT: regex patterns MODEL_CONTEXT_VARIANT_PATTERN / CLAUDE_MODEL_PATTERN /
+// CLAUDE_MSIX_PACKAGE_PATTERN approximated by hand-written scans.
+// DEFECT: JsonObject = Record<string, unknown> — config objects are JSON text
+// buffers manipulated with sa_json_obj_* placeholder helpers (set/delete/get).
+
+// type JsonObject = Record<string, unknown>  -> JSON text buffer.
+
+struct ClaudeDesktopRelayMapping {
+    from: [u8; 512],
+    from_len: u64,
+    to: [u8; 512],
+    to_len: u64,
+}
+
+struct ClaudeDesktopInjectionResult {
+    desktopModels: StrList,
+    groupModelMappings: [ClaudeDesktopRelayMapping; 256],
+    groupModelMappings_count: u64,
+}
+
+// Returned when automatic discovery cannot locate the config library, so the
+// client can prompt for a manually entered path (configLibraryDir).
+// TS: export const CLAUDE_DESKTOP_CONFIG_NOT_FOUND_CODE = "claudeDesktopConfigLibraryNotFound";
+// (string constant — referenced by literal at call sites.)
+
+struct ClaudeDesktopInjectionInput {
+    baseUrl: [u8; 2048],
+    baseUrl_len: u64,
+    token: [u8; 4096],
+    token_len: u64,
+    models: StrList,
+    has_configLibraryDir: bool,
+    configLibraryDir: [u8; 1024],
+    configLibraryDir_len: u64,
+    has_platform: bool, // NodeJS.Platform as string
+    platform: [u8; 32],
+    platform_len: u64,
+    has_localAppData: bool,
+    localAppData: [u8; 1024],
+    localAppData_len: u64,
+}
+
+struct ModelContextVariant {
+    baseModel: [u8; 512],
+    baseModel_len: u64,
+    contextSuffix: [u8; 64], // match text with whitespace removed, e.g. "[200k]"
+    contextSuffix_len: u64,
+}
+
+// splitModelContextVariant(model): { baseModel, contextSuffix }
+// DEFECT: MODEL_CONTEXT_VARIANT_PATTERN = /\[(\d+(?:\.\d+)?)\s*([km])\]$/i
+// approximated: trailing "[<digits[.digits]><spaces><k|m>]" bracket scan.
+fn splitModelContextVariant(model_ptr: ptr, model_len: u64, out: &ModelContextVariant) -> void {
+    // const normalized = model.trim();
+    let normalized = ByteBuf { bytes: [0u8; 512], len: 0 };
+    buf_append_bytes(&normalized, model_ptr, model_len);
+    buf_trim_in_place(&normalized);
+    out.contextSuffix_len = 0;
+    // find last '[' such that the tail matches the pattern and ends at the end
+    let match_start: i64 = -1;
+    let i: u64 = 0;
+    while i < normalized.len {
+        if normalized.bytes[i] == 91 { match_start = i; };
+        i = i + 1;
+    }
+    let ok: bool = false;
+    if match_start >= 0 && normalized.len > 0 && normalized.bytes[normalized.len - 1] == 93 {
+        let j: u64 = match_start + 1;
+        let digits: u64 = 0;
+        let dots: u64 = 0;
+        while j < normalized.len - 1 {
+            let c = normalized.bytes[j];
+            if c >= 48 && c <= 57 { digits = digits + 1; j = j + 1; }
+            else if c == 46 && dots == 0 { dots = dots + 1; j = j + 1; }
+            else { break; };
+        }
+        // \s*
+        while j < normalized.len - 1 && probe_is_space(normalized.bytes[j]) { j = j + 1; };
+        // ([km]) case-insensitive, then ']' at end
+        if digits > 0 && j == normalized.len - 2 {
+            let unit = normalized.bytes[j];
+            if unit == 107 || unit == 109 || unit == 75 || unit == 77 { ok = true; };
+        };
+    };
+    if ok {
+        // baseModel: normalized.slice(0, match.index).trim()
+        let base = ByteBuf { bytes: [0u8; 512], len: 0 };
+        buf_append_bytes(&base, &normalized.bytes, match_start);
+        buf_trim_in_place(&base);
+        out.baseModel_len = base.len;
+        buf_copy_to(&base, &out.baseModel);
+        // contextSuffix: match[0].replace(/\s+/g, "")
+        // DEFECT: regex whitespace strip approximated by scan.
+        out.contextSuffix_len = 0;
+        let k: u64 = match_start;
+        while k < normalized.len {
+            let c = normalized.bytes[k];
+            if probe_is_space(c) == false {
+                out.contextSuffix[out.contextSuffix_len] = c;
+                out.contextSuffix_len = out.contextSuffix_len + 1;
+            };
+            k = k + 1;
+        }
+        return;
+    };
+    // return { baseModel: normalized, contextSuffix: "" };
+    out.baseModel_len = normalized.len;
+    buf_copy_to(&normalized, &out.baseModel);
+    return;
+}
+
+// DEFECT: CLAUDE_MODEL_PATTERN = /(?:^|[./:_-])claude(?:[./:_-]|$)/i approximated:
+// find case-insensitive "claude" whose preceding char is start or one of ./:_-
+// and whose following char is one of ./:_- or end.
+fn claude_model_pattern_test(p: ptr, len: u64) -> bool {
+    if len < 6 { return false; };
+    let i: u64 = 0;
+    while i + 6 <= len {
+        let is_claude: bool = true;
+        let word: [u8; 6] = [99, 108, 97, 117, 100, 101]; // "claude"
+        let j: u64 = 0;
+        while j < 6 {
+            let c = PTR_BYTE_AT(p, i + j);
+            if c >= 65 && c <= 90 { c = c + 32; };
+            if c != word[j] { is_claude = false; };
+            j = j + 1;
+        }
+        if is_claude {
+            let before_ok: bool = i == 0 || is_model_sep(PTR_BYTE_AT(p, i - 1));
+            let after: u64 = i + 6;
+            let after_ok: bool = after >= len || is_model_sep(PTR_BYTE_AT(p, after));
+            if before_ok && after_ok { return true; };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn is_model_sep(c: u8) -> bool {
+    return c == 46 || c == 47 || c == 58 || c == 95 || c == 45;
+}
+
+// buildClaudeDesktopRelayInjection(sourceModels, modelMappings = {})
+// modelMappings is Record<string,string> as JSON text.
+// Returns 0 ok / 1 throw (error text in err).
+fn buildClaudeDesktopRelayInjection(sourceModels: &StrList, mappings_json_ptr: ptr, mappings_json_len: u64, out: &ClaudeDesktopInjectionResult, err: &ByteBuf) -> i32 {
+    out.desktopModels = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    out.groupModelMappings_count = 0;
+    // const aliasTargets = new Map<string, string>();
+    let aliasTargets = StrMap { keys: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, vals: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 } };
+    // for (const sourceModel of [...new Set(sourceModels.map(m => m.trim()).filter(Boolean))])
+    // DEFECT: Set dedup + map/filter chain approximated by explicit loop with seen-check.
+    let mappings_doc: u64 = 0;
+    if mappings_json_len > 0 { mappings_doc = sa_json_parse(mappings_json_ptr, mappings_json_len); };
+    let seen = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    let off: u64 = 0;
+    let si: u64 = 0;
+    while si < sourceModels.count {
+        let raw_model = ByteBuf { bytes: [0u8; 512], len: 0 };
+        buf_append_bytes(&raw_model, PTR_ADD(sourceModels.items, off), sourceModels.lens[si]);
+        off = off + sourceModels.lens[si];
+        si = si + 1;
+        buf_trim_in_place(&raw_model); // .map(m => m.trim())
+        if raw_model.len == 0 { continue; }; // .filter(Boolean)
+        if strset_has(&seen, &raw_model.bytes, raw_model.len) { continue; }; // new Set(...)
+        strset_add(&seen, &raw_model.bytes, raw_model.len);
+        let sourceModel = ByteBuf { bytes: [0u8; 512], len: 0 };
+        buf_append_bytes(&sourceModel, &raw_model.bytes, raw_model.len);
+        // const source = splitModelContextVariant(sourceModel);
+        let source = ModelContextVariant { baseModel: [0u8; 512], baseModel_len: 0, contextSuffix: [0u8; 64], contextSuffix_len: 0 };
+        splitModelContextVariant(&sourceModel.bytes, sourceModel.len, &source);
+        // if (CLAUDE_MODEL_PATTERN.test(source.baseModel)) { desktopModels.push(sourceModel); continue; }
+        if claude_model_pattern_test(&source.baseModel, source.baseModel_len) {
+            strlist_push_buf(&out.desktopModels, &sourceModel.bytes, sourceModel.len);
+            continue;
+        };
+        // const requestedAlias = (modelMappings[sourceModel] ?? modelMappings[source.baseModel] ?? "").trim();
+        let requestedAlias = ByteBuf { bytes: [0u8; 512], len: 0 };
+        let has_alias: bool = false;
+        if mappings_doc != 0 {
+            let n1: u64 = sa_json_get_string(mappings_doc, &sourceModel.bytes, sourceModel.len, &requestedAlias.bytes, 512);
+            if sa_json_has(mappings_doc, &sourceModel.bytes, sourceModel.len) { requestedAlias.len = n1; has_alias = true; }
+            else {
+                let n2: u64 = sa_json_get_string(mappings_doc, &source.baseModel, source.baseModel_len, &requestedAlias.bytes, 512);
+                if sa_json_has(mappings_doc, &source.baseModel, source.baseModel_len) { requestedAlias.len = n2; has_alias = true; };
+            };
+        };
+        if has_alias { buf_trim_in_place(&requestedAlias); } else { requestedAlias.len = 0; };
+        // const alias = splitModelContextVariant(requestedAlias);
+        let alias = ModelContextVariant { baseModel: [0u8; 512], baseModel_len: 0, contextSuffix: [0u8; 64], contextSuffix_len: 0 };
+        splitModelContextVariant(&requestedAlias.bytes, requestedAlias.len, &alias);
+        // if (!requestedAlias || !CLAUDE_MODEL_PATTERN.test(alias.baseModel)) throw new Error(`Claude model mapping is required for non-Claude model: ${sourceModel}`);
+        if requestedAlias.len == 0 || claude_model_pattern_test(&alias.baseModel, alias.baseModel_len) == false {
+            buf_append_lit(err, STR_PTR("Claude model mapping is required for non-Claude model: "), STR_LEN("Claude model mapping is required for non-Claude model: "));
+            buf_append_bytes(err, &sourceModel.bytes, sourceModel.len);
+            if mappings_doc != 0 { sa_json_free(mappings_doc); };
+            return 1;
+        };
+        // const existingTarget = aliasTargets.get(alias.baseModel);
+        // if (existingTarget && existingTarget !== source.baseModel) throw ...
+        let existingTarget = ByteBuf { bytes: [0u8; 512], len: 0 };
+        if strmap_get_latest(&aliasTargets, &alias.baseModel, alias.baseModel_len, &existingTarget) {
+            if existingTarget.len != source.baseModel_len || bytes_eq_buf(&existingTarget.bytes, existingTarget.len, &source.baseModel, source.baseModel_len) == false {
+                buf_append_lit(err, STR_PTR("Claude model alias is already mapped to another model: "), STR_LEN("Claude model alias is already mapped to another model: "));
+                buf_append_bytes(err, &alias.baseModel, alias.baseModel_len);
+                if mappings_doc != 0 { sa_json_free(mappings_doc); };
+                return 1;
+            };
+        };
+        // aliasTargets.set(alias.baseModel, source.baseModel);
+        strmap_set(&aliasTargets, &alias.baseModel, alias.baseModel_len, &source.baseModel, source.baseModel_len);
+        // const contextSuffix = source.contextSuffix || alias.contextSuffix;
+        // desktopModels.push(`${alias.baseModel}${contextSuffix}`);
+        let dm = ByteBuf { bytes: [0u8; 576], len: 0 };
+        buf_append_bytes(&dm, &alias.baseModel, alias.baseModel_len);
+        if source.contextSuffix_len > 0 { buf_append_bytes(&dm, &source.contextSuffix, source.contextSuffix_len); } else { buf_append_bytes(&dm, &alias.contextSuffix, alias.contextSuffix_len); };
+        strlist_push_buf(&out.desktopModels, &dm.bytes, dm.len);
+        // groupModelMappings.push({ from: alias.baseModel, to: source.baseModel });
+        // (dedup by `from` happens at return via new Map(...); applied on insert here)
+        // DEFECT: dedup-at-return approximated by replace-on-same-from at push time.
+        let replaced: bool = false;
+        let gi: u64 = 0;
+        while gi < out.groupModelMappings_count {
+            if out.groupModelMappings[gi].from_len == alias.baseModel_len && bytes_eq_buf(&out.groupModelMappings[gi].from, out.groupModelMappings[gi].from_len, &alias.baseModel, alias.baseModel_len) {
+                out.groupModelMappings[gi].to_len = source.baseModel_len;
+                buf_copy_buf(&source.baseModel, source.baseModel_len, &out.groupModelMappings[gi].to);
+                replaced = true;
+            };
+            gi = gi + 1;
+        }
+        if replaced == false && out.groupModelMappings_count < 256 {
+            let m = &out.groupModelMappings[out.groupModelMappings_count];
+            m.from_len = alias.baseModel_len;
+            buf_copy_buf(&alias.baseModel, alias.baseModel_len, &m.from);
+            m.to_len = source.baseModel_len;
+            buf_copy_buf(&source.baseModel, source.baseModel_len, &m.to);
+            out.groupModelMappings_count = out.groupModelMappings_count + 1;
+        };
+    }
+    if mappings_doc != 0 { sa_json_free(mappings_doc); };
+    // return { desktopModels: [...new Set(desktopModels)], groupModelMappings: [...new Map(...).values()] };
+    // DEFECT: final Set dedup of desktopModels approximated by in-place dedup pass.
+    dedup_strlist(&out.desktopModels);
+    return 0;
+}
+
+fn dedup_strlist(list: &StrList) -> void {
+    let out_list = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < list.count {
+        if strset_has(&out_list, PTR_ADD(list.items, off), list.lens[i]) == false {
+            strlist_push(&out_list, PTR_ADD(list.items, off), list.lens[i]);
+        };
+        off = off + list.lens[i];
+        i = i + 1;
+    }
+    list.items_len = out_list.items_len;
+    list.count = out_list.count;
+    let j: u64 = 0;
+    while j < out_list.items_len { list.items[j] = out_list.items[j]; j = j + 1; };
+    let k: u64 = 0;
+    while k < out_list.count { list.lens[k] = out_list.lens[k]; k = k + 1; };
+    return;
+}
+
+// The publisher hash suffix of the MSIX package family name varies per machine.
+// TS: const CLAUDE_MSIX_PACKAGE_PATTERN = /^Claude_[A-Za-z0-9]+$/i;
+// DEFECT: regex approximated by scan: prefix "Claude_" (case-insensitive) + 1..n alnum.
+fn msix_package_pattern_test(name_ptr: ptr, name_len: u64) -> bool {
+    if name_len < 8 { return false; };
+    let prefix: [u8; 7] = [99, 108, 97, 117, 100, 101, 95]; // "claude_"
+    let i: u64 = 0;
+    while i < 7 {
+        let c = PTR_BYTE_AT(name_ptr, i);
+        if c >= 65 && c <= 90 { c = c + 32; };
+        if c != prefix[i] { return false; };
+        i = i + 1;
+    }
+    let j: u64 = 7;
+    while j < name_len {
+        let c = PTR_BYTE_AT(name_ptr, j);
+        let alnum: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57);
+        if alnum == false { return false; };
+        j = j + 1;
+    }
+    return true;
+}
+
+// async function pathExists(path): Promise<boolean>
+// DEFECT: async + fs access try/catch -> synchronous exists probe.
+fn pathExists(path_ptr: ptr, path_len: u64) -> bool {
+    return sa_std_fs_exists(path_ptr, path_len) != 0;
+}
+
+// export async function resolveClaudeConfigLibraryDir(options = {}): Promise<string>
+// DEFECT: async — synchronous; returns 0 + path in out, 1 + error text in err (TS throws).
+// options.platform defaults to process.platform and options.localAppData to
+// process.env.LOCALAPPDATA — platform via host_platform_name placeholder.
+fn resolveClaudeConfigLibraryDir(has_platform: bool, platform_ptr: ptr, platform_len: u64, has_localAppData: bool, localAppData_ptr: ptr, localAppData_len: u64, env_ptr: ptr, env_len: u64, out: &ByteBuf, err: &ByteBuf) -> i32 {
+    // const targetPlatform = options.platform ?? process.platform;
+    let target = ByteBuf { bytes: [0u8; 32], len: 0 };
+    if has_platform { buf_append_bytes(&target, platform_ptr, platform_len); } else { host_platform_name(&target); };
+    // if (targetPlatform !== "win32") throw new Error("Claude Desktop injection is only available on Windows");
+    if bytes_eq_buf(&target.bytes, target.len, STR_PTR("win32"), STR_LEN("win32")) == false {
+        buf_append_lit(err, STR_PTR("Claude Desktop injection is only available on Windows"), STR_LEN("Claude Desktop injection is only available on Windows"));
+        return 1;
+    };
+    // const localAppData = options.localAppData ?? process.env.LOCALAPPDATA;
+    let lad = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    if has_localAppData { buf_append_bytes(&lad, localAppData_ptr, localAppData_len); } else { env_get(env_ptr, env_len, STR_PTR("LOCALAPPDATA"), STR_LEN("LOCALAPPDATA"), &lad); };
+    // if (!localAppData?.trim()) throw new Error("LOCALAPPDATA is unavailable");
+    let lad_probe = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    buf_append_bytes(&lad_probe, &lad.bytes, lad.len);
+    buf_trim_in_place(&lad_probe);
+    if lad_probe.len == 0 {
+        buf_append_lit(err, STR_PTR("LOCALAPPDATA is unavailable"), STR_LEN("LOCALAPPDATA is unavailable"));
+        return 1;
+    };
+    // const candidates = [join(localAppData, "Claude-3p", "configLibrary")];
+    let candidates = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    path_join_push(&candidates, &lad, STR_PTR("Claude-3p\\configLibrary"), STR_LEN("Claude-3p\\configLibrary"));
+    // try { const entries = (await readdir(packagesDir, {withFileTypes:true})).filter(isDirectory && PATTERN.test(name)).map(name).sort(); for (...) candidates.push(...Local..., ...Roaming...) } catch {}
+    let packagesDir = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    buf_append_bytes(&packagesDir, &lad.bytes, lad.len);
+    buf_append_lit(&packagesDir, STR_PTR("\\Packages"), STR_LEN("\\Packages"));
+    let entries = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    if sa_std_fs_list_dir(&packagesDir.bytes, packagesDir.len, &entries) == 0 {
+        // DEFECT: .sort() on entry names approximated — list_dir order assumed sorted.
+        let off: u64 = 0;
+        let ei: u64 = 0;
+        while ei < entries.count {
+            let name_len: u64 = entries.lens[ei];
+            let full = ByteBuf { bytes: [0u8; 2048], len: 0 };
+            buf_append_bytes(&full, &packagesDir.bytes, packagesDir.len);
+            buf_append_lit(&full, STR_PTR("\\"), STR_LEN("\\"));
+            buf_append_bytes(&full, PTR_ADD(entries.items, off), name_len);
+            if sa_std_fs_is_dir(&full.bytes, full.len) != 0 && msix_package_pattern_test(PTR_ADD(entries.items, off), name_len) {
+                path_join_push(&candidates, &full, STR_PTR("LocalCache\\Local\\Claude-3p\\configLibrary"), STR_LEN("LocalCache\\Local\\Claude-3p\\configLibrary"));
+                path_join_push(&candidates, &full, STR_PTR("LocalCache\\Roaming\\Claude-3p\\configLibrary"), STR_LEN("LocalCache\\Roaming\\Claude-3p\\configLibrary"));
+            };
+            off = off + name_len;
+            ei = ei + 1;
+        }
+    };
+    // for (const candidate of candidates) if (await pathExists(candidate)) return candidate;
+    let coff: u64 = 0;
+    let ci: u64 = 0;
+    while ci < candidates.count {
+        if pathExists(PTR_ADD(candidates.items, coff), candidates.lens[ci]) {
+            buf_append_bytes(out, PTR_ADD(candidates.items, coff), candidates.lens[ci]);
+            return 0;
+        };
+        coff = coff + candidates.lens[ci];
+        ci = ci + 1;
+    }
+    // throw new Error(`Claude Desktop config library directory was not found (searched: ${candidates.join(", ")})`);
+    buf_append_lit(err, STR_PTR("Claude Desktop config library directory was not found (searched: "), STR_LEN("Claude Desktop config library directory was not found (searched: "));
+    let joined = ByteBuf { bytes: [0u8; 8192], len: 0 };
+    strlist_join(&candidates, STR_PTR(", "), STR_LEN(", "), &joined);
+    buf_append_bytes(err, &joined.bytes, joined.len);
+    buf_append_lit(err, STR_PTR(")"), STR_LEN(")"));
+    return 1;
+}
+
+struct ClaudeActiveConfig {
+    id: [u8; 256],
+    id_len: u64,
+    path: [u8; 2048],
+    path_len: u64,
+    config_json: [u8; 262144], // JsonObject as JSON text
+    config_json_len: u64,
+}
+
+// export async function readClaudeActiveConfig(configLibraryDir): Promise<{ id, path, config }>
+// DEFECT: async — synchronous status-code form.
+fn readClaudeActiveConfig(configLibraryDir_ptr: ptr, configLibraryDir_len: u64, out: &ClaudeActiveConfig, err: &ByteBuf) -> i32 {
+    // const meta = parseJsonObject(await readFile(join(dir, "_meta.json"), "utf8"), "Claude Desktop config metadata");
+    let meta_path = ByteBuf { bytes: [0u8; 2048], len: 0 };
+    buf_append_bytes(&meta_path, configLibraryDir_ptr, configLibraryDir_len);
+    buf_append_lit(&meta_path, STR_PTR("\\_meta.json"), STR_LEN("\\_meta.json"));
+    let meta_src = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    if sa_std_fs_read_file(&meta_path.bytes, meta_path.len, &meta_src.bytes, 262144, &meta_src.len) != 0 {
+        buf_append_lit(err, STR_PTR("could not read Claude Desktop config metadata"), STR_LEN("could not read Claude Desktop config metadata"));
+        return 1;
+    };
+    let meta = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    if parseJsonObject(&meta_src.bytes, meta_src.len, STR_PTR("Claude Desktop config metadata"), STR_LEN("Claude Desktop config metadata"), &meta, err) != 0 { return 1; };
+    // const id = typeof meta.appliedId === "string" ? meta.appliedId.trim() : "";
+    let id = ByteBuf { bytes: [0u8; 256], len: 0 };
+    let meta_doc = sa_json_parse(&meta.bytes, meta.len);
+    if meta_doc != 0 {
+        if sa_json_has(meta_doc, STR_PTR("appliedId"), STR_LEN("appliedId")) {
+            id.len = sa_json_get_string(meta_doc, STR_PTR("appliedId"), STR_LEN("appliedId"), &id.bytes, 256);
+            buf_trim_in_place(&id);
+        };
+        sa_json_free(meta_doc);
+    };
+    // if (!id || basename(id) !== id || !/^[A-Za-z0-9_-]+$/.test(id)) throw ...
+    // DEFECT: id charset regex approximated by scan; basename check via separator scan.
+    let id_ok: bool = id.len > 0;
+    if id_ok {
+        let i: u64 = 0;
+        while i < id.len {
+            let c = id.bytes[i];
+            let ok_char: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 || c == 45;
+            if ok_char == false { id_ok = false; };
+            i = i + 1;
+        }
+    };
+    if id_ok == false {
+        buf_append_lit(err, STR_PTR("Claude Desktop active third-party config was not found"), STR_LEN("Claude Desktop active third-party config was not found"));
+        return 1;
+    };
+    out.id_len = id.len;
+    buf_copy_to(&id, &out.id);
+    // const path = join(configLibraryDir, `${id}.json`);
+    let path = ByteBuf { bytes: [0u8; 2048], len: 0 };
+    buf_append_bytes(&path, configLibraryDir_ptr, configLibraryDir_len);
+    buf_append_lit(&path, STR_PTR("\\"), STR_LEN("\\"));
+    buf_append_bytes(&path, &id.bytes, id.len);
+    buf_append_lit(&path, STR_PTR(".json"), STR_LEN(".json"));
+    out.path_len = path.len;
+    buf_copy_to(&path, &out.path);
+    // const config = parseJsonObject(await readFile(path, "utf8"), "Claude Desktop active config");
+    let cfg_src = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    if sa_std_fs_read_file(&path.bytes, path.len, &cfg_src.bytes, 262144, &cfg_src.len) != 0 {
+        buf_append_lit(err, STR_PTR("could not read Claude Desktop active config"), STR_LEN("could not read Claude Desktop active config"));
+        return 1;
+    };
+    let cfg = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    if parseJsonObject(&cfg_src.bytes, cfg_src.len, STR_PTR("Claude Desktop active config"), STR_LEN("Claude Desktop active config"), &cfg, err) != 0 { return 1; };
+    out.config_json_len = cfg.len;
+    buf_copy_to(&cfg, &out.config_json);
+    return 0;
+}
+
+struct ClaudeDesktopWriteResult {
+    id: [u8; 256],
+    id_len: u64,
+    configPath: [u8; 2048],
+    configPath_len: u64,
+    desktopConfigPath: [u8; 2048],
+    desktopConfigPath_len: u64,
+}
+
+// export async function writeClaudeDesktopInference(input): Promise<{ id, configPath, desktopConfigPath }>
+// DEFECT: async — synchronous status-code form.
+// DEFECT: dynamic JSON object merge ({...active.config, ...}) / delete keys /
+// JSON.stringify(..., null, 2) approximated by sa_json_obj_* placeholder helpers
+// operating on JSON text (key-order and pretty-print details not reproduced).
+fn writeClaudeDesktopInference(input: &ClaudeDesktopInjectionInput, env_ptr: ptr, env_len: u64, out: &ClaudeDesktopWriteResult, err: &ByteBuf) -> i32 {
+    // const baseUrl = input.baseUrl.trim().replace(/\/+$/, "");
+    // DEFECT: trailing-slash regex strip approximated by scan.
+    let baseUrl = ByteBuf { bytes: [0u8; 2048], len: 0 };
+    buf_append_bytes(&baseUrl, &input.baseUrl, input.baseUrl_len);
+    buf_trim_in_place(&baseUrl);
+    while baseUrl.len > 0 && baseUrl.bytes[baseUrl.len - 1] == 47 { baseUrl.len = baseUrl.len - 1; };
+    // const token = input.token.trim();
+    let token = ByteBuf { bytes: [0u8; 4096], len: 0 };
+    buf_append_bytes(&token, &input.token, input.token_len);
+    buf_trim_in_place(&token);
+    // const requestedModels = [...new Set(input.models.map(m => m.trim()).filter(Boolean))];
+    let requestedModels = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    let moff: u64 = 0;
+    let mi: u64 = 0;
+    while mi < input.models.count {
+        let m = ByteBuf { bytes: [0u8; 512], len: 0 };
+        buf_append_bytes(&m, PTR_ADD(input.models.items, moff), input.models.lens[mi]);
+        moff = moff + input.models.lens[mi];
+        mi = mi + 1;
+        buf_trim_in_place(&m);
+        if m.len > 0 && strset_has(&requestedModels, &m.bytes, m.len) == false {
+            strlist_push_buf(&requestedModels, &m.bytes, m.len);
+        };
+    }
+    // const variantBaseModels = new Set(requestedModels.flatMap(model => { const match = model.match(PATTERN); return match ? [model.slice(0, match.index).trim()] : []; }));
+    // DEFECT: flatMap approximated by loop; slice(0, match.index) equals splitModelContextVariant baseModel.
+    let variantBaseModels = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    let voff: u64 = 0;
+    let vi: u64 = 0;
+    while vi < requestedModels.count {
+        let v = ModelContextVariant { baseModel: [0u8; 512], baseModel_len: 0, contextSuffix: [0u8; 64], contextSuffix_len: 0 };
+        splitModelContextVariant(PTR_ADD(requestedModels.items, voff), requestedModels.lens[vi], &v);
+        if v.contextSuffix_len > 0 && strset_has(&variantBaseModels, &v.baseModel, v.baseModel_len) == false {
+            strlist_push_buf(&variantBaseModels, &v.baseModel, v.baseModel_len);
+        };
+        voff = voff + requestedModels.lens[vi];
+        vi = vi + 1;
+    }
+    // const models = requestedModels.filter(model => PATTERN.test(model) || !variantBaseModels.has(model));
+    // DEFECT: PATTERN.test(model) — model carries a variant suffix iff split yields one.
+    let models = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    let foff: u64 = 0;
+    let fi: u64 = 0;
+    while fi < requestedModels.count {
+        let v2 = ModelContextVariant { baseModel: [0u8; 512], baseModel_len: 0, contextSuffix: [0u8; 64], contextSuffix_len: 0 };
+        splitModelContextVariant(PTR_ADD(requestedModels.items, foff), requestedModels.lens[fi], &v2);
+        if v2.contextSuffix_len > 0 || strset_has(&variantBaseModels, PTR_ADD(requestedModels.items, foff), requestedModels.lens[fi]) == false {
+            strlist_push(&models, PTR_ADD(requestedModels.items, foff), requestedModels.lens[fi]);
+        };
+        foff = foff + requestedModels.lens[fi];
+        fi = fi + 1;
+    }
+    // if (!baseUrl || !token || models.length === 0) throw new Error("Claude Desktop injection requires a gateway URL, token, and at least one model");
+    if baseUrl.len == 0 || token.len == 0 || models.count == 0 {
+        buf_append_lit(err, STR_PTR("Claude Desktop injection requires a gateway URL, token, and at least one model"), STR_LEN("Claude Desktop injection requires a gateway URL, token, and at least one model"));
+        return 1;
+    };
+    // const configLibraryDir = input.configLibraryDir ?? await resolveClaudeConfigLibraryDir({ platform: input.platform, localAppData: input.localAppData });
+    let configLibraryDir = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    if input.has_configLibraryDir {
+        buf_append_bytes(&configLibraryDir, &input.configLibraryDir, input.configLibraryDir_len);
+    } else {
+        if resolveClaudeConfigLibraryDir(input.has_platform, &input.platform, input.platform_len, input.has_localAppData, &input.localAppData, input.localAppData_len, env_ptr, env_len, &configLibraryDir, err) != 0 { return 1; };
+    };
+    // const active = await readClaudeActiveConfig(configLibraryDir);
+    let active = ClaudeActiveConfig { id: [0u8; 256], id_len: 0, path: [0u8; 2048], path_len: 0, config_json: [0u8; 262144], config_json_len: 0 };
+    if readClaudeActiveConfig(&configLibraryDir.bytes, configLibraryDir.len, &active, err) != 0 { return 1; };
+    // const nextConfig: JsonObject = { ...active.config, inferenceGatewayBaseUrl: baseUrl, inferenceGatewayApiKey: token, inferenceGatewayAuthScheme: "bearer", inferenceProvider: "gateway", inferenceCredentialKind: "static", inferenceModels: models, modelDiscoveryEnabled: false };
+    // delete nextConfig.inference; delete nextConfig.models;
+    let nextConfig = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    buf_append_bytes(&nextConfig, &active.config_json, active.config_json_len);
+    sa_json_obj_set_string(&nextConfig, STR_PTR("inferenceGatewayBaseUrl"), STR_LEN("inferenceGatewayBaseUrl"), &baseUrl.bytes, baseUrl.len);
+    sa_json_obj_set_string(&nextConfig, STR_PTR("inferenceGatewayApiKey"), STR_LEN("inferenceGatewayApiKey"), &token.bytes, token.len);
+    sa_json_obj_set_string(&nextConfig, STR_PTR("inferenceGatewayAuthScheme"), STR_LEN("inferenceGatewayAuthScheme"), STR_PTR("bearer"), STR_LEN("bearer"));
+    sa_json_obj_set_string(&nextConfig, STR_PTR("inferenceProvider"), STR_LEN("inferenceProvider"), STR_PTR("gateway"), STR_LEN("gateway"));
+    sa_json_obj_set_string(&nextConfig, STR_PTR("inferenceCredentialKind"), STR_LEN("inferenceCredentialKind"), STR_PTR("static"), STR_LEN("static"));
+    sa_json_obj_set_string_array(&nextConfig, STR_PTR("inferenceModels"), STR_LEN("inferenceModels"), &models);
+    sa_json_obj_set_bool(&nextConfig, STR_PTR("modelDiscoveryEnabled"), STR_LEN("modelDiscoveryEnabled"), false);
+    sa_json_obj_delete(&nextConfig, STR_PTR("inference"), STR_LEN("inference"));
+    sa_json_obj_delete(&nextConfig, STR_PTR("models"), STR_LEN("models"));
+    // const temporaryPath = join(configLibraryDir, `.${active.id}.${randomUUID()}.tmp`);
+    let temporaryPath = ByteBuf { bytes: [0u8; 2048], len: 0 };
+    buf_append_bytes(&temporaryPath, &configLibraryDir.bytes, configLibraryDir.len);
+    buf_append_lit(&temporaryPath, STR_PTR("\\."), STR_LEN("\\."));
+    buf_append_bytes(&temporaryPath, &active.id, active.id_len);
+    buf_append_lit(&temporaryPath, STR_PTR("."), STR_LEN("."));
+    host_random_uuid(&temporaryPath);
+    buf_append_lit(&temporaryPath, STR_PTR(".tmp"), STR_LEN(".tmp"));
+    // await writeFile(temporaryPath, `${JSON.stringify(nextConfig, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    let rendered = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    sa_json_stringify_pretty(&nextConfig.bytes, nextConfig.len, &rendered);
+    buf_append_lit(&rendered, STR_PTR("\n"), STR_LEN("\n"));
+    if sa_std_fs_write_file_mode(&temporaryPath.bytes, temporaryPath.len, &rendered.bytes, rendered.len, 384) != 0 {
+        buf_append_lit(err, STR_PTR("could not write temporary config"), STR_LEN("could not write temporary config"));
+        return 1;
+    };
+    // await rename(temporaryPath, active.path);
+    if sa_std_fs_rename(&temporaryPath.bytes, temporaryPath.len, &active.path, active.path_len) != 0 {
+        buf_append_lit(err, STR_PTR("could not rename temporary config"), STR_LEN("could not rename temporary config"));
+        return 1;
+    };
+    // const desktopConfigPath = join(dirname(configLibraryDir), "claude_desktop_config.json");
+    let desktopConfigPath = ByteBuf { bytes: [0u8; 2048], len: 0 };
+    path_dirname(&configLibraryDir.bytes, configLibraryDir.len, &desktopConfigPath);
+    buf_append_lit(&desktopConfigPath, STR_PTR("\\claude_desktop_config.json"), STR_LEN("\\claude_desktop_config.json"));
+    // let existingDesktopConfig: JsonObject = {};
+    // try { existingDesktopConfig = parseJsonObject(await readFile(desktopConfigPath, "utf8"), "Claude Desktop settings"); }
+    // catch (error) { if (!(error instanceof Error) || !/ENOENT/.test(error.message)) throw error; }
+    // DEFECT: ENOENT detection on the error approximates "file missing" via exists probe.
+    let existingDesktopConfig = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    buf_append_lit(&existingDesktopConfig, STR_PTR("{}"), STR_LEN("{}"));
+    if pathExists(&desktopConfigPath.bytes, desktopConfigPath.len) {
+        let dsrc = ByteBuf { bytes: [0u8; 262144], len: 0 };
+        if sa_std_fs_read_file(&desktopConfigPath.bytes, desktopConfigPath.len, &dsrc.bytes, 262144, &dsrc.len) != 0 {
+            buf_append_lit(err, STR_PTR("could not read Claude Desktop settings"), STR_LEN("could not read Claude Desktop settings"));
+            return 1;
+        };
+        let parsed_desktop = ByteBuf { bytes: [0u8; 262144], len: 0 };
+        if parseJsonObject(&dsrc.bytes, dsrc.len, STR_PTR("Claude Desktop settings"), STR_LEN("Claude Desktop settings"), &parsed_desktop, err) != 0 { return 1; };
+        existingDesktopConfig.len = 0;
+        buf_append_bytes(&existingDesktopConfig, &parsed_desktop.bytes, parsed_desktop.len);
+    };
+    // const nextDesktopConfig: JsonObject = { ...existingDesktopConfig, deploymentMode: "3p" }; delete nextDesktopConfig.awaitingSignIn;
+    let nextDesktopConfig = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    buf_append_bytes(&nextDesktopConfig, &existingDesktopConfig.bytes, existingDesktopConfig.len);
+    sa_json_obj_set_string(&nextDesktopConfig, STR_PTR("deploymentMode"), STR_LEN("deploymentMode"), STR_PTR("3p"), STR_LEN("3p"));
+    sa_json_obj_delete(&nextDesktopConfig, STR_PTR("awaitingSignIn"), STR_LEN("awaitingSignIn"));
+    // await writeFile(desktopConfigPath, `${JSON.stringify(nextDesktopConfig, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    let rendered2 = ByteBuf { bytes: [0u8; 262144], len: 0 };
+    sa_json_stringify_pretty(&nextDesktopConfig.bytes, nextDesktopConfig.len, &rendered2);
+    buf_append_lit(&rendered2, STR_PTR("\n"), STR_LEN("\n"));
+    if sa_std_fs_write_file_mode(&desktopConfigPath.bytes, desktopConfigPath.len, &rendered2.bytes, rendered2.len, 384) != 0 {
+        buf_append_lit(err, STR_PTR("could not write desktop config"), STR_LEN("could not write desktop config"));
+        return 1;
+    };
+    // return { id: active.id, configPath: active.path, desktopConfigPath };
+    out.id_len = active.id_len;
+    buf_copy_buf(&active.id, active.id_len, &out.id);
+    out.configPath_len = active.path_len;
+    buf_copy_buf(&active.path, active.path_len, &out.configPath);
+    out.desktopConfigPath_len = desktopConfigPath.len;
+    buf_copy_to(&desktopConfigPath, &out.desktopConfigPath);
+    return 0;
+}
+
+// DEFECT: node:path dirname approximated — strip last segment after / or \.
+fn path_dirname(p: ptr, len: u64, out: &ByteBuf) -> void {
+    let end: u64 = len;
+    while end > 0 && (PTR_BYTE_AT(p, end - 1) == 47 || PTR_BYTE_AT(p, end - 1) == 92) { end = end - 1; };
+    let last: i64 = -1;
+    let i: u64 = 0;
+    while i < end {
+        let c = PTR_BYTE_AT(p, i);
+        if c == 47 || c == 92 { last = i; };
+        i = i + 1;
+    }
+    if last < 0 { buf_append_bytes(out, p, end); return; };
+    buf_append_bytes(out, p, last);
+    return;
+}
+
+// fn parseJsonObject(source, label): JsonObject — returns 0 + object JSON text in out, 1 + error in err.
+fn parseJsonObject(source_ptr: ptr, source_len: u64, label_ptr: ptr, label_len: u64, out: &ByteBuf, err: &ByteBuf) -> i32 {
+    // let value; try { value = JSON.parse(source); } catch { throw new Error(`${label} is not valid JSON`); }
+    let doc = sa_json_parse(source_ptr, source_len);
+    if doc == 0 {
+        buf_append_bytes(err, label_ptr, label_len);
+        buf_append_lit(err, STR_PTR(" is not valid JSON"), STR_LEN(" is not valid JSON"));
+        return 1;
+    };
+    // if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be a JSON object`);
+    let is_obj: bool = sa_json_is_object(doc);
+    sa_json_free(doc);
+    if is_obj == false {
+        buf_append_bytes(err, label_ptr, label_len);
+        buf_append_lit(err, STR_PTR(" must be a JSON object"), STR_LEN(" must be a JSON object"));
+        return 1;
+    };
+    buf_append_bytes(out, source_ptr, source_len);
+    return 0;
+}

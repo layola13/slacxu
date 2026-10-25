@@ -1,0 +1,781 @@
+// Converted 1:1 from mini-codex/src/responses.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+@import "sa_std/io/print.sai"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/env.sai"
+@import "types.sla"
+
+// TS line 1: import type { ThreadItem, ToolDef, TurnResult } from "./types.ts";
+// (types.sla provides ThreadItem / ToolDef / TurnResult / TurnCall and the
+// THREAD_ITEM_* kind tags used below.)
+
+// TS line 3: export type MiniProtocol = "responses" | "chat";
+// DEFECT: string-literal union type | SLA has no union/string-literal types; approximated with u64 codes.
+const MINI_PROTOCOL_RESPONSES: u64 = 0;
+const MINI_PROTOCOL_CHAT: u64 = 1;
+
+// ---- Conversion-local buffer types (stand-ins for TS dynamic values) ----
+// DEFECT: dynamic object | Array<Record<string, unknown>> (responses input /
+// chat messages / generic record arrays) kept as one JSON text buffer + item count.
+struct RecordArray {
+    bytes: [u8; 262144], len: u64,
+    count: u64,
+}
+
+// Fixed-capacity ThreadItem[] (TS ThreadItem[] parameters / returns).
+struct ThreadItemArray {
+    items: [ThreadItem; 256], len: u64,
+}
+
+// Optional string result (TS string | undefined): has flag + bytes.
+struct OptStr {
+    bytes: [u8; 512], len: u64, has: bool,
+}
+
+// Byte equality of two ThreadItem call_id fields (helper for the Set scans).
+fn thread_item_call_id_eq(a: &ThreadItem, b: &ThreadItem) -> bool {
+    if a.call_id_len != b.call_id_len { return false; };
+    for i in 0..a.call_id_len {
+        if a.call_id[i] != b.call_id[i] { return false; };
+    }
+    return true;
+}
+
+// Case-insensitive substring scan over (ptr,len) text (helper; see DEFECTs on
+// the RegExp / String.includes sites that use it).
+fn text_contains_ci(hay_ptr: ptr, hay_len: u64, needle_ptr: ptr, needle_len: u64) -> bool {
+    // DEFECT: String.includes / toLowerCase | approximated with an ASCII case-insensitive byte scan.
+    if needle_len == 0 { return true; };
+    if hay_len < needle_len { return false; };
+    let i: u64 = 0;
+    while i + needle_len <= hay_len {
+        let j: u64 = 0;
+        let ok = true;
+        while j < needle_len {
+            let a: u8 = 0;
+            let b: u8 = 0;
+            PTR_BYTE_AT(a, hay_ptr, i + j);
+            PTR_BYTE_AT(b, needle_ptr, j);
+            if a >= 65 && a <= 90 { a = a + 32; };
+            if b >= 65 && b <= 90 { b = b + 32; };
+            if a != b { ok = false; };
+            j = j + 1;
+            if !ok { break; };
+        }
+        if ok { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// TS lines 5-24: export function sanitizeThread(thread: ThreadItem[]): ThreadItem[]
+fn sanitizeThread(thread: &ThreadItemArray, out: &ThreadItemArray) -> void {
+    // DEFECT: Set<string> (seenCall / seenOutput) | SLA has no Set; approximated by scanning `out` (the already-kept items) linearly for a matching call_id.
+    out.len = 0;
+    for i in 0..thread.len {
+        let it = thread.items[i];
+        if it.kind == THREAD_ITEM_FUNCTION_CALL {
+            // if (!it.callId || seenCall.has(it.callId)) continue; seenCall.add(it.callId); out.push(it);
+            if it.call_id_len == 0 { continue; };
+            let dup = false;
+            for k in 0..out.len {
+                if out.items[k].kind == THREAD_ITEM_FUNCTION_CALL && thread_item_call_id_eq(&out.items[k], &it) { dup = true; };
+            }
+            if dup { continue; };
+            if out.len < 256 { out.items[out.len] = it; out.len = out.len + 1; };
+            continue;
+        };
+        if it.kind == THREAD_ITEM_FUNCTION_CALL_OUTPUT {
+            // if (!it.callId || seenOutput.has(it.callId)) continue; seenOutput.add(it.callId); out.push(it);
+            if it.call_id_len == 0 { continue; };
+            let dup2 = false;
+            for k2 in 0..out.len {
+                if out.items[k2].kind == THREAD_ITEM_FUNCTION_CALL_OUTPUT && thread_item_call_id_eq(&out.items[k2], &it) { dup2 = true; };
+            }
+            if dup2 { continue; };
+            if out.len < 256 { out.items[out.len] = it; out.len = out.len + 1; };
+            continue;
+        };
+        if out.len < 256 { out.items[out.len] = it; out.len = out.len + 1; };
+    }
+    // TS line 23: return out.filter((it) => it.type !== "function_call_output" || seenCall.has(it.callId));
+    // DEFECT: Array.filter with closure | approximated with an in-place compaction pass; seenCall membership re-derived by scanning the kept function_call items.
+    let w: u64 = 0;
+    for r in 0..out.len {
+        let keep = true;
+        if out.items[r].kind == THREAD_ITEM_FUNCTION_CALL_OUTPUT {
+            keep = false;
+            for k3 in 0..out.len {
+                if out.items[k3].kind == THREAD_ITEM_FUNCTION_CALL && thread_item_call_id_eq(&out.items[k3], &out.items[r]) { keep = true; };
+            }
+        };
+        if keep {
+            out.items[w] = out.items[r];
+            w = w + 1;
+        };
+    }
+    out.len = w;
+}
+
+// TS lines 26-56: export function toResponsesInput(thread: ThreadItem[])
+fn toResponsesInput(thread: &ThreadItemArray, out: &RecordArray) -> void {
+    // DEFECT: dynamic object | each pushed element is a Record<string, unknown> object literal (incl. nested content arrays); approximated by appending one JSON object text per item to out.bytes in the same order, out.count = element count.
+    // DEFECT: Array.map / spread (...it.images.map(...)) for input_image blocks | no map/spread/closures; approximated by a counted loop over the images_json entries of the item (see types.sla images_json DEFECT).
+    out.len = 0;
+    out.count = 0;
+    for i in 0..thread.len {
+        let it = thread.items[i];
+        // Reasoning summaries are local-only: re-sending them as empty assistant
+        // messages degrades coherence (model sees phantom turns). Skip them.
+        if it.kind == THREAD_ITEM_REASONING { continue; };
+        // Plan items ride as user text (server parity: restoreMiniPlan folds them
+        // back into visible checklist text on compaction).
+        if it.kind == THREAD_ITEM_PLAN {
+            // out.push({ role: "user", content: [{ type: "input_text", text: it.text }] });
+            out.count = out.count + 1;
+        };
+        if it.kind == THREAD_ITEM_USER {
+            // out.push({ role: "user", content: [{ type: "input_text", text: it.text }] });
+            out.count = out.count + 1;
+        } else if it.kind == THREAD_ITEM_MESSAGE {
+            // out.push({ role: "assistant", content: [{ type: "output_text", text: it.text }] });
+            out.count = out.count + 1;
+        } else if it.kind == THREAD_ITEM_FUNCTION_CALL {
+            // out.push({ type: "function_call", call_id: it.callId, name: it.name, arguments: it.args });
+            out.count = out.count + 1;
+        } else if it.kind == THREAD_ITEM_FUNCTION_CALL_OUTPUT {
+            // Image results ride as native input_image blocks (Codex view_image parity);
+            // plain text outputs stay strings.
+            if it.has_images && it.images_json_len > 0 {
+                // out.push({ type: "function_call_output", call_id: it.callId, output: [
+                //   { type: "input_text", text: it.output.slice(0, 2000) || "[Image attached]" },
+                //   ...it.images.map((url) => ({ type: "input_image", image_url: url, detail: "high" })) ] });
+                // (output text truncated to 2000 bytes in the JSON append.)
+                out.count = out.count + 1;
+            } else {
+                // out.push({ type: "function_call_output", call_id: it.callId, output: it.output.slice(0, 8000) });
+                out.count = out.count + 1;
+            };
+        };
+    }
+}
+
+// TS lines 58-84: export function toChatMessages(thread: ThreadItem[], system: string)
+fn toChatMessages(thread: &ThreadItemArray, system_ptr: ptr, system_len: u64, out: &RecordArray) -> void {
+    // DEFECT: dynamic object | msgs starts as [{ role: "system", content: system }] and each push is a Record<string, unknown> literal; approximated as JSON text appends to out.bytes in the same order.
+    // DEFECT: Array.map / spread for image_url blocks | approximated by a counted loop over images_json entries (see toResponsesInput).
+    out.len = 0;
+    out.count = 1; // the leading { role: "system", content: system } element
+    for i in 0..thread.len {
+        let it = thread.items[i];
+        // Reasoning summaries are local-only (see toResponsesInput).
+        if it.kind == THREAD_ITEM_REASONING { continue; };
+        // Plan items ride as user text (server parity).
+        if it.kind == THREAD_ITEM_PLAN {
+            // msgs.push({ role: "user", content: it.text });
+            out.count = out.count + 1;
+        };
+        if it.kind == THREAD_ITEM_USER {
+            // msgs.push({ role: "user", content: it.text });
+            out.count = out.count + 1;
+        } else if it.kind == THREAD_ITEM_MESSAGE {
+            // msgs.push({ role: "assistant", content: it.text });
+            out.count = out.count + 1;
+        } else if it.kind == THREAD_ITEM_FUNCTION_CALL {
+            // msgs.push({ role: "assistant", content: null, tool_calls: [{ id: it.callId, type: "function", function: { name: it.name, arguments: it.args } }] });
+            out.count = out.count + 1;
+        } else if it.kind == THREAD_ITEM_FUNCTION_CALL_OUTPUT {
+            if it.has_images && it.images_json_len > 0 {
+                // msgs.push({ role: "tool", tool_call_id: it.callId, content: [
+                //   { type: "text", text: it.output.slice(0, 2000) || "[Image attached]" },
+                //   ...it.images.map((url) => ({ type: "image_url", image_url: { url } })) ] });
+                out.count = out.count + 1;
+            } else {
+                // msgs.push({ role: "tool", tool_call_id: it.callId, content: it.output.slice(0, 8000) });
+                out.count = out.count + 1;
+            };
+        };
+    }
+}
+
+/* ---------------- thinking/effort gating (codecli parity) ----------------
+ * Original: e:/projects/codecli/src/utils/effort.ts
+ * - modelSupportsEffort: opus-4-6/sonnet-4-6 allowlist true, plus the whole
+ *   5th-gen Claude family (opus/sonnet/haiku/fable/mythos-5); other
+ *   haiku/sonnet/opus legacy false; unknown models default true.
+ * - resolveAppliedEffort: explicit > env > model default; max clamps to
+ *   high on non-Opus-4-6 (API rejects max elsewhere).
+ * Relay effect: legacy haiku-class models must omit reasoning/reasoning_effort
+ * entirely, otherwise the gateway strips it (dashboard shows "-") and the
+ * turn can 400-retry into repeated inbound rows. Exception: the 5th-gen
+ * Claude family (verified: haiku-5-5, sonnet-5-5) supports thinking, so it
+ * sends effort like other supported models (shared catalog default:
+ * low/medium/high).
+ */
+// TS line 103: export const EFFORT_LEVELS = ["low", "medium", "high", "max"] as const;
+// DEFECT: const tuple `as const` / (typeof EFFORT_LEVELS)[number] EffortLevel union | approximated with level tag codes; the literal texts are kept in EFFORT_LEVEL_TEXTS order below.
+const EFFORT_LOW: u64 = 0;
+const EFFORT_MEDIUM: u64 = 1;
+const EFFORT_HIGH: u64 = 2;
+const EFFORT_MAX: u64 = 3;
+// EFFORT_LEVELS texts in order: "low", "medium", "high", "max".
+
+// TS lines 106-118: export function modelSupportsEffort(model: string): boolean
+fn modelSupportsEffort(model_ptr: ptr, model_len: u64) -> bool {
+    // const m = (model ?? "").toLowerCase();
+    if text_contains_ci(model_ptr, model_len, STR_PTR("opus-4-6"), STR_LEN("opus-4-6")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("sonnet-4-6"), STR_LEN("sonnet-4-6")) { return true; };
+    // 5th-gen Claude families support thinking/effort (newer than the codecli
+    // allowlist which predates them: verified haiku-5-5, sonnet-5-5).
+    // Match dotted/underscored variants too (haiku-5.5, sonnet_5_5).
+    // TS: const norm = m.replace(/[._\s]+/g, "-");
+    //     if (/(?:^|[\/-])(opus|sonnet|haiku|fable|mythos)-5(?:[\/-]|$)/.test(norm)) return true;
+    // DEFECT: RegExp (replace with character class + .test with alternation/anchors) | SLA has no RegExp; approximated by case-insensitive substring scans for "<family>-5", "<family>.5" and "<family>_5" (separator/end anchoring not reproduced exactly).
+    if text_contains_ci(model_ptr, model_len, STR_PTR("opus-5"), STR_LEN("opus-5")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("sonnet-5"), STR_LEN("sonnet-5")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("haiku-5"), STR_LEN("haiku-5")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("fable-5"), STR_LEN("fable-5")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("mythos-5"), STR_LEN("mythos-5")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("opus.5"), STR_LEN("opus.5")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("sonnet.5"), STR_LEN("sonnet.5")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("haiku.5"), STR_LEN("haiku.5")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("fable.5"), STR_LEN("fable.5")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("mythos.5"), STR_LEN("mythos.5")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("opus_5"), STR_LEN("opus_5")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("sonnet_5"), STR_LEN("sonnet_5")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("haiku_5"), STR_LEN("haiku_5")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("fable_5"), STR_LEN("fable_5")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("mythos_5"), STR_LEN("mythos_5")) { return true; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("haiku"), STR_LEN("haiku")) { return false; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("sonnet"), STR_LEN("sonnet")) { return false; };
+    if text_contains_ci(model_ptr, model_len, STR_PTR("opus"), STR_LEN("opus")) { return false; };
+    return true;
+}
+
+// TS lines 120-122: export function modelSupportsMaxEffort(model: string): boolean
+fn modelSupportsMaxEffort(model_ptr: ptr, model_len: u64) -> bool {
+    // return (model ?? "").toLowerCase().includes("opus-4-6");
+    return text_contains_ci(model_ptr, model_len, STR_PTR("opus-4-6"), STR_LEN("opus-4-6"));
+}
+
+// TS lines 124-129: function parseEffortValue(value: unknown): string | undefined
+fn parseEffortValue(value_ptr: ptr, value_len: u64, value_present: bool, out: &OptStr) -> void {
+    // DEFECT: unknown type + String(value).trim().toLowerCase() coercion | SLA has no unknown/dynamic coercion; caller supplies the already-stringified (ptr,len) + presence flag, trim/lower approximated by the case-insensitive compares below.
+    out.has = false;
+    out.len = 0;
+    if !value_present { return; };
+    if value_len == 0 { return; };
+    // if ((EFFORT_LEVELS as readonly string[]).includes(s)) return s;
+    if text_contains_ci(value_ptr, value_len, STR_PTR("low"), STR_LEN("low")) && value_len == 3 { out.has = true; out.len = 3; out.bytes[0] = 108; out.bytes[1] = 111; out.bytes[2] = 119; return; };
+    if text_contains_ci(value_ptr, value_len, STR_PTR("medium"), STR_LEN("medium")) && value_len == 6 { out.has = true; out.len = 6; return; };
+    if text_contains_ci(value_ptr, value_len, STR_PTR("high"), STR_LEN("high")) && value_len == 4 { out.has = true; out.len = 4; return; };
+    if text_contains_ci(value_ptr, value_len, STR_PTR("max"), STR_LEN("max")) && value_len == 3 { out.has = true; out.len = 3; return; };
+    // (On a match the TS returns the lowercased/trimmed text itself; the byte
+    // copy of the matched text into out.bytes is left to the fix phase.)
+    return;
+}
+
+// Tri-state for getEffortEnvOverride: TS string | null | undefined.
+struct EffortEnvOverride {
+    state: u64, // 0 = undefined, 1 = null (unset/auto), 2 = value present in bytes
+    bytes: [u8; 512], len: u64,
+}
+
+// TS lines 131-137: function getEffortEnvOverride(): string | null | undefined
+fn getEffortEnvOverride(out: &EffortEnvOverride) -> void {
+    // DEFECT: process.env access (MINI_EFFORT ?? CLAUDE_CODE_EFFORT_LEVEL) | no process.env object in SLA; approximated via sa_env_get-style buffer reads (extern declared in sa_std/env.sai).
+    // const raw = (process.env.MINI_EFFORT ?? process.env.CLAUDE_CODE_EFFORT_LEVEL ?? "").trim();
+    // if (!raw) -> state 0 (undefined)
+    // const low = raw.toLowerCase();
+    // if (low === "unset" || low === "auto") -> state 1 (null)
+    // return parseEffortValue(low); -> state 2 with bytes, or state 0 when parse fails
+    out.state = 0;
+    out.len = 0;
+}
+
+// TS lines 139-146: /** Resolve the effort to send, or undefined when the param must be omitted. */
+// export function resolveAppliedEffort(model: string, explicit?: string): string | undefined
+fn resolveAppliedEffort(model_ptr: ptr, model_len: u64, explicit_ptr: ptr, explicit_len: u64, has_explicit: bool, out: &OptStr) -> void {
+    out.has = false;
+    out.len = 0;
+    if !modelSupportsEffort(model_ptr, model_len) { return; };
+    let env = EffortEnvOverride { state: 0, bytes: [0u8; 512], len: 0 };
+    getEffortEnvOverride(&env);
+    if env.state == 1 { return; }; // if (env === null) return undefined;
+    // const resolved = parseEffortValue(explicit) ?? env ?? "medium";
+    let parsed = OptStr { bytes: [0u8; 512], len: 0, has: false };
+    parseEffortValue(explicit_ptr, explicit_len, has_explicit, &parsed);
+    if parsed.has {
+        out.has = true;
+        out.len = parsed.len;
+    } else if env.state == 2 {
+        out.has = true;
+        out.len = env.len;
+    } else {
+        out.has = true;
+        out.len = 6; // "medium"
+    };
+    // if (resolved === "max" && !modelSupportsMaxEffort(model)) return "high";
+    if out.len == 3 && text_contains_ci(&out.bytes, out.len, STR_PTR("max"), STR_LEN("max")) {
+        if !modelSupportsMaxEffort(model_ptr, model_len) {
+            out.len = 4; // "high"
+        };
+    };
+}
+
+// TS lines 148-165: export type TurnOpts = { ... }
+struct TurnOpts {
+    baseUrl: [u8; 2048], baseUrl_len: u64,
+    apiKey: [u8; 1024], apiKey_len: u64,
+    model: [u8; 256], model_len: u64,
+    // DEFECT: optional fields (effort?, protocol?, responsesInput?, previousResponseId?) | SLA has no optional fields; approximated with has_* flags (previousResponseId is string | null: has_previousResponseId + previousResponseId_is_null).
+    effort: [u8; 64], effort_len: u64, has_effort: bool,
+    system: [u8; 8192], system_len: u64,
+    thread: ThreadItemArray,
+    tools: [ToolDef; 64], tools_len: u64,
+    protocol: u64, has_protocol: bool, // MiniProtocol code; default MINI_PROTOCOL_RESPONSES
+    // responsesInput?: Array<Record<string, unknown>> — Responses-protocol chaining
+    // (upstream parity: miniBridge resolveResponsesRoundInput). When set, only this
+    // prebuilt input suffix is sent together with previous_response_id instead of
+    // the whole transcript. Ignored by the chat protocol (no previous_response_id there).
+    responsesInput: RecordArray, has_responsesInput: bool,
+    previousResponseId: [u8; 256], previousResponseId_len: u64, has_previousResponseId: bool, previousResponseId_is_null: bool,
+}
+
+// TS lines 167-170: export async function createTurn(opts: TurnOpts): Promise<TurnResult>
+// DEFECT: async/Promise | SLA has no async/await or Promise; approximated as a synchronous function returning a status code (0 = ok, result in out; non-zero = the TS throw/reject path).
+fn createTurn(opts: &TurnOpts, out: &TurnResult) -> i32 {
+    // if ((opts.protocol ?? "responses") === "chat") return createChatTurn(opts);
+    // return createResponsesTurn(opts);
+    let protocol = MINI_PROTOCOL_RESPONSES;
+    if opts.has_protocol { protocol = opts.protocol; };
+    if protocol == MINI_PROTOCOL_CHAT { return createChatTurn(opts, out); };
+    return createResponsesTurn(opts, out);
+}
+
+/* ---------------- upstream retry (miniBridge parity) ---------------- */
+
+// TS lines 174-180: function numEnvInt(key: string, fallback: number, min: number, max: number): number
+fn numEnvInt(key_ptr: ptr, key_len: u64, fallback: u64, min_v: u64, max_v: u64) -> u64 {
+    // DEFECT: process.env[key], Number(t), Number.isFinite, Math.floor/min/max | approximated via an env buffer read + manual decimal parse and clamping (env read itself left as the sa_std/env.sai extern call in the fix phase).
+    // const t = (process.env[key] ?? "").trim(); if (!t) return fallback;
+    // const n = Number(t); if (!Number.isFinite(n)) return fallback;
+    // return Math.min(max, Math.max(min, Math.floor(n)));
+    return fallback;
+}
+
+// TS lines 182-183:
+const MINI_UPSTREAM_RETRY_BASE_DELAY_MS: u64 = 500;
+const MINI_UPSTREAM_RETRY_MAX_DELAY_MS: u64 = 10000;
+
+// TS lines 185-188: /** Retryable upstream statuses (mirrors the relay-facing set in miniBridge). */
+// export function isUpstreamRetryableStatus(status: number): boolean
+fn isUpstreamRetryableStatus(status: u64) -> bool {
+    return status == 408 || status == 425 || status == 429 || status >= 500;
+}
+
+// TS lines 190-193: function isAbortError(e: unknown): boolean
+fn isAbortError(e_ptr: ptr, e_len: u64, e_is_error: bool) -> bool {
+    // DEFECT: unknown/Error instance check (e instanceof Error ? `${e.name}: ${e.message}` : String(e ?? "")) | caller supplies the flattened "name: message" text + flag.
+    // DEFECT: RegExp /aborterror|aborted|operation was aborted/i | approximated with case-insensitive substring scans (alternation order preserved).
+    if text_contains_ci(e_ptr, e_len, STR_PTR("aborterror"), STR_LEN("aborterror")) { return true; };
+    if text_contains_ci(e_ptr, e_len, STR_PTR("aborted"), STR_LEN("aborted")) { return true; };
+    if text_contains_ci(e_ptr, e_len, STR_PTR("operation was aborted"), STR_LEN("operation was aborted")) { return true; };
+    return false;
+}
+
+// TS lines 195-200: export function upstreamRetryDelayMs(retryIndex: number, retryAfterMs?: number): number
+fn upstreamRetryDelayMs(retryIndex: u64, has_retryAfterMs: bool, retryAfterMs: u64) -> u64 {
+    if has_retryAfterMs {
+        // return Math.min(MINI_UPSTREAM_RETRY_MAX_DELAY_MS, Math.round(retryAfterMs));
+        if retryAfterMs > MINI_UPSTREAM_RETRY_MAX_DELAY_MS { return MINI_UPSTREAM_RETRY_MAX_DELAY_MS; };
+        return retryAfterMs;
+    };
+    // return Math.min(MAX, BASE * 2 ** Math.max(0, retryIndex));
+    let delay = MINI_UPSTREAM_RETRY_BASE_DELAY_MS;
+    for i in 0..retryIndex {
+        delay = delay * 2;
+        if delay > MINI_UPSTREAM_RETRY_MAX_DELAY_MS { return MINI_UPSTREAM_RETRY_MAX_DELAY_MS; };
+    }
+    if delay > MINI_UPSTREAM_RETRY_MAX_DELAY_MS { return MINI_UPSTREAM_RETRY_MAX_DELAY_MS; };
+    return delay;
+}
+
+// TS lines 202-224: /** Parse Retry-After / retry-after-ms headers plus "retry in N s" body hints. */
+// export function upstreamRetryAfterMs(headers?: Headers | null, bodyText?: string): number | undefined
+fn upstreamRetryAfterMs(headers_ptr: ptr, headers_len: u64, has_headers: bool, body_ptr: ptr, body_len: u64, has_body: bool, out: &OptStr) -> void {
+    // DEFECT: Headers object (headers?.get("retry-after") / .get("retry-after-ms")) | no Headers type in SLA/sa_std; caller supplies the headers flattened as text; per-name lookup approximated by substring scans for "retry-after" / "retry-after-ms" in the fix phase.
+    // DEFECT: Date.parse / Date.now() for HTTP-date Retry-After values | no date API counterpart used here; only the numeric-seconds branch is approximated, the date branch falls through to undefined.
+    // DEFECT: RegExp /(?:try again|retry)(?:\s+after|\s+in)?\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|milliseconds?|s|seconds?)/i.exec(bodyText) | no RegExp; approximated by scanning body text for "try again"/"retry" followed by a decimal number and a unit word in the fix phase.
+    // TS flow preserved: retry-after seconds -> *1000; else retry-after-ms -> round;
+    // else body hint value * (unit starts with "ms" ? 1 : 1000); else undefined (out.has = false).
+    out.has = false;
+    out.len = 0;
+}
+
+// TS lines 226-228: function sleep(ms: number): Promise<void>
+// DEFECT: async/Promise + setTimeout | no timers/Promise in SLA; approximated as a synchronous host-delay call (no-op placeholder in this pass).
+fn sleep(ms: u64) -> void {
+    // return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+// Fetch result stand-in (TS Response).
+struct FetchResponse {
+    status: u64,
+    ok: bool,
+    headers: [u8; 4096], headers_len: u64, // flattened headers text (see Headers DEFECT above)
+    body: [u8; 262144], body_len: u64,
+}
+
+// TS lines 230-268: /**
+//  * Relay-facing fetch with bounded retries (upstream parity: miniBridge
+//  * fetchMiniUpstream). Retryable HTTP statuses and network failures sleep with
+//  * exponential backoff (honoring Retry-After) and retry; anything else returns
+//  * as-is. After exhaustion it throws a `responses|chat <status>: <snippet>`
+//  * error matching the historical message shape — callers keep their `!res.ok`
+//  * guards for the non-retryable path.
+//  */
+// export async function fetchMiniUpstream(url: string, init: RequestInit, kind: "responses" | "chat", maxRetries?: number): Promise<Response>
+// DEFECT: async/Promise + global fetch / RequestInit / Response | no fetch API in sa_std used here (turns go through sa_http_client_* externs in the fix phase); approximated synchronously: returns 0 with the response in out, non-zero = the TS throw path (network error rethrow / retries-exhausted Error with `${kind} ${status}: ${snippet} (retries exhausted)` text assembled in err).
+// DEFECT: throw / try-catch | SLA has no exceptions; throw sites become non-zero returns, catch branches become status checks.
+fn fetchMiniUpstream(url_ptr: ptr, url_len: u64, init_ptr: ptr, init_len: u64, kind: u64, has_maxRetries: bool, maxRetries: u64, out: &FetchResponse, err: &OptStr) -> i32 {
+    // const retries = maxRetries ?? numEnvInt("MINI_UPSTREAM_RETRIES", 3, 0, 10);
+    let retries = maxRetries;
+    if !has_maxRetries { retries = numEnvInt(STR_PTR("MINI_UPSTREAM_RETRIES"), STR_LEN("MINI_UPSTREAM_RETRIES"), 3, 0, 10); };
+    let attempt: u64 = 0;
+    // for (;;) {
+    //   let res: Response;
+    //   try { res = await fetch(url, init); } catch (e) {
+    //     if (isAbortError(e) || attempt >= retries) throw e;
+    //     try { process.stderr.write(`[mini] upstream network error (${(e as Error)?.message ?? e}), retry ${attempt + 1}/${retries}.\n`); } catch { /* ignore */ }
+    //     // DEFECT: process.stderr.write inside try/catch-ignore | no process.stderr in SLA; diagnostic approximated with println.
+    //     await sleep(upstreamRetryDelayMs(attempt));
+    //     attempt++; continue;
+    //   }
+    //   if (res.ok || !isUpstreamRetryableStatus(res.status) || attempt >= retries) {
+    //     if (!res.ok && attempt >= retries && isUpstreamRetryableStatus(res.status)) {
+    //       let snippet = ""; try { snippet = (await res.text()).slice(0, 500); } catch { /* ignore */ }
+    //       // DEFECT: Response.text() Promise | body text is read from the FetchResponse buffer instead.
+    //       throw new Error(`${kind} ${res.status}: ${snippet} (retries exhausted)`);
+    //     }
+    //     return res;
+    //   }
+    //   let bodyText = ""; try { bodyText = await res.text(); } catch { /* ignore */ }
+    //   const delay = upstreamRetryDelayMs(attempt, upstreamRetryAfterMs(res.headers, bodyText));
+    //   try { process.stderr.write(`[mini] upstream ${res.status}, retry ${attempt + 1}/${retries} in ${delay}ms.\n`); } catch { /* ignore */ }
+    //   await sleep(delay);
+    //   attempt++;
+    // }
+    out.status = 0;
+    out.ok = false;
+    return 1; // placeholder: real fetch dispatch lands in the fix phase
+}
+
+/* ---------------- previous_response_id chaining (miniBridge parity) ---------------- */
+
+// TS lines 272-279: /** Conversation state for responses `previous_response_id` chaining. */
+// export interface MiniResponsesChain { prevId: string | null; sentHash: string; sentCount: number; }
+struct MiniResponsesChain {
+    // DEFECT: string | null field | approximated with has_prevId flag (false = null).
+    prevId: [u8; 256], prevId_len: u64, has_prevId: bool,
+    sentHash: [u8; 64], sentHash_len: u64,
+    sentCount: u64,
+}
+
+// TS line 281: export const EMPTY_MINI_RESPONSES_CHAIN: MiniResponsesChain = { prevId: null, sentHash: "", sentCount: 0 };
+// DEFECT: const object literal | SLA has no const struct values; approximated with an initializer function writing the EMPTY value.
+fn EMPTY_MINI_RESPONSES_CHAIN(out: &MiniResponsesChain) -> void {
+    out.has_prevId = false;
+    out.prevId_len = 0;
+    out.sentHash_len = 0;
+    out.sentCount = 0;
+}
+
+// TS lines 283-290: /** Tiny FNV-1a hash (avoids a crypto import for a prefix-equality check). */
+// export function hashMiniChainPrefix(s: string): string
+fn hashMiniChainPrefix(s_ptr: ptr, s_len: u64, out: &OptStr) -> void {
+    let h: u64 = 0x811c9dc5;
+    for i in 0..s_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, s_ptr, i);
+        h = h ^ (c as u64);
+        // TS: h = Math.imul(h, 0x01000193);
+        // DEFECT: Math.imul 32-bit multiply / (h >>> 0).toString(16) | approximated by keeping the low 32 bits after each multiply and rendering hex digits manually below.
+        h = (h * 0x01000193) % 4294967296;
+    }
+    // Render h as lowercase hex (no leading zeros, matching toString(16)) into out.bytes.
+    out.has = true;
+    out.len = 0;
+    if h == 0 {
+        out.bytes[0] = 48; // "0"
+        out.len = 1;
+        return;
+    };
+    let digits: [u8; 8] = [0u8; 8];
+    let n: u64 = 0;
+    let v = h;
+    while v > 0 {
+        let d = v % 16;
+        if d < 10 { digits[n] = 48 + (d as u8); } else { digits[n] = 87 + (d as u8); };
+        n = n + 1;
+        v = v / 16;
+    }
+    let w: u64 = 0;
+    let r = n;
+    while r > 0 {
+        r = r - 1;
+        out.bytes[w] = digits[r];
+        w = w + 1;
+    }
+    out.len = w;
+}
+
+// Result of resolveResponsesRoundInput (TS object return { input, previousResponseId, chained }).
+struct ResponsesRoundInput {
+    input: RecordArray,
+    previousResponseId: [u8; 256], previousResponseId_len: u64, has_previousResponseId: bool, // false = null
+    chained: bool,
+}
+
+// TS lines 292-310: /**
+//  * Resolve a responses round into full or chained input. When the thread still
+//  * starts with the exact prefix the server stored (hash match), only the new
+//  * suffix is sent with `previous_response_id`. Any mutation breaks the match
+//  * and falls back to a full send, so chaining can never corrupt the thread.
+//  */
+// export function resolveResponsesRoundInput<T extends Record<string, any>>(full: T[], chain: MiniResponsesChain): { input: T[]; previousResponseId: string | null; chained: boolean }
+// DEFECT: generic <T extends Record<string, any>> | SLA has no generics; T[] approximated as RecordArray (JSON text buffer) for all instantiations.
+// DEFECT: JSON.stringify(full.slice(0, chain.sentCount)) + Array.slice by item count | item byte offsets are not tracked in RecordArray; the caller supplies prefix_ptr/prefix_len = the JSON text of the first chain.sentCount items, and the suffix input bytes are full.bytes minus that prefix (prefix_bytes_len).
+fn resolveResponsesRoundInput(full: &RecordArray, prefix_ptr: ptr, prefix_len: u64, prefix_bytes_len: u64, chain: &MiniResponsesChain, out: &ResponsesRoundInput) -> void {
+    if chain.has_prevId && chain.sentCount > 0 && full.count >= chain.sentCount {
+        // try {
+        //   if (hashMiniChainPrefix(JSON.stringify(full.slice(0, chain.sentCount))) === chain.sentHash) {
+        //     return { input: full.slice(chain.sentCount), previousResponseId: chain.prevId, chained: true };
+        //   }
+        // } catch { /* Fall through to a full send. */ }
+        // DEFECT: try/catch around stringify/hash | approximated by the hash compare alone; a hashing failure cannot be distinguished in this pass.
+        let h = OptStr { bytes: [0u8; 512], len: 0, has: false };
+        hashMiniChainPrefix(prefix_ptr, prefix_len, &h);
+        let same = h.has && h.len == chain.sentHash_len;
+        if same {
+            for i in 0..h.len {
+                if h.bytes[i] != chain.sentHash[i] { same = false; };
+            }
+        };
+        if same {
+            // out.input = full bytes after prefix_bytes_len (suffix items only)
+            out.input.len = 0;
+            if full.len > prefix_bytes_len { out.input.len = full.len - prefix_bytes_len; };
+            out.input.count = full.count - chain.sentCount;
+            out.has_previousResponseId = true;
+            out.previousResponseId_len = chain.prevId_len;
+            for j in 0..chain.prevId_len { out.previousResponseId[j] = chain.prevId[j]; }
+            out.chained = true;
+            return;
+        };
+    };
+    // return { input: full, previousResponseId: null, chained: false };
+    out.input.len = full.len;
+    out.input.count = full.count;
+    out.has_previousResponseId = false;
+    out.previousResponseId_len = 0;
+    out.chained = false;
+}
+
+// TS lines 312-322: /** Advance the chain after a round whose response the server stored. */
+// export function advanceResponsesChain<T extends Record<string, any>>(full: T[], responseId: string | null | undefined): MiniResponsesChain
+// DEFECT: generic <T> (see resolveResponsesRoundInput) | full_json_ptr/full_json_len carry JSON.stringify(full).
+fn advanceResponsesChain(full: &RecordArray, full_json_ptr: ptr, full_json_len: u64, responseId_ptr: ptr, responseId_len: u64, has_responseId: bool, out: &MiniResponsesChain) -> void {
+    if !has_responseId {
+        // if (!responseId) return EMPTY_MINI_RESPONSES_CHAIN;
+        EMPTY_MINI_RESPONSES_CHAIN(out);
+        return;
+    };
+    // try {
+    //   return { prevId: responseId, sentHash: hashMiniChainPrefix(JSON.stringify(full)), sentCount: full.length };
+    // } catch { return EMPTY_MINI_RESPONSES_CHAIN; }
+    // DEFECT: try/catch | no exceptions in SLA; the catch fallback (EMPTY chain) is taken only on the !responseId path above in this pass.
+    out.has_prevId = true;
+    out.prevId_len = responseId_len;
+    for i in 0..responseId_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, responseId_ptr, i);
+        out.prevId[i] = b;
+    }
+    let h = OptStr { bytes: [0u8; 512], len: 0, has: false };
+    hashMiniChainPrefix(full_json_ptr, full_json_len, &h);
+    out.sentHash_len = h.len;
+    for j in 0..h.len { out.sentHash[j] = h.bytes[j]; }
+    out.sentCount = full.count;
+}
+
+// TS lines 324-328: /** A chained round the relay rejects (400 / stale id) must retry once with full input. */
+// export function isChainRejectedError(e: unknown, status?: number): boolean
+fn isChainRejectedError(e_ptr: ptr, e_len: u64, e_is_error: bool, has_status: bool, status: u64) -> bool {
+    if has_status && status == 400 { return true; };
+    // const msg = e instanceof Error ? e.message : String(e ?? "");
+    // DEFECT: unknown/Error instance check | caller supplies the flattened message text (see isAbortError).
+    // DEFECT: RegExp /previous_response_id|previous response|invalid.*response.*id|expired.*response|response.*not found|response.*expired/i | no RegExp (the .* alternatives cannot be reproduced by substring scan); approximated with case-insensitive substring scans for the literal alternatives and the key fragments of the .* patterns.
+    if text_contains_ci(e_ptr, e_len, STR_PTR("previous_response_id"), STR_LEN("previous_response_id")) { return true; };
+    if text_contains_ci(e_ptr, e_len, STR_PTR("previous response"), STR_LEN("previous response")) { return true; };
+    if text_contains_ci(e_ptr, e_len, STR_PTR("response"), STR_LEN("response")) && text_contains_ci(e_ptr, e_len, STR_PTR("expired"), STR_LEN("expired")) { return true; };
+    if text_contains_ci(e_ptr, e_len, STR_PTR("response"), STR_LEN("response")) && text_contains_ci(e_ptr, e_len, STR_PTR("not found"), STR_LEN("not found")) { return true; };
+    if text_contains_ci(e_ptr, e_len, STR_PTR("invalid"), STR_LEN("invalid")) && text_contains_ci(e_ptr, e_len, STR_PTR("response"), STR_LEN("response")) { return true; };
+    return false;
+}
+
+// TS lines 330-356: /**
+//  * One responses round through the chain: send only the new suffix when the
+//  * thread prefix matches what the server stored, else send full input. A relay
+//  * rejection of a chained round retries once with full input (miniBridge
+//  * parity), so a stale/expired stored response degrades to one wasted call,
+//  * never a failed turn.
+//  */
+// export async function createChainedTurn(opts: TurnOpts, fullInput: Array<Record<string, unknown>>, chain: MiniResponsesChain): Promise<{ result: TurnResult; chain: MiniResponsesChain }>
+// DEFECT: async/Promise + object return { result, chain } | approximated synchronously with a status return and out parameters (out_result / out_chain).
+// DEFECT: spread { ...opts, responsesInput: round.input, previousResponseId: round.previousResponseId } | no object spread; approximated by copying opts field-wise into round_opts and overriding the two fields.
+fn createChainedTurn(opts: &TurnOpts, fullInput: &RecordArray, prefix_ptr: ptr, prefix_len: u64, prefix_bytes_len: u64, full_json_ptr: ptr, full_json_len: u64, chain: &MiniResponsesChain, out_result: &TurnResult, out_chain: &MiniResponsesChain) -> i32 {
+    let round = ResponsesRoundInput { input: RecordArray { bytes: [0u8; 262144], len: 0, count: 0 }, previousResponseId: [0u8; 256], previousResponseId_len: 0, has_previousResponseId: false, chained: false };
+    resolveResponsesRoundInput(fullInput, prefix_ptr, prefix_len, prefix_bytes_len, chain, &round);
+    // try {
+    //   const result = await createTurn({ ...opts, responsesInput: round.input, previousResponseId: round.previousResponseId });
+    //   return { result, chain: advanceResponsesChain(fullInput, result.responseId) };
+    // } catch (e) {
+    //   if (round.chained && isChainRejectedError(e)) {
+    //     try { process.stderr.write(`[mini] previous_response_id rejected by relay; retrying with full input.\n`); } catch { /* ignore */ }
+    //     const result = await createTurn({ ...opts });
+    //     return { result, chain: advanceResponsesChain(fullInput, result.responseId) };
+    //   }
+    //   throw e;
+    // }
+    // DEFECT: try/catch / throw / await (see createTurn) | the chained attempt runs first; on a non-zero status with round.chained and a chain-rejection-shaped error text, one full-input retry runs; otherwise the status propagates (the TS throw).
+    let round_opts = TurnOpts {
+        baseUrl: opts.baseUrl, baseUrl_len: opts.baseUrl_len,
+        apiKey: opts.apiKey, apiKey_len: opts.apiKey_len,
+        model: opts.model, model_len: opts.model_len,
+        effort: opts.effort, effort_len: opts.effort_len, has_effort: opts.has_effort,
+        system: opts.system, system_len: opts.system_len,
+        thread: opts.thread,
+        tools: opts.tools, tools_len: opts.tools_len,
+        protocol: opts.protocol, has_protocol: opts.has_protocol,
+        responsesInput: round.input, has_responsesInput: true,
+        previousResponseId: round.previousResponseId, previousResponseId_len: round.previousResponseId_len, has_previousResponseId: true, previousResponseId_is_null: !round.has_previousResponseId,
+    };
+    let st = createTurn(&round_opts, out_result);
+    if st == 0 {
+        advanceResponsesChain(fullInput, full_json_ptr, full_json_len, &out_result.response_id, out_result.response_id_len, out_result.has_response_id, out_chain);
+        return 0;
+    };
+    if round.chained {
+        // (error text for isChainRejectedError would come from the failed turn;
+        // in this pass any chained failure takes the rejection check with an
+        // empty message + no status, i.e. only the 400-status path can match —
+        // recorded here as part of the async/throw approximation.)
+        println("[mini] previous_response_id rejected by relay; retrying with full input.");
+        let st2 = createTurn(opts, out_result);
+        if st2 == 0 {
+            advanceResponsesChain(fullInput, full_json_ptr, full_json_len, &out_result.response_id, out_result.response_id_len, out_result.has_response_id, out_chain);
+            return 0;
+        };
+        return st2;
+    };
+    return st;
+}
+
+// TS lines 358-390: export async function createResponsesTurn(opts: TurnOpts): Promise<TurnResult>
+// DEFECT: async/Promise (see createTurn) | synchronous status return, result in out.
+fn createResponsesTurn(opts: &TurnOpts, out: &TurnResult) -> i32 {
+    let effort = OptStr { bytes: [0u8; 512], len: 0, has: false };
+    // const effort = resolveAppliedEffort(opts.model, opts.effort);
+    resolveAppliedEffort(&opts.model, opts.model_len, &opts.effort, opts.effort_len, opts.has_effort, &effort);
+    // const res = await fetchMiniUpstream(`${opts.baseUrl.replace(/\/$/, "")}/responses`, {
+    //   method: "POST",
+    //   headers: { Authorization: `Bearer ${opts.apiKey}`, "Content-Type": "application/json" },
+    //   body: JSON.stringify({
+    //     model: opts.model,
+    //     ...(effort ? { reasoning: { effort } } : {}),
+    //     instructions: opts.system,
+    //     input: opts.responsesInput ?? toResponsesInput(opts.thread),
+    //     ...(opts.previousResponseId ? { previous_response_id: opts.previousResponseId } : {}),
+    //     tools: opts.tools.map((t) => ({ type: "function", name: t.name, description: t.description, parameters: t.schema })),
+    //     tool_choice: "auto",
+    //     parallel_tool_calls: true,
+    //   }),
+    // }, "responses");
+    // DEFECT: template literal URL + String.replace(/\/$/, "") + JSON.stringify of a nested object with conditional spreads ...(cond ? {...} : {}) and tools.map closure | no template literals/RegExp/spread/map; request JSON assembly approximated as sequential JSON-buffer appends in the same field order (model, reasoning?, instructions, input, previous_response_id?, tools, tool_choice, parallel_tool_calls) in the fix phase.
+    // DEFECT: dynamic JSON response parse (await res.json()) as { id?: unknown; output?: Array<Record<string, any>> } with per-item any-typed field reads (o.content.map((c: any) => c.text ?? "").join(""), o.summary, String(o.call_id ?? o.id ?? Math.random())) | approximated with sa_json_* extern navigation over the response buffer; Math.random() fallback call id has no counterpart and is left as an empty callId in this pass.
+    let res = FetchResponse { status: 0, ok: false, headers: [0u8; 4096], headers_len: 0, body: [0u8; 262144], body_len: 0 };
+    let err = OptStr { bytes: [0u8; 512], len: 0, has: false };
+    let fst = fetchMiniUpstream(&opts.baseUrl, opts.baseUrl_len, STR_PTR(""), 0, MINI_PROTOCOL_RESPONSES, false, 0, &res, &err);
+    if fst != 0 { return fst; };
+    // if (!res.ok) throw new Error(`responses ${res.status}: ${(await res.text()).slice(0, 500)}`);
+    if !res.ok { return 2; }; // throw path: error text = "responses <status>: <body[0..500]>"
+    // const data = (await res.json()) as { ... };
+    // const items: ThreadItem[] = []; const calls: TurnResult["calls"] = [];
+    // const seenCallId = new Set<string>(); let text = "";
+    // DEFECT: Set<string> seenCallId | approximated by scanning out.calls linearly (same as sanitizeThread).
+    out.items_len = 0;
+    out.calls_len = 0;
+    out.text_len = 0;
+    out.has_response_id = false;
+    out.response_id_len = 0;
+    // for (const o of data.output ?? []) {
+    //   if (o.type === "message" && Array.isArray(o.content)) {
+    //     const t = o.content.map((c: any) => c.text ?? "").join(""); text += t; items.push({ type: "message", text: t });
+    //   } else if (o.type === "reasoning") {
+    //     const t = (o.summary ?? []).map((s: any) => s.text ?? "").join("") || ""; if (t) items.push({ type: "reasoning", text: t });
+    //   } else if (o.type === "function_call") {
+    //     const c = { callId: String(o.call_id ?? o.id ?? Math.random()), name: String(o.name), args: String(o.arguments ?? "{}") };
+    //     if (seenCallId.has(c.callId)) continue; seenCallId.add(c.callId); calls.push(c); items.push({ type: "function_call", ...c });
+    //     // DEFECT: object spread { type: "function_call", ...c } | field-wise copy in the fix phase.
+    //   }
+    // }
+    // return { items, calls, text, responseId: typeof data.id === "string" ? data.id : undefined };
+    return 0;
+}
+
+// TS lines 392-437: export async function createChatTurn(opts: TurnOpts): Promise<TurnResult>
+// DEFECT: async/Promise (see createTurn) | synchronous status return, result in out.
+fn createChatTurn(opts: &TurnOpts, out: &TurnResult) -> i32 {
+    let effort = OptStr { bytes: [0u8; 512], len: 0, has: false };
+    resolveAppliedEffort(&opts.model, opts.model_len, &opts.effort, opts.effort_len, opts.has_effort, &effort);
+    // const res = await fetchMiniUpstream(`${opts.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    //   method: "POST",
+    //   headers: { Authorization: `Bearer ${opts.apiKey}`, "Content-Type": "application/json" },
+    //   body: JSON.stringify({
+    //     model: opts.model,
+    //     ...(effort ? { reasoning_effort: effort } : {}),
+    //     messages: toChatMessages(opts.thread, opts.system),
+    //     tools: opts.tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.schema } })),
+    //     tool_choice: "auto",
+    //     parallel_tool_calls: true,
+    //   }),
+    // });
+    // DEFECT: template literal URL / replace / JSON.stringify with conditional spread + tools.map (see createResponsesTurn) | same sequential-append approximation; note this call passes no `kind` argument (fetchMiniUpstream kind is undefined in TS — kind only feeds the exhausted-retry error prefix).
+    // DEFECT: dynamic JSON response parse + optional chaining (data.choices?.[0]?.message, msg?.tool_calls ?? [], tc.function?.name) and String(... ?? Math.random()) | no optional chaining; approximated with sa_json_* navigation and explicit presence flags; Math.random() fallback left empty (see createResponsesTurn).
+    let res = FetchResponse { status: 0, ok: false, headers: [0u8; 4096], headers_len: 0, body: [0u8; 262144], body_len: 0 };
+    let err = OptStr { bytes: [0u8; 512], len: 0, has: false };
+    let fst = fetchMiniUpstream(&opts.baseUrl, opts.baseUrl_len, STR_PTR(""), 0, MINI_PROTOCOL_CHAT, false, 0, &res, &err);
+    if fst != 0 { return fst; };
+    // if (!res.ok) throw new Error(`chat ${res.status}: ${(await res.text()).slice(0, 500)}`);
+    if !res.ok { return 2; }; // throw path: error text = "chat <status>: <body[0..500]>"
+    // const data = (await res.json()) as { id?: unknown; choices?: Array<{ message?: { content?: string | null; tool_calls?: ... } }> };
+    // const msg = data.choices?.[0]?.message;
+    // const items: ThreadItem[] = []; const calls: TurnResult["calls"] = [];
+    // const text = typeof msg?.content === "string" ? msg.content : "";
+    // if (text) items.push({ type: "message", text });
+    // const seenCallId = new Set<string>();
+    // DEFECT: Set<string> seenCallId | linear scan of out.calls (see createResponsesTurn).
+    out.items_len = 0;
+    out.calls_len = 0;
+    out.text_len = 0;
+    out.has_response_id = false;
+    out.response_id_len = 0;
+    // for (const tc of msg?.tool_calls ?? []) {
+    //   const c = { callId: String(tc.id ?? Math.random()), name: String(tc.function?.name ?? ""), args: String(tc.function?.arguments ?? "{}") };
+    //   if (!c.name || seenCallId.has(c.callId)) continue; seenCallId.add(c.callId); calls.push(c); items.push({ type: "function_call", ...c });
+    // }
+    // return { items, calls, text, responseId: typeof data.id === "string" ? data.id : undefined };
+    return 0;
+}

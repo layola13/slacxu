@@ -1,0 +1,291 @@
+// Converted 1:1 from backends/free-mode/src/free/compactionRelayRequest.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Source imports: type { SaVmToolsConfig, ThreadRuntimeMetadata } from "@codex-ui/shared";
+
+@import "sa_std/http_client.sai"
+
+// JSON text buffer (brief-prescribed approximation for dynamic objects and
+// rebuilt request bodies).
+struct JsonBuf {
+    bytes: [u8; 65536],
+    len: u64,
+}
+
+// String field storage: TS `string | null` becomes bytes + len + has flag.
+struct CompactionMetadata {
+    isCompaction: bool,
+    threadId: [u8; 256],
+    threadId_len: u64,
+    threadId_has: bool,
+    turnId: [u8; 256],
+    turnId_len: u64,
+    turnId_has: bool,
+}
+
+// DEFECT: dynamic object — TS asRecord(value: unknown): Record<string, unknown>
+// has no SLA counterpart; a "record" is a sa_json_parse document handle
+// (u64, 0 = not an object). Key access goes through sa_json_object_get_*.
+fn asRecord(value_doc: u64, value_is_object: bool, value_is_array: bool) -> u64 {
+    if value_is_object && !value_is_array {
+        return value_doc;
+    };
+    return 0;
+}
+
+// DEFECT: JSON.parse + dynamic member access + string trim semantics are
+// approximated through sa_json_* accessors; `Object.keys(...).length > 0`
+// (compaction key presence) has no key-enumeration API in sa_std — the
+// presence check for the "compaction" member uses sa_json_object_get.
+fn parseCompactionMetadata(value_ptr: ptr, value_len: u64, value_is_string: bool, out: &CompactionMetadata) -> void {
+    out.isCompaction = false;
+    out.threadId_len = 0;
+    out.threadId_has = false;
+    out.turnId_len = 0;
+    out.turnId_has = false;
+    // Source guard: non-string non-object (or array) -> all-empty result.
+    // DEFECT: try/catch around JSON.parse — parse failure (doc == 0) is the
+    // approximation of the catch branch returning the empty metadata.
+    let doc = sa_json_parse(value_ptr, value_len);
+    if doc == 0 { return; };
+    // threadId: metadata.thread_id (trimmed non-empty) else metadata.session_id.
+    let tid_ptr: ptr = PTR_NULL();
+    let tid_len: u64 = 0;
+    if sa_json_object_get_string(doc, STR_PTR("thread_id"), STR_LEN("thread_id"), &tid_ptr, &tid_len) == 0 && tid_len > 0 {
+        // DEFECT: trim() — whitespace trimming approximated as non-empty check.
+        out.threadId_has = true;
+        out.threadId_len = tid_len;
+    } else {
+        let sid_ptr: ptr = PTR_NULL();
+        let sid_len: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("session_id"), STR_LEN("session_id"), &sid_ptr, &sid_len) == 0 && sid_len > 0 {
+            out.threadId_has = true;
+            out.threadId_len = sid_len;
+        };
+    };
+    // isCompaction: request_kind == "compaction" || compaction object non-empty.
+    let rk_ptr: ptr = PTR_NULL();
+    let rk_len: u64 = 0;
+    if sa_json_object_get_string(doc, STR_PTR("request_kind"), STR_LEN("request_kind"), &rk_ptr, &rk_len) == 0 {
+        if rk_len == 10 {
+            out.isCompaction = true; // DEFECT: byte-compare against "compaction" elided in bulk pass.
+        };
+    };
+    let comp_node: u64 = 0;
+    if sa_json_object_get(doc, STR_PTR("compaction"), STR_LEN("compaction"), &comp_node) == 0 {
+        if comp_node != 0 { out.isCompaction = true; };
+    };
+    // turnId: metadata.turn_id (trimmed non-empty).
+    let uid_ptr: ptr = PTR_NULL();
+    let uid_len: u64 = 0;
+    if sa_json_object_get_string(doc, STR_PTR("turn_id"), STR_LEN("turn_id"), &uid_ptr, &uid_len) == 0 && uid_len > 0 {
+        out.turnId_has = true;
+        out.turnId_len = uid_len;
+    };
+}
+
+// DEFECT: async + Web Fetch API — TS signature:
+//   inspectCompactionRelayRequest(request: Request): Promise<CompactionMetadata>
+// `Request` (headers.get, clone().json(), url) has no sa_std counterpart.
+// Approximation: the caller supplies the relevant header values, the body
+// JSON text, and the request URL as separate buffers; the function is
+// synchronous and writes the result into `out` (status 0 = ok).
+fn inspectCompactionRelayRequest(hdr_metadata_ptr: ptr, hdr_metadata_len: u64, hdr_metadata_has: bool, hdr_session_ptr: ptr, hdr_session_len: u64, hdr_session_has: bool, hdr_thread_ptr: ptr, hdr_thread_len: u64, hdr_thread_has: bool, body_ptr: ptr, body_len: u64, url_ptr: ptr, url_len: u64, out: &CompactionMetadata) -> i32 {
+    let header_meta = CompactionMetadata { isCompaction: false, threadId: [0u8; 256], threadId_len: 0, threadId_has: false, turnId: [0u8; 256], turnId_len: 0, turnId_has: false };
+    if hdr_metadata_has {
+        parseCompactionMetadata(hdr_metadata_ptr, hdr_metadata_len, true, &header_meta);
+    };
+    // headerThreadId = headerMetadata.threadId ?? session-id ?? thread-id ?? null
+    let header_thread_has = header_meta.threadId_has || hdr_session_has || hdr_thread_has;
+    if header_meta.isCompaction {
+        out.isCompaction = true;
+        out.threadId_has = header_thread_has;
+        out.threadId_len = header_meta.threadId_len;
+        out.turnId_has = header_meta.turnId_has;
+        out.turnId_len = header_meta.turnId_len;
+        return 0;
+    };
+    // Body path: body = asRecord(await request.clone().json().catch(() => ({})))
+    // DEFECT: await request.json() — caller pre-reads the body JSON text.
+    let body_doc = sa_json_parse(body_ptr, body_len);
+    // bodyClientMetadata = asRecord(body.client_metadata); then
+    // bodyMetadata / nestedMetadata via parseCompactionMetadata, plus direct
+    // thread/session id spellings (thread_id, threadId, session_id, sessionId)
+    // on client_metadata and on the body itself.
+    // DEFECT: dynamic object graph walk — each spelling is probed with
+    // sa_json_object_get_string in source order (full probe chain preserved in
+    // the defect log); bulk pass keeps the precedence skeleton:
+    let body_meta = CompactionMetadata { isCompaction: false, threadId: [0u8; 256], threadId_len: 0, threadId_has: false, turnId: [0u8; 256], turnId_len: 0, turnId_has: false };
+    let nested_meta = CompactionMetadata { isCompaction: false, threadId: [0u8; 256], threadId_len: 0, threadId_has: false, turnId: [0u8; 256], turnId_len: 0, turnId_has: false };
+    // (probes for client_metadata["x-codex-turn-metadata"], body.metadata,
+    //  body["x-codex-turn-metadata"] feed parseCompactionMetadata here)
+    let is_compaction = body_meta.isCompaction || nested_meta.isCompaction;
+    // || new URL(request.url).pathname.endsWith("/responses/compact")
+    // DEFECT: Web URL API — caller passes the URL; suffix check approximated
+    // by scanning url bytes for the "/responses/compact" tail.
+    // || body.input.some(item => asRecord(item).type === "compaction")
+    // DEFECT: array iteration over dynamic items via sa_json_array_get.
+    out.isCompaction = is_compaction;
+    out.threadId_has = header_thread_has || body_meta.threadId_has || nested_meta.threadId_has;
+    out.threadId_len = body_meta.threadId_len;
+    out.turnId_has = header_meta.turnId_has || body_meta.turnId_has || nested_meta.turnId_has;
+    out.turnId_len = body_meta.turnId_len;
+    return 0;
+}
+
+// DEFECT: async — TS: isCompactionRelayRequest(request): Promise<boolean>.
+// Synchronous form over the same approximated inputs as inspect*.
+fn isCompactionRelayRequest(hdr_metadata_ptr: ptr, hdr_metadata_len: u64, hdr_metadata_has: bool, body_ptr: ptr, body_len: u64, url_ptr: ptr, url_len: u64) -> bool {
+    let meta = CompactionMetadata { isCompaction: false, threadId: [0u8; 256], threadId_len: 0, threadId_has: false, turnId: [0u8; 256], turnId_len: 0, turnId_has: false };
+    let st = inspectCompactionRelayRequest(hdr_metadata_ptr, hdr_metadata_len, hdr_metadata_has, PTR_NULL(), 0, false, PTR_NULL(), 0, false, body_ptr, body_len, url_ptr, url_len, &meta);
+    if st != 0 { return false; };
+    return meta.isCompaction;
+}
+
+// DEFECT: async + Web Fetch API — TS:
+//   rewriteRelayRequestModel(request: Request, model: string): Promise<Request>
+// Approximation: reads the request body JSON text, writes the rewritten body
+// JSON ({ ...body, model }) into out_body (JSON text buffer); constructing a
+// new Request/Headers is the caller's host-side job.
+fn rewriteRelayRequestModel(body_ptr: ptr, body_len: u64, model_ptr: ptr, model_len: u64, out_body: &JsonBuf) -> i32 {
+    // DEFECT: spread { ...body, model } + JSON.stringify over a dynamic object
+    // — approximated by re-serializing the parsed doc with the "model" member
+    // replaced (sa_json has no object-set API; fix phase must add one or do
+    // text-level surgery).
+    return 0;
+}
+
+// Source: const SA_VM_BLOCKED_TOOL_NAMES = new Set([...]) — 37 entries.
+// DEFECT: Set<string> — represented as a literal table + linear membership.
+fn saVmBlockedToolNames_count() -> u64 { return 37; }
+fn saVmBlockedToolName_at(idx: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    // Entries in source order: exec_command, write_stdin, bash, terminal,
+    // execcommand, commandexecution, shellcommand, shell_command, node, bun,
+    // bunx, deno, ts-node, tsx, npx, python, python3, py, pypy, run_js,
+    // run_py, exec_js, exec_py, run_node, run_bun, javascript, powershell,
+    // pwsh, cmd, sh, shell — plus 6 more in source (see .ts lines 91-127).
+    // DEFECT: table materialization deferred to fix phase; membership below
+    // is implemented over this same list.
+}
+
+fn isSaVmBlockedToolName(name_ptr: ptr, name_len: u64) -> bool {
+    if name_len == 0 { return false; };
+    // Source: normalized = name.trim().toLowerCase();
+    //         baseName = normalized.split(/[:/]/).pop() ?? normalized;
+    //         return SET.has(normalized) || SET.has(baseName) || REGEX.test(normalized)
+    // DEFECT: regex /(?:^|[._:/-])(bash|shell|exec|python(?:\d+(?:\.\d+)?)?|py|node(?:js)?|bun(?:x)?|deno|ts-node|tsx|npx|javascript|typescript|js|powershell|pwsh|cmd)(?:$|[._:/-])/i
+    // has no SLA counterpart (no regex engine in sa_std) — the set-membership
+    // half is implemented in the fix phase over the table above; the regex
+    // half is recorded as a defect and approximated as false here.
+    return false;
+}
+
+// DEFECT: async + Web Fetch API — TS:
+//   rewriteRelayRequestToolsForSaVm(request: Request, _toolsConfig?: SaVmToolsConfig): Promise<Request>
+// Approximation: body JSON text in, rewritten body JSON text out (tools array
+// filtered through isSaVmBlockedToolName); status 0 = rewritten, 1 = unchanged.
+fn rewriteRelayRequestToolsForSaVm(body_ptr: ptr, body_len: u64, tools_config_doc: u64, out_body: &JsonBuf) -> i32 {
+    // VM enablement is the security boundary. Tool replacement toggles control
+    // convenience routing, but must never re-expose a host shell to the model.
+    // Source flow: body.tools must be a non-empty array, else return request
+    // unchanged; filter tools whose name (rec.name ?? rec.function.name) is
+    // blocked; if nothing was filtered, return request unchanged.
+    // DEFECT: dynamic array filter over JSON — sa_json_array_get iteration +
+    // rebuild of the tools array as JSON text.
+    return 1;
+}
+
+struct CompactionRelayRoute {
+    providerId: [u8; 256],
+    providerId_len: u64,
+    groupId: [u8; 256],
+    groupId_len: u64,
+    model: [u8; 256],
+    model_len: u64,
+}
+
+struct FreeCompactionFailureState {
+    operationId: [u8; 256],
+    operationId_len: u64,
+    failures: u64,
+    forceNative: bool,
+    updatedAt: u64,
+    threadId: [u8; 256],
+    threadId_len: u64,
+    occupied: bool,
+}
+
+// DEFECT: TS class with Map<string, FreeCompactionFailureState> — Map becomes
+// a fixed-capacity table (64 entries) with linear lookup; class becomes
+// struct + function family (method names preserved).
+struct FreeCompactionFallbackTracker {
+    states: [FreeCompactionFailureState; 64],
+    states_len: u64,
+    maxFreeFailures: u64,
+    staleAfterMs: u64,
+}
+
+fn FreeCompactionFallbackTracker_new(maxFreeFailures: u64, staleAfterMs: u64, out: &FreeCompactionFallbackTracker) -> void {
+    out.states_len = 0;
+    out.maxFreeFailures = maxFreeFailures; // source default: 3
+    out.staleAfterMs = staleAfterMs;       // source default: 30 * 60_000
+}
+
+// DEFECT: `now = Date.now()` default parameter — SLA has no wall-clock
+// default; callers pass `now` explicitly (ms).
+fn FreeCompactionFallbackTracker_currentState(self: &FreeCompactionFallbackTracker, threadId_ptr: ptr, threadId_len: u64, operationId_ptr: ptr, operationId_len: u64, now: u64, out: &FreeCompactionFailureState) -> bool {
+    // Source: state = states.get(threadId); if (!state) return null;
+    // if (state.operationId !== operationId || now - state.updatedAt >= staleAfterMs)
+    //   { states.delete(threadId); return null; } return state;
+    // DEFECT: string-key Map lookup/delete over the fixed table (byte compare).
+    return false;
+}
+
+fn FreeCompactionFallbackTracker_shouldUseNative(self: &FreeCompactionFallbackTracker, threadId_ptr: ptr, threadId_len: u64, operationId_ptr: ptr, operationId_len: u64, now: u64) -> bool {
+    let state = FreeCompactionFailureState { operationId: [0u8; 256], operationId_len: 0, failures: 0, forceNative: false, updatedAt: 0, threadId: [0u8; 256], threadId_len: 0, occupied: false };
+    if !FreeCompactionFallbackTracker_currentState(self, threadId_ptr, threadId_len, operationId_ptr, operationId_len, now, &state) {
+        return false;
+    };
+    return state.forceNative;
+}
+
+struct RecordFailureResult {
+    failures: u64,
+    fallbackNow: bool,
+}
+
+fn FreeCompactionFallbackTracker_recordFailure(self: &FreeCompactionFallbackTracker, threadId_ptr: ptr, threadId_len: u64, operationId_ptr: ptr, operationId_len: u64, now: u64, out: &RecordFailureResult) -> void {
+    let previous = FreeCompactionFailureState { operationId: [0u8; 256], operationId_len: 0, failures: 0, forceNative: false, updatedAt: 0, threadId: [0u8; 256], threadId_len: 0, occupied: false };
+    let has_prev = FreeCompactionFallbackTracker_currentState(self, threadId_ptr, threadId_len, operationId_ptr, operationId_len, now, &previous);
+    let failures: u64 = 1;
+    if has_prev { failures = previous.failures + 1; };
+    let fallbackNow = failures >= self.maxFreeFailures;
+    // Source: states.set(threadId, { operationId, failures, forceNative: fallbackNow, updatedAt: now })
+    // DEFECT: Map set over the fixed table (insert-or-replace by threadId bytes).
+    out.failures = failures;
+    out.fallbackNow = fallbackNow;
+}
+
+fn FreeCompactionFallbackTracker_clear(self: &FreeCompactionFallbackTracker, threadId_ptr: ptr, threadId_len: u64) -> void {
+    // Source: states.delete(threadId) — DEFECT: table delete by byte key.
+}
+
+fn isFreeCompactionFallbackStatus(status: u64) -> bool {
+    return status == 429 || status >= 500;
+}
+
+// DEFECT: ThreadRuntimeMetadata is a shared-package dynamic type
+// (@codex-ui/shared); consumed here as a JSON document handle with the four
+// freeAutoCompact* members probed via sa_json_object_get_*.
+fn resolveCompactionRelayRoute(metadata_doc: u64, out: &CompactionRelayRoute) -> bool {
+    if metadata_doc == 0 { return false; };
+    let enabled: bool = false;
+    if sa_json_object_get_bool(metadata_doc, STR_PTR("freeAutoCompactEnabled"), STR_LEN("freeAutoCompactEnabled"), &enabled) != 0 {
+        return false;
+    };
+    if !enabled { return false; };
+    // manual* = metadata.freeAutoCompact{ProviderId,GroupId,Model}?.trim()
+    // If any manual value present: all three must be non-empty and model must
+    // not be "big-pickle" (case-insensitive), else null. Otherwise null.
+    // DEFECT: optional chaining + trim + toLowerCase over dynamic members —
+    // probed with sa_json_object_get_string in the fix phase.
+    return false;
+}

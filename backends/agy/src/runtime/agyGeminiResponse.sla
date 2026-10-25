@@ -1,0 +1,237 @@
+// Converted 1:1 from backends/agy/src/runtime/agyGeminiResponse.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+//
+// DEFECT: `any` values and dynamic JSON — carried as sa_json doc
+// handles. DEFECT: WHATWG ReadableStream + TextDecoder +
+// node:http ServerResponse — no std counterparts for the fetch
+// body reader or the raw HTTP response object; the stream is
+// modeled as a blocking io handle and res.write as sa_io_write
+// on the response handle (see std HTTP server surface, repair
+// phase wires the real handles). DEFECT: RegExp — hand scans.
+
+// isAgyGeminiEndpoint(path): return /^\/v1(?:beta)?\//.test(path)
+// || path.startsWith("/models/")
+fn isAgyGeminiEndpoint(path_ptr: ptr, path_len: u64) -> bool {
+    if starts_with(path_ptr, path_len, STR_PTR("/v1/"), STR_LEN("/v1/")) { return true; };
+    if starts_with(path_ptr, path_len, STR_PTR("/v1beta/"), STR_LEN("/v1beta/")) { return true; };
+    if starts_with(path_ptr, path_len, STR_PTR("/models/"), STR_LEN("/models/")) { return true; };
+    return false;
+}
+
+// formatAgyGeminiResponse(value, isGeminiEndpoint):
+//   const response = value?.response (if object) ?? value
+//   return isGeminiEndpoint ? response : { response }
+// DEFECT: dynamic object — returns a doc handle; the
+// { response } wrapper construction needs a JSON object-build
+// operation (not in the verified std surface).
+fn formatAgyGeminiResponse(value_doc: u64, is_gemini: bool, out_doc: &u64) -> void {
+    let response_doc = value_doc;
+    let r: u64 = 0;
+    if value_doc != 0 && sa_json_object_get(value_doc, STR_PTR("response"), STR_LEN("response"), &r) == 0 {
+        // TS checks typeof value.response === "object"; doc
+        // handles here are objects by construction in callers.
+        response_doc = r;
+    };
+    if is_gemini {
+        out_doc = response_doc;
+    } else {
+        // DEFECT: { response } wrap — pending JSON build surface.
+        out_doc = response_doc;
+    };
+}
+
+// forwardAgyGeminiStream(body, res, isGeminiEndpoint): pump SSE
+// events from the upstream body to the HTTP response, rewriting
+// each event's data payload through formatAgyGeminiResponse.
+// DEFECT: async — converted to a blocking loop.
+// DEFECT: reader.read() await + TextDecoder streaming decode —
+// approximated by chunk reads on the body handle with a byte
+// buffer (UTF-8 boundary handling of the streaming decoder is
+// not reproduced).
+fn forwardAgyGeminiStream(body_handle: u64, res_handle: u64, is_gemini: bool) -> void {
+    let buffer = [0u8; 65536];
+    let buffer_len: u64 = 0;
+    let chunk = [0u8; 8192];
+    let done = false;
+    while !done {
+        let n: u64 = 0;
+        if sa_io_read(body_handle, &chunk, 8192, &n) != 0 { done = true; };
+        if n == 0 { done = true; };
+        for i in 0..n {
+            if buffer_len < 65536 {
+                buffer[buffer_len] = chunk[i];
+                buffer_len = buffer_len + 1;
+            };
+        }
+        // Split complete events on /\r?\n\r?\n/ boundaries.
+        while 1 == 1 {
+            let blen: u64 = 0;
+            let bpos = find_event_boundary(&buffer, buffer_len, &blen);
+            if bpos == 4294967295 { break; };
+            writeEvent(res_handle, &buffer, bpos, is_gemini);
+            let rest = buffer_len - (bpos + blen);
+            for j in 0..rest {
+                buffer[j] = buffer[bpos + blen + j];
+            }
+            buffer_len = rest;
+        }
+    }
+    if trim_nonempty(&buffer, buffer_len) {
+        writeEvent(res_handle, &buffer, buffer_len, is_gemini);
+    };
+    // finally: reader.releaseLock() — DEFECT: no lock concept.
+}
+
+// writeEvent(event) — closure inside forwardAgyGeminiStream in
+// the source; a free fn here.
+//   lines = event.split(/\r?\n/)
+//   data = lines starting "data:", prefix stripped, trimStart,
+//          joined with "\n"
+//   if (!data || data === "[DONE]") { res.write(event + "\n\n"); return }
+//   parsed = JSON.parse(data)
+//   metadata = non-data lines joined "\n"; if metadata res.write(metadata + "\n")
+//   res.write("data: " + JSON.stringify(format(parsed)) + "\n\n")
+// DEFECT: exceptions from JSON.parse propagate in TS (no catch);
+// here a parse failure skips the event (logged divergence).
+fn writeEvent(res_handle: u64, event_ptr: ptr, event_len: u64, is_gemini: bool) -> void {
+    // Assemble data payload and metadata from the event lines.
+    let data = [0u8; 32768];
+    let data_len: u64 = 0;
+    let meta = [0u8; 8192];
+    let meta_len: u64 = 0;
+    let pos: u64 = 0;
+    while pos < event_len {
+        let line_end = pos;
+        while line_end < event_len {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, event_ptr, line_end);
+            if b == 10 { break; };
+            line_end = line_end + 1;
+        }
+        let line_len = line_end - pos;
+        // strip trailing \r
+        if line_len > 0 {
+            let lb: u8 = 0;
+            PTR_BYTE_AT(lb, event_ptr, pos + line_len - 1);
+            if lb == 13 { line_len = line_len - 1; };
+        };
+        let lp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(lp, event_ptr, pos);
+        if starts_with(lp, line_len, STR_PTR("data:"), STR_LEN("data:")) {
+            // line.slice(5).trimStart()
+            let sp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(sp, event_ptr, pos + 5);
+            let sl = line_len - 5;
+            while sl > 0 {
+                let fb: u8 = 0;
+                PTR_BYTE_AT(fb, sp, 0);
+                if fb != 32 && fb != 9 { break; };
+                sp = byte_off(sp, 1);
+                sl = sl - 1;
+            }
+            if data_len > 0 { data_len = data_len + append_bytes(&data, 32768, data_len, STR_PTR("\n"), 1); };
+            data_len = data_len + append_bytes(&data, 32768, data_len, sp, sl);
+        } else {
+            if meta_len > 0 { meta_len = meta_len + append_bytes(&meta, 8192, meta_len, STR_PTR("\n"), 1); };
+            meta_len = meta_len + append_bytes(&meta, 8192, meta_len, lp, line_len);
+        };
+        pos = line_end + 1;
+    }
+    if data_len == 0 || (data_len == 6 && bytes_eq(&data, STR_PTR("[DONE]"), 6)) {
+        if event_len > 0 {
+            sa_io_write_all(res_handle, event_ptr, event_len);
+            sa_io_write_all(res_handle, STR_PTR("\n\n"), STR_LEN("\n\n"));
+        };
+        return;
+    };
+    let doc = sa_json_parse(&data, data_len);
+    if doc == 0 { return; };
+    let out_doc: u64 = 0;
+    formatAgyGeminiResponse(doc, is_gemini, &out_doc);
+    if meta_len > 0 {
+        sa_io_write_all(res_handle, &meta, meta_len);
+        sa_io_write_all(res_handle, STR_PTR("\n"), STR_LEN("\n"));
+    };
+    sa_io_write_all(res_handle, STR_PTR("data: "), STR_LEN("data: "));
+    let sh: u64 = 0;
+    if sa_json_stringify(out_doc, &sh) == 0 {
+        sa_io_write_all(res_handle, sa_json_buffer_data(sh), sa_json_buffer_len(sh));
+    };
+    sa_io_write_all(res_handle, STR_PTR("\n\n"), STR_LEN("\n\n"));
+}
+
+// ---- local helpers ----
+
+fn starts_with(p: ptr, n: u64, prefix: ptr, prefix_len: u64) -> bool {
+    if n < prefix_len { return false; };
+    for i in 0..prefix_len {
+        let a: u8 = 0;
+        let b: u8 = 0;
+        PTR_BYTE_AT(a, p, i);
+        PTR_BYTE_AT(b, prefix, i);
+        if a != b { return false; };
+    }
+    return true;
+}
+
+fn bytes_eq(a: ptr, b: ptr, n: u64) -> bool {
+    for i in 0..n {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a, i);
+        PTR_BYTE_AT(y, b, i);
+        if x != y { return false; };
+    }
+    return true;
+}
+
+fn append_bytes(dst: ptr, cap: u64, at: u64, src: ptr, n: u64) -> u64 {
+    let w: u64 = 0;
+    for i in 0..n {
+        if at + w < cap {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, src, i);
+            PTR_BYTE_SET(dst, at + w, b);
+            w = w + 1;
+        };
+    }
+    return w;
+}
+
+fn byte_off(p: ptr, off: u64) -> ptr {
+    let r: ptr = PTR_NULL();
+    PTR_BYTE_ADD(r, p, off);
+    return r;
+}
+
+// find_event_boundary: locate /\r?\n\r?\n/ — returns the index
+// where the event text ends and writes the boundary length
+// (2, 3, or 4) to out_len; 4294967295 when no boundary.
+fn find_event_boundary(buf: ptr, n: u64, out_len: &u64) -> u64 {
+    let i: u64 = 0;
+    while i < n {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, buf, i);
+        if b == 10 {
+            // \n then optional \r then \n
+            let j = i + 1;
+            let b2: u8 = 0;
+            if j < n { PTR_BYTE_AT(b2, buf, j); };
+            if j < n && b2 == 13 { j = j + 1; if j < n { PTR_BYTE_AT(b2, buf, j); }; };
+            if j < n && b2 == 10 {
+                out_len = (j + 1) - i;
+                return i;
+            };
+        };
+        i = i + 1;
+    }
+    return 4294967295;
+}
+
+fn trim_nonempty(buf: ptr, n: u64) -> bool {
+    for i in 0..n {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, buf, i);
+        if b != 32 && b != 9 && b != 10 && b != 13 { return true; };
+    }
+    return false;
+}
