@@ -256,3 +256,27 @@ MINI_MCP_CONFIG path (.toml suffix selects TOML), then
 .mini-agent/mcp.json. The acceptance suite's live MCP
 round now runs on the TOML config; mcpSmoke covers both
 formats (each with exactly one initialize).
+
+## v16 — plan persistence + termination rule (CXU 0.1.5/0.1.10)
+
+- `Thread` carries the current plan verbatim (`plan_bytes`
+  4096 + `plan_len`): the `update_plan` dispatch stores the
+  model's plan array on every call, and `threadStore`
+  persists it in a `<!--mini-plan-begin-->` block after the
+  messages (absent in older thread files; load defaults to
+  no plan), so a plan survives restarts and later turns.
+- Termination rule (CXU 0.1.10): a text round no longer
+  completes the turn while the stored plan has `pending` or
+  `in_progress` steps. The bridge appends a continuation
+  user message ("Continue: the plan still has unfinished
+  steps...") and loops. No budget cap, faithful to CXU; the
+  brakes are client disconnect, upstream error, and the
+  message-buffer ceiling. A completed (or empty) plan
+  completes normally.
+- Offline proof: `scripts/planSmoke` — a scripted double
+  answers update_plan(unfinished), text, update_plan(all
+  completed), text; the bridge must issue all four
+  requests, complete exactly once, and persist the final
+  plan. Live suite green on the Kilo channel (the oaifree
+  key began returning 401 on 2026-10-25 ~23:47,
+  channel-side).

@@ -233,3 +233,18 @@ ids: the relay translates between the two protocols).
   are per-turn rather than cross-turn daemons, and the
   bridge caps persistent sessions at four servers (extras
   are per-call).
+
+- SLA flattener `ForbiddenSyntax: InvalidLiteral` can be a
+  malformed string literal produced by the PATCH SCRIPT,
+  not the language: when a Python triple-quoted patch
+  string ends with an escaped quote right before its
+  closing quotes, the quote character is eaten and the
+  generated SLA literal breaks. Bisect by removal plus
+  standalone probes before blaming the compiler (v16 lost
+  two rounds to this; the literal text, continue-in-if,
+  and the helper were all innocent). The same trap broke
+  the first v16 docs script itself.
+- `pgrep -f <pattern>` over ssh matches the remote shell's
+  own command line — suite liveness checks must use the
+  log mtime or the listen port instead (v16 verification
+  wasted ~15 minutes watching a finished suite).
