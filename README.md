@@ -60,5 +60,27 @@ framing checks; EOF mid-round is a hard failure).
 Slice 3 (landed): child argument vectors — `CXU_AGENT_CMDLINE`
 carries a full command line (space-tokenized, max 4 tokens, no
 quoting), e.g. `CXU_AGENT_CMDLINE="/bin/cat -u"`; smoke covers all
-three selection paths. Next: the live codex round (needs a codex
-CLI install + login on the build machine).
+three selection paths.
+Slice 4 (landed): request lines are env-overridable — `CXU_REQ1` /
+`CXU_REQ2` replace the default ping lines (newline appended when
+missing), so protocol shapes need no recompile.
+
+## Live codex round (ready to fire)
+
+With a codex CLI installed and logged in on the build machine:
+
+```sh
+CXU_AGENT_CMDLINE="codex app-server --stdio" \
+CXU_REQ1='{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-tui","title":"Codex TUI","version":"0.1.0"},"capabilities":{"experimentalApi":true,"mcpServerOpenaiFormElicitation":true}}}' \
+CXU_REQ2='{"method":"initialized","params":{}}' \
+./src/main
+```
+
+The two request lines are byte-for-byte the handshake the TS bridge
+sends (extracted from apps/server codex bridge: spawn args
+`app-server --stdio`, initialize params with the codex-tui clientInfo
+and experimentalApi capability, then the `initialized`
+notification). Exit 0 = the app-server answered initialize with a
+JSON line and accepted the session shape. A real turn
+(thread/start, turn/start, streamed notifications) is the next
+slice after this answers.

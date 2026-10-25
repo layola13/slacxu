@@ -14,4 +14,12 @@ timeout 300 sa build-exe src/main.sla || { echo "BRIDGE BUILD FAILED"; exit 1; }
 timeout 30 ./src/main || { echo "CAT ROUND FAILED rc=$?"; exit 1; }
 CXU_AGENT_CMD="$PWD/fake_agent.sh" timeout 30 ./src/main || { echo "AGENT ROUND FAILED rc=$?"; exit 1; }
 CXU_AGENT_CMDLINE="/bin/cat -u" timeout 30 ./src/main || { echo "CMDLINE ROUND FAILED rc=$?"; exit 1; }
+# Codex app-server handshake shapes (extracted from the TS bridge):
+# spawn `codex app-server --stdio`, send initialize, then the
+# initialized notification. Echoed through cat here; the same env
+# lines drive the live codex round unchanged.
+CXU_AGENT_CMDLINE="/bin/cat -u" \
+CXU_REQ1='{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-tui","title":"Codex TUI","version":"0.1.0"},"capabilities":{"experimentalApi":true,"mcpServerOpenaiFormElicitation":true}}}' \
+CXU_REQ2='{"method":"initialized","params":{}}' \
+timeout 30 ./src/main || { echo "CODEX SHAPE ROUND FAILED rc=$?"; exit 1; }
 echo "cxu-bridge smoke ok"
