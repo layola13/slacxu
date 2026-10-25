@@ -61,4 +61,31 @@ OUT4=$(timeout 120 curl -sN -X POST http://127.0.0.1:18086/api/chat \
   -d '{"prompt":"What code word did I ask you to remember earlier? Reply with exactly the code word and nothing else.","threadId":"t-persist"}')
 echo "$OUT4" | grep -q '"text":"BANANA42"' || { echo "PERSIST RECALL FAILED"; echo "$OUT4" | tail -3; exit 1; }
 echo "mini-agent persistence recall ok"
+
+OUT5=$(timeout 180 curl -sN -X POST http://127.0.0.1:18086/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Find files with bridge in the name under the current directory using the find_files tool, then tell me one path you found.","threadId":"t-find"}')
+echo "$OUT5" | grep -q '"action":"find_files"' || { echo "FIND TURN FAILED (no find_files)"; echo "$OUT5" | tail -3; exit 1; }
+echo "$OUT5" | grep -q 'mini_bridge' || { echo "FIND TURN FAILED (no mini_bridge path)"; echo "$OUT5" | tail -3; exit 1; }
+echo "$OUT5" | grep -q '"method":"turn/completed"' || { echo "FIND TURN FAILED (no turn/completed)"; echo "$OUT5" | tail -3; exit 1; }
+echo "mini-agent find_files ok"
+
+OUT6=$(timeout 180 curl -sN -X POST http://127.0.0.1:18086/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Use the run_host tool to run /bin/pwd with no arguments, then tell me exactly what it printed.","threadId":"t-exec"}')
+echo "$OUT6" | grep -q '"action":"run_host"' || { echo "EXEC TURN FAILED (no run_host)"; echo "$OUT6" | tail -3; exit 1; }
+echo "$OUT6" | grep -q 'apps/server' || { echo "EXEC TURN FAILED (no cwd in output)"; echo "$OUT6" | tail -3; exit 1; }
+echo "$OUT6" | grep -q '"method":"turn/completed"' || { echo "EXEC TURN FAILED (no turn/completed)"; echo "$OUT6" | tail -3; exit 1; }
+echo "mini-agent run_host ok"
+
+mkdir -p .claude/skills/demo
+printf 'DEMO SKILL BODY: always answer in haiku form.\n' > .claude/skills/demo/SKILL.md
+OUT7=$(timeout 180 curl -sN -X POST http://127.0.0.1:18086/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Read the demo skill with the read_skill tool and tell me what the skill body says.","threadId":"t-skill"}')
+rm -rf .claude
+echo "$OUT7" | grep -q '"name":"read_skill"' || { echo "SKILL TURN FAILED (no read_skill)"; echo "$OUT7" | tail -3; exit 1; }
+echo "$OUT7" | grep -qi 'haiku' || { echo "SKILL TURN FAILED (no haiku)"; echo "$OUT7" | tail -3; exit 1; }
+echo "$OUT7" | grep -q '"method":"turn/completed"' || { echo "SKILL TURN FAILED (no turn/completed)"; echo "$OUT7" | tail -3; exit 1; }
+echo "mini-agent read_skill ok"
 echo "mini-agent e2e ok"

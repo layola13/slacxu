@@ -66,15 +66,17 @@ this list to be complete when the live codex turn lands.
    import resolution, not the code just written.
 
 
-## Imported-file limits (found by mini-agent v2, 2026-10-25)
+## mini-agent v3/v4 notes (2026-10-25)
 
-- The SLA import expander rejects functions in @imported files
-  that declare very large array locals (a 40960-byte array
-  local fails with an unlocated error.SyntaxError; 4096 works;
-  root files are exempt). Large scratch buffers must be
-  caller-allocated and passed as &Struct parameters. Concatenating
-  the imported file plus its caller into one root file restores
-  located parse errors and is the reliable bisect method.
-- A `while` block followed by `;` (notably inside if/else
-  branches) trips "Unexpected prefix token: semicolon" in the
-  same expansion path; `if` blocks may keep their `;`.
+- An SLA user function named `str_eq` collides with a checker
+  intrinsic of the same name: calls report InvalidArgsCount
+  against the 4-parameter definition. Rename user helpers to
+  distinctive names (bytes_eq_str) instead of fighting it.
+- sa_vm run_host drains stdout only; a child that fills its
+  stderr pipe can block. CXU's runtime buffers both; a dual
+  drain (or redirecting stderr into the capture) is future
+  work, stated here rather than hidden.
+- The live thread's 40960-byte message cap also bounds
+  persisted threads: thread_store restores at most the same
+  bytes the live thread enforces, so restore is lossless by
+  construction.

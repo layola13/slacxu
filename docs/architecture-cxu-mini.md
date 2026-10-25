@@ -50,12 +50,12 @@ agentRuntime/*`, `apps/web` waterfall item rendering.
 
 | CXU | slacxu | status |
 |---|---|---|
-| miniBridge.ts (turn loop) | apps/server/src/mini_bridge.sla | done (v2): loop + items + history + intent forcing |
+| miniBridge.ts (turn loop) | src/mini_bridge.sla | v2: loop + items + sa_vm subset |
 | relay gateway (chat, stream) | Kilo gateway free channel via std sse_turn / sse stream | done (v1 relay proven) |
-| saVmTool.ts (sa_vm actions) | apps/server/src/sa_vm.sla — list_dir, read_file | done (v2) |
-| item event stream to web | apps/server/src/main.sla emits the same method vocabulary as SSE lines | done (v2) |
-| apps/web waterfall | apps/web/index.html renders items (user / toolCall / agent segments) | done (v2) |
-| file-per-thread history | apps/server/src/agent_runtime/thread_store.sla | done: frontmatter + marker-delimited raw messages, restore on thread switch, verified across a server restart (code-word recall) |
+| saVmTool.ts (sa_vm actions) | src/sa_vm.sla — list_dir, read_file first | v2 |
+| item event stream to web | server.sla emits the same method vocabulary as SSE lines | v2 |
+| apps/web waterfall | www/index.html renders items (user / reasoning / toolCall / agent segments) | v2 |
+| file-per-thread history | src/thread_store (slice B) | planned |
 | read_skill / skills roots | — | later slice |
 | update_plan / plan item | — | later slice |
 | MCP (mcp__server__tool) | — | later slice |
@@ -68,6 +68,6 @@ agentRuntime/*`, `apps/web` waterfall item rendering.
   slacxu v2 exposes POST /api/chat returning the item-event
   stream as SSE. The event vocabulary and item shapes match;
   the carrier is simpler.
-- One process, one live thread in memory; its file is rewritten after every turn and restored on thread switch or restart.
+- One process, threads in memory; file persistence is slice B.
 - Tool subset: list_dir + read_file only; run_host and the rest
   follow as their own slices.
