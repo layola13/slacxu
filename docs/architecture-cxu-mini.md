@@ -117,3 +117,5 @@ process.sa PROCESS_ARGV_SET_PTR (slot-computed argv entries,
 verified from SLA). Deleted: apps/server/src/{byteseq,ptradd,
 argvfill}.sa and packages/cxu-bridge/src/{argv1,argvfill,
 ptradd}.sa (argv1's ARGV_FILL1 had no call sites left).
+
+Verification (2026-10-25): full suite 13/13 lines green in ONE run on the oaifree Responses wire (gpt-6-luna), including the reasoning round (summary deltas become reasoning items) and the spawn_agent round. The chat wire on the same relay passes everything except reasoning (not exposed there).
