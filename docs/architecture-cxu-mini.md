@@ -50,9 +50,9 @@ agentRuntime/*`, `apps/web` waterfall item rendering.
 
 | CXU | slacxu | status |
 |---|---|---|
-| miniBridge.ts (turn loop) | src/mini_bridge.sla | v2: loop + items + sa_vm subset |
+| miniBridge.ts (turn loop) | src/miniBridge.sla | v2: loop + items + sa_vm subset |
 | relay gateway (chat, stream) | Kilo gateway free channel via std sse_turn / sse stream | done (v1 relay proven) |
-| saVmTool.ts (sa_vm actions) | src/sa_vm.sla — list_dir, read_file first | v2 |
+| saVmTool.ts (sa_vm actions) | src/saVmTool.sla — list_dir, read_file first | v2 |
 | item event stream to web | server.sla emits the same method vocabulary as SSE lines | v2 |
 | apps/web waterfall | www/index.html renders items (user / reasoning / toolCall / agent segments) | v2 |
 | file-per-thread history | src/thread_store (slice B) | planned |
@@ -71,16 +71,16 @@ agentRuntime/*`, `apps/web` waterfall item rendering.
 - One process, threads in memory; file persistence is slice B.
 - Tool subset: list_dir + read_file only; run_host and the rest
   follow as their own slices.
-| reasoning items | apps/server/src/mini_bridge.sla + std sse_turn_ex reasoning accumulation | done: item/started + item/reasoning/textDelta + item/completed per round when the channel streamed reasoning; the page renders reasoning blocks dimmed |
+| reasoning items | apps/server/src/miniBridge.sla + std sse_turn_ex reasoning accumulation | done: item/started + item/reasoning/textDelta + item/completed per round when the channel streamed reasoning; the page renders reasoning blocks dimmed |
 
 
 ## v8 landing notes (2026-10-25)
 
 | CXU | slacxu | status |
 |---|---|---|
-| spawn_agent family | apps/server/src/mini_bridge.sla - spawn_agent tool, depth <= 1, child thread <parent>-sub-<n> with its own turn loop and item stream, final answer returned as the tool result | done: verified live on the deepkey grok-4.7 channel (child thread t-spawn-sub-1 ran list_dir and reported run.sh; the parent completed with the child answer). Child threads are not persisted (stated divergence); CXU concurrency <= 5 is not replicated - sub-agents run sequentially |
-| relay gateway configuration | apps/server/src/mini_bridge.sla - MINI_RELAY_URL / MINI_RELAY_KEY / MINI_MODEL env vars override the channel; defaults unchanged (keyless Kilo gateway, kilo-auto/free) | done: the whole verification suite ran through the env-configured deepkey channel |
-| sa_vm find_files pattern | apps/server/src/sa_vm.sla - surrounding '*' of glob-style patterns are stripped before the substring match | done: grok sends "*bridge*"; Kilo-era models sent the bare substring |
+| spawn_agent family | apps/server/src/miniBridge.sla - spawn_agent tool, depth <= 1, child thread <parent>-sub-<n> with its own turn loop and item stream, final answer returned as the tool result | done: verified live on the deepkey grok-4.7 channel (child thread t-spawn-sub-1 ran list_dir and reported run.sh; the parent completed with the child answer). Child threads are not persisted (stated divergence); CXU concurrency <= 5 is not replicated - sub-agents run sequentially |
+| relay gateway configuration | apps/server/src/miniBridge.sla - MINI_RELAY_URL / MINI_RELAY_KEY / MINI_MODEL env vars override the channel; defaults unchanged (keyless Kilo gateway, kilo-auto/free) | done: the whole verification suite ran through the env-configured deepkey channel |
+| sa_vm find_files pattern | apps/server/src/saVmTool.sla - surrounding '*' of glob-style patterns are stripped before the substring match | done: grok sends "*bridge*"; Kilo-era models sent the bare substring |
 
 Verification note (2026-10-25): in one clean run.sh run on
 grok-4.7 the suite passed page, text, tool, thread file,
@@ -119,3 +119,39 @@ argvfill}.sa and packages/cxu-bridge/src/{argv1,argvfill,
 ptradd}.sa (argv1's ARGV_FILL1 had no call sites left).
 
 Verification (2026-10-25): full suite 13/13 lines green in ONE run on the oaifree Responses wire (gpt-6-luna), including the reasoning round (summary deltas become reasoning items) and the spawn_agent round. The chat wire on the same relay passes everything except reasoning (not exposed there).
+
+## v10 layout alignment (2026-10-25)
+
+Directory layout and file names now mirror codex-react-ui
+strictly for the Mini Agent scope: apps/server/src holds
+index.sla (was main.sla), miniBridge.sla, saVmTool.sla and
+codeCliBridge.sla (the P1 bridge kernel, moved out of the
+former packages/cxu-bridge); thread persistence lives at
+apps/server/src/runtime/threadStore.sla; apps/web is
+index.html + src/main.js + public/favicon.svg, served at /,
+/src/main.js and /favicon.svg; the smokes live under scripts/
+(mini-agent-smoke.sh, codeCliBridgeSmoke/ with the harness
+entry and protocol doubles). The packages/ layer is gone --
+the root sa.mod lists apps/server only. The suite's find_files
+expectation follows the rename (pattern "Bridge", path
+miniBridge.sla).
+
+Style: counted loops use SLA `for x in 0..n` throughout the
+server sources (36 loops converted from hand-written while);
+the remaining while loops are scans, polling or guard loops.
+
+Operational note: MINI_RELAY_URL is a FULL endpoint URL
+(.../chat/completions or .../responses); the bridge appends
+nothing. Passing a bare base URL yields upstream 404s that
+surface as "upstream error" (root-caused 2026-10-25 after
+three mislaunched verification runs).
+
+Verification (2026-10-25, after a full environment restore on
+a fresh Colab runtime): full suite green in ONE run on the
+oaifree Responses wire (gpt-6-luna) on the new layout --
+page, web js, text, tool, thread file, persistence recall,
+find_files, run_host, read_skill, update_plan, token usage,
+reasoning, spawn_agent, e2e. The reasoning round is subject
+to relay variance (measured 1-in-3 summary hit rate with
+tools attached that evening); the bridge emits a reasoning
+item only when the channel actually streams a summary.

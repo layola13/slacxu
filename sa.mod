@@ -1,4 +1,4 @@
 workspace {
-  members ["apps/server", "packages/cxu-bridge"]
+  members ["apps/server"]
   default_member "server"
 }

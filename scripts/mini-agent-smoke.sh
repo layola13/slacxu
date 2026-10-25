@@ -9,15 +9,15 @@
 set -u
 export PATH=/content/sa_all/sci/zig-out/bin:/content/sa_all/sa_plugin_sla/zig-out/bin:$PATH
 export SA_PLUGIN_DEV=1 SLA_NO_FRESHNESS_CACHE=1
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../apps/server"
 
-rm -f src/main src/main.sa src/main.sa.bc
-timeout 600 sa build-exe src/main.sla || { echo "MINI BUILD FAILED"; exit 1; }
+rm -f src/index src/index.sa src/index.sa.bc
+timeout 600 sa build-exe src/index.sla || { echo "MINI BUILD FAILED"; exit 1; }
 rm -rf threads
 
 SRV_PID=""
 start_server() {
-  ./src/main & SRV_PID=$!
+  ./src/index & SRV_PID=$!
   curl -s --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:18086/ > /dev/null || { echo "SERVER START FAILED"; exit 1; }
 }
 stop_server() {
@@ -30,6 +30,8 @@ start_server
 PAGE=$(curl -s http://127.0.0.1:18086/)
 echo "$PAGE" | grep -q "Mini Agent" || { echo "PAGE CHECK FAILED"; exit 1; }
 echo "mini-agent page ok"
+curl -s http://127.0.0.1:18086/src/main.js | grep -q "api/chat" || { echo "JS CHECK FAILED"; exit 1; }
+echo "mini-agent web js ok"
 
 OUT1=$(timeout 120 curl -sN -X POST http://127.0.0.1:18086/api/chat \
   -H "Content-Type: application/json" \
@@ -64,9 +66,9 @@ echo "mini-agent persistence recall ok"
 
 OUT5=$(timeout 180 curl -sN -X POST http://127.0.0.1:18086/api/chat \
   -H "Content-Type: application/json" \
-  -d '{"prompt":"Find files with bridge in the name under the current directory using the find_files tool, then tell me one path you found.","threadId":"t-find"}')
+  -d '{"prompt":"Find files with Bridge in the name under the current directory using the find_files tool, then tell me one path you found.","threadId":"t-find"}')
 echo "$OUT5" | grep -q '"action":"find_files"' || { echo "FIND TURN FAILED (no find_files)"; echo "$OUT5" | tail -3; exit 1; }
-echo "$OUT5" | grep -q 'mini_bridge' || { echo "FIND TURN FAILED (no mini_bridge path)"; echo "$OUT5" | tail -3; exit 1; }
+echo "$OUT5" | grep -q 'miniBridge' || { echo "FIND TURN FAILED (no miniBridge path)"; echo "$OUT5" | tail -3; exit 1; }
 echo "$OUT5" | grep -q '"method":"turn/completed"' || { echo "FIND TURN FAILED (no turn/completed)"; echo "$OUT5" | tail -3; exit 1; }
 echo "mini-agent find_files ok"
 

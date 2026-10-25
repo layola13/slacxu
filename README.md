@@ -31,15 +31,24 @@ repo is where those proven pieces become the real project.
 ## Layout
 
 ```
-sa.mod                     workspace manifest
-packages/
-  cxu-bridge/              P1 pilot: stdio bridge to an agent CLI
+sa.mod                     workspace manifest (member: apps/server)
+apps/
+  server/
     sa.mod
-    src/main.sla           entry: CXU_AGENT_CMD selects the child
-    src/bridge.sla         spawn/pump kernel (from demo D1)
-    src/argv1.sa           argv fill macro
-    fake_agent.sh          stand-in agent for offline runs
-    run.sh                 build + smoke (cat echo + fake agent)
+    src/index.sla          HTTP surface (entry)
+    src/miniBridge.sla     turn loop (thread/turn/item events)
+    src/saVmTool.sla       sa_vm actions, read_skill, update_plan
+    src/codeCliBridge.sla  stdio bridge kernel to an agent CLI (P1)
+    src/helpers.sla        shared byte-buffer helpers
+    src/runtime/threadStore.sla  file-per-thread history
+  web/
+    index.html             waterfall page
+    src/main.js            page client (served at /src/main.js)
+    public/favicon.svg     served at /favicon.svg
+scripts/
+  mini-agent-smoke.sh      end-to-end suite (server + web + agent)
+  codeCliBridgeSmoke/      bridge harness + protocol doubles
+docs/                      architecture mapping + wall list
 ```
 
 ## Build & smoke
@@ -47,7 +56,8 @@ packages/
 ```sh
 export PATH=<sci>/zig-out/bin:<sa_plugin_sla>/zig-out/bin:$PATH
 export SA_PLUGIN_DEV=1
-cd packages/cxu-bridge && bash run.sh
+bash scripts/codeCliBridgeSmoke/run.sh   # bridge smoke
+bash scripts/mini-agent-smoke.sh         # full mini-agent suite (live relay)
 ```
 
 The bridge child defaults to `/bin/cat` (echo smoke). Point
@@ -147,6 +157,6 @@ with message history across turns, the turn loop, tool_choice
 "required" on action-intent first turns, and the codex item
 event vocabulary over SSE. Stated limits: one request at a
 time (single-threaded accept loop), threads in memory (file
-now landed: agent_runtime/thread_store.sla), sa_vm subset (list_dir,
+now landed: runtime/threadStore.sla), sa_vm subset (list_dir,
 read_file), and text arrives as one delta per turn because the
 std sse_turn call aggregates the upstream stream.

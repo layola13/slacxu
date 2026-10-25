@@ -6,14 +6,14 @@ cd "$(dirname "$0")"
 export PATH=/content/sa_all/sci/zig-out/bin:/content/sa_all/sa_plugin_sla/zig-out/bin:/tools/node/bin:$PATH
 export SA_PLUGIN_DEV=1
 
-rm -f src/main src/main.sa src/main.sa.bc
-timeout 300 sa build-exe src/main.sla || { echo "BRIDGE BUILD FAILED"; exit 1; }
+rm -f main main.sa main.sa.bc
+timeout 300 sa build-exe main.sla || { echo "BRIDGE BUILD FAILED"; exit 1; }
 # build-exe places the binary next to the source file.
-[ -x ./src/main ] || { echo "BRIDGE BINARY MISSING"; ls src; exit 1; }
+[ -x ./main ] || { echo "BRIDGE BINARY MISSING"; ls; exit 1; }
 
-timeout 30 ./src/main || { echo "CAT ROUND FAILED rc=$?"; exit 1; }
-CXU_AGENT_CMD="$PWD/fake_agent.sh" timeout 30 ./src/main || { echo "AGENT ROUND FAILED rc=$?"; exit 1; }
-CXU_AGENT_CMDLINE="/bin/cat -u" timeout 30 ./src/main || { echo "CMDLINE ROUND FAILED rc=$?"; exit 1; }
+timeout 30 ./main || { echo "CAT ROUND FAILED rc=$?"; exit 1; }
+CXU_AGENT_CMD="$PWD/fake_agent.sh" timeout 30 ./main || { echo "AGENT ROUND FAILED rc=$?"; exit 1; }
+CXU_AGENT_CMDLINE="/bin/cat -u" timeout 30 ./main || { echo "CMDLINE ROUND FAILED rc=$?"; exit 1; }
 # Codex app-server handshake shapes (extracted from the TS bridge):
 # spawn `codex app-server --stdio`, send initialize, then the
 # initialized notification. Echoed through cat here; the same env
@@ -21,7 +21,7 @@ CXU_AGENT_CMDLINE="/bin/cat -u" timeout 30 ./src/main || { echo "CMDLINE ROUND F
 CXU_AGENT_CMDLINE="/bin/cat -u" \
 CXU_REQ1='{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-tui","title":"Codex TUI","version":"0.1.0"},"capabilities":{"experimentalApi":true,"mcpServerOpenaiFormElicitation":true}}}' \
 CXU_REQ2='{"method":"initialized","params":{}}' \
-timeout 30 ./src/main || { echo "CODEX SHAPE ROUND FAILED rc=$?"; exit 1; }
+timeout 30 ./main || { echo "CODEX SHAPE ROUND FAILED rc=$?"; exit 1; }
 # Slice 5 session phase against the protocol double: the turn only
 # completes when the bridge splices the issued thread id into
 # turn/start, so a green run proves extraction + splicing + stream
@@ -33,7 +33,7 @@ CXU_REQ2='{"id":2,"method":"thread/list","params":{}}' \
 CXU_REQ3='{"id":3,"method":"thread/start","params":{}}' \
 CXU_REQ4_PRE='{"id":4,"method":"turn/start","params":{"threadId":"' \
 CXU_REQ4_POST='","input":[{"type":"text","text":"Reply with exactly: ok"}]}}' \
-timeout 30 ./src/main || { echo "SESSION ROUND FAILED rc=$?"; exit 1; }
+timeout 30 ./main || { echo "SESSION ROUND FAILED rc=$?"; exit 1; }
 echo "cxu-bridge turn ok"
 # P2 generalized driver against the ACP double (opencode shape):
 # the id comes from round 2 (session/new), the prompt is phase A
@@ -46,6 +46,6 @@ CXU_MARKER='"sessionId":"' \
 CXU_REQ3_PRE='{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"' \
 CXU_REQ3_POST='","prompt":[{"type":"text","text":"Reply with exactly: ok"}]}}' \
 CXU_ID3='"stopReason"' \
-timeout 30 ./src/main || { echo "ACP ROUND FAILED rc=$?"; exit 1; }
+timeout 30 ./main || { echo "ACP ROUND FAILED rc=$?"; exit 1; }
 echo "cxu-bridge acp ok"
 echo "cxu-bridge smoke ok"
