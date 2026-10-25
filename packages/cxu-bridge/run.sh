@@ -13,4 +13,5 @@ timeout 300 sa build-exe src/main.sla || { echo "BRIDGE BUILD FAILED"; exit 1; }
 
 timeout 30 ./src/main || { echo "CAT ROUND FAILED rc=$?"; exit 1; }
 CXU_AGENT_CMD="$PWD/fake_agent.sh" timeout 30 ./src/main || { echo "AGENT ROUND FAILED rc=$?"; exit 1; }
+CXU_AGENT_CMDLINE="/bin/cat -u" timeout 30 ./src/main || { echo "CMDLINE ROUND FAILED rc=$?"; exit 1; }
 echo "cxu-bridge smoke ok"

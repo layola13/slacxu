@@ -56,6 +56,9 @@ a single executable path in this slice (no argument splitting yet).
 
 Slice 2 (landed): the pump is multi-round — stdin stays open while
 replies are read line by line (two rounds, ids 1 and 2, per-round
-framing checks; EOF mid-round is a hard failure). Next: argument
-vectors for the child (a real agent CLI needs flags), then the live
-codex round.
+framing checks; EOF mid-round is a hard failure).
+Slice 3 (landed): child argument vectors — `CXU_AGENT_CMDLINE`
+carries a full command line (space-tokenized, max 4 tokens, no
+quoting), e.g. `CXU_AGENT_CMDLINE="/bin/cat -u"`; smoke covers all
+three selection paths. Next: the live codex round (needs a codex
+CLI install + login on the build machine).
