@@ -129,3 +129,17 @@ this list to be complete when the live codex turn lands.
   quota is per egress IP: the Colab box stayed limited
   (429 PROMOTION_MODEL_LIMIT_REACHED) while this machine's
   egress had already recovered.
+
+
+## oaifree responses relay: tool_choice "required" is rejected
+
+On https://hub.oaifree.com/v1/responses (measured 2026-10-25),
+every tool_choice form except the string "auto" fails with
+`Missing required parameter: 'tool_choice.type'` -- the string
+"required", {"type":"required"} and {"type":"auto"} all fail
+identically; omitting tool_choice works and the model still
+calls functions. The bridge therefore sends "auto" on the
+responses wire; the weak-model force-required discipline
+applies to the chat wire only. The chat wire on the same relay
+accepts "required" normally (and its chunks even carry resp_
+ids: the relay translates between the two protocols).

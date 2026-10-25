@@ -90,3 +90,30 @@ on that channel because grok streams no reasoning deltas
 there (its thinking is inline in the answer text); reasoning
 items were verified on Kilo in v7. The spawn round passed
 standalone with the complete child-thread event stream.
+
+
+## v9 landing notes (2026-10-25)
+
+Dual wire APIs, mirroring the CXU miniBridge gateway (chat /
+responses): `MINI_WIRE_API=responses` switches request
+construction to the Responses shape. Thread storage stays
+chat-format (the canonical persisted shape); translation to
+Responses input items happens only while building the request
+(append_input_items in mini_bridge.sla): role messages pass
+through, an assistant tool_calls message becomes one
+function_call item per call, a tool message becomes a
+function_call_output item. Tools use the flat responses schema
+form, the request carries reasoning {summary: "auto"}, and std
+is called with api_mode 0. Usage parsing accepts both key
+families (prompt/completion_tokens and input/output_tokens).
+Default stays chat (Kilo); responses is opt-in per channel.
+
+The local .sa macro files are gone. This is a full-SLA project:
+shared SA belongs in sa_std. BYTES_EQ moved into sci
+sa_std/mem.sa, BYTE_AT_OUT was upstreamed as PTR_BYTE_AT in
+sa_std/ptr.sa, PTR_ADD_OUT call sites use the existing std
+PTR_BYTE_ADD, and the ARGV_SET<i> family was replaced by std
+process.sa PROCESS_ARGV_SET_PTR (slot-computed argv entries,
+verified from SLA). Deleted: apps/server/src/{byteseq,ptradd,
+argvfill}.sa and packages/cxu-bridge/src/{argv1,argvfill,
+ptradd}.sa (argv1's ARGV_FILL1 had no call sites left).
