@@ -120,3 +120,26 @@ ran the whole session — initialize, initialized, thread/list,
 thread/start, id extraction, turn/start, stream through
 turn/completed — in ~11 s, exit 0. That is the P1 acceptance: a
 real codex turn through the SLA backend.
+
+## packages/mini-agent — Mini Agent, front and back (P2 focus)
+
+The SLA rebuild of CXU's Mini Agent as one runnable service
+(`packages/mini-agent/`, port 18086):
+
+- **Backend** (`src/server.sla`): an SLA HTTP server. `GET /`
+  serves the page; `POST /api/chat` with `{"prompt": "..."}`
+  parses the JSON with std json, builds a chat-completions body
+  (prompt JSON-escaped), calls the Kilo gateway free channel
+  through the std SSE client (`sa_http_client_sse_*`, empty API
+  key — the channel is keyless, and rejects bogus tokens), and
+  relays the upstream SSE stream verbatim into a streamed
+  response.
+- **Frontend** (`www/index.html`): a single page that posts the
+  prompt and renders streamed `delta.content` tokens live.
+
+`run.sh` is the end-to-end check: build, serve, page contains
+"Mini Agent", and a real prompt streams back `content:"ok"` plus
+`[DONE]` — `mini-agent e2e ok`. v1 limits, stated plainly: one
+request at a time (single-threaded accept loop), single-turn (no
+history yet), no tool calls yet; the thread of work is making
+this surface grow toward the TS Mini Agent's shape.

@@ -35,4 +35,17 @@ CXU_REQ4_PRE='{"id":4,"method":"turn/start","params":{"threadId":"' \
 CXU_REQ4_POST='","input":[{"type":"text","text":"Reply with exactly: ok"}]}}' \
 timeout 30 ./src/main || { echo "SESSION ROUND FAILED rc=$?"; exit 1; }
 echo "cxu-bridge turn ok"
+# P2 generalized driver against the ACP double (opencode shape):
+# the id comes from round 2 (session/new), the prompt is phase A
+# assembled around it, and the wait needle is the ACP stopReason.
+CXU_AGENT_CMD="$PWD/fake_acp.sh" \
+CXU_REQ1='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"slacxu","version":"0.1"}}}' \
+CXU_REQ2='{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/root","mcpServers":[]}}' \
+CXU_EXTRACT_FROM=2 \
+CXU_MARKER='"sessionId":"' \
+CXU_REQ3_PRE='{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"' \
+CXU_REQ3_POST='","prompt":[{"type":"text","text":"Reply with exactly: ok"}]}}' \
+CXU_ID3='"stopReason"' \
+timeout 30 ./src/main || { echo "ACP ROUND FAILED rc=$?"; exit 1; }
+echo "cxu-bridge acp ok"
 echo "cxu-bridge smoke ok"
