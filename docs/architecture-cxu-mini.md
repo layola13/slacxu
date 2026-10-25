@@ -71,3 +71,4 @@ agentRuntime/*`, `apps/web` waterfall item rendering.
 - One process, threads in memory; file persistence is slice B.
 - Tool subset: list_dir + read_file only; run_host and the rest
   follow as their own slices.
+| reasoning items | apps/server/src/mini_bridge.sla + std sse_turn_ex reasoning accumulation | done: item/started + item/reasoning/textDelta + item/completed per round when the channel streamed reasoning; the page renders reasoning blocks dimmed |

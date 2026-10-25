@@ -106,4 +106,12 @@ OUT9=$(timeout 120 curl -sN -X POST http://127.0.0.1:18086/api/chat \
 echo "$OUT9" | grep -q '"method":"thread/tokenUsage/updated"' || { echo "USAGE TURN FAILED (no usage event)"; echo "$OUT9" | tail -3; exit 1; }
 echo "$OUT9" | grep -qE '"inputTokens":[1-9]' || { echo "USAGE TURN FAILED (no input tokens)"; echo "$OUT9" | tail -3; exit 1; }
 echo "mini-agent token usage ok"
+
+OUT10=$(timeout 180 curl -sN -X POST http://127.0.0.1:18086/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"A bat and a ball cost 1.10 dollars in total. The bat costs 1.00 dollar more than the ball. Think step by step, then tell me exactly how much the ball costs.","threadId":"t-reason"}')
+echo "$OUT10" | grep -q '"type":"reasoning"' || { echo "REASON TURN FAILED (no reasoning item)"; echo "$OUT10" | tail -3; exit 1; }
+echo "$OUT10" | grep -q 'item/reasoning/textDelta' || { echo "REASON TURN FAILED (no reasoning delta)"; echo "$OUT10" | tail -3; exit 1; }
+echo "$OUT10" | grep -q '"method":"turn/completed"' || { echo "REASON TURN FAILED (no turn/completed)"; echo "$OUT10" | tail -3; exit 1; }
+echo "mini-agent reasoning ok"
 echo "mini-agent e2e ok"
