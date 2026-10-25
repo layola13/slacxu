@@ -143,3 +143,25 @@ responses wire; the weak-model force-required discipline
 applies to the chat wire only. The chat wire on the same relay
 accepts "required" normally (and its chunks even carry resp_
 ids: the relay translates between the two protocols).
+
+## mini-agent v11 notes (2026-10-25)
+
+- MCP sessions are per operation: discovery and every
+  tools/call spawn a fresh server process and run initialize
+  each time. Spec-legal for stdio servers and stateless tools;
+  a stateful MCP server (server-side session state across
+  calls) would need persistent connections — future work,
+  stated rather than hidden.
+- sa_print_bytes cannot take a dynamic buffer pointer from
+  SLA: both &struct.field and a PTR_BYTE_ADD-derived ptr trap
+  CapabilityMismatch in SAB codegen. Smoke harnesses print
+  fixed println markers and use exit codes for diagnosis
+  instead of dumping buffers.
+- oaifree reasoning summaries are per-request variance on the
+  relay side, worse in some windows: on 2026-10-25 evening,
+  identical direct probes measured 4 summary deltas on one
+  request and 0 on the next, while the bridge missed 11/11
+  attempts (v9/v10 evenings it hit roughly 1 in 3 with tools
+  attached). The bridge emits a reasoning item only when a
+  summary actually streams, so a bad window reads as a
+  reasoning failure without any code change.

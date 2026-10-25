@@ -124,4 +124,15 @@ echo "$OUT11" | grep -q '"action":"spawn_agent"' || { echo "SPAWN TURN FAILED (n
 echo "$OUT11" | grep -q '"threadId":"t-spawn-sub-' || { echo "SPAWN TURN FAILED (no child thread)"; echo "$OUT11" | tail -3; exit 1; }
 echo "$OUT11" | grep -q '"method":"turn/completed"' || { echo "SPAWN TURN FAILED (no turn/completed)"; echo "$OUT11" | tail -3; exit 1; }
 echo "mini-agent spawn_agent ok"
+
+mkdir -p .mini-agent
+printf '{"servers":[{"name":"fake","cmdline":"python3 ../../scripts/mcpSmoke/fake_mcp.py"}]}' > .mini-agent/mcp.json
+OUT12=$(timeout 180 curl -sN -X POST http://127.0.0.1:18086/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Use the tool mcp__fake__workspace_fact to get the workspace fact word, then tell me exactly what word it returned.","threadId":"t-mcp"}')
+rm -rf .mini-agent
+echo "$OUT12" | grep -q '"name":"mcp__fake__workspace_fact"' || { echo "MCP TURN FAILED (no mcp tool call)"; echo "$OUT12" | tail -3; exit 1; }
+echo "$OUT12" | grep -q 'MCPWORD42' || { echo "MCP TURN FAILED (no fact word)"; echo "$OUT12" | tail -3; exit 1; }
+echo "$OUT12" | grep -q '"method":"turn/completed"' || { echo "MCP TURN FAILED (no turn/completed)"; echo "$OUT12" | tail -3; exit 1; }
+echo "mini-agent mcp ok"
 echo "mini-agent e2e ok"

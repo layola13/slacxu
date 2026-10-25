@@ -155,3 +155,31 @@ reasoning, spawn_agent, e2e. The reasoning round is subject
 to relay variance (measured 1-in-3 summary hit rate with
 tools attached that evening); the bridge emits a reasoning
 item only when the channel actually streams a summary.
+
+## v11 MCP tools (2026-10-25)
+
+CXU parity item closed: MCP tools. apps/server/src/mcpClient.sla
+is a stdio JSON-RPC MCP client. Servers come from a JSON config
+(MINI_MCP_CONFIG env path, default .mini-agent/mcp.json):
+{"servers":[{"name":"demo","cmdline":"python3 server.py"}]}.
+At each top-level turn the bridge discovers tools (spawn,
+initialize, tools/list) and offers every tool to the model as
+mcp__<server>__<tool> (CXU's naming), with the server's own
+inputSchema as the parameters, on both wire forms. Calls run
+session-per-call (spawn, initialize, tools/call) and flatten
+result.content text into the tool result; JSON-RPC errors and
+isError results surface as explicit "error: mcp ..." results,
+and discovery failures emit thread/mcpFailed. Stated
+divergences from CXU: sessions are per-call rather than
+persistent connections, and the config is a JSON file rather
+than [mcp_servers] TOML sections.
+
+Verification (2026-10-25): scripts/mcpSmoke (offline harness
+against fake_mcp.py) green — discover (2 tools recorded),
+echo_text call, workspace_fact call, unknown-tool error.
+Server build green. Live suite on the oaifree Responses wire:
+every round green including the new MCP round
+(mcp__fake__workspace_fact returned MCPWORD42 through the
+bridge) — except the reasoning round, which missed on channel
+variance all evening (see wall-list); the reasoning path is
+unchanged since its v9/v10 green runs.
