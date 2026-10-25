@@ -80,7 +80,17 @@ The two request lines are byte-for-byte the handshake the TS bridge
 sends (extracted from apps/server codex bridge: spawn args
 `app-server --stdio`, initialize params with the codex-tui clientInfo
 and experimentalApi capability, then the `initialized`
-notification). Exit 0 = the app-server answered initialize with a
-JSON line and accepted the session shape. A real turn
-(thread/start, turn/start, streamed notifications) is the next
-slice after this answers.
+notification). One protocol correction landed with the live run:
+`initialized` is a notification and gets NO reply, so the bridge
+gained a write-only step — `CXU_NOTIFY` is written after round 1
+without a read (reading for it deadlocks the session).
+
+**Live result (2026-10-25): PASS.** On the build machine, codex-cli
+0.164.0 with a keyless custom provider (OpenCode Zen free channel,
+`base_url = "https://opencode.ai/zen/v1"`, model `big-pickle`,
+placeholder env key — no OpenAI login) answered initialize through
+the SLA bridge (`userAgent: codex-tui/0.164.0`), accepted the
+notification, and answered `thread/list`; the bridge printed
+`cxu-bridge pump ok`, exit 0. Next: slice 5, a full turn —
+thread/start, thread-id extraction, turn/start, and reading the
+notification stream through turn/completed.
