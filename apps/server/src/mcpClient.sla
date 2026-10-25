@@ -3,8 +3,13 @@
 // model as a first-class tool named mcp__<server>__<tool>; this
 // file implements the stdio JSON-RPC client behind that surface:
 //
-//   config   MINI_MCP_CONFIG env path, default .mini-agent/mcp.json
-//            {"servers":[{"name":"demo","cmdline":"python3 s.py"}]}
+//   config   MINI_MCP_CONFIG env path; default .mini-agent/
+//            config.toml (CXU format: [mcp_servers.<name>] with
+//            command/args, enabled honored) when present, else
+//            .mini-agent/mcp.json {"servers":[{"name":"demo",
+//            "cmdline":"python3 s.py"}]}. TOML is normalized to
+//            the JSON shape at load; routing/calls are blind
+//            to the source format.
 //   discover per top-level turn: spawn each server, initialize,
 //            tools/list, record {full, server, tool, desc, schema}
 //   defs     mcp_append_defs renders the records as relay tool
@@ -28,6 +33,7 @@
 @import "sa_std/process.sai"
 @import "sa_std/io.sai"
 @import "sa_std/encoding/json.sai"
+@import "sa_std/encoding/toml.sai"
 @import "sa_std/string.sa"
 @import "sa_std/ptr.sa"
 @import "sa_std/process.sa"
@@ -520,6 +526,168 @@ fn mcp_discover_server(state: &McpState, slot: u64, srv_ptr: ptr, srv_len: u64, 
 // Loads the MCP config and discovers every configured server.
 // No config file is the normal unconfigured case (zero tools, no
 // error). A config that exists but cannot be parsed is an error.
+
+fn mcp_resp_append(state: &McpState, src_ptr: ptr, src_len: u64) -> void {
+    let byte: u8 = 0;
+    for i in 0..src_len {
+        PTR_BYTE_AT(byte, src_ptr, i);
+        if state.resp_len < 32768 {
+            state.resp_bytes[state.resp_len] = byte;
+            state.resp_len = state.resp_len + 1;
+        };
+    }
+}
+
+fn mcp_resp_append_escaped(state: &McpState, src_ptr: ptr, src_len: u64) -> void {
+    let byte: u8 = 0;
+    for i in 0..src_len {
+        PTR_BYTE_AT(byte, src_ptr, i);
+        if byte == 34 {
+            mcp_resp_append(state, STR_PTR("\\\""), STR_LEN("\\\""));
+        } else if byte == 92 {
+            mcp_resp_append(state, STR_PTR("\\\\"), STR_LEN("\\\\"));
+        } else if byte == 10 {
+            mcp_resp_append(state, STR_PTR("\\n"), STR_LEN("\\n"));
+        } else if byte == 13 {
+            mcp_resp_append(state, STR_PTR("\\r"), STR_LEN("\\r"));
+        } else if byte == 9 {
+            mcp_resp_append(state, STR_PTR("\\t"), STR_LEN("\\t"));
+        } else {
+            if state.resp_len < 32768 {
+                state.resp_bytes[state.resp_len] = byte;
+                state.resp_len = state.resp_len + 1;
+            };
+        };
+    }
+}
+
+fn mcp_cfg_append(state: &McpState, src_ptr: ptr, src_len: u64) -> void {
+    let byte: u8 = 0;
+    for i in 0..src_len {
+        PTR_BYTE_AT(byte, src_ptr, i);
+        if state.cfg_len < 8192 {
+            state.cfg_bytes[state.cfg_len] = byte;
+            state.cfg_len = state.cfg_len + 1;
+        };
+    }
+}
+
+// Builds the dotted TOML path "mcp_servers.<name><suffix>"
+// into state.path_bytes.
+fn mcp_toml_path(state: &McpState, name_ptr: ptr, name_len: u64, suffix_ptr: ptr, suffix_len: u64) -> void {
+    state.path_len = 0;
+    mcp_path_append(state, STR_PTR("mcp_servers."), STR_LEN("mcp_servers."));
+    mcp_path_append(state, name_ptr, name_len);
+    mcp_path_append(state, suffix_ptr, suffix_len);
+}
+
+// TOML config support: state.cfg_bytes holds the raw TOML
+// document (CXU format). Server names come from scanning the
+// [mcp_servers.<name>] headers (the TOML surface has no key
+// enumeration; headers are line-anchored and names are
+// identifier-shaped). Values are read through sa_toml_* by
+// dotted path; the result is normalized into the JSON config
+// shape in state.cfg_bytes so the rest of discovery and all
+// calls stay format-blind. cmdline joins command + args with
+// single spaces (the inverse of mcp_tokenize; args containing
+// spaces are unsupported, as in the JSON form).
+fn mcp_normalize_toml(state: &McpState) -> bool {
+    let doc = sa_toml_parse(&state.cfg_bytes, state.cfg_len);
+    if doc == 0 {
+        mcp_err_append(state, STR_PTR("mcp config is not valid TOML"), STR_LEN("mcp config is not valid TOML"));
+        let ep: ptr = PTR_NULL();
+        let el: u64 = 0;
+        if sa_toml_last_error(&ep, &el) == 0 && el > 0 {
+            mcp_err_append(state, STR_PTR(": "), STR_LEN(": "));
+            mcp_err_append(state, ep, el);
+        };
+        return false;
+    };
+    state.resp_len = 0;
+    mcp_resp_append(state, STR_PTR("{\"servers\":["), STR_LEN("{\"servers\":["));
+    let first = true;
+    let pos: u64 = 0;
+    let at_line_start = true;
+    while pos < state.cfg_len {
+        let b: u8 = state.cfg_bytes[pos];
+        let handled = false;
+        if at_line_start && b == 91 && pos + 13 <= state.cfg_len {
+            let is_hdr = true;
+            for hi in 0..13 {
+                let hb: u8 = 0;
+                PTR_BYTE_AT(hb, STR_PTR("[mcp_servers."), hi);
+                if state.cfg_bytes[pos + hi] != hb { is_hdr = false; };
+            }
+            if is_hdr {
+                let name_start = pos + 13;
+                let k = name_start;
+                while k < state.cfg_len && state.cfg_bytes[k] != 93 && state.cfg_bytes[k] != 10 {
+                    k = k + 1;
+                }
+                if k < state.cfg_len && state.cfg_bytes[k] == 93 && k > name_start && k - name_start < 128 {
+                    let name_len = k - name_start;
+                    let name_ptr: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(name_ptr, &state.cfg_bytes, name_start);
+                    mcp_toml_path(state, name_ptr, name_len, STR_PTR(".enabled"), STR_LEN(".enabled"));
+                    let en: u64 = 1;
+                    let has_en = sa_toml_get_bool(doc, &state.path_bytes, state.path_len, &en) == 0;
+                    let skip = false;
+                    if has_en && en == 0 { skip = true; };
+                    if !skip {
+                        mcp_toml_path(state, name_ptr, name_len, STR_PTR(".command"), STR_LEN(".command"));
+                        let cmd_ptr: ptr = PTR_NULL();
+                        let cmd_len: u64 = 0;
+                        if sa_toml_get_string(doc, &state.path_bytes, state.path_len, &cmd_ptr, &cmd_len) != 0 || cmd_len == 0 {
+                            if state.err_len > 0 { mcp_err_append(state, STR_PTR("; "), STR_LEN("; ")); };
+                            mcp_err_append(state, STR_PTR("mcp config: server "), STR_LEN("mcp config: server "));
+                            mcp_err_append(state, name_ptr, name_len);
+                            mcp_err_append(state, STR_PTR(" missing command"), STR_LEN(" missing command"));
+                        } else {
+                            state.req_len = 0;
+                            mcp_req_append(state, cmd_ptr, cmd_len);
+                            mcp_toml_path(state, name_ptr, name_len, STR_PTR(".args"), STR_LEN(".args"));
+                            let acount: u64 = 0;
+                            if sa_toml_array_len(doc, &state.path_bytes, state.path_len, &acount) == 0 {
+                                for ai in 0..acount {
+                                    let a_ptr: ptr = PTR_NULL();
+                                    let a_len: u64 = 0;
+                                    if sa_toml_array_get_string(doc, &state.path_bytes, state.path_len, ai, &a_ptr, &a_len) == 0 {
+                                        mcp_req_append(state, STR_PTR(" "), STR_LEN(" "));
+                                        mcp_req_append(state, a_ptr, a_len);
+                                    };
+                                }
+                            };
+                            if !first { mcp_resp_append(state, STR_PTR(","), STR_LEN(",")); };
+                            first = false;
+                            mcp_resp_append(state, STR_PTR("{\"name\":\""), STR_LEN("{\"name\":\""));
+                            mcp_resp_append_escaped(state, name_ptr, name_len);
+                            mcp_resp_append(state, STR_PTR("\",\"cmdline\":\""), STR_LEN("\",\"cmdline\":\""));
+                            let req_ptr: ptr = PTR_NULL();
+                            PTR_BYTE_ADD(req_ptr, &state.req_bytes, 0);
+                            mcp_resp_append_escaped(state, req_ptr, state.req_len);
+                            mcp_resp_append(state, STR_PTR("\"}"), STR_LEN("\"}"));
+                        };
+                    };
+                    pos = k;
+                    handled = true;
+                };
+            };
+        };
+        if !handled {
+            if b == 10 { at_line_start = true; } else { at_line_start = false; };
+            pos = pos + 1;
+        };
+    }
+    mcp_resp_append(state, STR_PTR("]}"), STR_LEN("]}"));
+    let resp_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(resp_ptr, &state.resp_bytes, 0);
+    let total_norm = state.resp_len;
+    state.cfg_len = 0;
+    mcp_cfg_append(state, resp_ptr, total_norm);
+    sa_toml_free(doc);
+    return true;
+}
+
 fn mcp_discover(state: &McpState) -> void {
     mcp_close_all(state);
     state.next_req = 100;
@@ -536,8 +704,24 @@ fn mcp_discover(state: &McpState) -> void {
         let vl = sa_env_buffer_len(e_cfg);
         if vl > 0 && vl < 8192 { mcp_path_append(state, vp, vl); };
     };
+    let toml_mode = false;
+    if state.path_len == 0 {
+        let t_probe: u64 = 0;
+        if sa_std_fs_len(STR_PTR(".mini-agent/config.toml"), STR_LEN(".mini-agent/config.toml"), &t_probe) == 0 {
+            mcp_path_append(state, STR_PTR(".mini-agent/config.toml"), STR_LEN(".mini-agent/config.toml"));
+            toml_mode = true;
+        };
+    };
     if state.path_len == 0 {
         mcp_path_append(state, STR_PTR(".mini-agent/mcp.json"), STR_LEN(".mini-agent/mcp.json"));
+    };
+    if !toml_mode && state.path_len >= 5 {
+        let c0: u8 = state.path_bytes[state.path_len - 5];
+        let c1: u8 = state.path_bytes[state.path_len - 4];
+        let c2: u8 = state.path_bytes[state.path_len - 3];
+        let c3: u8 = state.path_bytes[state.path_len - 2];
+        let c4: u8 = state.path_bytes[state.path_len - 1];
+        if c0 == 46 && c1 == 116 && c2 == 111 && c3 == 109 && c4 == 108 { toml_mode = true; };
     };
     let total: u64 = 0;
     if sa_std_fs_len(&state.path_bytes, state.path_len, &total) != 0 {
@@ -563,6 +747,12 @@ fn mcp_discover(state: &McpState) -> void {
         return;
     };
     state.cfg_len = read_n;
+    if toml_mode {
+        if !mcp_normalize_toml(state) {
+            mcp_rec_append(state, STR_PTR("]"), STR_LEN("]"));
+            return;
+        };
+    };
     let doc = sa_json_parse(&state.cfg_bytes, state.cfg_len);
     if doc == 0 {
         mcp_err_append(state, STR_PTR("mcp config is not valid JSON"), STR_LEN("mcp config is not valid JSON"));

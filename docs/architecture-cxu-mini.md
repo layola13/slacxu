@@ -238,3 +238,21 @@ The change flushed out a std deadlock (fixed in sci, see
 wall-list): sse turns now coexist with long-lived child
 processes, which the CXU shape requires anyway (an MCP
 server outlives many relay rounds by design).
+
+## v15 CXU-format TOML MCP config (2026-10-25)
+
+Closes the v11 config-format divergence: discovery now
+accepts CXU's own .mini-agent/config.toml —
+[mcp_servers.<name>] sections with command + args (and
+enabled = false honored) — in addition to the JSON form.
+The TOML document is normalized into the JSON config shape
+at load (server names scanned from the section headers —
+the std TOML surface reads values by dotted path but has
+no key enumeration; cmdline joins command and args with
+single spaces, the inverse of the tokenizer), so routing
+and calls are format-blind. Resolution order: an explicit
+MINI_MCP_CONFIG path (.toml suffix selects TOML), then
+.mini-agent/config.toml when present, then
+.mini-agent/mcp.json. The acceptance suite's live MCP
+round now runs on the TOML config; mcpSmoke covers both
+formats (each with exactly one initialize).

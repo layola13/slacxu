@@ -224,3 +224,12 @@ ids: the relay translates between the two protocols).
 - MCP config format divergence is unchanged (JSON, not
   CXU's config.toml [mcp_servers]); sessions are per-turn,
   not cross-turn persistent processes.
+
+## mini-agent v15 notes (2026-10-25)
+
+- The v11 "JSON config, not CXU TOML" divergence is
+  closed: config.toml is a first-class config source (see
+  architecture v15). Remaining MCP divergences: sessions
+  are per-turn rather than cross-turn daemons, and the
+  bridge caps persistent sessions at four servers (extras
+  are per-call).

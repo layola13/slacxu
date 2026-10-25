@@ -128,7 +128,11 @@ ls threads/t-spawn-sub-*.md > /dev/null 2>&1 || { echo "SPAWN PERSIST FAILED (no
 echo "mini-agent spawn persist ok"
 
 mkdir -p .mini-agent
-printf '{"servers":[{"name":"fake","cmdline":"python3 ../../scripts/mcpSmoke/fake_mcp.py"}]}' > .mini-agent/mcp.json
+cat > .mini-agent/config.toml <<'EOF'
+[mcp_servers.fake]
+command = "python3"
+args = ["../../scripts/mcpSmoke/fake_mcp.py"]
+EOF
 OUT12=$(timeout 180 curl -sN -X POST http://127.0.0.1:18086/api/chat \
   -H "Content-Type: application/json" \
   -d '{"prompt":"Use the tool mcp__fake__workspace_fact to get the workspace fact word, then tell me exactly what word it returned.","threadId":"t-mcp"}')
