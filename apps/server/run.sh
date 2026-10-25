@@ -97,4 +97,13 @@ echo "$OUT8" | grep -q '"step"' || { echo "PLAN TURN FAILED (no steps)"; echo "$
 echo "$OUT8" | grep -q '"action":"list_dir"' || { echo "PLAN TURN FAILED (plan not executed)"; echo "$OUT8" | tail -3; exit 1; }
 echo "$OUT8" | grep -q '"method":"turn/completed"' || { echo "PLAN TURN FAILED (no turn/completed)"; echo "$OUT8" | tail -3; exit 1; }
 echo "mini-agent update_plan ok"
+
+# usage round reuses the t-text thread output shape: a fresh text
+# turn must carry thread/tokenUsage/updated with real numbers.
+OUT9=$(timeout 120 curl -sN -X POST http://127.0.0.1:18086/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Reply with exactly: ok","threadId":"t-usage"}')
+echo "$OUT9" | grep -q '"method":"thread/tokenUsage/updated"' || { echo "USAGE TURN FAILED (no usage event)"; echo "$OUT9" | tail -3; exit 1; }
+echo "$OUT9" | grep -qE '"inputTokens":[1-9]' || { echo "USAGE TURN FAILED (no input tokens)"; echo "$OUT9" | tail -3; exit 1; }
+echo "mini-agent token usage ok"
 echo "mini-agent e2e ok"

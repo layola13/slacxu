@@ -93,3 +93,18 @@ this list to be complete when the live codex turn lands.
   persisted threads: thread_store restores at most the same
   bytes the live thread enforces, so restore is lossless by
   construction.
+
+- sse_turn's out buffers cannot be freed from SLA: the .sai
+  free contract takes an owned capability pointer, and the out
+  ptrs bind as plain ptrs (CapabilityMismatch at the call site).
+  No SLA consumer frees them today (codexmini included); the
+  mini-agent server leaks the per-round text/calls/usage buffers
+  until a plain-ptr free variant exists in std. Stated, not
+  hidden.
+- Token usage needs std help: sse_turn discarded the channel's
+  usage object, so sci gained sa_http_client_sse_turn_ex, which
+  also returns the raw JSON span of the last top-level "usage"
+  value. The bridge asks for it with
+  stream_options.include_usage and emits
+  thread/tokenUsage/updated only when the channel actually
+  reported usage (absence is never rendered as zero).
