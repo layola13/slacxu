@@ -124,6 +124,8 @@ echo "$OUT11" | grep -q '"action":"spawn_agent"' || { echo "SPAWN TURN FAILED (n
 echo "$OUT11" | grep -q '"threadId":"t-spawn-sub-' || { echo "SPAWN TURN FAILED (no child thread)"; echo "$OUT11" | tail -3; exit 1; }
 echo "$OUT11" | grep -q '"method":"turn/completed"' || { echo "SPAWN TURN FAILED (no turn/completed)"; echo "$OUT11" | tail -3; exit 1; }
 echo "mini-agent spawn_agent ok"
+ls threads/t-spawn-sub-*.md > /dev/null 2>&1 || { echo "SPAWN PERSIST FAILED (no child thread file)"; ls threads/; exit 1; }
+echo "mini-agent spawn persist ok"
 
 mkdir -p .mini-agent
 printf '{"servers":[{"name":"fake","cmdline":"python3 ../../scripts/mcpSmoke/fake_mcp.py"}]}' > .mini-agent/mcp.json

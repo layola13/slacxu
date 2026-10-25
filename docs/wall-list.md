@@ -165,3 +165,31 @@ ids: the relay translates between the two protocols).
   attached). The bridge emits a reasoning item only when a
   summary actually streams, so a bad window reads as a
   reasoning failure without any code change.
+
+## mini-agent v12 notes (2026-10-25)
+
+- sa_term_epoll_* cannot be called from SLA as declared:
+  term.sai declares sa_term_epoll_create(flags) -> ^ptr!, but
+  the Zig export is (flags, out_handle) -> i32. Calling it in
+  the declared style returns null or segfaults (the hidden
+  out slot lands in the wrong register); the out-param style
+  is rejected by the SLA checker (InvalidArgsCount). Until
+  the declaration or the export is aligned, epoll is unusable
+  from SLA; run_host drains stderr via a file redirect
+  instead (see architecture v12).
+- The std HTTP server lets several instances bind the same
+  127.0.0.1 port at once (observed twice: two LISTEN sockets
+  on 18086 with different pids, requests load-balanced
+  between them). A stale server silently invalidates live
+  tests pointed at the port — one capture experiment was
+  poisoned this way. Harnesses must kill by pid from
+  ss -tlnp and verify NO listener remains before starting.
+- Reasoning summaries on oaifree, resolved as far as it
+  goes: the bridge+std pipeline is correct (capture-double
+  proof, 2026-10-25 evening). On the real relay the same
+  evening, bridge turns went 0/15 while bare probes hit
+  ~1/3; no isolated factor explains it (tools on/off, system
+  item present/absent, tool_choice, thread history, prompt —
+  each hit in isolation at least once). Counted as relay-side
+  stochastic delivery; the suite reasoning round stays a
+  lottery ticket, not a code signal.

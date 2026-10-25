@@ -180,9 +180,19 @@ fn walk(dir: &PathBuf, pat_ptr: ptr, pat_len: u64, out: &ByteBuf, depth: u64) ->
 }
 
 fn run_host(exe_ptr: ptr, exe_len: u64, args_ptr: ptr, args_len: u64, out: &ByteBuf) -> void {
-    let argv = [0u64; 14];
-    PROCESS_ARGV_SET_PTR(&argv, 0, exe_ptr, exe_len);
-    let count: u64 = 1;
+    // The child's stderr is redirected to a scratch file by a /bin/sh
+    // prelude ("exec 2>file; exec $@"), so a child flooding stderr can
+    // never block on a full pipe while stdout is drained here; the
+    // file is read back (capped) after the child exits. argv is
+    // preserved verbatim: sh replaces itself with the target.
+    sa_fs_remove_file(STR_PTR(".runhost_err.tmp"), STR_LEN(".runhost_err.tmp"));
+    let argv = [0u64; 22];
+    PROCESS_ARGV_SET_PTR(&argv, 0, STR_PTR("/bin/sh"), STR_LEN("/bin/sh"));
+    PROCESS_ARGV_SET_PTR(&argv, 1, STR_PTR("-c"), STR_LEN("-c"));
+    PROCESS_ARGV_SET_PTR(&argv, 2, STR_PTR("exec 2>.runhost_err.tmp; exec \"$@\""), STR_LEN("exec 2>.runhost_err.tmp; exec \"$@\""));
+    PROCESS_ARGV_SET_PTR(&argv, 3, STR_PTR("sh"), STR_LEN("sh"));
+    PROCESS_ARGV_SET_PTR(&argv, 4, exe_ptr, exe_len);
+    let count: u64 = 5;
     let adoc = sa_json_parse(args_ptr, args_len);
     if adoc != 0 {
         for idx in 0..6 {
@@ -190,12 +200,12 @@ fn run_host(exe_ptr: ptr, exe_len: u64, args_ptr: ptr, args_len: u64, out: &Byte
             if sa_json_array_get(adoc, idx, &el) != 0 { break; };
             let sp: ptr = sa_json_string_ptr(el);
             let sl = sa_json_string_len(el);
-            if idx == 0 { PROCESS_ARGV_SET_PTR(&argv, 1, sp, sl); };
-            if idx == 1 { PROCESS_ARGV_SET_PTR(&argv, 2, sp, sl); };
-            if idx == 2 { PROCESS_ARGV_SET_PTR(&argv, 3, sp, sl); };
-            if idx == 3 { PROCESS_ARGV_SET_PTR(&argv, 4, sp, sl); };
-            if idx == 4 { PROCESS_ARGV_SET_PTR(&argv, 5, sp, sl); };
-            if idx == 5 { PROCESS_ARGV_SET_PTR(&argv, 6, sp, sl); };
+            if idx == 0 { PROCESS_ARGV_SET_PTR(&argv, 5, sp, sl); };
+            if idx == 1 { PROCESS_ARGV_SET_PTR(&argv, 6, sp, sl); };
+            if idx == 2 { PROCESS_ARGV_SET_PTR(&argv, 7, sp, sl); };
+            if idx == 3 { PROCESS_ARGV_SET_PTR(&argv, 8, sp, sl); };
+            if idx == 4 { PROCESS_ARGV_SET_PTR(&argv, 9, sp, sl); };
+            if idx == 5 { PROCESS_ARGV_SET_PTR(&argv, 10, sp, sl); };
             count = count + 1;
         }
     };
@@ -209,10 +219,11 @@ fn run_host(exe_ptr: ptr, exe_len: u64, args_ptr: ptr, args_len: u64, out: &Byte
         return;
     };
     sa_std_close(hin);
+    sa_std_close(herr);
     let cap = SmallBuf { bytes: [0u8; 4096], len: 0 };
     let stage = SmallBuf { bytes: [0u8; 4096], len: 0 };
     let guard: u64 = 0;
-    while guard < 64 {
+    while guard < 8192 {
         let n: u64 = 0;
         if sa_io_read(hout, &stage.bytes, 2048, &n) != 0 { break; };
         if n == 0 { break; };
@@ -225,9 +236,39 @@ fn run_host(exe_ptr: ptr, exe_len: u64, args_ptr: ptr, args_len: u64, out: &Byte
         guard = guard + 1;
     }
     sa_std_close(hout);
-    sa_std_close(herr);
     let code: u64 = 0;
     sa_std_process_wait(proc, &code);
+    let ecap = SmallBuf { bytes: [0u8; 4096], len: 0 };
+    let etotal: u64 = 0;
+    if sa_std_fs_len(STR_PTR(".runhost_err.tmp"), STR_LEN(".runhost_err.tmp"), &etotal) == 0 {
+        let fh: u64 = 0;
+        if sa_std_fs_open_read(STR_PTR(".runhost_err.tmp"), STR_LEN(".runhost_err.tmp"), &fh) == 0 {
+            // Keep the stderr TAIL (last 1500 bytes): diagnostics
+            // and final error lines live at the end of a flood.
+            let eguard: u64 = 0;
+            while eguard < 512 {
+                let en: u64 = 0;
+                if sa_std_fs_file_read(fh, &stage.bytes, 2048, &en) != 0 { break; };
+                if en == 0 { break; };
+                for ci in 0..en {
+                    if ecap.len < 4096 {
+                        ecap.bytes[ecap.len] = stage.bytes[ci];
+                        ecap.len = ecap.len + 1;
+                    };
+                }
+                if ecap.len > 1500 {
+                    let shift = ecap.len - 1500;
+                    for si in 0..1500 {
+                        ecap.bytes[si] = ecap.bytes[si + shift];
+                    }
+                    ecap.len = 1500;
+                };
+                eguard = eguard + 1;
+            }
+            sa_fs_file_close(fh);
+        };
+    };
+    sa_fs_remove_file(STR_PTR(".runhost_err.tmp"), STR_LEN(".runhost_err.tmp"));
     buf_append_lit(out, STR_PTR("exit "), STR_LEN("exit "));
     buf_append_u64(out, code);
     buf_append_lit(out, STR_PTR("\n"), STR_LEN("\n"));
@@ -237,6 +278,15 @@ fn run_host(exe_ptr: ptr, exe_len: u64, args_ptr: ptr, args_len: u64, out: &Byte
             out.len = out.len + 1;
         };
     }
+    if ecap.len > 0 {
+        buf_append_lit(out, STR_PTR("\n[stderr]\n"), STR_LEN("\n[stderr]\n"));
+        for ei in 0..ecap.len {
+            if out.len < 40960 {
+                out.bytes[out.len] = ecap.bytes[ei];
+                out.len = out.len + 1;
+            };
+        }
+    };
 }
 
 fn sa_vm_execute(action_ptr: ptr, action_len: u64, path_ptr: ptr, path_len: u64, extra_ptr: ptr, extra_len: u64, out: &ByteBuf) -> void {

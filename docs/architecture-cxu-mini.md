@@ -183,3 +183,39 @@ every round green including the new MCP round
 bridge) — except the reasoning round, which missed on channel
 variance all evening (see wall-list); the reasoning path is
 unchanged since its v9/v10 green runs.
+
+## v12 run_host stderr + spawn persistence (2026-10-25)
+
+Two stated divergences closed:
+
+1. run_host stderr (saVmTool.sla): the child now runs through
+   a /bin/sh prelude ("exec 2>.runhost_err.tmp; exec $@") that
+   redirects stderr to a scratch file, so a child flooding
+   stderr can never block on a full pipe while the bridge
+   drains stdout; argv is preserved verbatim (sh replaces
+   itself via exec, exit code is the target's). After the
+   child exits, the stderr TAIL (last 1500 bytes — diagnostics
+   live at the end of a flood) is appended to the tool result
+   after a "[stderr]" marker. Stdout draining is now unbounded
+   (kept prefix still capped at 4000 bytes). Verified offline
+   by scripts/vmSmoke: a child writing 200 KB to stderr
+   completes, its tail surfaces, exit codes 0 and 3 propagate.
+   The epoll surface in sa_std/term.sai could not be used for
+   this — see wall-list.
+
+2. spawn_agent child threads are persisted: the spawn branch
+   now calls thread_save for the child thread right after its
+   turn (thread/saveFailed is emitted on the parent stream if
+   the save fails). This supersedes the v8 note that child
+   threads were not persisted; the suite asserts the child
+   thread file (threads/<parent>-sub-N.md) exists.
+
+Live verification on the oaifree Responses wire (v12 build):
+the full suite rounds page/text/tool/thread file/persistence/
+find_files/run_host/read_skill/update_plan/token usage green,
+then spawn_agent + spawn persist + MCP rounds green in the
+tail run. The reasoning round missed again on relay variance;
+the pipeline itself was re-verified the same evening with a
+local capture double (a canned Responses stream containing a
+reasoning summary delta produces item/reasoning/textDelta
+through the bridge) — see wall-list for the full evidence.
