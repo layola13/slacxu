@@ -176,6 +176,16 @@ ids: the relay translates between the two protocols).
   end to end from SLA (epoll over both spawn pipes,
   EPOLL_OK). run_host keeps the file-redirect drain (working
   and verified); epoll is available for future poll loops.
+- SLA codegen rejects plain ptr arguments to void-returning
+  ptr externs (CapabilityMismatch at SAB time): the existing
+  per-buffer sa_http_client_sse_turn_free (void) and
+  sa_print_bytes both trap this way, while value-returning
+  externs (sa_json_parse) accept the same ptrs. Workaround
+  landed in std: sa_http_client_sse_turn_free_all (u32) frees
+  all four turn outs; the bridge calls it at the end of every
+  round, closing the per-round out-buffer leak noted since
+  v6. (Root-causing the void rule itself is SLA compiler
+  territory, not yet scheduled.)
 - The std HTTP server lets several instances bind the same
   127.0.0.1 port at once (observed twice: two LISTEN sockets
   on 18086 with different pids, requests load-balanced
