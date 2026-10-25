@@ -35,3 +35,20 @@ CALL_COUNT=$(grep -c "^tools/call$" fake.log || true)
 if [ "$INIT_COUNT" != "1" ]; then echo "TOML PERSIST FAILED (initialize x$INIT_COUNT, want 1)"; exit 1; fi
 if [ "$CALL_COUNT" != "2" ]; then echo "TOML PERSIST FAILED (tools/call x$CALL_COUNT, want 2)"; exit 1; fi
 echo "mcp toml ok"
+
+cat > mcp.json <<'EOF'
+{"servers":[{"name":"fake","cmdline":"python3 fake_mcp.py","disabled_tools":["workspace_fact"]}]}
+EOF
+export MINI_MCP_CONFIG="$PWD/mcp.json"
+rm -f main3 main3.sa main3.sa.bc
+timeout 600 sa build-exe main3.sla || { echo "MCP MAIN3 BUILD FAILED"; exit 1; }
+export FAKE_MCP_PING=1
+rm -f fake.log
+timeout 60 ./main3
+RC=$?
+unset FAKE_MCP_PING
+if [ $RC -ne 0 ]; then echo "MCP FILTER/PING SMOKE FAILED rc=$RC"; exit 1; fi
+grep -q '^ping-reply ' fake.log || { echo "PING REPLY MISSING"; cat fake.log; exit 1; }
+grep -q '"id":777' fake.log || { echo "PING REPLY WRONG ID"; cat fake.log; exit 1; }
+grep -q '"result":{}' fake.log || { echo "PING REPLY WRONG RESULT"; cat fake.log; exit 1; }
+echo "mcp filters+ping ok"

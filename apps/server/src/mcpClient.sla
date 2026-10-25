@@ -60,6 +60,7 @@ struct McpState {
     err: [u8; 512],
     err_len: u64,
     n_tools: u64,
+    cap_tools: u64,
     s0_proc: u64,
     s0_hin: u64,
     s0_hout: u64,
@@ -349,7 +350,7 @@ fn mcp_send_call(state: &McpState, pr: &McpProc, tool_ptr: ptr, tool_len: u64, a
 // are skipped. Blocking reads (wall-list #2 discipline): a server
 // that never answers hangs until the outer timeout, exactly like
 // the cxu-bridge pump.
-fn mcp_read_until_id(state: &McpState, hout: u64, want_id: u64) -> bool {
+fn mcp_read_until_id(state: &McpState, pr: &McpProc, want_id: u64) -> bool {
     let chunk = [0u8; 256];
     while 1 == 1 {
         let k: u64 = 0;
@@ -378,12 +379,32 @@ fn mcp_read_until_id(state: &McpState, hout: u64, want_id: u64) -> bool {
                 if sa_json_object_get_i64(doc, STR_PTR("id"), STR_LEN("id"), &v) == 0 {
                     if v == want_id { return true; };
                 };
+                // Server-initiated request (method + id):
+                // answer it so a negotiating server does not
+                // stall the session (CXU 0.1.25). req_bytes is
+                // free here: the request we await was sent.
+                let mp: ptr = PTR_NULL();
+                let ml: u64 = 0;
+                let rid: u64 = 0;
+                if sa_json_object_get_string(doc, STR_PTR("method"), STR_LEN("method"), &mp, &ml) == 0 && sa_json_object_get_i64(doc, STR_PTR("id"), STR_LEN("id"), &rid) == 0 {
+                    state.req_len = 0;
+                    mcp_req_append(state, STR_PTR("{\"jsonrpc\":\"2.0\",\"id\":"), STR_LEN("{\"jsonrpc\":\"2.0\",\"id\":"));
+                    mcp_req_append_u64(state, rid);
+                    if mcp_str_eq(mp, ml, STR_PTR("ping"), STR_LEN("ping")) {
+                        mcp_req_append(state, STR_PTR(",\"result\":{}}\n"), STR_LEN(",\"result\":{}}\n"));
+                    } else if mcp_str_eq(mp, ml, STR_PTR("roots/list"), STR_LEN("roots/list")) {
+                        mcp_req_append(state, STR_PTR(",\"result\":{\"roots\":[]}}\n"), STR_LEN(",\"result\":{\"roots\":[]}}\n"));
+                    } else {
+                        mcp_req_append(state, STR_PTR(",\"error\":{\"code\":-32601,\"message\":\"method not found\"}}\n"), STR_LEN(",\"error\":{\"code\":-32601,\"message\":\"method not found\"}}\n"));
+                    };
+                    mcp_send(state, pr.hin);
+                };
             };
             continue;
         };
         if state.lb_len >= 32768 { return false; };
         let n: u64 = 0;
-        if sa_io_read(hout, &chunk, 256, &n) != 0 { return false; };
+        if sa_io_read(pr.hout, &chunk, 256, &n) != 0 { return false; };
         if n == 0 { return false; };
         for i2 in 0..n {
             if state.lb_len < 32768 {
@@ -407,13 +428,13 @@ fn mcp_open_session(state: &McpState, cmd_ptr: ptr, cmd_len: u64, pr: &McpProc) 
     state.lb_len = 0;
     if !mcp_spawn(cmd_ptr, cmd_len, pr) { return false; };
     state.req_len = 0;
-    let init = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"slacxu-mini\",\"version\":\"0.13.0\"}}}\n";
+    let init = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"slacxu-mini\",\"version\":\"0.17.0\"}}}\n";
     mcp_req_append(state, STR_PTR(init), STR_LEN(init));
     if !mcp_send(state, pr.hin) {
         mcp_close(pr);
         return false;
     };
-    if !mcp_read_until_id(state, pr.hout, 1) {
+    if !mcp_read_until_id(state, pr, 1) {
         mcp_close(pr);
         return false;
     };
@@ -437,11 +458,36 @@ fn mcp_open_session(state: &McpState, cmd_ptr: ptr, cmd_len: u64, pr: &McpProc) 
 
 // Records one tools/list tool into state.rec_* (a JSON array under
 // construction; the caller owns the brackets).
-fn mcp_record_tool(state: &McpState, srv_ptr: ptr, srv_len: u64, tool_node: u64) -> void {
+fn mcp_record_tool(state: &McpState, srv_ptr: ptr, srv_len: u64, tool_node: u64, en_node: u64, dis_node: u64) -> void {
     let nm_ptr: ptr = PTR_NULL();
     let nm_len: u64 = 0;
     if sa_json_object_get_string(tool_node, STR_PTR("name"), STR_LEN("name"), &nm_ptr, &nm_len) != 0 { return; };
     if nm_len == 0 { return; };
+    if state.n_tools >= state.cap_tools { return; };
+    if en_node != 0 {
+        let listed = false;
+        let fi: u64 = 0;
+        while 1 == 1 {
+            let fe: u64 = 0;
+            if sa_json_array_get(en_node, fi, &fe) != 0 { break; };
+            let fp: ptr = sa_json_string_ptr(fe);
+            let fl: u64 = sa_json_string_len(fe);
+            if mcp_str_eq(fp, fl, nm_ptr, nm_len) { listed = true; };
+            fi = fi + 1;
+        }
+        if !listed { return; };
+    };
+    if dis_node != 0 {
+        let di: u64 = 0;
+        while 1 == 1 {
+            let de: u64 = 0;
+            if sa_json_array_get(dis_node, di, &de) != 0 { break; };
+            let dp: ptr = sa_json_string_ptr(de);
+            let dl: u64 = sa_json_string_len(de);
+            if mcp_str_eq(dp, dl, nm_ptr, nm_len) { return; };
+            di = di + 1;
+        }
+    };
     let ds_ptr: ptr = PTR_NULL();
     let ds_len: u64 = 0;
     sa_json_object_get_string(tool_node, STR_PTR("description"), STR_LEN("description"), &ds_ptr, &ds_len);
@@ -479,7 +525,7 @@ fn mcp_record_tool(state: &McpState, srv_ptr: ptr, srv_len: u64, tool_node: u64)
 // Runs tools/list against one server and records its tools.
 // Failures append to state.err (the bridge surfaces them as
 // thread/mcpFailed) and discovery continues with other servers.
-fn mcp_discover_server(state: &McpState, slot: u64, srv_ptr: ptr, srv_len: u64, cmd_ptr: ptr, cmd_len: u64) -> void {
+fn mcp_discover_server(state: &McpState, slot: u64, srv_ptr: ptr, srv_len: u64, cmd_ptr: ptr, cmd_len: u64, en_node: u64, dis_node: u64) -> void {
     let pr = McpProc { proc: 0, hin: 0, hout: 0, herr: 0 };
     if !mcp_open_session(state, cmd_ptr, cmd_len, &pr) {
         if state.err_len > 0 { mcp_err_append(state, STR_PTR("; "), STR_LEN("; ")); };
@@ -491,7 +537,7 @@ fn mcp_discover_server(state: &McpState, slot: u64, srv_ptr: ptr, srv_len: u64, 
     state.req_len = 0;
     let tl = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n";
     mcp_req_append(state, STR_PTR(tl), STR_LEN(tl));
-    if !mcp_send(state, pr.hin) || !mcp_read_until_id(state, pr.hout, 2) {
+    if !mcp_send(state, pr.hin) || !mcp_read_until_id(state, &pr, 2) {
         if state.err_len > 0 { mcp_err_append(state, STR_PTR("; "), STR_LEN("; ")); };
         mcp_err_append(state, STR_PTR("mcp server "), STR_LEN("mcp server "));
         mcp_err_append(state, srv_ptr, srv_len);
@@ -518,7 +564,7 @@ fn mcp_discover_server(state: &McpState, slot: u64, srv_ptr: ptr, srv_len: u64, 
     while 1 == 1 {
         let el: u64 = 0;
         if sa_json_array_get(tools, idx, &el) != 0 { break; };
-        mcp_record_tool(state, srv_ptr, srv_len, el);
+        mcp_record_tool(state, srv_ptr, srv_len, el, en_node, dis_node);
         idx = idx + 1;
     }
 }
@@ -665,7 +711,50 @@ fn mcp_normalize_toml(state: &McpState) -> bool {
                             let req_ptr: ptr = PTR_NULL();
                             PTR_BYTE_ADD(req_ptr, &state.req_bytes, 0);
                             mcp_resp_append_escaped(state, req_ptr, state.req_len);
-                            mcp_resp_append(state, STR_PTR("\"}"), STR_LEN("\"}"));
+                            let str_open = true;
+                            mcp_toml_path(state, name_ptr, name_len, STR_PTR(".enabled_tools"), STR_LEN(".enabled_tools"));
+                            let etc: u64 = 0;
+                            if sa_toml_array_len(doc, &state.path_bytes, state.path_len, &etc) == 0 && etc > 0 {
+                                if str_open {
+                                    mcp_resp_append(state, STR_PTR("\",\"enabled_tools\":[\""), STR_LEN("\",\"enabled_tools\":[\""));
+                                    str_open = false;
+                                } else {
+                                    mcp_resp_append(state, STR_PTR(",\"enabled_tools\":[\""), STR_LEN(",\"enabled_tools\":[\""));
+                                };
+                                for ei in 0..etc {
+                                    let e_ptr: ptr = PTR_NULL();
+                                    let e_len: u64 = 0;
+                                    if sa_toml_array_get_string(doc, &state.path_bytes, state.path_len, ei, &e_ptr, &e_len) == 0 {
+                                        if ei > 0 { mcp_resp_append(state, STR_PTR("\",\""), STR_LEN("\",\"")); };
+                                        mcp_resp_append_escaped(state, e_ptr, e_len);
+                                    };
+                                }
+                                mcp_resp_append(state, STR_PTR("\"]"), STR_LEN("\"]"));
+                            };
+                            mcp_toml_path(state, name_ptr, name_len, STR_PTR(".disabled_tools"), STR_LEN(".disabled_tools"));
+                            let dtc: u64 = 0;
+                            if sa_toml_array_len(doc, &state.path_bytes, state.path_len, &dtc) == 0 && dtc > 0 {
+                                if str_open {
+                                    mcp_resp_append(state, STR_PTR("\",\"disabled_tools\":[\""), STR_LEN("\",\"disabled_tools\":[\""));
+                                    str_open = false;
+                                } else {
+                                    mcp_resp_append(state, STR_PTR(",\"disabled_tools\":[\""), STR_LEN(",\"disabled_tools\":[\""));
+                                };
+                                for dti in 0..dtc {
+                                    let d_ptr: ptr = PTR_NULL();
+                                    let d_len: u64 = 0;
+                                    if sa_toml_array_get_string(doc, &state.path_bytes, state.path_len, dti, &d_ptr, &d_len) == 0 {
+                                        if dti > 0 { mcp_resp_append(state, STR_PTR("\",\""), STR_LEN("\",\"")); };
+                                        mcp_resp_append_escaped(state, d_ptr, d_len);
+                                    };
+                                }
+                                mcp_resp_append(state, STR_PTR("\"]"), STR_LEN("\"]"));
+                            };
+                            if str_open {
+                                mcp_resp_append(state, STR_PTR("\"}"), STR_LEN("\"}"));
+                            } else {
+                                mcp_resp_append(state, STR_PTR("}"), STR_LEN("}"));
+                            };
                         };
                     };
                     pos = k;
@@ -695,6 +784,41 @@ fn mcp_discover(state: &McpState) -> void {
     mcp_rec_append(state, STR_PTR("["), STR_LEN("["));
     state.n_tools = 0;
     mcp_err_reset(state);
+    // MINI_MCP=off kill switch (CXU 0.1.24).
+    let e_off = sa_env_get(STR_PTR("MINI_MCP"), STR_LEN("MINI_MCP"));
+    if e_off != 0 {
+        let off_p: ptr = sa_env_buffer_data(e_off);
+        let off_l = sa_env_buffer_len(e_off);
+        if off_l == 3 {
+            let ob0: u8 = 0;
+            let ob1: u8 = 0;
+            let ob2: u8 = 0;
+            PTR_BYTE_AT(ob0, off_p, 0);
+            PTR_BYTE_AT(ob1, off_p, 1);
+            PTR_BYTE_AT(ob2, off_p, 2);
+            if ob0 == 111 && ob1 == 102 && ob2 == 102 {
+                mcp_rec_append(state, STR_PTR("]"), STR_LEN("]"));
+                return;
+            };
+        };
+    };
+    // Tool cap: MINI_MCP_MAX_TOOLS, default 64 (CXU 0.1.24).
+    state.cap_tools = 64;
+    let e_cap = sa_env_get(STR_PTR("MINI_MCP_MAX_TOOLS"), STR_LEN("MINI_MCP_MAX_TOOLS"));
+    if e_cap != 0 {
+        let cap_p: ptr = sa_env_buffer_data(e_cap);
+        let cap_l = sa_env_buffer_len(e_cap);
+        if cap_l > 0 && cap_l < 6 {
+            let parsed: u64 = 0;
+            let cok = true;
+            for ci in 0..cap_l {
+                let cb: u8 = 0;
+                PTR_BYTE_AT(cb, cap_p, ci);
+                if cb < 48 || cb > 57 { cok = false; } else { parsed = parsed * 10 + (cb - 48) as u64; };
+            }
+            if cok && parsed > 0 { state.cap_tools = parsed; };
+        };
+    };
     // Config path: MINI_MCP_CONFIG env, else .mini-agent/mcp.json
     // (relative to the server working directory, apps/server).
     state.path_len = 0;
@@ -775,11 +899,15 @@ fn mcp_discover(state: &McpState) -> void {
         let cm_len: u64 = 0;
         sa_json_object_get_string(el, STR_PTR("name"), STR_LEN("name"), &nm_ptr, &nm_len);
         sa_json_object_get_string(el, STR_PTR("cmdline"), STR_LEN("cmdline"), &cm_ptr, &cm_len);
+        let en_node: u64 = 0;
+        let dis_node: u64 = 0;
+        sa_json_object_get(el, STR_PTR("enabled_tools"), STR_LEN("enabled_tools"), &en_node);
+        sa_json_object_get(el, STR_PTR("disabled_tools"), STR_LEN("disabled_tools"), &dis_node);
         if nm_len == 0 || cm_len == 0 {
             if state.err_len > 0 { mcp_err_append(state, STR_PTR("; "), STR_LEN("; ")); };
             mcp_err_append(state, STR_PTR("mcp config: server entry missing name/cmdline"), STR_LEN("mcp config: server entry missing name/cmdline"));
         } else {
-            mcp_discover_server(state, idx, nm_ptr, nm_len, cm_ptr, cm_len);
+            mcp_discover_server(state, idx, nm_ptr, nm_len, cm_ptr, cm_len, en_node, dis_node);
         };
         idx = idx + 1;
     }
@@ -1006,7 +1134,7 @@ fn mcp_call(state: &McpState, name_ptr: ptr, name_len: u64, args_ptr: ptr, args_
                 state.lb_len = 0;
                 state.lb_owner = srv_ord + 1;
             };
-            if mcp_send_call(state, &spr, tool_ptr, tool_len, args_ptr, args_len, req_id) && mcp_read_until_id(state, spr.hout, req_id) {
+            if mcp_send_call(state, &spr, tool_ptr, tool_len, args_ptr, args_len, req_id) && mcp_read_until_id(state, &spr, req_id) {
                 mcp_emit_result(state, srv_ptr, srv_len, name_ptr, name_len, out);
                 done = true;
             } else {
@@ -1025,7 +1153,7 @@ fn mcp_call(state: &McpState, name_ptr: ptr, name_len: u64, args_ptr: ptr, args_
             return;
         };
         state.lb_owner = 0;
-        if !mcp_send_call(state, &pr, tool_ptr, tool_len, args_ptr, args_len, req_id) || !mcp_read_until_id(state, pr.hout, req_id) {
+        if !mcp_send_call(state, &pr, tool_ptr, tool_len, args_ptr, args_len, req_id) || !mcp_read_until_id(state, &pr, req_id) {
             mcp_close(&pr);
             buf_append_lit(out, STR_PTR("error: mcp server "), STR_LEN("error: mcp server "));
             buf_append_lit(out, srv_ptr, srv_len);

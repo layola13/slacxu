@@ -280,3 +280,21 @@ formats (each with exactly one initialize).
   plan. Live suite green on the Kilo channel (the oaifree
   key began returning 401 on 2026-10-25 ~23:47,
   channel-side).
+
+## v17 — MCP protocol hardening (CXU 0.1.24/0.1.25)
+
+- Server-initiated requests are answered while awaiting a
+  response (`mcp_read_until_id` now holds the session):
+  `ping` -> `{}`, `roots/list` -> `{"roots": []}`, anything
+  else -> error -32601. A negotiating server can no longer
+  stall a session by asking first.
+- Config discipline: `MINI_MCP=off` kill switch;
+  `MINI_MCP_MAX_TOOLS` cap (default 64) on recorded tools;
+  per-server `enabled_tools` / `disabled_tools` filters,
+  honored from both the JSON config and TOML (the
+  normalizer now carries the arrays through).
+- clientInfo version 0.17.0. `scripts/mcpSmoke` run 3
+  proves filters + ping: with `workspace_fact` disabled,
+  discovery records exactly one tool, and the fake server
+  (which pings before answering) logs the client's reply
+  (`"id":777`, `"result":{}`) before the echo completes.

@@ -46,6 +46,9 @@ def reply(mid, result=None, error=None):
     sys.stdout.flush()
 
 
+PINGED = [False]
+
+
 def main():
     for line in sys.stdin:
         line = line.strip()
@@ -69,6 +72,16 @@ def main():
         elif method == "tools/list":
             reply(mid, {"tools": TOOLS})
         elif method == "tools/call":
+            if os.environ.get("FAKE_MCP_PING") and not PINGED[0]:
+                PINGED[0] = True
+                sys.stdout.write(json.dumps(
+                    {"jsonrpc": "2.0", "id": 777, "method": "ping"}) + "\n")
+                sys.stdout.flush()
+                resp = sys.stdin.readline()
+                path = os.environ.get("FAKE_MCP_LOG")
+                if path:
+                    with open(path, "a") as fh:
+                        fh.write("ping-reply " + resp.strip() + "\n")
             params = req.get("params") or {}
             name = params.get("name", "")
             args = params.get("arguments") or {}
