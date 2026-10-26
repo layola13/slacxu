@@ -73,7 +73,9 @@ TS 真值中 fs 存在性判断点（译时逐点核极性，落点一律 `== 0`
 | B5 | 3183-4638 | history 文本、图片剥离、计划族、echo 门、收件箱、紧凑/锚点、上游错误、评审族、patch 校验、去重/sanitize | PASS | de895c9 |
 | B6 | 4560-4638 余 + 类前自由函数 | readSseStream、extractUserInputAnswer、runMiniWebSearch、AGENTS.md active 追踪 | PASS | 440df75 |
 | B7 | 4639-5430 | 类状态/构造/emit 队列模型、respond/pending、会话恢复、resolveTarget、摘要请求、usage/retry 通知、fetch 上游、exec 会话族 | PASS | cdee17d |
-| B8 | 5431-7630 | request 分发、子代理调用族、排队/等待/收尾 | 待 | — |
+| B8a | 5431-约6100 | 运行队列模型（pending_runs + mb_enqueue_run）、delta 族、子线程队列泵、finish_subagent、apply_goal_directive、fail/interrupt/complete 结算三件套骨架、request 第 1 部（thread/start、read/resume、list、turns/items list、compact/start、review/start、delete、archive、fork） | PASS | 67f1a60 |
+| B8b | 约6100-5431 余 | request 第 2 部（capabilities/list、mcp reload/status/tool/resource、command/exec 族、goal set/get/clear、name/set、turn/steer、turn/interrupt、fs/readFile、fs/writeFile）+ schedule_goal_auto_continuation、fs 路径助手 | PASS | 130e0a8 |
+| B8c | 5431-7630 余 | complete_turn/drain_queued_turn/settle_goal、start_goal_continuation_turn、fire_due_goal_timers、answer_status、compact_session、handle_request_user_input、request_approval、子代理状态/收件箱族、handle_subagent_call 全族（spawn/send/followup/read_report/wait/close/resume/interrupt/list）、request 的 turn/start case（含 goal 抢占、auto-compact 屏障、slash 路由、技能展开、目标替换） | PASS | 本笔 |
 | B9 | 7631-10282 | runMiniTurn/Once 主循环 | 待 | — |
 
 ## 7. 普查三账（终态填充）
