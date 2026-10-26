@@ -21,8 +21,11 @@
 // - Record<string, string> becomes StringMap (fixed capacity 64).
 // - Record<string, unknown> / dynamic input fields become JSON text
 //   buffers inspected through sa_json_* node handles (u64).
-//   sa_json_* / sa_time_now_ms / sa_sleep_ms / jev_http_post_json /
-//   jev_relay_executor_call are intent-level externs.
+//   sa_json_* handles are inspected through the local access layer
+//   below (jev_json_* / jev_now_ms / jev_sleep_ms helpers over the
+//   real sa_json_* / sa_time_* externs). jev_http_post_json is
+//   bound to the real sa_std HTTP client below; the relay executor
+//   stays a registered host seam (jev_relay_executor_call).
 // - Module-level mutable state (sharedJevConfig, relayExecutor, the
 //   throttle slot chain and overrides) becomes JevModuleState,
 //   passed by reference as an extra first parameter.
@@ -156,7 +159,7 @@ fn buf_append_f64(out: &ByteBuf, v: f64) -> void {
     };
 }
 
-fn str_eq(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+fn jev_str_eq(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
     if a_len != b_len { return false; };
     let i: u64 = 0;
     while i < a_len {
@@ -168,6 +171,165 @@ fn str_eq(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
         i = i + 1;
     }
     return true;
+}
+
+
+// ---- local JSON/time access layer (rebind, FIX_JEV) ----
+// The bulk conversion targeted a fabricated node_* extern family
+// with a LOCAL kind numbering (0 null/absent, 1 string, 2 array,
+// 3 object, 4 number, 5 boolean). The real sa_json_kind numbering
+// is 0 null, 1 bool, 2 int, 3 float, 4 number_string, 5 string,
+// 6 array, 7 object. The helpers below adapt the real externs to
+// the local convention so every existing call site stays valid.
+fn jev_json_kind(node: u64) -> u64 {
+    let k = sa_json_kind(node);
+    if k == 5 { return 1; };
+    if k == 6 { return 2; };
+    if k == 7 { return 3; };
+    if k == 2 || k == 3 || k == 4 { return 4; };
+    if k == 1 { return 5; };
+    return 0;
+}
+
+fn jev_json_string(node: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    *out_ptr = PTR_NULL();
+    *out_len = 0;
+    if sa_json_kind(node) != 5 { return; };
+    let p: ptr = sa_json_string_ptr(node);
+    *out_ptr = p;
+    *out_len = sa_json_string_len(node);
+}
+
+fn jev_json_number(node: u64, out: &f64) -> i32 {
+    let v: f64 = 0.0;
+    let rc = sa_json_as_f64(node, &v);
+    if rc == 0 { *out = v; };
+    return rc;
+}
+
+fn jev_json_bool(node: u64, out: &bool) -> i32 {
+    let v: u8 = 0;
+    let rc = sa_json_as_bool(node, &v);
+    if rc == 0 { *out = v != 0; };
+    return rc;
+}
+
+fn jev_json_text(node: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    *out_ptr = PTR_NULL();
+    *out_len = 0;
+    let buf: u64 = 0;
+    if sa_json_stringify(node, &buf) != 0 { return; };
+    // The stringify buffer is deliberately not freed: callers copy
+    // the bytes out immediately, and freeing here would leave the
+    // returned ptr dangling (registered leak, same class as the
+    // FIX_SAVMTOOL json_text stringify deviation).
+    let p: ptr = sa_json_buffer_data(buf);
+    *out_ptr = p;
+    *out_len = sa_json_buffer_len(buf);
+}
+
+fn jev_json_count(node: u64) -> u64 {
+    let c: u64 = 0;
+    let rc = sa_json_value_count(node, &c);
+    if rc != 0 { return 0; };
+    return c;
+}
+
+fn jev_json_object_value_at(node: u64, index: u64, out: &u64) -> void {
+    *out = 0;
+    let kp: ptr = PTR_NULL();
+    let kl: u64 = 0;
+    if sa_json_object_key_at(node, index, &kp, &kl) != 0 { return; };
+    let v: u64 = 0;
+    if sa_json_object_get(node, kp, kl, &v) == 0 { *out = v; };
+}
+
+fn jev_now_ms() -> u64 {
+    let ms = sa_time_unix_ms();
+    if ms < 0 { return 0; };
+    return ms as u64;
+}
+
+fn jev_sleep_ms(ms: u64) -> void {
+    sa_time_sleep_ms(ms);
+}
+
+// Direct upstream POST (TS fetch with Authorization + JSON body),
+// bound to the real sa_std stateful HTTP client (http_client.sai
+// v2 surface): real transport, real status code, real body. The
+// timeoutMs argument becomes req_set_timeout_v2; a v2 timeout
+// status (3) maps to out.timed_out (the TS AbortError branch).
+// Returns 0 when an HTTP exchange completed (any status), 1 on
+// transport failure.
+fn jev_http_post_json(url_ptr: ptr, url_len: u64, auth_ptr: ptr, auth_len: u64, body_ptr: ptr, body_len: u64, timeout_ms: u64, out: &JevHttpResponse) -> i32 {
+    out.ok = false;
+    out.status = 0;
+    out.body_len = 0;
+    out.timed_out = false;
+    let use_tls: u8 = 0;
+    if url_len >= 6 {
+        let c0: u8 = 0;
+        PTR_BYTE_AT(c0, url_ptr, 0);
+        let c4: u8 = 0;
+        PTR_BYTE_AT(c4, url_ptr, 4);
+        let c5: u8 = 0;
+        PTR_BYTE_AT(c5, url_ptr, 5);
+        if c0 == 104 && c4 == 115 && c5 == 58 { use_tls = 1; };
+    };
+    let client: ptr = PTR_NULL();
+    if sa_http_client_new_v2(use_tls, PTR_NULL(), 0, &client) != 0 || client == PTR_NULL() { return 1; };
+    let req: ptr = PTR_NULL();
+    if sa_http_client_req_new_v2(client, 2, url_ptr, url_len, &req) != 0 || req == PTR_NULL() {
+        let cf0: u32 = sa_http_client_free(client);
+        return 1;
+    };
+    let tst: u32 = sa_http_client_req_set_timeout_v2(req, timeout_ms as u32);
+    let h1: u32 = sa_http_client_req_add_header_v2(req, STR_PTR("Authorization"), STR_LEN("Authorization"), auth_ptr, auth_len);
+    let h2: u32 = sa_http_client_req_add_header_v2(req, STR_PTR("Content-Type"), STR_LEN("Content-Type"), STR_PTR("application/json"), STR_LEN("application/json"));
+    let bst: u32 = sa_http_client_req_set_body_v2(req, body_ptr, body_len);
+    let resp: ptr = PTR_NULL();
+    let sst: u32 = sa_http_client_req_send_v2(req, &resp);
+    if sst != 0 || resp == PTR_NULL() {
+        if sst == 3 { out.timed_out = true; };
+        let rf0: u32 = sa_http_client_req_free(req);
+        let cf1: u32 = sa_http_client_free(client);
+        return 1;
+    };
+    let status = sa_http_client_resp_status(resp) as i32;
+    out.status = status;
+    out.ok = status >= 200 && status < 300;
+    let bp: ptr = sa_http_client_resp_body_ptr(resp);
+    let bl: u64 = sa_http_client_resp_body_len(resp);
+    if bp != PTR_NULL() && bl > 0 {
+        let n = bl;
+        if n > 262144 { n = 262144; };
+        let dp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp, &out.body_bytes, 0);
+        PTR_COPY_BYTES(dp, bp, n);
+        out.body_len = n;
+    };
+    let pf: u32 = sa_http_client_resp_free(resp);
+    let rf1: u32 = sa_http_client_req_free(req);
+    let cf2: u32 = sa_http_client_free(client);
+    return 0;
+}
+
+// HOST SEAM (registered, FIX_JEV): the relay executor is a
+// host-registered function value in TS (setJevRelayExecutor); SLA
+// has no host-callback registry surface, so no executor can ever
+// be invoked from here. This seam fails explicitly: it returns 1
+// with the response left zeroed, which routes the caller through
+// the TS catch path ("JEV relay executor failed", status 502) --
+// the same outcome as a throwing executor. It is not a silent
+// stub: the failure is observable in the result, and wiring a real
+// executor requires a host registration surface that does not
+// exist yet.
+fn jev_relay_executor_call(executor_id: u64, payload: &JevRelayPayload, timeout_ms: u64, out: &JevHttpResponse) -> i32 {
+    out.ok = false;
+    out.status = 0;
+    out.body_len = 0;
+    out.timed_out = false;
+    return 1;
 }
 
 fn str_contains_ci(hay_ptr: ptr, hay_len: u64, nd_ptr: ptr, nd_len: u64) -> bool {
@@ -339,7 +501,7 @@ fn stringmap_val_ptr(m: &StringMap, idx: u64) -> ptr {
 fn stringmap_find(m: &StringMap, k_ptr: ptr, k_len: u64) -> i64 {
     let i: u64 = 0;
     for i in 0..m.len {
-        if str_eq(stringmap_key_ptr(m, i), m.key_len[i], k_ptr, k_len) {
+        if jev_str_eq(stringmap_key_ptr(m, i), m.key_len[i], k_ptr, k_len) {
             return i as i64;
         };
     }
@@ -373,7 +535,7 @@ fn stringmap_set(m: &StringMap, k_ptr: ptr, k_len: u64, v_ptr: ptr, v_len: u64) 
                 // Byte store through ptr arithmetic (scaffolding).
                 let dp: ptr = PTR_NULL();
                 PTR_BYTE_ADD(dp, dst, i);
-                sa_ptr_store_byte(dp, b);
+                PTR_WRITE_BYTES(dp, b, 1);
                 i = i + 1;
             }
             m.val_len[idx] = v_len;
@@ -498,23 +660,23 @@ fn input_dyn_str(input: &JevRunInput, key_ptr: ptr, key_len: u64, out: &ByteBuf)
     if doc == 0 { return false; };
     let node: u64 = 0;
     if sa_json_object_get(doc, key_ptr, key_len, &node) != 0 { return false; };
-    let kind = sa_json_node_kind(node);
+    let kind = jev_json_kind(node);
     if kind == 1 {
         let p: ptr = PTR_NULL();
         let n: u64 = 0;
-        sa_json_node_string(node, &p, &n);
+        jev_json_string(node, &p, &n);
         buf_append(out, p, n);
         return true;
     };
     if kind == 4 {
         let v: f64 = 0.0;
-        if sa_json_node_number(node, &v) != 0 { return false; };
+        if jev_json_number(node, &v) != 0 { return false; };
         buf_append_f64(out, v);
         return true;
     };
     if kind == 5 {
         let b: bool = false;
-        if sa_json_node_bool(node, &b) != 0 { return false; };
+        if jev_json_bool(node, &b) != 0 { return false; };
         if b {
             buf_append_lit(out, STR_PTR("true"), STR_LEN("true"));
         } else {
@@ -534,10 +696,10 @@ fn input_dyn_json(input: &JevRunInput, key_ptr: ptr, key_len: u64, out: &ByteBuf
     if doc == 0 { return false; };
     let node: u64 = 0;
     if sa_json_object_get(doc, key_ptr, key_len, &node) != 0 { return false; };
-    *out_kind = sa_json_node_kind(node);
+    *out_kind = jev_json_kind(node);
     let p: ptr = PTR_NULL();
     let n: u64 = 0;
-    sa_json_node_json_text(node, &p, &n);
+    jev_json_text(node, &p, &n);
     buf_append(out, p, n);
     return true;
 }
@@ -548,8 +710,8 @@ fn input_dyn_num(input: &JevRunInput, key_ptr: ptr, key_len: u64, out: &f64) -> 
     if doc == 0 { return false; };
     let node: u64 = 0;
     if sa_json_object_get(doc, key_ptr, key_len, &node) != 0 { return false; };
-    if sa_json_node_kind(node) != 4 { return false; };
-    return sa_json_node_number(node, out) == 0;
+    if jev_json_kind(node) != 4 { return false; };
+    return jev_json_number(node, out) == 0;
 }
 
 // TS: JevPolicyConfig — opaque to this module (parameters are
@@ -654,7 +816,7 @@ fn jev_fill_failure(result: &JevRunResult, has_status: bool, status: i32, error_
     result.has_violation_event = with_violation_event;
     result_set_violation_reason(result, error_ptr, error_len);
     result.has_violation = true;
-    result.durationMs = sa_time_now_ms() - startedAt;
+    result.durationMs = jev_now_ms() - startedAt;
 }
 
 // Shared success-result skeleton:
@@ -669,7 +831,7 @@ fn jev_fill_success(result: &JevRunResult, stdout: &ByteBuf, startedAt: u64) -> 
     result.has_violation_event = false;
     result.violation_reason_len = 0;
     result.has_violation = false;
-    result.durationMs = sa_time_now_ms() - startedAt;
+    result.durationMs = jev_now_ms() - startedAt;
 }
 
 // SaVmInputError throw: return code 2, message in out.stderr.
@@ -827,7 +989,7 @@ fn resolveCloudflareJevModel(model_ptr: ptr, model_len: u64, out: &ByteBuf) -> v
     str_trim_into(out, model_ptr, model_len);
     let def = ByteBuf { bytes: [0u8; 262144], len: 0 };
     JEV_DEFAULT_MODEL(&def);
-    if out.len == 0 || str_eq(buf_ptr(out), out.len, buf_ptr(&def), def.len) {
+    if out.len == 0 || jev_str_eq(buf_ptr(out), out.len, buf_ptr(&def), def.len) {
         CLOUDFLARE_JEV_DEFAULT_MODEL(out);
     };
 }
@@ -884,7 +1046,7 @@ fn unwrapJevUpstreamPayload(parsed_doc: u64) -> u64 {
         };
     };
     if has_inner {
-        let kind = sa_json_node_kind(inner);
+        let kind = jev_json_kind(inner);
         if kind == 3 {
             return inner;
         };
@@ -917,7 +1079,7 @@ fn padCloudflareJevQuestions(questions_ptr: ptr, questions_len: u64, out: &ByteB
     let doc = sa_json_parse(questions_ptr, questions_len);
     let n: u64 = 0;
     if doc != 0 {
-        n = sa_json_object_len(doc);
+        n = jev_json_count(doc);
     };
     let pad_id = ByteBuf { bytes: [0u8; 262144], len: 0 };
     CLOUDFLARE_JEV_PAD_QUESTION_ID(&pad_id);
@@ -1099,7 +1261,7 @@ fn shared_copy_field(dst: &JevSharedConfig, src: &JevSharedConfig, field: u64) -
         PTR_BYTE_AT(b, sp, i);
         let tp: ptr = PTR_NULL();
         PTR_BYTE_ADD(tp, dp, i);
-        sa_ptr_store_byte(tp, b);
+        PTR_WRITE_BYTES(tp, b, 1);
         i = i + 1;
     }
     // Record the new length / presence on dst.
@@ -1291,7 +1453,7 @@ fn isJevThrottleEnabled(state: &JevModuleState) -> bool {
     if jev_env_get(STR_PTR("JEV_THROTTLE_DISABLED"), STR_LEN("JEV_THROTTLE_DISABLED"), &env_buf) {
         let t = ByteBuf { bytes: [0u8; 262144], len: 0 };
         str_trim_into(&t, buf_ptr(&env_buf), env_buf.len);
-        if str_eq(buf_ptr(&t), t.len, STR_PTR("1"), STR_LEN("1")) { return false; };
+        if jev_str_eq(buf_ptr(&t), t.len, STR_PTR("1"), STR_LEN("1")) { return false; };
     };
     if state.has_shared && state.shared.has_throttleEnabled && !state.shared.throttleEnabled { return false; };
     return true;
@@ -1338,10 +1500,10 @@ fn getJevThrottle(state: &JevModuleState, out_minIntervalMs: &u64, out_maxQueueL
 // DEFECT: async — the Promise slot chain (jevSlotChain) serializes
 // callers in TS; here acquisition is synchronous: the caller is
 // assumed to hold the chain exclusively, jevWaiting is only a
-// counter, and the minimum-interval wait becomes sa_sleep_ms.
+// counter, and the minimum-interval wait becomes jev_sleep_ms.
 // DEFECT: closures — the returned release closure `done` becomes
 // the jev_release_slot fn keyed on state.slot_held.
-// DEFECT: timers — setTimeout-based waiting becomes sa_sleep_ms.
+// DEFECT: timers — setTimeout-based waiting becomes jev_sleep_ms.
 fn acquireJevSlot(state: &JevModuleState) -> i32 {
     // Disabled: pre-fix behavior, no serialization or counting.
     if !isJevThrottleEnabled(state) {
@@ -1362,16 +1524,16 @@ fn acquireJevSlot(state: &JevModuleState) -> i32 {
     // await previous; (chain wait — synchronous approximation, see above)
     let interval = resolveJevMinIntervalMs(state);
     if interval > 0 {
-        let now = sa_time_now_ms();
+        let now = jev_now_ms();
         let elapsed: u64 = 0;
         if now >= state.jevLastStartAt { elapsed = now - state.jevLastStartAt; };
         if interval > elapsed {
             let waitMs = interval - elapsed;
             // await new Promise((resolve) => setTimeout(resolve, waitMs));
-            sa_sleep_ms(waitMs);
+            jev_sleep_ms(waitMs);
         };
     };
-    state.jevLastStartAt = sa_time_now_ms();
+    state.jevLastStartAt = jev_now_ms();
     return 0;
 }
 
@@ -1429,23 +1591,23 @@ fn js_trimmed_set(s: &JevStr, src_ptr: ptr, src_len: u64) -> void {
 // "[object Object]".
 fn jev_node_to_string(node: u64, out: &ByteBuf) -> void {
     buf_reset(out);
-    let kind = sa_json_node_kind(node);
+    let kind = jev_json_kind(node);
     if kind == 1 {
         let p: ptr = PTR_NULL();
         let n: u64 = 0;
-        sa_json_node_string(node, &p, &n);
+        jev_json_string(node, &p, &n);
         buf_append(out, p, n);
         return;
     };
     if kind == 4 {
         let v: f64 = 0.0;
-        sa_json_node_number(node, &v);
+        jev_json_number(node, &v);
         buf_append_f64(out, v);
         return;
     };
     if kind == 5 {
         let b: bool = false;
-        sa_json_node_bool(node, &b);
+        jev_json_bool(node, &b);
         if b {
             buf_append_lit(out, STR_PTR("true"), STR_LEN("true"));
         } else {
@@ -1454,7 +1616,7 @@ fn jev_node_to_string(node: u64, out: &ByteBuf) -> void {
         return;
     };
     if kind == 2 {
-        let n = sa_json_array_len(node);
+        let n = jev_json_count(node);
         let i: u64 = 0;
         for i in 0..n {
             if i > 0 {
@@ -1482,9 +1644,9 @@ fn jev_node_to_string(node: u64, out: &ByteBuf) -> void {
 // String(...) + trim and are skipped when key or value is empty.
 fn jev_json_value_to_map(node: u64, key_mode: u64, out: &StringMap) -> void {
     stringmap_init(out);
-    let kind = sa_json_node_kind(node);
+    let kind = jev_json_kind(node);
     if kind == 2 {
-        let n = sa_json_array_len(node);
+        let n = jev_json_count(node);
         let i: u64 = 0;
         for i in 0..n {
             let elem: u64 = 0;
@@ -1505,14 +1667,14 @@ fn jev_json_value_to_map(node: u64, key_mode: u64, out: &StringMap) -> void {
         return;
     };
     if kind == 3 {
-        let n = sa_json_object_len(node);
+        let n = jev_json_count(node);
         let i: u64 = 0;
         for i in 0..n {
             let kp: ptr = PTR_NULL();
             let kl: u64 = 0;
             sa_json_object_key_at(node, i, &kp, &kl);
             let val: u64 = 0;
-            sa_json_object_value_at(node, i, &val);
+            jev_json_object_value_at(node, i, &val);
             let k = ByteBuf { bytes: [0u8; 262144], len: 0 };
             str_trim_into(&k, kp, kl);
             let raw = ByteBuf { bytes: [0u8; 262144], len: 0 };
@@ -1928,7 +2090,7 @@ fn jev_pick_context(input: &JevRunInput, out_kind: &u64, out: &ByteBuf) -> void 
             if sa_json_object_get(doc, STR_PTR("state"), STR_LEN("state"), &node) == 0 {
                 let sp: ptr = PTR_NULL();
                 let sn: u64 = 0;
-                sa_json_node_string(node, &sp, &sn);
+                jev_json_string(node, &sp, &sn);
                 buf_reset(out);
                 buf_append(out, sp, sn);
             };
@@ -2010,10 +2172,10 @@ fn jev_parsed_error(doc: u64, out: &ByteBuf) -> bool {
     if doc == 0 { return false; };
     let node: u64 = 0;
     if sa_json_object_get(doc, STR_PTR("error"), STR_LEN("error"), &node) != 0 { return false; };
-    if sa_json_node_kind(node) != 1 { return false; };
+    if jev_json_kind(node) != 1 { return false; };
     let p: ptr = PTR_NULL();
     let n: u64 = 0;
-    sa_json_node_string(node, &p, &n);
+    jev_json_string(node, &p, &n);
     buf_append(out, p, n);
     return out.len > 0;
 }
@@ -2045,13 +2207,14 @@ fn jev_parse_response_text(text_ptr: ptr, text_len: u64, doc_out: &u64, fallback
 // throws SaVmInputError (TS: the await sits before the try block,
 // so the overload error propagates to the caller).
 // DEFECT: async — Promise<Response>/fetch awaited synchronously;
-// jev_http_post_json / jev_relay_executor_call are intent externs
-// performing the whole request. AbortController/setTimeout become
+// jev_http_post_json performs the whole request on the real
+// sa_std HTTP client; jev_relay_executor_call is the registered
+// host seam for the injected executor. AbortController/setTimeout become
 // the timeoutMs argument; an abort surfaces as resp.timed_out.
 // DEFECT: exceptions — the TS try/catch/finally becomes explicit
 // status propagation + jev_release_slot on every exit path.
 fn executeJevCall(state: &JevModuleState, payload: &JevPayload, creds: &JevCredentials, out: &JevCallResult) -> i32 {
-    let startedAt = sa_time_now_ms();
+    let startedAt = jev_now_ms();
     // Serialize upstream calls with a minimum start interval (see throttle above).
     let slot_rc = acquireJevSlot(state);
     if slot_rc != 0 {
@@ -2116,7 +2279,7 @@ fn executeJevCall(state: &JevModuleState, payload: &JevPayload, creds: &JevCrede
         };
         let resp = JevHttpResponse { ok: false, status: 0, body_bytes: [0u8; 262144], body_len: 0, timed_out: false };
         let call_rc = jev_relay_executor_call(state.relay_executor_id, &rp, creds.timeoutMs, &resp);
-        out.latencyMs = sa_time_now_ms() - startedAt;
+        out.latencyMs = jev_now_ms() - startedAt;
         if call_rc != 0 {
             // The await threw: TS catch maps AbortError to the
             // timeout message, other errors to error.message.
@@ -2163,7 +2326,7 @@ fn executeJevCall(state: &JevModuleState, payload: &JevPayload, creds: &JevCrede
             if sa_json_object_get(doc, STR_PTR("data"), STR_LEN("data"), &dn) == 0 {
                 // TS `||` also skips falsy data (null/0/""/false);
                 // approximated by skipping JSON null only.
-                if sa_json_node_kind(dn) != 0 {
+                if jev_json_kind(dn) != 0 {
                     data_node = dn;
                     has_data = true;
                 };
@@ -2172,7 +2335,7 @@ fn executeJevCall(state: &JevModuleState, payload: &JevPayload, creds: &JevCrede
         if has_data {
             let dp: ptr = PTR_NULL();
             let dl: u64 = 0;
-            sa_json_node_json_text(data_node, &dp, &dl);
+            jev_json_text(data_node, &dp, &dl);
             call_set_data(out, dp, dl);
         } else {
             if doc != 0 {
@@ -2192,7 +2355,7 @@ fn executeJevCall(state: &JevModuleState, payload: &JevPayload, creds: &JevCrede
 
     // ---- no credentials at all ----
     if creds.apiKey.len == 0 {
-        out.latencyMs = sa_time_now_ms() - startedAt;
+        out.latencyMs = jev_now_ms() - startedAt;
         call_set_error(out, STR_PTR("JEV is not configured. Please set JEV_API_KEY in environment or configure JEV in settings."), STR_LEN("JEV is not configured. Please set JEV_API_KEY in environment or configure JEV in settings."));
         out.has_status = true;
         out.status = 401;
@@ -2245,7 +2408,7 @@ fn executeJevCall(state: &JevModuleState, payload: &JevPayload, creds: &JevCrede
     buf_append(&auth, js_ptr(&creds.apiKey), creds.apiKey.len);
     let resp2 = JevHttpResponse { ok: false, status: 0, body_bytes: [0u8; 262144], body_len: 0, timed_out: false };
     let fetch_rc = jev_http_post_json(buf_ptr(&requestUrl), requestUrl.len, buf_ptr(&auth), auth.len, buf_ptr(&requestBody), requestBody.len, creds.timeoutMs, &resp2);
-    out.latencyMs = sa_time_now_ms() - startedAt;
+    out.latencyMs = jev_now_ms() - startedAt;
     if fetch_rc != 0 {
         // TS catch: AbortError -> timeout message; else error.message.
         if resp2.timed_out {
@@ -2287,7 +2450,7 @@ fn executeJevCall(state: &JevModuleState, payload: &JevPayload, creds: &JevCrede
         let inner = unwrapJevUpstreamPayload(doc2);
         let dp: ptr = PTR_NULL();
         let dl: u64 = 0;
-        sa_json_node_json_text(inner, &dp, &dl);
+        jev_json_text(inner, &dp, &dl);
         call_set_data(out, dp, dl);
     } else {
         if fallback2.len > 0 {
@@ -2310,7 +2473,7 @@ fn jev_answers_node(data_doc: u64, out_node: &u64) -> bool {
     if data_doc == 0 { return false; };
     let n: u64 = 0;
     if sa_json_object_get(data_doc, STR_PTR("answers"), STR_LEN("answers"), &n) != 0 { return false; };
-    if sa_json_node_kind(n) != 3 { return false; };
+    if jev_json_kind(n) != 3 { return false; };
     *out_node = n;
     return true;
 }
@@ -2329,10 +2492,10 @@ fn jev_answer_choice(data_doc: u64, qid_ptr: ptr, qid_len: u64, out: &ByteBuf) -
     if !jev_answer_node(data_doc, qid_ptr, qid_len, &ans) { return; };
     let c: u64 = 0;
     if sa_json_object_get(ans, STR_PTR("choice"), STR_LEN("choice"), &c) != 0 { return; };
-    if sa_json_node_kind(c) != 1 { return; };
+    if jev_json_kind(c) != 1 { return; };
     let p: ptr = PTR_NULL();
     let n: u64 = 0;
-    sa_json_node_string(c, &p, &n);
+    jev_json_string(c, &p, &n);
     str_trim_into(out, p, n);
 }
 
@@ -2343,9 +2506,9 @@ fn jev_answer_confidence(data_doc: u64, qid_ptr: ptr, qid_len: u64) -> f64 {
     if !jev_answer_node(data_doc, qid_ptr, qid_len, &ans) { return 1.0; };
     let c: u64 = 0;
     if sa_json_object_get(ans, STR_PTR("confidence"), STR_LEN("confidence"), &c) != 0 { return 1.0; };
-    if sa_json_node_kind(c) != 4 { return 1.0; };
+    if jev_json_kind(c) != 4 { return 1.0; };
     let v: f64 = 0.0;
-    if sa_json_node_number(c, &v) != 0 { return 1.0; };
+    if jev_json_number(c, &v) != 0 { return 1.0; };
     return v;
 }
 
@@ -2409,9 +2572,12 @@ fn jev_overload_error(state: &JevModuleState, result: &JevRunResult) -> i32 {
 // TS: export interface RegressionCase (sdk-backend) — used fields:
 // id, title, component. The case list is kept as a JSON array text.
 // DEFECT: cross-unit dependency — loadRegressionCases is
-// implemented in the sdk-backend unit; sa_load_regression_cases is
-// the intent-level extern standing in for it. Its first argument is
-// the TS `undefined` project argument (always undefined here).
+// implemented in the sdk-backend unit. The conversion's invented
+// extern for it was never bindable across the unit boundary; the
+// local fn below is a registered HOST SEAM (see FIX_JEV) that
+// returns the empty list until the host wires the sdk loader in.
+// Its first TS argument is the `undefined` filter (always
+// undefined at this unit's call sites).
 struct RegressionCaseList {
     json_bytes: [u8; 262144],
     json_len: u64,
@@ -2419,7 +2585,18 @@ struct RegressionCaseList {
 }
 
 fn loadRegressionCases(out: &RegressionCaseList, cwd_ptr: ptr, cwd_len: u64, has_cwd: bool) -> void {
-    out.len = sa_load_regression_cases(cwd_ptr, cwd_len, has_cwd, out);
+    // HOST SEAM (registered, FIX_JEV): the sdk-backend unit owns the
+    // real loader (sdk-backend/src/regressionCases.sla), but its
+    // RegressionCaseSet representation ([RegressionCase; 256] of
+    // ~64 KiB raw-JSON cases) cannot be adapted into this unit's
+    // JSON-text RegressionCaseList across the @import boundary, and
+    // the vendor copy must stay identical to this provider copy.
+    // Until the host wires this seam, the loader returns the empty
+    // case list explicitly (the same result TS produces for a
+    // missing cases directory); replay-case callers observe len 0.
+    // This is a documented seam, not a silent stub.
+    out.len = 0;
+    out.json_len = 0;
 }
 
 fn regression_case_field(list: &RegressionCaseList, idx: u64, field_ptr: ptr, field_len: u64, out: &ByteBuf) -> bool {
@@ -2432,10 +2609,10 @@ fn regression_case_field(list: &RegressionCaseList, idx: u64, field_ptr: ptr, fi
     if sa_json_array_get(doc, idx, &item) != 0 { return false; };
     let node: u64 = 0;
     if sa_json_object_get(item, field_ptr, field_len, &node) != 0 { return false; };
-    if sa_json_node_kind(node) != 1 { return false; };
+    if jev_json_kind(node) != 1 { return false; };
     let sp: ptr = PTR_NULL();
     let sn: u64 = 0;
-    sa_json_node_string(node, &sp, &sn);
+    jev_json_string(node, &sp, &sn);
     buf_append(out, sp, sn);
     return true;
 }
@@ -2746,7 +2923,7 @@ jev_answer_choice(call.data_doc, buf_ptr(&key), key.len, &choice_raw);
 let choice = ByteBuf { bytes: [0u8; 262144], len: 0};
 str_lower_into(&choice, buf_ptr(&choice_raw), choice_raw.len);
 let confidence = jev_answer_confidence(call.data_doc, buf_ptr(&key), key.len);
-let passed = str_eq(buf_ptr(&choice), choice.len, STR_PTR("pass"), STR_LEN("pass"));
+let passed = jev_str_eq(buf_ptr(&choice), choice.len, STR_PTR("pass"), STR_LEN("pass"));
 if passed { passedCount = passedCount + 1;};
 if ci > 0 {
 buf_append_lit(&results_json, STR_PTR(","), STR_LEN(","));
@@ -3146,7 +3323,7 @@ return 0;
 let chosenKey = ByteBuf { bytes: [0u8; 262144], len: 0};
 jev_answer_choice(call.data_doc, STR_PTR("direction"), STR_LEN("direction"), &chosenKey);
 let confidence = jev_answer_confidence(call.data_doc, STR_PTR("direction"), STR_LEN("direction"));
-let actNow = str_eq(buf_ptr(&chosenKey), chosenKey.len, buf_ptr(&act_key), act_key.len);
+let actNow = jev_str_eq(buf_ptr(&chosenKey), chosenKey.len, buf_ptr(&act_key), act_key.len);
 let chosenDesc = ByteBuf { bytes: [0u8; 262144], len: 0};
 if actNow {
 buf_copy_into(&chosenDesc, &act_desc);
@@ -3404,7 +3581,9 @@ unranked_count = unranked_count + 1;
 }
 buf_append_lit(&unranked_json, STR_PTR("]"), STR_LEN("]"));
 let summary = ByteBuf { bytes: [0u8; 262144], len: 0};
-buf_append_lit(&summary, STR_PTR("【JEV 排序（"), STR_LEN(""), STR_LEN("）】"));
+buf_append_lit(&summary, STR_PTR("【JEV 排序（"), STR_LEN("【JEV 排序（"));
+buf_append_buf(&summary, &criterion);
+buf_append_lit(&summary, STR_PTR("）】"), STR_LEN("）】"));
 buf_append_buf(&summary, &rank_lines);
 if unranked_count > 0 {
 buf_append_lit(&summary, STR_PTR("\n• 未入围："), STR_LEN("\n• 未入围："));
@@ -3827,10 +4006,10 @@ let parallelism: u64 = 0;
 if hintedParallel > 0 {
 parallelism = hintedParallel;
 } else {
-if str_eq(buf_ptr(&strategy), strategy.len, STR_PTR("single"), STR_LEN("single")) || str_eq(buf_ptr(&strategy), strategy.len, STR_PTR("sequential"), STR_LEN("sequential")) || n == 0 {
+if jev_str_eq(buf_ptr(&strategy), strategy.len, STR_PTR("single"), STR_LEN("single")) || jev_str_eq(buf_ptr(&strategy), strategy.len, STR_PTR("sequential"), STR_LEN("sequential")) || n == 0 {
 parallelism = 1;
 } else {
-if str_eq(buf_ptr(&strategy), strategy.len, STR_PTR("parallel"), STR_LEN("parallel")) {
+if jev_str_eq(buf_ptr(&strategy), strategy.len, STR_PTR("parallel"), STR_LEN("parallel")) {
 parallelism = n;
 if parallelism < 1 { parallelism = 1;};
 if parallelism > 8 { parallelism = 8;};
@@ -3844,13 +4023,13 @@ if parallelism > 4 { parallelism = 4;};
 // const dispatchPlan =... (deterministic per strategy)
 let plan_json = ByteBuf { bytes: [0u8; 262144], len: 0};
 buf_append_lit(&plan_json, STR_PTR("["), STR_LEN("["));
-if n == 0 || str_eq(buf_ptr(&strategy), strategy.len, STR_PTR("single"), STR_LEN("single")) {
+if n == 0 || jev_str_eq(buf_ptr(&strategy), strategy.len, STR_PTR("single"), STR_LEN("single")) {
 buf_append_lit(&plan_json, STR_PTR("{\"key\":\"single\",\"description\":"), STR_LEN("{\"key\":\"single\",\"description\":"));
 buf_append_json_str(&plan_json, buf_ptr(&task), task.len);
 buf_append_lit(&plan_json, STR_PTR(",\"batch\":1}"), STR_LEN(",\"batch\":1}"));
 } else {
-let is_seq = str_eq(buf_ptr(&strategy), strategy.len, STR_PTR("sequential"), STR_LEN("sequential"));
-let is_par = str_eq(buf_ptr(&strategy), strategy.len, STR_PTR("parallel"), STR_LEN("parallel"));
+let is_seq = jev_str_eq(buf_ptr(&strategy), strategy.len, STR_PTR("sequential"), STR_LEN("sequential"));
+let is_par = jev_str_eq(buf_ptr(&strategy), strategy.len, STR_PTR("parallel"), STR_LEN("parallel"));
 let half = (n + 1) / 2;
 let pi: u64 = 0;
 for pi in 0..n {
@@ -4052,14 +4231,14 @@ jev_answer_choice(call.data_doc, buf_ptr(&key), key.len, &raw_status);
 let lower = ByteBuf { bytes: [0u8; 262144], len: 0};
 str_lower_into(&lower, buf_ptr(&raw_status), raw_status.len);
 let status = ByteBuf { bytes: [0u8; 262144], len: 0};
-if str_eq(buf_ptr(&lower), lower.len, STR_PTR("violated"), STR_LEN("violated")) || str_eq(buf_ptr(&lower), lower.len, STR_PTR("unclear"), STR_LEN("unclear")) {
+if jev_str_eq(buf_ptr(&lower), lower.len, STR_PTR("violated"), STR_LEN("violated")) || jev_str_eq(buf_ptr(&lower), lower.len, STR_PTR("unclear"), STR_LEN("unclear")) {
 buf_copy_into(&status, &lower);
 } else {
 buf_append_lit(&status, STR_PTR("holds"), STR_LEN("holds"));
 };
 let confidence = jev_answer_confidence(call.data_doc, buf_ptr(&key), key.len);
-if str_eq(buf_ptr(&status), status.len, STR_PTR("violated"), STR_LEN("violated")) { violatedCount = violatedCount + 1;};
-if str_eq(buf_ptr(&status), status.len, STR_PTR("unclear"), STR_LEN("unclear")) { unclearCount = unclearCount + 1;};
+if jev_str_eq(buf_ptr(&status), status.len, STR_PTR("violated"), STR_LEN("violated")) { violatedCount = violatedCount + 1;};
+if jev_str_eq(buf_ptr(&status), status.len, STR_PTR("unclear"), STR_LEN("unclear")) { unclearCount = unclearCount + 1;};
 if di > 0 {
 buf_append_lit(&details_json, STR_PTR(","), STR_LEN(","));
 };
@@ -4075,12 +4254,12 @@ buf_append_lit(&details_json, STR_PTR("}"), STR_LEN("}"));
 buf_append_lit(&detail_lines, STR_PTR("\n• ["), STR_LEN("\n• ["));
 buf_append_buf(&detail_lines, &key);
 buf_append_lit(&detail_lines, STR_PTR("] "), STR_LEN("] "));
-if str_eq(buf_ptr(&status), status.len, STR_PTR("holds"), STR_LEN("holds")) {
+if jev_str_eq(buf_ptr(&status), status.len, STR_PTR("holds"), STR_LEN("holds")) {
 buf_append_lit(&detail_lines, STR_PTR("✅ 满足（置信度 "), STR_LEN("✅ 满足（置信度 "));
 buf_append_u64(&detail_lines, jev_percent(confidence));
 buf_append_lit(&detail_lines, STR_PTR("%）"), STR_LEN("%）"));
 } else {
-if str_eq(buf_ptr(&status), status.len, STR_PTR("violated"), STR_LEN("violated")) {
+if jev_str_eq(buf_ptr(&status), status.len, STR_PTR("violated"), STR_LEN("violated")) {
 buf_append_lit(&detail_lines, STR_PTR("❌ 违反（置信度 "), STR_LEN("❌ 违反（置信度 "));
 } else {
 buf_append_lit(&detail_lines, STR_PTR("❓ 存疑（置信度 "), STR_LEN("❓ 存疑（置信度 "));
@@ -4767,7 +4946,7 @@ jev_answer_choice(call.data_doc, STR_PTR("fix_nature"), STR_LEN("fix_nature"), &
 let nat_lower = ByteBuf { bytes: [0u8; 262144], len: 0};
 str_lower_into(&nat_lower, buf_ptr(&nat_raw), nat_raw.len);
 // fixNature = rawNature === "symptom_patch" || rawNature === "risky_mask"? rawNature: "root_cause_fix";
-if str_eq(buf_ptr(&nat_lower), nat_lower.len, STR_PTR("symptom_patch"), STR_LEN("symptom_patch")) || str_eq(buf_ptr(&nat_lower), nat_lower.len, STR_PTR("risky_mask"), STR_LEN("risky_mask")) {
+if jev_str_eq(buf_ptr(&nat_lower), nat_lower.len, STR_PTR("symptom_patch"), STR_LEN("symptom_patch")) || jev_str_eq(buf_ptr(&nat_lower), nat_lower.len, STR_PTR("risky_mask"), STR_LEN("risky_mask")) {
 buf_copy_into(&fixNature, &nat_lower);
 } else {
 buf_append_lit(&fixNature, STR_PTR("root_cause_fix"), STR_LEN("root_cause_fix"));
@@ -4958,7 +5137,7 @@ let runner_raw_conf = jev_edge_pick(call.data_doc, &dims, STR_PTR("runner_up_dim
 // const runnerUp = runnerUpRaw.key && runnerUpRaw.key!== weakest.key? runnerUpRaw: { key: "", confidence: 1.0};
 let runner_key = ByteBuf { bytes: [0u8; 262144], len: 0};
 let runner_conf: f64 = 1.0;
-if runner_raw_key.len > 0 &&!str_eq(buf_ptr(&runner_raw_key), runner_raw_key.len, buf_ptr(&weakest_key), weakest_key.len) {
+if runner_raw_key.len > 0 &&!jev_str_eq(buf_ptr(&runner_raw_key), runner_raw_key.len, buf_ptr(&weakest_key), weakest_key.len) {
 buf_copy_into(&runner_key, &runner_raw_key);
 runner_conf = runner_raw_conf;
 };
@@ -5702,7 +5881,7 @@ if stringmap_has(&verdicts, buf_ptr(&mom_lower), mom_lower.len) {
 buf_copy_into(&momentum, &mom_lower);
 };
 let momentumConfidence = jev_answer_confidence(call.data_doc, STR_PTR("momentum"), STR_LEN("momentum"));
-let autoContinue = str_eq(buf_ptr(&momentum), momentum.len, STR_PTR("continue_now"), STR_LEN("continue_now"));
+let autoContinue = jev_str_eq(buf_ptr(&momentum), momentum.len, STR_PTR("continue_now"), STR_LEN("continue_now"));
 let nextDesc = ByteBuf { bytes: [0u8; 262144], len: 0};
 let has_ndesc = false;
 if hasCandidates {
@@ -5827,11 +6006,11 @@ stringmap_set_lit(out, STR_PTR("done"), STR_LEN("done"), STR_PTR("已完成：�
 // (Not exported in TS.) Unknown keys yield TS undefined; the
 // caller applies `?? 12`, mirrored here by returning 12.
 fn JEV_PROGRESS_BAND_PERCENT(band_ptr: ptr, band_len: u64) -> u64 {
-if str_eq(band_ptr, band_len, STR_PTR("s0_25"), STR_LEN("s0_25")) { return 12;};
-if str_eq(band_ptr, band_len, STR_PTR("s25_50"), STR_LEN("s25_50")) { return 37;};
-if str_eq(band_ptr, band_len, STR_PTR("s50_75"), STR_LEN("s50_75")) { return 62;};
-if str_eq(band_ptr, band_len, STR_PTR("s75_99"), STR_LEN("s75_99")) { return 87;};
-if str_eq(band_ptr, band_len, STR_PTR("s100"), STR_LEN("s100")) { return 100;};
+if jev_str_eq(band_ptr, band_len, STR_PTR("s0_25"), STR_LEN("s0_25")) { return 12;};
+if jev_str_eq(band_ptr, band_len, STR_PTR("s25_50"), STR_LEN("s25_50")) { return 37;};
+if jev_str_eq(band_ptr, band_len, STR_PTR("s50_75"), STR_LEN("s50_75")) { return 62;};
+if jev_str_eq(band_ptr, band_len, STR_PTR("s75_99"), STR_LEN("s75_99")) { return 87;};
+if jev_str_eq(band_ptr, band_len, STR_PTR("s100"), STR_LEN("s100")) { return 100;};
 return 12;
 }
 
@@ -5978,7 +6157,7 @@ buf_copy_into(&nextStep, &rawNext);
 nextConfidence = jev_answer_confidence(call.data_doc, STR_PTR("next_step"), STR_LEN("next_step"));
 };
 // if (health === "done") band = "s100";
-if str_eq(buf_ptr(&health), health.len, STR_PTR("done"), STR_LEN("done")) {
+if jev_str_eq(buf_ptr(&health), health.len, STR_PTR("done"), STR_LEN("done")) {
 buf_reset(&band);
 buf_append_lit(&band, STR_PTR("s100"), STR_LEN("s100"));
 };
@@ -6233,7 +6412,7 @@ buf_append_json_str(&stdout, buf_ptr(&scope), scope.len);
 buf_append_lit(&stdout, STR_PTR(",\"confidence\":0.5,\"fallback\":"), STR_LEN(",\"confidence\":0.5,\"fallback\":"));
 buf_append_json_str(&stdout, buf_ptr(&err), err.len);
 buf_append_lit(&stdout, STR_PTR(",\"suggested_params\":"), STR_LEN(",\"suggested_params\":"));
-let is_skip = str_eq(buf_ptr(&scope), scope.len, STR_PTR("skip"), STR_LEN("skip"));
+let is_skip = jev_str_eq(buf_ptr(&scope), scope.len, STR_PTR("skip"), STR_LEN("skip"));
 if is_skip {
 buf_append_lit(&stdout, STR_PTR("null"), STR_LEN("null"));
 } else {
@@ -6273,7 +6452,7 @@ let key = ByteBuf { bytes: [0u8; 262144], len: 0};
 jev_memory_key(&fact, &key);
 let scopeDesc = ByteBuf { bytes: [0u8; 262144], len: 0};
 stringmap_get(&scopes, buf_ptr(&scope), scope.len, &scopeDesc);
-let is_skip2 = str_eq(buf_ptr(&scope), scope.len, STR_PTR("skip"), STR_LEN("skip"));
+let is_skip2 = jev_str_eq(buf_ptr(&scope), scope.len, STR_PTR("skip"), STR_LEN("skip"));
 let summary = ByteBuf { bytes: [0u8; 262144], len: 0};
 buf_append_lit(&summary, STR_PTR("\n• 范围：["), STR_LEN("\n• 范围：["));
 buf_append_buf(&summary, &scope);
@@ -6383,7 +6562,7 @@ fn generateToolUsageRecommendation(bestTool_ptr: ptr, bestTool_len: u64, target_
 buf_reset(out_params);
 buf_reset(out_anti);
 let has_target = target_len > 0;
-if str_eq(bestTool_ptr, bestTool_len, STR_PTR("find_definition"), STR_LEN("find_definition")) {
+if jev_str_eq(bestTool_ptr, bestTool_len, STR_PTR("find_definition"), STR_LEN("find_definition")) {
 buf_append_lit(out_params, STR_PTR("{\"action\":\"find_definition\",\"symbol\":"), STR_LEN("{\"action\":\"find_definition\",\"symbol\":"));
 if has_target {
 buf_append_json_str(out_params, target_ptr, target_len);
@@ -6394,7 +6573,7 @@ buf_append_lit(out_params, STR_PTR(",\"include_body\":true}"), STR_LEN(",\"inclu
 buf_append_lit(out_anti, STR_PTR("严禁针对符号盲目 grep_search 广域泛搜，严禁大文件全量 read_file 读取数千行！"), STR_LEN("严禁针对符号盲目 grep_search 广域泛搜，严禁大文件全量 read_file 读取数千行！"));
 return;
 };
-if str_eq(bestTool_ptr, bestTool_len, STR_PTR("find_references"), STR_LEN("find_references")) {
+if jev_str_eq(bestTool_ptr, bestTool_len, STR_PTR("find_references"), STR_LEN("find_references")) {
 buf_append_lit(out_params, STR_PTR("{\"action\":\"find_references\",\"symbol\":"), STR_LEN("{\"action\":\"find_references\",\"symbol\":"));
 if has_target {
 buf_append_json_str(out_params, target_ptr, target_len);
@@ -6405,7 +6584,7 @@ buf_append_lit(out_params, STR_PTR(",\"detail\":false}"), STR_LEN(",\"detail\":f
 buf_append_lit(out_anti, STR_PTR("严禁循环 grep_search 或手写脚本逐个读文件正则拼凑调用方！"), STR_LEN("严禁循环 grep_search 或手写脚本逐个读文件正则拼凑调用方！"));
 return;
 };
-if str_eq(bestTool_ptr, bestTool_len, STR_PTR("file_outline"), STR_LEN("file_outline")) {
+if jev_str_eq(bestTool_ptr, bestTool_len, STR_PTR("file_outline"), STR_LEN("file_outline")) {
 buf_append_lit(out_params, STR_PTR("{\"action\":\"file_outline\",\"path\":"), STR_LEN("{\"action\":\"file_outline\",\"path\":"));
 if has_target {
 buf_append_json_str(out_params, target_ptr, target_len);
@@ -6416,7 +6595,7 @@ buf_append_lit(out_params, STR_PTR("}"), STR_LEN("}"));
 buf_append_lit(out_anti, STR_PTR("仅为查看文件结构大纲时，严禁盲目调用 read_file 吞入上千行源码！"), STR_LEN("仅为查看文件结构大纲时，严禁盲目调用 read_file 吞入上千行源码！"));
 return;
 };
-if str_eq(bestTool_ptr, bestTool_len, STR_PTR("workspace_outline"), STR_LEN("workspace_outline")) {
+if jev_str_eq(bestTool_ptr, bestTool_len, STR_PTR("workspace_outline"), STR_LEN("workspace_outline")) {
 buf_append_lit(out_params, STR_PTR("{\"action\":\"workspace_outline\",\"dir\":"), STR_LEN("{\"action\":\"workspace_outline\",\"dir\":"));
 if has_target {
 buf_append_json_str(out_params, target_ptr, target_len);
@@ -6427,7 +6606,7 @@ buf_append_lit(out_params, STR_PTR("}"), STR_LEN("}"));
 buf_append_lit(out_anti, STR_PTR("严禁在终端运行递归列目录脚本或递归读取全仓文件！"), STR_LEN("严禁在终端运行递归列目录脚本或递归读取全仓文件！"));
 return;
 };
-if str_eq(bestTool_ptr, bestTool_len, STR_PTR("read_lines"), STR_LEN("read_lines")) {
+if jev_str_eq(bestTool_ptr, bestTool_len, STR_PTR("read_lines"), STR_LEN("read_lines")) {
 buf_append_lit(out_params, STR_PTR("{\"action\":\"read_lines\",\"path\":"), STR_LEN("{\"action\":\"read_lines\",\"path\":"));
 if has_target {
 buf_append_json_str(out_params, target_ptr, target_len);
@@ -6438,7 +6617,7 @@ buf_append_lit(out_params, STR_PTR(",\"start_line\":1,\"end_line\":100}"), STR_L
 buf_append_lit(out_anti, STR_PTR("文件超过 500 行时，严禁使用 read_file 全量读取，必须使用 read_lines 定向切片！"), STR_LEN("文件超过 500 行时，严禁使用 read_file 全量读取，必须使用 read_lines 定向切片！"));
 return;
 };
-if str_eq(bestTool_ptr, bestTool_len, STR_PTR("read_file_tail"), STR_LEN("read_file_tail")) {
+if jev_str_eq(bestTool_ptr, bestTool_len, STR_PTR("read_file_tail"), STR_LEN("read_file_tail")) {
 buf_append_lit(out_params, STR_PTR("{\"action\":\"read_file_tail\",\"path\":"), STR_LEN("{\"action\":\"read_file_tail\",\"path\":"));
 if has_target {
 buf_append_json_str(out_params, target_ptr, target_len);
@@ -6449,7 +6628,7 @@ buf_append_lit(out_params, STR_PTR(",\"lines\":50}"), STR_LEN(",\"lines\":50}"))
 buf_append_lit(out_anti, STR_PTR("排查错误日志时，严禁使用 read_file 或终端 cat 读整个大日志！"), STR_LEN("排查错误日志时，严禁使用 read_file 或终端 cat 读整个大日志！"));
 return;
 };
-if str_eq(bestTool_ptr, bestTool_len, STR_PTR("edit_file"), STR_LEN("edit_file")) {
+if jev_str_eq(bestTool_ptr, bestTool_len, STR_PTR("edit_file"), STR_LEN("edit_file")) {
 buf_append_lit(out_params, STR_PTR("{\"action\":\"edit_file\",\"path\":"), STR_LEN("{\"action\":\"edit_file\",\"path\":"));
 if has_target {
 buf_append_json_str(out_params, target_ptr, target_len);
@@ -6460,14 +6639,14 @@ buf_append_lit(out_params, STR_PTR(",\"old_text\":\"/* exact target */\",\"new_t
 buf_append_lit(out_anti, STR_PTR("单处局部修改严禁手写脚本或用 write_file 覆写数千行全文件！"), STR_LEN("单处局部修改严禁手写脚本或用 write_file 覆写数千行全文件！"));
 return;
 };
-if str_eq(bestTool_ptr, bestTool_len, STR_PTR("apply_patch"), STR_LEN("apply_patch")) {
+if jev_str_eq(bestTool_ptr, bestTool_len, STR_PTR("apply_patch"), STR_LEN("apply_patch")) {
 buf_append_lit(out_params, STR_PTR("{\"action\":\"apply_patch\",\"patch\":"), STR_LEN("{\"action\":\"apply_patch\",\"patch\":"));
 buf_append_json_str(out_params, STR_PTR("*** Begin Patch\n*** Update File: path/to/file.ts\n..."), STR_LEN("*** Begin Patch\n*** Update File: path/to/file.ts\n..."));
 buf_append_lit(out_params, STR_PTR("}"), STR_LEN("}"));
 buf_append_lit(out_anti, STR_PTR("跨文件或多处联动修改，严禁连续调用多次碎片化 edit_file！"), STR_LEN("跨文件或多处联动修改，严禁连续调用多次碎片化 edit_file！"));
 return;
 };
-if str_eq(bestTool_ptr, bestTool_len, STR_PTR("code_graph"), STR_LEN("code_graph")) {
+if jev_str_eq(bestTool_ptr, bestTool_len, STR_PTR("code_graph"), STR_LEN("code_graph")) {
 buf_append_lit(out_params, STR_PTR("{\"action\":\"code_graph\",\"target\":"), STR_LEN("{\"action\":\"code_graph\",\"target\":"));
 if has_target {
 buf_append_json_str(out_params, target_ptr, target_len);
@@ -6478,7 +6657,7 @@ buf_append_lit(out_params, STR_PTR(",\"mode\":\"symbol_hierarchy\",\"depth\":2,\
 buf_append_lit(out_anti, STR_PTR("严禁将 code_graph 用于微观写代码场景；拿到拓扑后切忌无脑遍历，应结合 find_definition！"), STR_LEN("严禁将 code_graph 用于微观写代码场景；拿到拓扑后切忌无脑遍历，应结合 find_definition！"));
 return;
 };
-if str_eq(bestTool_ptr, bestTool_len, STR_PTR("grep_search_async"), STR_LEN("grep_search_async")) {
+if jev_str_eq(bestTool_ptr, bestTool_len, STR_PTR("grep_search_async"), STR_LEN("grep_search_async")) {
 buf_append_lit(out_params, STR_PTR("{\"action\":\"grep_search_async\",\"queries\":["), STR_LEN("{\"action\":\"grep_search_async\",\"queries\":["));
 if has_target {
 buf_append_json_str(out_params, target_ptr, target_len);
@@ -6491,7 +6670,7 @@ buf_append_lit(out_params, STR_PTR("]}"), STR_LEN("]}"));
 buf_append_lit(out_anti, STR_PTR("多个关键词搜索时，严禁串行循环单个 grep_search！"), STR_LEN("多个关键词搜索时，严禁串行循环单个 grep_search！"));
 return;
 };
-if str_eq(bestTool_ptr, bestTool_len, STR_PTR("run_js"), STR_LEN("run_js")) {
+if jev_str_eq(bestTool_ptr, bestTool_len, STR_PTR("run_js"), STR_LEN("run_js")) {
 buf_append_lit(out_params, STR_PTR("{\"action\":\"run_js\",\"content\":"), STR_LEN("{\"action\":\"run_js\",\"content\":"));
 buf_append_json_str(out_params, STR_PTR("export async function main(): Promise<number> {\n // computation logic\n return 0;\n}"), STR_LEN("export async function main(): Promise<number> {\n // computation logic\n return 0;\n}"));
 buf_append_lit(out_params, STR_PTR("}"), STR_LEN("}"));
