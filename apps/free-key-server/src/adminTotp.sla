@@ -1,6 +1,8 @@
 // Converted 1:1 from apps/free-key-server/src/adminTotp.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
 @import "sa_std/ptr.sa"
 @import "sa_std/string.sa"
+@import "sa_std/crypto.sai"
+@import "sa_std/net.sai"
 @import "config.sla"
 
 // TS: import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from "node:crypto";
@@ -11,6 +13,131 @@
 // phase must provide. Buffer is approximated by fixed arrays + lengths.
 // DEFECT: default parameters (byteLength = 20, now = Date.now(),
 // issuer = "Codex Ultra") become explicit arguments.
+
+// Hex nibble for the hex->raw digest decodes below.
+fn hex_nibble(c: u8) -> u64 {
+    if c >= 97 && c <= 102 { return (c - 87) as u64; };
+    if c >= 65 && c <= 70 { return (c - 55) as u64; };
+    if c >= 48 && c <= 57 { return (c - 48) as u64; };
+    return 0;
+}
+
+// createHash("sha256").digest() — std exposes only the hex form
+// (sa_std_net_sha256_hex, net.sai); decode it back to raw 32 bytes.
+fn sha256_digest(data: ptr, data_len: u64, out32: ptr) -> void {
+    let hexbuf = [0u8; 64];
+    let __ap_sx: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_sx, hexbuf, 0);
+    let hex_len: u64 = 0;
+    if sa_std_net_sha256_hex(data, data_len, __ap_sx, 64, &hex_len) != 0 { return; };
+    for i in 0..32 {
+        let c1: u8 = 0;
+        PTR_BYTE_AT(c1, __ap_sx, i * 2);
+        let c2: u8 = 0;
+        PTR_BYTE_AT(c2, __ap_sx, i * 2 + 1);
+        let b = ((hex_nibble(c1) << 4) | hex_nibble(c2)) as u8;
+        let __wp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(__wp, out32, i);
+        PTR_WRITE_U8(__wp, b);
+    }
+}
+
+// Buffer.toString("base64url") — local implementation (the domain
+// has no base64 hub; alphabet is the URL-safe one, no padding).
+fn base64url_encode(data: ptr, data_len: u64, out: &ByteBuf) -> void {
+    buf_reset(out);
+    let alpha = STR_PTR("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_");
+    let i: u64 = 0;
+    while i + 3 <= data_len {
+        let b0: u8 = 0;
+        PTR_BYTE_AT(b0, data, i);
+        let b1: u8 = 0;
+        PTR_BYTE_AT(b1, data, i + 1);
+        let b2: u8 = 0;
+        PTR_BYTE_AT(b2, data, i + 2);
+        let n = ((b0 as u64) << 16) | ((b1 as u64) << 8) | (b2 as u64);
+        for k in 0..4 {
+            let ch: u8 = 0;
+            PTR_BYTE_AT(ch, alpha, (n >> (18 - k * 6)) & 63);
+            buf_append_byte(out, ch);
+        }
+        i = i + 3;
+    }
+    let rem = data_len - i;
+    if rem == 1 {
+        let b0: u8 = 0;
+        PTR_BYTE_AT(b0, data, i);
+        let n = (b0 as u64) << 16;
+        for k in 0..2 {
+            let ch: u8 = 0;
+            PTR_BYTE_AT(ch, alpha, (n >> (18 - k * 6)) & 63);
+            buf_append_byte(out, ch);
+        }
+    };
+    if rem == 2 {
+        let b0: u8 = 0;
+        PTR_BYTE_AT(b0, data, i);
+        let b1: u8 = 0;
+        PTR_BYTE_AT(b1, data, i + 1);
+        let n = ((b0 as u64) << 16) | ((b1 as u64) << 8);
+        for k in 0..3 {
+            let ch: u8 = 0;
+            PTR_BYTE_AT(ch, alpha, (n >> (18 - k * 6)) & 63);
+            buf_append_byte(out, ch);
+        }
+    };
+}
+
+// Buffer.from(s, "base64url") — local implementation; returns 1 on
+// an invalid character (TS throws).
+fn base64url_decode(data: ptr, data_len: u64, out: &ByteBuf) -> i32 {
+    buf_reset(out);
+    let value: u64 = 0;
+    let bits: u64 = 0;
+    for i in 0..data_len {
+        let ch: u8 = 0;
+        PTR_BYTE_AT(ch, data, i);
+        if ch == 61 { break; };
+        let idx: u64 = 4294967295;
+        if ch >= 65 && ch <= 90 { idx = (ch - 65) as u64; };
+        if ch >= 97 && ch <= 122 { idx = (ch - 71) as u64; };
+        if ch >= 48 && ch <= 57 { idx = (ch + 4) as u64; };
+        if ch == 45 { idx = 62; };
+        if ch == 95 { idx = 63; };
+        if idx == 4294967295 { return 1; };
+        value = (value << 6) | idx;
+        bits = bits + 6;
+        if bits >= 8 {
+            let b = (value >> (bits - 8)) & 255;
+            buf_append_byte(out, b as u8);
+            bits = bits - 8;
+        };
+    }
+    return 0;
+}
+
+// encodeURIComponent — local implementation (appends into out):
+// every byte outside the unreserved set [A-Za-z0-9-_.!~*'()] is
+// percent-encoded with uppercase hex.
+fn uri_encode_component(out: &ByteBuf, data: ptr, data_len: u64) -> void {
+    let hexd = STR_PTR("0123456789ABCDEF");
+    for i in 0..data_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, data, i);
+        let unres = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 45 || b == 95 || b == 46 || b == 33 || b == 126 || b == 42 || b == 39 || b == 40 || b == 41;
+        if unres {
+            buf_append_byte(out, b);
+        } else {
+            buf_append_byte(out, 37);
+            let h1: u8 = 0;
+            PTR_BYTE_AT(h1, hexd, (b >> 4) as u64);
+            buf_append_byte(out, h1);
+            let h2: u8 = 0;
+            PTR_BYTE_AT(h2, hexd, (b & 15) as u64);
+            buf_append_byte(out, h2);
+        };
+    }
+}
 
 fn base32_alphabet() -> ptr { return STR_PTR("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"); }
 
@@ -76,8 +203,11 @@ fn base32_decode(out_bytes: ptr, out_len: &u64, in_ptr: ptr, in_len: u64) -> i32
 // TS: export function generateTotpSecret(byteLength = 20): string
 fn generate_totp_secret(out: &ByteBuf, byte_length: u64) -> void {
     let raw = [0u8; 64];
-    // DEFECT: randomBytes — intent extern sa_crypto_random_bytes.
-    sa_crypto_random_bytes(&raw, byte_length);
+    // randomBytes rebound to the OS CSPRNG (sa_crypto_random_bytes,
+    // crypto.sai — landed with the std crypto wave).
+    let __ap_raw: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_raw, raw, 0);
+    sa_crypto_random_bytes(__ap_raw, byte_length);
     let __ap279: ptr = PTR_NULL();
     PTR_BYTE_ADD(__ap279, raw, 0);
     base32_encode(out, __ap279, byte_length);
@@ -99,8 +229,25 @@ fn totp_code(out: &ByteBuf, sec_ptr: ptr, sec_len: u64, now_ms: u64) -> void {
     PTR_BYTE_ADD(__ap280, key, 0);
     base32_decode(__ap280, &key_len, sec_ptr, sec_len);
     let digest = [0u8; 20];
-    // DEFECT: createHmac("sha1", key) — intent extern sa_crypto_hmac_sha1.
-    sa_crypto_hmac_sha1(&key, key_len, &message, 8, &digest);
+    // createHmac("sha1", key) rebound to sa_hmac_sha1_hex
+    // (crypto.sai); the std surface returns hex, so decode the 40
+    // hex chars back to the raw 20-byte digest TOTP operates on.
+    let hexbuf = [0u8; 40];
+    let __ap_hk: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_hk, key, 0);
+    let __ap_hm: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_hm, message, 0);
+    let __ap_hx: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_hx, hexbuf, 0);
+    let hex_len: u64 = 0;
+    sa_hmac_sha1_hex(__ap_hk, key_len, __ap_hm, 8, __ap_hx, 40, &hex_len);
+    for i in 0..20 {
+        let c1: u8 = 0;
+        PTR_BYTE_AT(c1, __ap_hx, i * 2);
+        let c2: u8 = 0;
+        PTR_BYTE_AT(c2, __ap_hx, i * 2 + 1);
+        digest[i] = ((hex_nibble(c1) << 4) | hex_nibble(c2)) as u8;
+    }
     let offset = (digest[19] & 15) as u64;
     let binary = ((digest[offset] & 127) as u64) << 24 | ((digest[offset + 1] as u64) << 16) | ((digest[offset + 2] as u64) << 8) | (digest[offset + 3] as u64);
     let code = binary % 1000000;
@@ -166,17 +313,19 @@ fn verify_totp(sec_ptr: ptr, sec_len: u64, code_ptr: ptr, code_len: u64, now_ms:
 // TS: export function totpUri(secret: string, username: string, issuer = "Codex Ultra"): string
 fn totp_uri(out: &ByteBuf, sec_ptr: ptr, sec_len: u64, un_ptr: ptr, un_len: u64, iss_ptr: ptr, iss_len: u64) -> void {
     buf_reset(out);
-    // DEFECT: encodeURIComponent — intent extern sa_uri_encode_component.
+    // encodeURIComponent — local uri_encode_component (above).
     let label = ByteBuf { bytes: [0u8; 40960], len: 0 };
     buf_append_lit(&label, iss_ptr, iss_len);
     buf_append_lit(&label, STR_PTR(":"), STR_LEN(":"));
     buf_append_lit(&label, un_ptr, un_len);
     buf_append_lit(out, STR_PTR("otpauth://totp/"), STR_LEN("otpauth://totp/"));
-    sa_uri_encode_component(out, &label.bytes, label.len);
+    let __ap_lab: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_lab, label.bytes, 0);
+    uri_encode_component(out, __ap_lab, label.len);
     buf_append_lit(out, STR_PTR("?secret="), STR_LEN("?secret="));
-    sa_uri_encode_component(out, sec_ptr, sec_len);
+    uri_encode_component(out, sec_ptr, sec_len);
     buf_append_lit(out, STR_PTR("&issuer="), STR_LEN("&issuer="));
-    sa_uri_encode_component(out, iss_ptr, iss_len);
+    uri_encode_component(out, iss_ptr, iss_len);
     buf_append_lit(out, STR_PTR("&algorithm=SHA1&digits=6&period=30"), STR_LEN("&algorithm=SHA1&digits=6&period=30"));
 }
 
@@ -184,24 +333,15 @@ fn totp_uri(out: &ByteBuf, sec_ptr: ptr, sec_len: u64, un_ptr: ptr, un_len: u64,
 // "v1:<iv b64url>:<tag b64url>:<ciphertext b64url>", key = sha256(encryptionSecret), AES-256-GCM, 12-byte IV.
 fn encrypt_totp_secret(out: &ByteBuf, sec_ptr: ptr, sec_len: u64, enc_ptr: ptr, enc_len: u64) -> void {
     buf_reset(out);
-    let key = [0u8; 32];
-    // DEFECT: createHash("sha256") + AES-256-GCM cipher — intent externs.
-    sa_crypto_sha256(enc_ptr, enc_len, &key);
-    let iv = [0u8; 12];
-    sa_crypto_random_bytes(&iv, 12);
-    let ct = ByteBuf { bytes: [0u8; 40960], len: 0 };
-    let tag = [0u8; 16];
-    sa_crypto_aes256gcm_encrypt(&key, &iv, sec_ptr, sec_len, &ct, &tag);
-    let enc_buf = ByteBuf { bytes: [0u8; 40960], len: 0 };
-    buf_append_lit(out, STR_PTR("v1:"), STR_LEN("v1:"));
-    sa_crypto_base64url_encode(&iv, 12, &enc_buf);
-    buf_append_buf(out, &enc_buf);
-    buf_append_lit(out, STR_PTR(":"), STR_LEN(":"));
-    sa_crypto_base64url_encode(&tag, 16, &enc_buf);
-    buf_append_buf(out, &enc_buf);
-    buf_append_lit(out, STR_PTR(":"), STR_LEN(":"));
-    sa_crypto_base64url_encode(&ct.bytes, ct.len, &enc_buf);
-    buf_append_buf(out, &enc_buf);
+    // DEFECT (B-class, four-source verdict): AES-256-GCM has NO
+    // counterpart in sala docs, SLA demos/tests, the sa_plugin_sla
+    // corpus, or the sa_std inventory (.sai/.sla/.sa + sa_std.h) —
+    // authenticated encryption is UNSUPPORTED in this build, so no
+    // "v1:" string is produced (out stays empty; callers treat empty
+    // as failure). The surrounding surfaces ARE bound: key
+    // derivation via sha256_digest, IV via sa_crypto_random_bytes,
+    // segment encoding via base64url_encode — only the GCM cipher
+    // itself is missing. Registered in FIX_OTHER_APPS.md.
 }
 
 // TS: export function decryptTotpSecret(encoded: string, encryptionSecret: string): string
@@ -231,20 +371,26 @@ fn decrypt_totp_secret(out: &ByteBuf, enc_text_ptr: ptr, enc_text_len: u64, enc_
     if spans[1] != 2 || !bytes_eq_str(v_ptr, spans[1], STR_PTR("v1"), STR_LEN("v1")) { return 1; };
     if spans[3] == 0 || spans[5] == 0 || spans[7] == 0 { return 1; };
     let key = [0u8; 32];
-    sa_crypto_sha256(enc_ptr, enc_len, &key);
+    let __ap_dk: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_dk, key, 0);
+    sha256_digest(enc_ptr, enc_len, __ap_dk);
     let iv = ByteBuf { bytes: [0u8; 40960], len: 0 };
     let tag = ByteBuf { bytes: [0u8; 40960], len: 0 };
     let ct = ByteBuf { bytes: [0u8; 40960], len: 0 };
     let p1: ptr = PTR_NULL();
     PTR_BYTE_ADD(p1, enc_text_ptr, spans[2]);
-    if sa_crypto_base64url_decode(p1, spans[3], &iv) != 0 { return 1; };
+    if base64url_decode(p1, spans[3], &iv) != 0 { return 1; };
     let p2: ptr = PTR_NULL();
     PTR_BYTE_ADD(p2, enc_text_ptr, spans[4]);
-    if sa_crypto_base64url_decode(p2, spans[5], &tag) != 0 { return 1; };
+    if base64url_decode(p2, spans[5], &tag) != 0 { return 1; };
     let p3: ptr = PTR_NULL();
     PTR_BYTE_ADD(p3, enc_text_ptr, spans[6]);
-    if sa_crypto_base64url_decode(p3, spans[7], &ct) != 0 { return 1; };
-    // DEFECT: createDecipheriv("aes-256-gcm") + setAuthTag — intent extern.
-    if sa_crypto_aes256gcm_decrypt(&key, &iv.bytes, iv.len, &tag.bytes, &ct.bytes, ct.len, out) != 0 { return 1; };
-    return 0;
+    if base64url_decode(p3, spans[7], &ct) != 0 { return 1; };
+    // DEFECT (B-class, four-source verdict as in
+    // encrypt_totp_secret): AES-256-GCM decryption is UNSUPPORTED
+    // in this build — format parsing, key derivation and segment
+    // decoding above are genuine, but the cipher step cannot run,
+    // so every well-formed input fails here with the TS throw
+    // status (1).
+    return 1;
 }
