@@ -1,314 +1,3371 @@
-// Converted 1:1 from packages/cxu/src/vendor/saVmCodeGraph.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// pkg-cxu vendor port (2026-10-26, FIX_PKG_CXU): content = apps/server/src/saVmCodeGraph.sla -- the verified SLA
+// translation of the identical TS source; only @import paths remapped to vendor
+// siblings (registered diffs in _defects/FIX_PKG_CXU.md).
+// Converted 1:1 from apps/server/src/saVmCodeGraph.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// NOTE: single-file sequential conversion of the 1,344-line code-graph
+// module. Tree-sitter Node objects are u64 handles into a host-side
+// node table via the assumed ts_node_* extern surface declared in
+// saVmTreeSitter.sla (NOT in sa_std — see defect log). The policy types
+// and checkSaVmPath / normalizeSaVmPolicy belong to the
+// backends/vmtool-security unit; CgRunResult belongs to the
+// saVmResultKind unit — both are referenced here, not redefined in
+// substance.
 
-// Code graph extraction (tree-sitter AST + regex fallback), scoped
-// graph crawling (module_dependency / call_flow / symbol_hierarchy)
-// and DOT / Python-stub / NetworkX formatters.
-// DEFECT: web-tree-sitter Node objects, dynamic import(), Map/Set,
-// async fs and closures capturing mutable state have no SLA
-// equivalents; tree nodes become opaque handles (TsNode), maps/sets
-// become fixed arrays + linear scans, async becomes synchronous +
-// status code, and recursive visitor closures become explicit
-// stack-based walk functions (approximated in this bulk pass).
 @import "sa_std/io/print.sai"
 @import "sa_std/ptr.sa"
-@import "../shared-types.sla"
-@import "./saVmPolicy.sla"
-@import "./saVmTreeSitter.sla"
-@import "./saVmResultKind.sla"
+@import "sa_std/string.sa"
 
-// DEFECT: tree-sitter Node -> opaque handle struct.
-struct TsNode { handle: u64, valid: bool }
-fn ts_node_type_len(n: &TsNode) -> u64 { return 0; }
-fn ts_node_child_count(n: &TsNode) -> u64 { return 0; }
-fn ts_node_child(n: &TsNode, idx: u64, out: &TsNode) -> bool { out.valid = false; return false; }
-fn ts_node_child_for_field(n: &TsNode, field_ptr: ptr, field_len: u64, out: &TsNode) -> bool { out.valid = false; return false; }
-fn ts_node_text(n: &TsNode, out_ptr: ptr, out_cap: u64) -> u64 { return 0; }
-fn ts_node_start_row(n: &TsNode) -> u64 { return 0; }
+@import "./saVmTreeSitter.sla" // getLanguageNameForFile, loadLanguageForFile, TreeSitterState, StrBuf + sb_* helpers, ts_node_* surface (was commented in bulk pass)
+@import "./saVmPolicy.sla" // checkSaVmPath, normalizeSaVmPolicy, NormalizedSaVmPolicy
+// @import "./saVmResultKind.sla"   // CgRunResult
+// DEFECT: node:fs (existsSync/readdirSync/statSync via require),
+// node:fs/promises (readFile/writeFile), node:path — no sa_std
+// counterpart; assumed externs: fs_exists, fs_stat_is_file,
+// fs_read_file(path, out &StrBuf) -> bool, fs_write_file(path, content) -> bool,
+// fs_readdir(dir, out &StrBuf /* \n-joined names */, dirs &StrBuf) -> bool,
+// path_dirname/path_extname/path_join2/path_resolve2/path_relative/is_absolute.
 
-// export type CodeGraphEdgeKind = "extends"|"implements"|"owns"|"imports"|"calls"
+// ---- cross-unit types (referenced, owned by other units) ----
+// CgPolicyConfig is a dynamic options object from @codex-ui/shared,
+// flattened here to its JSON doc handle. NormalizedSaVmPolicy is the
+// vmtool-security unit's normalized form, imported from saVmPolicy.sla
+// above together with checkSaVmPath / normalizeSaVmPolicy.
+struct CgPolicyConfig { handle: u64, has_value: bool }
+
+// Policy gate for this unit: cgCheckSaVmPath adapts the flattened
+// (policy, action "read"|"write", absPath, cwd) call shape used below
+// onto the vmtool-security unit's checkSaVmPath decision API.
+fn cgCheckSaVmPath(policy: &NormalizedSaVmPolicy, action_p: ptr, action_n: u64, absPath: &StrBuf, cwd: &StrBuf, reasonOut: &StrBuf) -> bool {
+    // Bound to the vmtool-security unit's checkSaVmPath
+    // (saVmPolicy.sla): action "read" -> operation 0, "write" ->
+    // operation 1 (the SaVmPathOperation tags of that unit). The
+    // decision's reason text is copied into reasonOut.
+    let op: u32 = 0;
+    let ab = StrBuf { bytes: [0u8; 65536], len: 0 };
+    sb_append(&ab, action_p, action_n);
+    if sb_eq_lit(&ab, STR_PTR("write"), STR_LEN("write")) { op = 1; };
+    let decision = SaVmPolicyDecision { allowed: false, reason: [0u8; 2048], reason_len: 0, path: [0u8; 1024], path_len: 0, path_has: false };
+    let pp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pp, &absPath.bytes, 0);
+    let cp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cp, &cwd.bytes, 0);
+    checkSaVmPath(policy, op, pp, absPath.len, cp, cwd.len, &decision);
+    if !decision.allowed {
+        sb_clear(reasonOut);
+        let rp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp, &decision.reason, 0);
+        sb_append(reasonOut, rp, decision.reason_len);
+        return false;
+    };
+    return true;
+}
+
+fn cgNormalizeSaVmPolicy(policy: &CgPolicyConfig, cwd: &StrBuf, out: &NormalizedSaVmPolicy) {
+    // Bound to the vmtool-security unit's normalizeSaVmPolicy
+    // (saVmPolicy.sla): config_doc is the policy config's JSON doc
+    // handle (this unit's flattened CgPolicyConfig.handle); the
+    // code graph supplies no additional roots.
+    let roots = StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 };
+    let cp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cp, &cwd.bytes, 0);
+    normalizeSaVmPolicy(policy.handle, cp, cwd.len, &roots, out);
+}
+
+// CgRunResult (saVmResultKind unit): events/violation are dynamic
+// objects in TS; flattened here. DEFECT: dynamic object.
+struct CgRunResult {
+    ok: bool,
+    kind: [u8; 64], kind_len: u64,               // "success" | "sa_error" | "capability_denied" | ...
+    exitCode: i32,
+    stdout: [u8; 65536], stdout_len: u64,
+    stderr: [u8; 8192], stderr_len: u64,
+    events_json: [u8; 8192], events_json_len: u64, // saVmEvents: Array<Record> as JSON text (DEFECT)
+    violation_reason: [u8; 1024], violation_reason_len: u64, has_violation: bool, // saVmViolation | null
+    durationMs: u64,
+}
+
+// ---- src/saVmCodeGraph.ts:11 — type CodeGraphEdgeKind (string union -> u64 tag) ----
 const EDGE_EXTENDS: u64 = 0;
 const EDGE_IMPLEMENTS: u64 = 1;
 const EDGE_OWNS: u64 = 2;
 const EDGE_IMPORTS: u64 = 3;
 const EDGE_CALLS: u64 = 4;
 
-// export interface CodeGraphNode { id, label, kind, file?, line? }
-// kind: "class"|"interface"|"module"|"function"|"unknown" -> u64 tag.
-const NODE_CLASS: u64 = 0;
-const NODE_INTERFACE: u64 = 1;
-const NODE_MODULE: u64 = 2;
-const NODE_FUNCTION: u64 = 3;
-const NODE_UNKNOWN: u64 = 4;
-struct CodeGraphNode {
-    id_bytes: [u8; 1024], id_len: u64,
-    label_bytes: [u8; 1024], label_len: u64,
-    kind: u64,
-    has_file: bool, file_bytes: [u8; 4096], file_len: u64,
-    has_line: bool, line: u64,
+fn edge_kind_name(kind: u64, out: &StrBuf) {
+    sb_clear(out);
+    if kind == EDGE_EXTENDS { sb_append(out, STR_PTR("extends"), STR_LEN("extends")); return; };
+    if kind == EDGE_IMPLEMENTS { sb_append(out, STR_PTR("implements"), STR_LEN("implements")); return; };
+    if kind == EDGE_OWNS { sb_append(out, STR_PTR("owns"), STR_LEN("owns")); return; };
+    if kind == EDGE_IMPORTS { sb_append(out, STR_PTR("imports"), STR_LEN("imports")); return; };
+    sb_append(out, STR_PTR("calls"), STR_LEN("calls"));
 }
-// export interface CodeGraphEdge { source, target, kind, label? }
-struct CodeGraphEdge {
-    source_bytes: [u8; 1024], source_len: u64,
-    target_bytes: [u8; 1024], target_len: u64,
-    kind: u64, has_label: bool, label_bytes: [u8; 256], label_len: u64,
-}
-// DEFECT: graph arrays -> fixed arrays (max_nodes budget <= 100 in
-// source; capacity 128 here; edges capacity 1024).
-struct CodeGraph { nodes: [CodeGraphNode; 128], nodes_len: u64, edges: [CodeGraphEdge; 1024], edges_len: u64, root_id_bytes: [u8; 1024], root_id_len: u64, truncated: bool }
 
-// Field/method sub-records of ExtractedClassInfo.
-// DEFECT: Array<{name, type?}> / Array<{name, calls[]}> -> JSON bufs.
+// ---- src/saVmCodeGraph.ts:13-19 — interface CodeGraphNode ----
+// DEFECT: `kind` is a string union; u64 tag (0 class, 1 interface,
+// 2 module, 3 function, 4 unknown). Optional file?/line? -> flags.
+struct CodeGraphNode {
+    id: [u8; 1024], id_len: u64,
+    label: [u8; 1024], label_len: u64,
+    kind: u64,
+    file: [u8; 1024], file_len: u64, has_file: bool,
+    line: u64, has_line: bool,
+}
+
+struct CodeGraphNodeList {
+    items: [CodeGraphNode; 256], len: u64,
+}
+
+// ---- src/saVmCodeGraph.ts:21-26 — interface CodeGraphEdge ----
+struct CodeGraphEdge {
+    source: [u8; 1024], source_len: u64,
+    target: [u8; 1024], target_len: u64,
+    kind: u64,
+    label: [u8; 256], label_len: u64, has_label: bool,
+}
+
+struct CodeGraphEdgeList {
+    items: [CodeGraphEdge; 1024], len: u64,
+}
+
+// ---- src/saVmCodeGraph.ts:28-35 — interface ExtractedClassInfo ----
+// DEFECT: string[] (bases/interfaces) -> ", "-joined buffers; fields /
+// methods object arrays -> fixed lists below.
+struct ExtractedField {
+    name: [u8; 256], name_len: u64,
+    type_: [u8; 512], type_len: u64, has_type: bool,
+}
+
+struct ExtractedMethod {
+    name: [u8; 256], name_len: u64,
+    calls: [u8; 4096], calls_len: u64,   // string[] as ", "-joined
+}
+
 struct ExtractedClassInfo {
-    name_bytes: [u8; 512], name_len: u64,
-    bases_json: [u8; 2048], bases_json_len: u64, bases_count: u64,
-    interfaces_json: [u8; 2048], interfaces_json_len: u64, interfaces_count: u64,
-    fields_json: [u8; 4096], fields_json_len: u64, fields_count: u64,
-    methods_json: [u8; 8192], methods_json_len: u64, methods_count: u64,
+    name: [u8; 256], name_len: u64,
+    bases: [u8; 2048], bases_len: u64,         // string[] joined
+    interfaces: [u8; 2048], interfaces_len: u64,
+    fields: [ExtractedField; 128], fields_len: u64,
+    methods: [ExtractedMethod; 128], methods_len: u64,
     line: u64,
 }
+
+struct ExtractedClassList {
+    items: [ExtractedClassInfo; 256], len: u64,
+}
+
+// ---- src/saVmCodeGraph.ts:37-42 — interface ExtractedImportInfo ----
+struct ImportSymbol {
+    imported: [u8; 256], imported_len: u64,
+    local: [u8; 256], local_len: u64,
+}
+
 struct ExtractedImportInfo {
-    specifier_bytes: [u8; 1024], specifier_len: u64,
-    symbols_json: [u8; 4096], symbols_json_len: u64, symbols_count: u64,
-    is_default: bool, is_namespace: bool,
+    specifier: [u8; 1024], specifier_len: u64,
+    symbols: [ImportSymbol; 128], symbols_len: u64,
+    isDefault: bool, has_isDefault: bool,   // isDefault?: boolean
+    isNamespace: bool, has_isNamespace: bool,
 }
+
+struct ExtractedImportList {
+    items: [ExtractedImportInfo; 256], len: u64,
+}
+
+// ---- src/saVmCodeGraph.ts:44-49 — interface ExtractedFileInfo ----
+struct ExtractedFunction {
+    name: [u8; 256], name_len: u64,
+    calls: [u8; 4096], calls_len: u64,   // string[] joined
+    line: u64,
+}
+
 struct ExtractedFileInfo {
-    file_path_bytes: [u8; 4096], file_path_len: u64,
-    classes: [ExtractedClassInfo; 256], classes_len: u64,
-    imports: [ExtractedImportInfo; 256], imports_len: u64,
-    functions_json: [u8; 16384], functions_json_len: u64, functions_count: u64,
+    filePath: [u8; 1024], filePath_len: u64,
+    classes_first: u64, classes_len: u64,     // ranges in caller lists
+    imports_first: u64, imports_len: u64,
+    functions: [ExtractedFunction; 512], functions_len: u64,
 }
 
-// export type CodeGraphMode = "symbol_hierarchy"|"module_dependency"|"module_deps"|"call_flow"
-const MODE_SYMBOL_HIERARCHY: u64 = 0;
-const MODE_MODULE_DEPENDENCY: u64 = 1;
-const MODE_CALL_FLOW: u64 = 2;
-// export interface CodeGraphOptions
+// ---- src/saVmCodeGraph.ts:51-65 — CodeGraphMode / CodeGraphOptions ----
+// DEFECT: mode/format/direction are string unions -> u64 tags
+// (mode: 0 symbol_hierarchy, 1 module_dependency, 2 module_deps alias,
+// 3 call_flow; direction: 0 upstream, 1 downstream, 2 both;
+// format: 0 dot, 1 py_stub, 2 networkx). Optional fields -> flags;
+// candidate_files/files are string[] -> \n-joined buffer.
 struct CodeGraphOptions {
-    target_bytes: [u8; 1024], target_len: u64,
-    has_mode: bool, mode: u64,
-    has_depth: bool, depth: u64,
-    has_direction: bool, direction: u64,
-    has_format: bool, format: u64,
-    has_max_nodes: bool, max_nodes: u64,
-    has_max_tokens: bool, max_tokens: u64,
-    has_output_file: bool, output_file_bytes: [u8; 4096], output_file_len: u64,
-    candidate_json: [u8; 8192], candidate_json_len: u64, candidate_count: u64,
-    has_candidate: bool,
-    timeout_ms: u64, has_timeout: bool,
-}
-const DIR_UPSTREAM: u64 = 0;
-const DIR_DOWNSTREAM: u64 = 1;
-const DIR_BOTH: u64 = 2;
-const FMT_DOT: u64 = 0;
-const FMT_PY_STUB: u64 = 1;
-const FMT_NETWORKX: u64 = 2;
-
-// --- AST Extraction ---
-// function cleanSymbolName(raw) -> string
-fn cleanSymbolName(raw_ptr: ptr, raw_len: u64, out_ptr: ptr, out_cap: u64) -> u64 {
-    // DEFECT: RegExp strip /^[<{(]+|[>})]+$/ + \s+ collapse -> byte
-    // scan: trim leading <{( chars, trailing >}) chars, collapse
-    // whitespace runs to one space, trim.
-    return 0;
-}
-// function extractTypeIdentifiers(node: Node | null) -> string[]
-// DEFECT: recursive closure walk -> explicit recursive fn + JSON out.
-fn extractTypeIdentifiers(node: &TsNode, has_node: bool, out_ptr: ptr, out_cap: u64, out_count: &u64) -> i32 {
-    // collects type_identifier / identifier / nested_type_identifier
-    // texts via cleanSymbolName, excluding keyword texts (implements,
-    // extends, class, interface, type, public, private, protected,
-    // readonly); deduped preserving order.
-    out_count = 0;
-    return 0;
-}
-// function extractTsClass(node: Node) -> ExtractedClassInfo
-fn extractTsClass(node: &TsNode, out: &ExtractedClassInfo) -> i32 {
-    // name from "name" field, else first type/identifier child, else
-    // "(anonymous)". class_heritage: extends_clause -> bases,
-    // implements_clause -> interfaces (extractTypeIdentifiers).
-    // class_body: field definitions -> fields {name, type sans ": "};
-    // method_definition -> methods {name, calls} where calls are
-    // call_expression function texts stripped of "this." / "<obj>."
-    // prefixes and filtered to plain identifiers, deduped.
-    // line = startPosition.row + 1.
-    out.name_len = 0;
-    return 0;
-}
-// function extractTsInterface(node: Node) -> ExtractedClassInfo
-fn extractTsInterface(node: &TsNode, out: &ExtractedClassInfo) -> i32 {
-    // name field or "(anonymous)"; extends(_type)_clause -> bases;
-    // interface_body/object_type property/method signatures ->
-    // fields; interfaces/methods empty; line = row + 1.
-    return 0;
-}
-// function extractTsImports(node: Node) -> ExtractedImportInfo[]
-fn extractTsImports(root: &TsNode, out: &ExtractedFileInfo) -> i32 {
-    // recursive visit: import_statement -> specifier from "source"
-    // field sans quotes; import_clause children: identifier ->
-    // default symbol; namespace_import -> "*" symbol + isNamespace;
-    // named_imports/import_specifier -> {imported: name, local:
-    // alias ?? name}. Pushes into out.imports.
-    return 0;
-}
-// function extractPythonClass(node: Node) -> ExtractedClassInfo
-fn extractPythonClass(node: &TsNode, out: &ExtractedClassInfo) -> i32 {
-    // name field; superclasses identifiers -> bases; body
-    // function_definition -> methods (calls from "call" nodes:
-    // identifier text or attribute field text, deduped);
-    // expression_statement assignment -> fields {left identifier,
-    // type}. interfaces empty; line = row + 1.
-    return 0;
-}
-// function extractPythonImports(node: Node) -> ExtractedImportInfo[]
-fn extractPythonImports(root: &TsNode, out: &ExtractedFileInfo) -> i32 {
-    // visit: import_statement dotted_name children -> one import
-    // each (symbol = itself); import_from_statement -> specifier
-    // from module_name field, other dotted_names as symbols.
-    return 0;
+    target: [u8; 1024], target_len: u64,
+    mode: u64, has_mode: bool,
+    depth: u64, has_depth: bool,
+    direction: u64, has_direction: bool,
+    format: u64, has_format: bool,
+    max_nodes: u64, has_max_nodes: bool,
+    max_tokens: u64, has_max_tokens: bool,
+    output_file: [u8; 1024], output_file_len: u64, has_output_file: bool,
+    candidate_files: [u8; 16384], candidate_files_len: u64, has_candidate_files: bool,
+    files: [u8; 16384], files_len: u64, has_files: bool,
+    timeout_ms: u64, has_timeout_ms: bool,
 }
 
-// function extractRegexFallback(content, filePath) -> ExtractedFileInfo
-// DEFECT: four global RegExps with capture groups + exec loops ->
-// hand-written scanners (bulk pass keeps the pattern inventory and
-// result shape; scanners are stubs returning counts).
-fn extractRegexFallback(content_ptr: ptr, content_len: u64, file_ptr: ptr, file_len: u64, out: &ExtractedFileInfo) -> i32 {
-    // classRegex: (export)?(default)?class Name (extends X)?
-    //   (implements A, B)? -> classes {name, bases, interfaces,
-    //   fields [], methods [], line by newline count}.
-    // importRegex: import {..}|Name|* as Name from 'spec' -> imports.
-    // functionRegex: (export)?(async)?function Name(params){body}
-    //   -> functions with calls = identifier( tokens in body minus
-    //   if/for/while/switch/catch/function, deduped.
-    // arrowRegex: (export)?(const|let|var) Name = (async)?(params)=>
-    //   {body} -> same call extraction.
-    out.classes_len = 0; out.imports_len = 0; out.functions_count = 0;
-    return 0;
+// ---- shared node-type helper (same surface as saVmTreeSitter unit) ----
+fn cg_node_type_is(n: u64, p: ptr, len: u64) -> bool {
+    // Same shape as the saVmTreeSitter unit's node_type_is: the type
+    // string is materialized via ts_node_type_sb (sa_ts_node_type).
+    if n == 0 { return false; };
+    let tb = StrBuf { bytes: [0u8; 65536], len: 0 };
+    ts_node_type_sb(n, &tb);
+    if tb.len != len { return false; };
+    let i: u64 = 0;
+    while i < len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, p, i);
+        if tb.bytes[i] != b { return false; };
+        i = i + 1;
+    }
+    return true;
 }
 
-// export async function extractFileInfo(filePath, content)
-// DEFECT: async; dynamic import("web-tree-sitter") + Parser.init
-// wasm locateFile -> tree-sitter extern session (saVmTreeSitter.sla).
-fn extractFileInfo(file_ptr: ptr, file_len: u64, content_ptr: ptr, content_len: u64, out: &ExtractedFileInfo) -> i32 {
-    // lang = loadLanguageForFile(filePath); none -> regex fallback.
-    // Parse; failure/null tree/exception -> regex fallback.
-    // typescript|tsx|javascript: extractTsImports + visit classes
-    // (class_declaration / named class), interfaces, function
-    // declarations (calls walk, deduped, line row+1) and lexical/
-    // variable declarations holding arrow/function expressions.
-    // python: extractPythonImports + class_definition /
-    // function_definition visit. Other languages -> regex fallback.
-    return extractRegexFallback(content_ptr, content_len, file_ptr, file_len, out);
+fn cg_field(n: u64, p: ptr, len: u64) -> u64 {
+    if n == 0 { return 0; };
+    return ts_node_child_by_field(n, p, len);
 }
 
-// --- Path & Import Resolution ---
-// export function resolveImportFilePath(importerAbsPath, specifier, _cwd?)
-// DEFECT: string | null -> has return flag + output buffer.
-fn resolveImportFilePath(imp_ptr: ptr, imp_len: u64, spec_ptr: ptr, spec_len: u64, out_ptr: ptr, out_cap: u64) -> bool {
-    // non-"." specifier -> null (external package). Candidates in
-    // order: base, .js->.ts, .js->.tsx, +.ts, +.tsx, +.js, +.mjs,
-    // +.py, /index.ts, /index.tsx, /index.js; first existing file
-    // (existsSync + statSyncSafe isFile) wins.
+fn cg_field_text(n: u64, p: ptr, len: u64, out: &StrBuf) {
+    sb_clear(out);
+    let f = cg_field(n, p, len);
+    if f != 0 { ts_node_text(f, out); };
+}
+
+fn cg_copy_into(field: &[u8; 256], out_len: &u64, src: &StrBuf) {
+    *out_len = 0;
+    let i: u64 = 0;
+    while i < src.len && i < 256 {
+        field[i] = src.bytes[i];
+        let n = *out_len;
+        *out_len = n + 1;
+        i = i + 1;
+    }
+}
+
+fn cg_buf_eq(field: ptr, n: u64, other: &StrBuf) -> bool {
+    // ptr + len form: the compared fields have different capacities
+    // at the call sites (the flattened helper takes ptr/len).
+    if n != other.len { return false; };
+    let i: u64 = 0;
+    while i < n {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, field, i);
+        if c != other.bytes[i] { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn cg_field_to_sb(field: ptr, n: u64, out: &StrBuf) {
+    // field is a byte pointer + length (the call sites' arrays have
+    // different capacities, so the flattened helper takes ptr/len).
+    sb_clear(out);
+    let i: u64 = 0;
+    while i < n {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, field, i);
+        sb_append_byte(out, c);
+        i = i + 1;
+    }
+}
+
+// dedup-append to a ", "-joined list (source: [...new Set(xs)])
+fn cg_join_add(joined: &StrBuf, item: &StrBuf) {
+    if item.len == 0 { return; };
+    if cg_join_contains(joined, item) { return; };
+    if joined.len > 0 { sb_append(joined, STR_PTR(", "), STR_LEN(", ")); };
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &item.bytes, 0);
+    sb_append(joined, p, item.len);
+}
+
+fn cg_join_contains(joined: &StrBuf, item: &StrBuf) -> bool {
+    // entries are ", "-joined; test membership segment-wise
+    let pos: u64 = 0;
+    while pos <= joined.len {
+        let end = pos;
+        while end < joined.len && !(joined.bytes[end] == 44 && end + 1 < joined.len && joined.bytes[end + 1] == 32) { end = end + 1; }
+        if end - pos == item.len {
+            let same = true;
+            let q: u64 = 0;
+            while q < item.len {
+                if joined.bytes[pos + q] != item.bytes[q] { same = false; };
+                q = q + 1;
+                if !same { break; };
+            }
+            if same { return true; };
+        };
+        if end >= joined.len { break; };
+        pos = end + 2;
+    }
     return false;
 }
-fn statSyncSafe(path_ptr: ptr, path_len: u64, is_file_out: &bool) -> bool {
-    // DEFECT: require("node:fs") inside fn + try/catch -> fs extern;
-    // returns false (null) on any error.
-    is_file_out = false;
+
+fn cg_join_count(joined: &StrBuf) -> u64 {
+    if joined.len == 0 { return 0; };
+    let n: u64 = 1;
+    let i: u64 = 0;
+    while i + 1 < joined.len {
+        if joined.bytes[i] == 44 && joined.bytes[i + 1] == 32 { n = n + 1; };
+        i = i + 1;
+    }
+    return n;
+}
+
+// ---- src/saVmCodeGraph.ts:69-71 — cleanSymbolName ----
+// DEFECT: chained regex replaces (/^[<{(]+|[>})]+$/g and /\s+/g) —
+// hand-rolled: strip leading [<{( and trailing [>})] runs, collapse
+// whitespace, trim.
+fn cleanSymbolName(raw: &StrBuf, out: &StrBuf) {
+    sb_clear(out);
+    let s: u64 = 0;
+    while s < raw.len && (raw.bytes[s] == 60 || raw.bytes[s] == 123 || raw.bytes[s] == 40) { s = s + 1; }
+    let e = raw.len;
+    while e > s && (raw.bytes[e - 1] == 62 || raw.bytes[e - 1] == 125 || raw.bytes[e - 1] == 41) { e = e - 1; }
+    let lastSpace = true;
+    let i = s;
+    while i < e {
+        let c = raw.bytes[i];
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            if !lastSpace { sb_append_byte(out, 32); lastSpace = true; };
+        } else {
+            sb_append_byte(out, c);
+            lastSpace = false;
+        };
+        i = i + 1;
+    }
+    if out.len > 0 && out.bytes[out.len - 1] == 32 { out.len = out.len - 1; };
+}
+
+// ---- src/saVmCodeGraph.ts:73-94 — extractTypeIdentifiers ----
+// DEFECT: nested recursive `walk` closure capturing `results`, and
+// [...new Set(results)] dedup — explicit recursive fn + join_add.
+fn extractTypeIdentifiersWalk(node: u64, outJoined: &StrBuf) {
+    if cg_node_type_is(node, STR_PTR("type_identifier"), STR_LEN("type_identifier")) ||
+       cg_node_type_is(node, STR_PTR("identifier"), STR_LEN("identifier")) ||
+       cg_node_type_is(node, STR_PTR("nested_type_identifier"), STR_LEN("nested_type_identifier")) {
+        let raw = StrBuf { bytes: [0u8; 65536], len: 0 };
+        ts_node_text(node, &raw);
+        let text = StrBuf { bytes: [0u8; 65536], len: 0 };
+        cleanSymbolName(&raw, &text);
+        // !["implements","extends","class","interface","type","public",
+        //   "private","protected","readonly"].includes(text)
+        let banned = StrBuf { bytes: [0u8; 65536], len: 0 };
+        sb_append(&banned, STR_PTR("implements extends class interface type public private protected readonly"), STR_LEN("implements extends class interface type public private protected readonly"));
+        if text.len > 0 && !word_in_space_list(&banned, &text) {
+            cg_join_add(outJoined, &text);
+        };
+    };
+    let i: u64 = 0;
+    let cc = ts_node_child_count(node);
+    while i < cc {
+        let child = ts_node_child(node, i);
+        if child != 0 { extractTypeIdentifiersWalk(child, outJoined); };
+        i = i + 1;
+    }
+}
+
+fn word_in_space_list(list: &StrBuf, word: &StrBuf) -> bool {
+    let pos: u64 = 0;
+    while pos <= list.len {
+        let end = pos;
+        while end < list.len && list.bytes[end] != 32 { end = end + 1; }
+        if end - pos == word.len {
+            let same = true;
+            let q: u64 = 0;
+            while q < word.len {
+                if list.bytes[pos + q] != word.bytes[q] { same = false; };
+                q = q + 1;
+                if !same { break; };
+            }
+            if same { return true; };
+        };
+        if end >= list.len { break; };
+        pos = end + 1;
+    }
     return false;
 }
-// export function findProjectSourceFiles(dir, maxFiles = 200) -> string[]
-fn findProjectSourceFiles(dir_ptr: ptr, dir_len: u64, max_files: u64, out_ptr: ptr, out_cap: u64, out_count: &u64) -> i32 {
-    // recursive walk, depth <= 6, stop at maxFiles; skip dot-dirs
-    // and node_modules/dist/build/coverage/release/desktop-
-    // resources/temp/tmp; collect .ts/.tsx/.js/.jsx/.mjs/.py files.
-    // DEFECT: closure recursion -> explicit stack walk; readdir
-    // errors silently skipped (1:1 with source catch {}).
-    out_count = 0;
-    return 0;
+
+fn extractTypeIdentifiers(node: u64, outJoined: &StrBuf) {
+    sb_clear(outJoined);
+    if node == 0 { return; };
+    extractTypeIdentifiersWalk(node, outJoined);
 }
 
-// --- Scoped Graph Crawler ---
-// export async function buildScopedCodeGraph(options, policy, cwd)
-// DEFECT: async; Map/Set/queue closures -> fixed arrays + index
-// queues inside CodeGraph and local caches (capacity noted inline).
-fn buildScopedCodeGraph(opts: &CodeGraphOptions, policy: &NormalizedSaVmPolicy, cwd_ptr: ptr, cwd_len: u64, out: &CodeGraph) -> i32 {
-    // target trimmed; maxDepth = clamp(depth ?? 2, 1, 5);
-    // maxNodes = clamp(max_nodes ?? 30, 5, 100); direction ?? both.
-    // mode normalize: module_dependency|module_deps ->
-    // module_dependency; call_flow stays; else file target ->
-    // module_dependency, symbol target -> symbol_hierarchy.
-    // getFileAST(absPath): cache; checkSaVmPath read must allow;
-    // readFile utf8; extractFileInfo(relative path, content).
-    // module_dependency: root module node; upstream BFS over
-    // resolved imports (edges "imports"); downstream scan of all
-    // candidate/project files importing each queued module.
-    // call_flow: locate class/function by name; seed root node;
-    // build allFunctions map (functions + qualified/bare methods);
-    // BFS over calls with has_method edges from the class root.
-    // symbol_hierarchy: locate class (candidate files, else the
-    // three hardcoded heuristic paths from source lines 1019-1023:
-    // apps/server/src/opencodeBridge.ts,
-    // backends/mini/src/runtime/miniBridge.ts, apps/server/src/
-    // index.ts); missing -> mock class node; else extends edges to
-    // bases, implements edges to interfaces, owns edges to fields
-    // whose type is a capitalized non-builtin type name; depth > 1
-    // follows base imports one more level for grandparents.
-    // truncated set whenever the maxNodes budget stops growth.
-    out.nodes_len = 0; out.edges_len = 0; out.truncated = false;
-    return 0;
+// ---- call-collection walks (source: per-method nested walkCalls closures) ----
+// DEFECT: closures capturing `calls` per method/function -> explicit
+// recursive fns writing into a joined buffer. TS variant keeps
+// call_expression nodes whose function text, after stripping
+// /^this\./ and /^[a-zA-Z0-9_$]+\./, matches /^[a-zA-Z0-9_$]+$/.
+fn cg_walkCallsTs(node: u64, outJoined: &StrBuf) {
+    if cg_node_type_is(node, STR_PTR("call_expression"), STR_LEN("call_expression")) {
+        let fnNode = cg_field(node, STR_PTR("function"), STR_LEN("function"));
+        if fnNode != 0 {
+            let raw = StrBuf { bytes: [0u8; 65536], len: 0 };
+            ts_node_text(fnNode, &raw);
+            let callText = StrBuf { bytes: [0u8; 65536], len: 0 };
+            strip_call_prefix(&raw, &callText);
+            if callText.len > 0 && is_ident_text(&callText) {
+                cg_join_add(outJoined, &callText);
+            };
+        };
+    };
+    let i: u64 = 0;
+    let cc = ts_node_child_count(node);
+    while i < cc {
+        let sub = ts_node_child(node, i);
+        if sub != 0 { cg_walkCallsTs(sub, outJoined); };
+        i = i + 1;
+    }
 }
 
-// --- Formatters ---
-// export function formatAsDot(graph, title?) -> string
-fn formatAsDot(g: &CodeGraph, title_ptr: ptr, title_len: u64, has_title: bool, out_ptr: ptr, out_cap: u64) -> u64 {
-    // graphName = (title || rootId || "CodeGraph") with
-    // non [a-zA-Z0-9_] -> "_"; header lines digraph/rankdir/node/
-    // edge; root highlighted filled #e1f5fe; edges grouped by
-    // source|kind|label (single -> "a" -> "b"; many -> { t1 t2 });
-    // implements dashed, owns arrowhead diamond, calls dotted;
-    // no edges -> bare node lines; truncated -> trailing comment.
-    // DEFECT: Map grouping + template strings -> buffer appends.
-    return 0;
-}
-// export function formatAsPyStub(graph) -> string
-fn formatAsPyStub(g: &CodeGraph, out_ptr: ptr, out_cap: u64) -> u64 {
-    // header comments + typing imports; per node "class <id>(<bases>):"
-    // with docstring file note, owned fields as lowercased-first
-    // "<field>: <Type>" lines, or "pass" when no file/fields;
-    // result trimEnd()ed in source.
-    return 0;
-}
-// export function formatAsNetworkX(graph) -> string
-fn formatAsNetworkX(g: &CodeGraph, out_ptr: ptr, out_cap: u64) -> u64 {
-    // "import networkx as nx", G = nx.DiGraph(); add_node lines
-    // (kind + optional file); add_edge lines (rel + optional label);
-    // query helper comments incl. root ancestors/descendants.
-    return 0;
+fn strip_call_prefix(raw: &StrBuf, out: &StrBuf) {
+    // .replace(/^this\./, "").replace(/^[a-zA-Z0-9_$]+\./, "")
+    sb_clear(out);
+    let s: u64 = 0;
+    if sb_starts_with(raw, STR_PTR("this."), STR_LEN("this.")) { s = 5; };
+    // first ident run followed by "." is dropped (regex applies once)
+    let j = s;
+    while j < raw.len && is_word_byte_cg(raw.bytes[j]) { j = j + 1; }
+    if j > s && j < raw.len && raw.bytes[j] == 46 { s = j + 1; };
+    while s < raw.len { sb_append_byte(out, raw.bytes[s]); s = s + 1; }
 }
 
-// --- Native Action Entry Point ---
-// export async function nativeCodeGraph(rawInput, policy, cwd, startedAt)
-// DEFECT: async; Record<string, any> -> JSON buffer; Date.now() ->
-// now_ms parameter (duration = now - startedAt computed by caller
-// helper duration_since(startedAt)).
-fn nativeCodeGraph(raw_json_ptr: ptr, raw_json_len: u64, has_policy: bool, policy_json_ptr: ptr, policy_json_len: u64, cwd_ptr: ptr, cwd_len: u64, started_at: u64, now_ms: u64, out: &SaVmRunResult) -> i32 {
-    // target = rawInput.target ?? symbol ?? path ?? query ?? name,
-    // stringified + trimmed; empty -> sa_error exit 1 result with
-    // "target parameter is required for code_graph ..." stderr.
-    // normalized = normalizeSaVmPolicy(policy, cwd); options built
-    // with typeof-number/string guards (depth, max_nodes,
-    // max_tokens, output_file, candidate_files ?? files, format
-    // default "dot"). buildScopedCodeGraph; format by format.
-    // output_file: resolve, checkSaVmPath write; denied ->
-    // capability_denied exit 228 result carrying the formatted
-    // output on stdout; allowed -> writeFile utf8 and prefix
-    // "[Graph saved to <output_file>]\n\n".
-    // success: ok, exit 0, one code_graph event {timestamp, type,
-    // target, nodes, edges}, stderr notes truncation.
-    // exception -> sa_error exit 1 "[code_graph] error analyzing
-    // <target>: <msg>".
-    // DEFECT: SaVmRunResult here is the saVmTypes.sla shape; the
-    // source imports it from saVmResultKind.ts — kept as one struct.
-    out.ok = false;
-    return 0;
+fn is_ident_text(t: &StrBuf) -> bool {
+    if t.len == 0 { return false; };
+    let i: u64 = 0;
+    while i < t.len {
+        if !is_word_byte_cg(t.bytes[i]) { return false; };
+        i = i + 1;
+    }
+    return true;
 }
+
+fn is_word_byte_cg(c: u8) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 || c == 36;
+}
+
+// Python variant: `call` nodes; identifier -> text, attribute -> attribute text.
+fn cg_walkCallsPy(node: u64, outJoined: &StrBuf) {
+    if cg_node_type_is(node, STR_PTR("call"), STR_LEN("call")) {
+        let fnNode = cg_field(node, STR_PTR("function"), STR_LEN("function"));
+        if fnNode != 0 {
+            if cg_node_type_is(fnNode, STR_PTR("identifier"), STR_LEN("identifier")) {
+                let t = StrBuf { bytes: [0u8; 65536], len: 0 };
+                ts_node_text(fnNode, &t);
+                cg_join_add(outJoined, &t);
+            } else if cg_node_type_is(fnNode, STR_PTR("attribute"), STR_LEN("attribute")) {
+                let attr = cg_field(fnNode, STR_PTR("attribute"), STR_LEN("attribute"));
+                if attr != 0 {
+                    let t = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    ts_node_text(attr, &t);
+                    cg_join_add(outJoined, &t);
+                };
+            };
+        };
+    };
+    let i: u64 = 0;
+    let cc = ts_node_child_count(node);
+    while i < cc {
+        let sub = ts_node_child(node, i);
+        if sub != 0 { cg_walkCallsPy(sub, outJoined); };
+        i = i + 1;
+    }
+}
+
+// ---- src/saVmCodeGraph.ts:96-186 — extractTsClass ----
+fn extractTsClass(node: u64, out: &ExtractedClassInfo) {
+    out.fields_len = 0;
+    out.methods_len = 0;
+    out.bases_len = 0;
+    out.interfaces_len = 0;
+    out.line = ts_node_start_row(node) + 1;
+    let name = StrBuf { bytes: [0u8; 65536], len: 0 };
+    cg_field_text(node, STR_PTR("name"), STR_LEN("name"), &name);
+    let nt = StrBuf { bytes: [0u8; 65536], len: 0 };
+    sb_trim(&name, &nt);
+    if nt.len == 0 {
+        // scan children for a type_identifier / identifier child
+        let i: u64 = 0;
+        let cc = ts_node_child_count(node);
+        while i < cc {
+            let c = ts_node_child(node, i);
+            if c != 0 && (cg_node_type_is(c, STR_PTR("type_identifier"), STR_LEN("type_identifier")) || cg_node_type_is(c, STR_PTR("identifier"), STR_LEN("identifier"))) {
+                ts_node_text(c, &nt);
+                let t2 = StrBuf { bytes: [0u8; 65536], len: 0 };
+                sb_trim(&nt, &t2);
+                nt = t2;
+                break;
+            };
+            i = i + 1;
+        }
+    };
+    if nt.len == 0 { sb_append(&nt, STR_PTR("(anonymous)"), STR_LEN("(anonymous)")); };
+    cg_copy_into(&out.name, &out.name_len, &nt);
+    let bases = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let ifaces = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let i: u64 = 0;
+    let cc = ts_node_child_count(node);
+    while i < cc {
+        let child = ts_node_child(node, i);
+        if child != 0 {
+            if cg_node_type_is(child, STR_PTR("class_heritage"), STR_LEN("class_heritage")) {
+                let j: u64 = 0;
+                let hc = ts_node_child_count(child);
+                while j < hc {
+                    let clause = ts_node_child(child, j);
+                    if clause != 0 {
+                        let ids = StrBuf { bytes: [0u8; 65536], len: 0 };
+                        if cg_node_type_is(clause, STR_PTR("extends_clause"), STR_LEN("extends_clause")) {
+                            extractTypeIdentifiers(clause, &ids);
+                            join_extend(&bases, &ids);
+                        } else if cg_node_type_is(clause, STR_PTR("implements_clause"), STR_LEN("implements_clause")) {
+                            extractTypeIdentifiers(clause, &ids);
+                            join_extend(&ifaces, &ids);
+                        };
+                    };
+                    j = j + 1;
+                }
+            } else if cg_node_type_is(child, STR_PTR("class_body"), STR_LEN("class_body")) {
+                let j: u64 = 0;
+                let bc = ts_node_child_count(child);
+                while j < bc {
+                    let member = ts_node_child(child, j);
+                    if member != 0 {
+                        if cg_node_type_is(member, STR_PTR("public_field_definition"), STR_LEN("public_field_definition")) ||
+                           cg_node_type_is(member, STR_PTR("field_definition"), STR_LEN("field_definition")) ||
+                           cg_node_type_is(member, STR_PTR("property_definition"), STR_LEN("property_definition")) {
+                            // propName = field "name" ?? field "property"
+                            let propName = StrBuf { bytes: [0u8; 65536], len: 0 };
+                            cg_field_text(member, STR_PTR("name"), STR_LEN("name"), &propName);
+                            if propName.len == 0 { cg_field_text(member, STR_PTR("property"), STR_LEN("property"), &propName); };
+                            if propName.len > 0 {
+                                let typeAnn = StrBuf { bytes: [0u8; 65536], len: 0 };
+                                cg_field_text(member, STR_PTR("type"), STR_LEN("type"), &typeAnn);
+                                strip_colon_prefix(&typeAnn);
+                                push_field(out, &propName, &typeAnn);
+                            };
+                        } else if cg_node_type_is(member, STR_PTR("method_definition"), STR_LEN("method_definition")) {
+                            let mName = StrBuf { bytes: [0u8; 65536], len: 0 };
+                            cg_field_text(member, STR_PTR("name"), STR_LEN("name"), &mName);
+                            if mName.len == 0 { sb_append(&mName, STR_PTR("(anonymous)"), STR_LEN("(anonymous)")); };
+                            let calls = StrBuf { bytes: [0u8; 65536], len: 0 };
+                            cg_walkCallsTs(member, &calls);
+                            push_method(out, &mName, &calls);
+                        };
+                    };
+                    j = j + 1;
+                }
+            };
+        };
+        i = i + 1;
+    }
+    // bases/interfaces deduped (source spreads new Set over the arrays)
+    out.bases_len = 0;
+    let bi: u64 = 0;
+    while bi < bases.len && bi < 2048 { out.bases[bi] = bases.bytes[bi]; out.bases_len = out.bases_len + 1; bi = bi + 1; }
+    out.interfaces_len = 0;
+    let ii: u64 = 0;
+    while ii < ifaces.len && ii < 2048 { out.interfaces[ii] = ifaces.bytes[ii]; out.interfaces_len = out.interfaces_len + 1; ii = ii + 1; }
+}
+
+fn join_extend(dst: &StrBuf, srcJoined: &StrBuf) {
+    // dst.push(...ids) then dedup at the end mirrors the source's
+    // bases.push(...typeIds) + final Set; join_add already dedups.
+    let pos: u64 = 0;
+    while pos <= srcJoined.len {
+        let end = pos;
+        while end < srcJoined.len && !(srcJoined.bytes[end] == 44 && end + 1 < srcJoined.len && srcJoined.bytes[end + 1] == 32) { end = end + 1; }
+        let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let q: u64 = 0;
+        while pos + q < end { sb_append_byte(&seg, srcJoined.bytes[pos + q]); q = q + 1; }
+        if seg.len > 0 { cg_join_add(dst, &seg); };
+        if end >= srcJoined.len { break; };
+        pos = end + 2;
+    }
+}
+
+fn strip_colon_prefix(t: &StrBuf) {
+    // typeAnn?.replace(/^:\s*/, "").trim() — applied in place
+    let s: u64 = 0;
+    if t.len > 0 && t.bytes[0] == 58 {
+        s = 1;
+        while s < t.len && (t.bytes[s] == 32 || t.bytes[s] == 9) { s = s + 1; }
+    };
+    if s > 0 {
+        let rest = StrBuf { bytes: [0u8; 65536], len: 0 };
+        while s < t.len { sb_append_byte(&rest, t.bytes[s]); s = s + 1; }
+        let tr = StrBuf { bytes: [0u8; 65536], len: 0 };
+        sb_trim(&rest, &tr);
+        sb_clear(t);
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, &tr.bytes, 0);
+        sb_append(t, p, tr.len);
+        return;
+    };
+    let tr = StrBuf { bytes: [0u8; 65536], len: 0 };
+    sb_trim(t, &tr);
+    sb_clear(t);
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &tr.bytes, 0);
+    sb_append(t, p, tr.len);
+}
+
+fn push_field(out: &ExtractedClassInfo, name: &StrBuf, typeAnn: &StrBuf) {
+    if out.fields_len >= 128 { return; };
+    let slot = out.fields_len;
+    cg_copy_into(&out.fields[slot].name, &out.fields[slot].name_len, name);
+    out.fields[slot].has_type = typeAnn.len > 0;
+    out.fields[slot].type_len = 0;
+    let i: u64 = 0;
+    while i < typeAnn.len && i < 512 { out.fields[slot].type_[i] = typeAnn.bytes[i]; out.fields[slot].type_len = out.fields[slot].type_len + 1; i = i + 1; }
+    out.fields_len = out.fields_len + 1;
+}
+
+fn push_method(out: &ExtractedClassInfo, name: &StrBuf, callsJoined: &StrBuf) {
+    if out.methods_len >= 128 { return; };
+    let slot = out.methods_len;
+    cg_copy_into(&out.methods[slot].name, &out.methods[slot].name_len, name);
+    out.methods[slot].calls_len = 0;
+    let i: u64 = 0;
+    while i < callsJoined.len && i < 4096 { out.methods[slot].calls[i] = callsJoined.bytes[i]; out.methods[slot].calls_len = out.methods[slot].calls_len + 1; i = i + 1; }
+    out.methods_len = out.methods_len + 1;
+}
+
+// ---- src/saVmCodeGraph.ts:188-222 — extractTsInterface ----
+fn extractTsInterface(node: u64, out: &ExtractedClassInfo) {
+    out.fields_len = 0;
+    out.methods_len = 0;
+    out.bases_len = 0;
+    out.interfaces_len = 0;
+    out.line = ts_node_start_row(node) + 1;
+    let name = StrBuf { bytes: [0u8; 65536], len: 0 };
+    cg_field_text(node, STR_PTR("name"), STR_LEN("name"), &name);
+    let nt = StrBuf { bytes: [0u8; 65536], len: 0 };
+    sb_trim(&name, &nt);
+    if nt.len == 0 { sb_append(&nt, STR_PTR("(anonymous)"), STR_LEN("(anonymous)")); };
+    cg_copy_into(&out.name, &out.name_len, &nt);
+    let bases = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let i: u64 = 0;
+    let cc = ts_node_child_count(node);
+    while i < cc {
+        let child = ts_node_child(node, i);
+        if child != 0 {
+            if cg_node_type_is(child, STR_PTR("extends_clause"), STR_LEN("extends_clause")) || cg_node_type_is(child, STR_PTR("extends_type_clause"), STR_LEN("extends_type_clause")) {
+                let ids = StrBuf { bytes: [0u8; 65536], len: 0 };
+                extractTypeIdentifiers(child, &ids);
+                join_extend(&bases, &ids);
+            } else if cg_node_type_is(child, STR_PTR("interface_body"), STR_LEN("interface_body")) || cg_node_type_is(child, STR_PTR("object_type"), STR_LEN("object_type")) {
+                let j: u64 = 0;
+                let bc = ts_node_child_count(child);
+                while j < bc {
+                    let member = ts_node_child(child, j);
+                    if member != 0 && (cg_node_type_is(member, STR_PTR("property_signature"), STR_LEN("property_signature")) || cg_node_type_is(member, STR_PTR("method_signature"), STR_LEN("method_signature"))) {
+                        let propName = StrBuf { bytes: [0u8; 65536], len: 0 };
+                        cg_field_text(member, STR_PTR("name"), STR_LEN("name"), &propName);
+                        if propName.len > 0 {
+                            let typeAnn = StrBuf { bytes: [0u8; 65536], len: 0 };
+                            cg_field_text(member, STR_PTR("type"), STR_LEN("type"), &typeAnn);
+                            strip_colon_prefix(&typeAnn);
+                            push_field(out, &propName, &typeAnn);
+                        };
+                    };
+                    j = j + 1;
+                }
+            };
+        };
+        i = i + 1;
+    }
+    out.bases_len = 0;
+    let bi: u64 = 0;
+    while bi < bases.len && bi < 2048 { out.bases[bi] = bases.bytes[bi]; out.bases_len = out.bases_len + 1; bi = bi + 1; }
+}
+
+// ---- src/saVmCodeGraph.ts:224-276 — extractTsImports ----
+// DEFECT: nested recursive `visit` closure capturing `imports`.
+fn extractTsImportsVisit(node: u64, out: &ExtractedImportList) {
+    if cg_node_type_is(node, STR_PTR("import_statement"), STR_LEN("import_statement")) {
+        let spec = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let srcNode = cg_field(node, STR_PTR("source"), STR_LEN("source"));
+        if srcNode != 0 {
+            let raw = StrBuf { bytes: [0u8; 65536], len: 0 };
+            ts_node_text(srcNode, &raw);
+            strip_quote_pair(&raw, &spec); // .replace(/^['"]|['"]$/g, "")
+        };
+        if spec.len > 0 && out.len < 256 {
+            let slot = out.len;
+            out.items[slot].specifier_len = 0;
+            let q: u64 = 0;
+            while q < spec.len && q < 1024 { out.items[slot].specifier[q] = spec.bytes[q]; out.items[slot].specifier_len = out.items[slot].specifier_len + 1; q = q + 1; }
+            out.items[slot].symbols_len = 0;
+            out.items[slot].has_isDefault = false;
+            out.items[slot].isDefault = false;
+            out.items[slot].has_isNamespace = false;
+            out.items[slot].isNamespace = false;
+            let i: u64 = 0;
+            let cc = ts_node_child_count(node);
+            while i < cc {
+                let c = ts_node_child(node, i);
+                if c != 0 && cg_node_type_is(c, STR_PTR("import_clause"), STR_LEN("import_clause")) {
+                    let j: u64 = 0;
+                    let kc = ts_node_child_count(c);
+                    while j < kc {
+                        let clauseChild = ts_node_child(c, j);
+                        if clauseChild != 0 {
+                            if cg_node_type_is(clauseChild, STR_PTR("identifier"), STR_LEN("identifier")) {
+                                let t = StrBuf { bytes: [0u8; 65536], len: 0 };
+                                ts_node_text(clauseChild, &t);
+                                push_import_symbol(&out.items[slot], &t, &t);
+                                out.items[slot].isDefault = true;
+                                out.items[slot].has_isDefault = true;
+                            } else if cg_node_type_is(clauseChild, STR_PTR("namespace_import"), STR_LEN("namespace_import")) {
+                                // local = (field "name" || lastNamedChild).text
+                                let idNode = cg_field(clauseChild, STR_PTR("name"), STR_LEN("name"));
+                                if idNode == 0 { idNode = ts_node_last_named_child(clauseChild); };
+                                let local = StrBuf { bytes: [0u8; 65536], len: 0 };
+                                if idNode != 0 { ts_node_text(idNode, &local); } else { sb_append(&local, STR_PTR("*"), STR_LEN("*")); };
+                                let star = StrBuf { bytes: [0u8; 65536], len: 0 };
+                                sb_append(&star, STR_PTR("*"), STR_LEN("*"));
+                                push_import_symbol(&out.items[slot], &star, &local);
+                                out.items[slot].isNamespace = true;
+                                out.items[slot].has_isNamespace = true;
+                            } else if cg_node_type_is(clauseChild, STR_PTR("named_imports"), STR_LEN("named_imports")) {
+                                let k: u64 = 0;
+                                let nc = ts_node_child_count(clauseChild);
+                                while k < nc {
+                                    let sp = ts_node_child(clauseChild, k);
+                                    if sp != 0 && cg_node_type_is(sp, STR_PTR("import_specifier"), STR_LEN("import_specifier")) {
+                                        let impNode = cg_field(sp, STR_PTR("name"), STR_LEN("name"));
+                                        let imported = StrBuf { bytes: [0u8; 65536], len: 0 };
+                                        if impNode != 0 { ts_node_text(impNode, &imported); } else { ts_node_text(sp, &imported); };
+                                        let aliasNode = cg_field(sp, STR_PTR("alias"), STR_LEN("alias"));
+                                        let local = StrBuf { bytes: [0u8; 65536], len: 0 };
+                                        if aliasNode != 0 { ts_node_text(aliasNode, &local); } else {
+                                            let p: ptr = PTR_NULL();
+                                            PTR_BYTE_ADD(p, &imported.bytes, 0);
+                                            sb_append(&local, p, imported.len);
+                                        };
+                                        push_import_symbol(&out.items[slot], &imported, &local);
+                                    };
+                                    k = k + 1;
+                                }
+                            };
+                        };
+                        j = j + 1;
+                    }
+                };
+                i = i + 1;
+            }
+            out.len = out.len + 1;
+        };
+    };
+    let i: u64 = 0;
+    let cc = ts_node_child_count(node);
+    while i < cc {
+        let child = ts_node_child(node, i);
+        if child != 0 { extractTsImportsVisit(child, out); };
+        i = i + 1;
+    }
+}
+
+fn strip_quote_pair(raw: &StrBuf, out: &StrBuf) {
+    sb_clear(out);
+    let s: u64 = 0;
+    let e = raw.len;
+    if e > 0 && (raw.bytes[0] == 39 || raw.bytes[0] == 34) { s = 1; };
+    if e > s && (raw.bytes[e - 1] == 39 || raw.bytes[e - 1] == 34) { e = e - 1; };
+    while s < e { sb_append_byte(out, raw.bytes[s]); s = s + 1; }
+}
+
+fn push_import_symbol(item: &ExtractedImportInfo, imported: &StrBuf, local: &StrBuf) {
+    if item.symbols_len >= 128 { return; };
+    let slot = item.symbols_len;
+    cg_copy_into(&item.symbols[slot].imported, &item.symbols[slot].imported_len, imported);
+    cg_copy_into(&item.symbols[slot].local, &item.symbols[slot].local_len, local);
+    item.symbols_len = item.symbols_len + 1;
+}
+
+fn extractTsImports(root: u64, out: &ExtractedImportList) {
+    out.len = 0;
+    extractTsImportsVisit(root, out);
+}
+
+// ---- src/saVmCodeGraph.ts:278-343 — extractPythonClass ----
+fn extractPythonClass(node: u64, out: &ExtractedClassInfo) {
+    out.fields_len = 0;
+    out.methods_len = 0;
+    out.bases_len = 0;
+    out.interfaces_len = 0;
+    out.line = ts_node_start_row(node) + 1;
+    let name = StrBuf { bytes: [0u8; 65536], len: 0 };
+    cg_field_text(node, STR_PTR("name"), STR_LEN("name"), &name);
+    let nt = StrBuf { bytes: [0u8; 65536], len: 0 };
+    sb_trim(&name, &nt);
+    if nt.len == 0 { sb_append(&nt, STR_PTR("(anonymous)"), STR_LEN("(anonymous)")); };
+    cg_copy_into(&out.name, &out.name_len, &nt);
+    let bases = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let superArgs = cg_field(node, STR_PTR("superclasses"), STR_LEN("superclasses"));
+    if superArgs != 0 {
+        let i: u64 = 0;
+        let cc = ts_node_child_count(superArgs);
+        while i < cc {
+            let c = ts_node_child(superArgs, i);
+            if c != 0 && cg_node_type_is(c, STR_PTR("identifier"), STR_LEN("identifier")) {
+                let t = StrBuf { bytes: [0u8; 65536], len: 0 };
+                ts_node_text(c, &t);
+                let tt = StrBuf { bytes: [0u8; 65536], len: 0 };
+                sb_trim(&t, &tt);
+                cg_join_add(&bases, &tt);
+            };
+            i = i + 1;
+        }
+    };
+    let body = cg_field(node, STR_PTR("body"), STR_LEN("body"));
+    if body != 0 {
+        let i: u64 = 0;
+        let cc = ts_node_child_count(body);
+        while i < cc {
+            let c = ts_node_child(body, i);
+            if c != 0 {
+                if cg_node_type_is(c, STR_PTR("function_definition"), STR_LEN("function_definition")) {
+                    let mName = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    cg_field_text(c, STR_PTR("name"), STR_LEN("name"), &mName);
+                    if mName.len == 0 { sb_append(&mName, STR_PTR("(anonymous)"), STR_LEN("(anonymous)")); };
+                    let calls = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    cg_walkCallsPy(c, &calls);
+                    push_method(out, &mName, &calls);
+                } else if cg_node_type_is(c, STR_PTR("expression_statement"), STR_LEN("expression_statement")) {
+                    // e.g. x: int = 5 — firstNamedChild assignment
+                    let first = ts_node_named_child(c, 0);
+                    if first != 0 && cg_node_type_is(first, STR_PTR("assignment"), STR_LEN("assignment")) {
+                        let left = cg_field(first, STR_PTR("left"), STR_LEN("left"));
+                        if left != 0 && cg_node_type_is(left, STR_PTR("identifier"), STR_LEN("identifier")) {
+                            let fname = StrBuf { bytes: [0u8; 65536], len: 0 };
+                            ts_node_text(left, &fname);
+                            let typeAnn = StrBuf { bytes: [0u8; 65536], len: 0 };
+                            cg_field_text(first, STR_PTR("type"), STR_LEN("type"), &typeAnn);
+                            push_field(out, &fname, &typeAnn);
+                        };
+                    };
+                };
+            };
+            i = i + 1;
+        }
+    };
+    out.bases_len = 0;
+    let bi: u64 = 0;
+    while bi < bases.len && bi < 2048 { out.bases[bi] = bases.bytes[bi]; out.bases_len = out.bases_len + 1; bi = bi + 1; }
+}
+
+// ---- src/saVmCodeGraph.ts:345-379 — extractPythonImports ----
+// DEFECT: nested recursive `visit` closure capturing `imports`.
+fn extractPythonImportsVisit(node: u64, out: &ExtractedImportList) {
+    if cg_node_type_is(node, STR_PTR("import_statement"), STR_LEN("import_statement")) {
+        let i: u64 = 0;
+        let cc = ts_node_child_count(node);
+        while i < cc {
+            let c = ts_node_child(node, i);
+            if c != 0 && cg_node_type_is(c, STR_PTR("dotted_name"), STR_LEN("dotted_name")) && out.len < 256 {
+                let t = StrBuf { bytes: [0u8; 65536], len: 0 };
+                ts_node_text(c, &t);
+                let slot = out.len;
+                out.items[slot].specifier_len = 0;
+                let q: u64 = 0;
+                while q < t.len && q < 1024 { out.items[slot].specifier[q] = t.bytes[q]; out.items[slot].specifier_len = out.items[slot].specifier_len + 1; q = q + 1; }
+                out.items[slot].symbols_len = 0;
+                push_import_symbol(&out.items[slot], &t, &t);
+                out.items[slot].has_isDefault = false;
+                out.items[slot].has_isNamespace = false;
+                out.len = out.len + 1;
+            };
+            i = i + 1;
+        }
+    } else if cg_node_type_is(node, STR_PTR("import_from_statement"), STR_LEN("import_from_statement")) {
+        let modNode = cg_field(node, STR_PTR("module_name"), STR_LEN("module_name"));
+        let spec = StrBuf { bytes: [0u8; 65536], len: 0 };
+        if modNode != 0 { ts_node_text(modNode, &spec); };
+        if spec.len > 0 && out.len < 256 {
+            let slot = out.len;
+            out.items[slot].specifier_len = 0;
+            let q: u64 = 0;
+            while q < spec.len && q < 1024 { out.items[slot].specifier[q] = spec.bytes[q]; out.items[slot].specifier_len = out.items[slot].specifier_len + 1; q = q + 1; }
+            out.items[slot].symbols_len = 0;
+            out.items[slot].has_isDefault = false;
+            out.items[slot].has_isNamespace = false;
+            let i: u64 = 0;
+            let cc = ts_node_child_count(node);
+            while i < cc {
+                let c = ts_node_child(node, i);
+                if c != 0 && c != modNode && cg_node_type_is(c, STR_PTR("dotted_name"), STR_LEN("dotted_name")) {
+                    let t = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    ts_node_text(c, &t);
+                    push_import_symbol(&out.items[slot], &t, &t);
+                };
+                i = i + 1;
+            }
+            out.len = out.len + 1;
+        };
+    };
+    let i: u64 = 0;
+    let cc = ts_node_child_count(node);
+    while i < cc {
+        let child = ts_node_child(node, i);
+        if child != 0 { extractPythonImportsVisit(child, out); };
+        i = i + 1;
+    }
+}
+
+fn extractPythonImports(root: u64, out: &ExtractedImportList) {
+    out.len = 0;
+    extractPythonImportsVisit(root, out);
+}
+
+// ---- src/saVmCodeGraph.ts:381-460 — extractRegexFallback ----
+// DEFECT: four global regexes with capture groups (class with
+// extends/implements, import forms, function declarations, arrow
+// functions) plus a nested call-name regex — no regex engine in
+// sa_std. Converted as line/substring scans approximating the same
+// anchored shapes; multi-line constructs the regexes would not match
+// either (no /s flag on bodies beyond [^}] spans) stay unmatched.
+// Line numbers computed as content.slice(0, m.index).split("\n").length.
+fn extractRegexFallback(content: &StrBuf, filePath: &StrBuf, classes: &ExtractedClassList, imports: &ExtractedImportList, out: &ExtractedFileInfo) {
+    out.classes_first = classes.len;
+    out.imports_first = imports.len;
+    out.functions_len = 0;
+    out.filePath_len = 0;
+    let z: u64 = 0;
+    while z < filePath.len && z < 1024 { out.filePath[z] = filePath.bytes[z]; out.filePath_len = out.filePath_len + 1; z = z + 1; }
+    // split content into lines (regexes scan the whole text; the class
+    // and import patterns are effectively line-anchored in practice)
+    let starts = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let pos: u64 = 0;
+    let lineNo: u64 = 1;
+    while pos <= content.len {
+        let end = pos;
+        while end < content.len && content.bytes[end] != 10 { end = end + 1; }
+        let line = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let q: u64 = 0;
+        while pos + q < end { sb_append_byte(&line, content.bytes[pos + q]); q = q + 1; }
+        if line.len > 0 && line.bytes[line.len - 1] == 13 { line.len = line.len - 1; };
+        regexFallbackLine(&line, lineNo, classes, imports, out);
+        if end >= content.len { break; };
+        pos = end + 1;
+        lineNo = lineNo + 1;
+    }
+    out.classes_len = classes.len - out.classes_first;
+    out.imports_len = imports.len - out.imports_first;
+}
+
+fn regexFallbackLine(line: &StrBuf, lineNo: u64, classes: &ExtractedClassList, imports: &ExtractedImportList, out: &ExtractedFileInfo) {
+    let lt = StrBuf { bytes: [0u8; 65536], len: 0 };
+    sb_trim(line, &lt);
+    // class: (?:export\s+)?(?:default\s+)?class\s+(NAME)(?:\s+extends\s+([A-Za-z0-9_$.]+))?(?:\s+implements\s+([A-Za-z0-9_$,\s]+))?
+    let rest = StrBuf { bytes: [0u8; 65536], len: 0 };
+    strip_export_default(&lt, &rest);
+    if sb_starts_with(&rest, STR_PTR("class "), STR_LEN("class ")) {
+        let name = StrBuf { bytes: [0u8; 65536], len: 0 };
+        read_word_at(&rest, 6, &name);
+        if name.len > 0 && classes.len < 256 {
+            let slot = classes.len;
+            init_class(&classes.items[slot], &name, lineNo);
+            // extends target
+            let ext = StrBuf { bytes: [0u8; 65536], len: 0 };
+            if find_kw_value(&rest, STR_PTR("extends"), STR_LEN("extends"), &ext) {
+                let b = StrBuf { bytes: [0u8; 65536], len: 0 };
+                let bp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(bp, &ext.bytes, 0);
+                sb_append(&b, bp, ext.len);
+                classes.items[slot].bases_len = 0;
+                let w: u64 = 0;
+                while w < b.len && w < 2048 { classes.items[slot].bases[w] = b.bytes[w]; classes.items[slot].bases_len = classes.items[slot].bases_len + 1; w = w + 1; }
+            };
+            // implements list: split(",").map(trim).filter(Boolean)
+            let impl_sb = StrBuf { bytes: [0u8; 65536], len: 0 };
+            if find_kw_value(&rest, STR_PTR("implements"), STR_LEN("implements"), &impl_sb) {
+                classes.items[slot].interfaces_len = 0;
+                let w: u64 = 0;
+                while w < impl_sb.len && w < 2048 { classes.items[slot].interfaces[w] = impl_sb.bytes[w]; classes.items[slot].interfaces_len = classes.items[slot].interfaces_len + 1; w = w + 1; }
+            };
+            classes.len = classes.len + 1;
+            return;
+        };
+    };
+    // imports: import\s+(?:\{([^}]+)\}|(NAME)|\*\s+as\s+(NAME))\s+from\s+['"]([^'"]+)['"]
+    if sb_starts_with(&lt, STR_PTR("import"), STR_LEN("import")) && imports.len < 256 {
+        let spec = StrBuf { bytes: [0u8; 65536], len: 0 };
+        if extract_from_module_cg(&lt, &spec) {
+            let slot = imports.len;
+            imports.items[slot].specifier_len = 0;
+            let w: u64 = 0;
+            while w < spec.len && w < 1024 { imports.items[slot].specifier[w] = spec.bytes[w]; imports.items[slot].specifier_len = imports.items[slot].specifier_len + 1; w = w + 1; }
+            imports.items[slot].symbols_len = 0;
+            imports.items[slot].has_isDefault = false;
+            imports.items[slot].has_isNamespace = false;
+            let inner = StrBuf { bytes: [0u8; 65536], len: 0 };
+            if extract_braces_inner_cg(&lt, &inner) {
+                // { a, b as c } — source fallback keeps imported == local
+                // == the raw trimmed part (it does not split "as")
+                let pos2: u64 = 0;
+                while pos2 <= inner.len {
+                    let e2 = pos2;
+                    while e2 < inner.len && inner.bytes[e2] != 44 { e2 = e2 + 1; }
+                    let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    let qq: u64 = 0;
+                    while pos2 + qq < e2 { sb_append_byte(&seg, inner.bytes[pos2 + qq]); qq = qq + 1; }
+                    let t = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    sb_trim(&seg, &t);
+                    if t.len > 0 { push_import_symbol(&imports.items[slot], &t, &t); };
+                    if e2 >= inner.len { break; };
+                    pos2 = e2 + 1;
+                }
+            } else if sb_contains(&lt, STR_PTR("* as "), STR_LEN("* as ")) {
+                let nm = StrBuf { bytes: [0u8; 65536], len: 0 };
+                read_word_after(&lt, STR_PTR("* as "), STR_LEN("* as "), &nm);
+                let star = StrBuf { bytes: [0u8; 65536], len: 0 };
+                sb_append(&star, STR_PTR("*"), STR_LEN("*"));
+                if nm.len > 0 { push_import_symbol(&imports.items[slot], &star, &nm); };
+            } else {
+                let nm = StrBuf { bytes: [0u8; 65536], len: 0 };
+                read_word_at(&lt, 7, &nm);
+                if nm.len > 0 { push_import_symbol(&imports.items[slot], &nm, &nm); };
+            };
+            imports.len = imports.len + 1;
+            return;
+        };
+    };
+    // functions: (?:export\s+)?(?:async\s+)?function\s+(NAME)\s*\(([^)]*)\)\s*\{([^}]*)\}
+    // DEFECT: body capture [^}]* spans only to the first "}" and the
+    // pattern can start mid-line; the line scan approximates this by
+    // taking the remainder of the line as the body segment.
+    let frest = StrBuf { bytes: [0u8; 65536], len: 0 };
+    strip_export_default(&lt, &frest);
+    let fpos: u64 = 0;
+    if sb_starts_with(&frest, STR_PTR("async "), STR_LEN("async ")) { fpos = 6; };
+    let isFn = false;
+    let isArrow = false;
+    let nameAt: u64 = 0;
+    if fpos + 9 <= frest.len && kw_at_cg(&frest, fpos, STR_PTR("function"), STR_LEN("function")) {
+        isFn = true;
+        nameAt = fpos + 8;
+    };
+    if isFn {
+        let name = StrBuf { bytes: [0u8; 65536], len: 0 };
+        read_word_at(&frest, nameAt, &name);
+        if name.len > 0 {
+            let calls = StrBuf { bytes: [0u8; 65536], len: 0 };
+            collect_regex_calls(&frest, &calls);
+            push_extracted_function(out, &name, &calls, lineNo);
+            return;
+        };
+    };
+    // arrow: (?:export\s+)?(?:const|let|var)\s+(NAME)\s*=\s*(?:async\s*)?(?:\([^)]*\)|NAME)\s*=>\s*\{([^}]*)\}
+    let kwLen: u64 = 0;
+    if sb_starts_with(&frest, STR_PTR("const "), STR_LEN("const ")) { kwLen = 6; } else if sb_starts_with(&frest, STR_PTR("let "), STR_LEN("let ")) { kwLen = 4; } else if sb_starts_with(&frest, STR_PTR("var "), STR_LEN("var ")) { kwLen = 4; };
+    if kwLen > 0 && sb_contains(&frest, STR_PTR("=>"), 2) {
+        let name = StrBuf { bytes: [0u8; 65536], len: 0 };
+        read_word_at(&frest, kwLen, &name);
+        if name.len > 0 {
+            isArrow = true;
+            let calls = StrBuf { bytes: [0u8; 65536], len: 0 };
+            collect_regex_calls(&frest, &calls);
+            push_extracted_function(out, &name, &calls, lineNo);
+        };
+    };
+}
+
+fn init_class(item: &ExtractedClassInfo, name: &StrBuf, line: u64) {
+    cg_copy_into(&item.name, &item.name_len, name);
+    item.bases_len = 0;
+    item.interfaces_len = 0;
+    item.fields_len = 0;
+    item.methods_len = 0;
+    item.line = line;
+}
+
+fn strip_export_default(lt: &StrBuf, out: &StrBuf) {
+    sb_clear(out);
+    let s: u64 = 0;
+    if sb_starts_with(lt, STR_PTR("export "), STR_LEN("export ")) { s = 7; };
+    if s + 8 <= lt.len && kw_at_cg(lt, s, STR_PTR("default"), STR_LEN("default")) {
+        s = s + 7;
+        while s < lt.len && lt.bytes[s] == 32 { s = s + 1; }
+    };
+    while s < lt.len { sb_append_byte(out, lt.bytes[s]); s = s + 1; }
+}
+
+fn kw_at_cg(text: &StrBuf, pos: u64, kw_p: ptr, kw_n: u64) -> bool {
+    if pos + kw_n > text.len { return false; };
+    let i: u64 = 0;
+    while i < kw_n {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, kw_p, i);
+        if text.bytes[pos + i] != c { return false; };
+        i = i + 1;
+    }
+    let after = pos + kw_n;
+    return after >= text.len || !is_word_byte_cg(text.bytes[after]);
+}
+
+fn read_word_at(text: &StrBuf, at: u64, out: &StrBuf) {
+    sb_clear(out);
+    let i = at;
+    while i < text.len && (text.bytes[i] == 32 || text.bytes[i] == 9) { i = i + 1; }
+    while i < text.len && is_word_byte_cg(text.bytes[i]) { sb_append_byte(out, text.bytes[i]); i = i + 1; }
+}
+
+fn read_word_after(text: &StrBuf, marker_p: ptr, marker_n: u64, out: &StrBuf) {
+    sb_clear(out);
+    let pos: u64 = 0;
+    while pos + marker_n <= text.len {
+        let same = true;
+        let q: u64 = 0;
+        while q < marker_n {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, marker_p, q);
+            if text.bytes[pos + q] != c { same = false; };
+            q = q + 1;
+            if !same { break; };
+        }
+        if same { read_word_at(text, pos + marker_n, out); return; };
+        pos = pos + 1;
+    }
+}
+
+fn find_kw_value(text: &StrBuf, kw_p: ptr, kw_n: u64, out: &StrBuf) -> bool {
+    // " extends VALUE" / " implements VALUE(, VALUE)*" capture
+    sb_clear(out);
+    let pos: u64 = 0;
+    while pos + kw_n <= text.len {
+        if (pos == 0 || !is_word_byte_cg(text.bytes[pos - 1])) && kw_at_cg(text, pos, kw_p, kw_n) {
+            let s = pos + kw_n;
+            while s < text.len && (text.bytes[s] == 32 || text.bytes[s] == 9) { s = s + 1; }
+            // value chars: ident, $, ., comma, space (implements list)
+            while s < text.len && (is_word_byte_cg(text.bytes[s]) || text.bytes[s] == 46 || text.bytes[s] == 44 || text.bytes[s] == 32) {
+                sb_append_byte(out, text.bytes[s]);
+                s = s + 1;
+            }
+            let t = StrBuf { bytes: [0u8; 65536], len: 0 };
+            sb_trim(out, &t);
+            sb_clear(out);
+            let p: ptr = PTR_NULL();
+            PTR_BYTE_ADD(p, &t.bytes, 0);
+            sb_append(out, p, t.len);
+            return out.len > 0;
+        };
+        pos = pos + 1;
+    }
+    return false;
+}
+
+fn extract_from_module_cg(text: &StrBuf, out: &StrBuf) -> bool {
+    sb_clear(out);
+    let fromAt: i64 = -1;
+    let pos: u64 = 0;
+    while pos + 4 <= text.len {
+        if text.bytes[pos] == 102 && text.bytes[pos + 1] == 114 && text.bytes[pos + 2] == 111 && text.bytes[pos + 3] == 109 { fromAt = pos as i64; };
+        pos = pos + 1;
+    }
+    if fromAt == -1 { return false; };
+    let i = (fromAt as u64) + 4;
+    while i < text.len && text.bytes[i] != 39 && text.bytes[i] != 34 { i = i + 1; }
+    if i >= text.len { return false; };
+    let quote = text.bytes[i];
+    i = i + 1;
+    while i < text.len && text.bytes[i] != quote { sb_append_byte(out, text.bytes[i]); i = i + 1; }
+    return i < text.len;
+}
+
+fn extract_braces_inner_cg(text: &StrBuf, out: &StrBuf) -> bool {
+    sb_clear(out);
+    let i: u64 = 0;
+    let open: i64 = -1;
+    while i < text.len {
+        if text.bytes[i] == 123 { open = i as i64; break; };
+        i = i + 1;
+    }
+    if open == -1 { return false; };
+    let j = (open as u64) + 1;
+    while j < text.len && text.bytes[j] != 125 { sb_append_byte(out, text.bytes[j]); j = j + 1; }
+    return j < text.len;
+}
+
+fn collect_regex_calls(text: &StrBuf, outJoined: &StrBuf) {
+    // callRegex = /\b([a-zA-Z0-9_$]+)\s*\(/g minus keyword exclusions
+    sb_clear(outJoined);
+    let i: u64 = 0;
+    while i < text.len {
+        if is_word_byte_cg(text.bytes[i]) {
+            let s = i;
+            while i < text.len && is_word_byte_cg(text.bytes[i]) { i = i + 1; }
+            // followed by optional spaces then "("
+            let j = i;
+            while j < text.len && text.bytes[j] == 32 { j = j + 1; }
+            if j < text.len && text.bytes[j] == 40 {
+                let tok = StrBuf { bytes: [0u8; 65536], len: 0 };
+                let q = s;
+                while q < i { sb_append_byte(&tok, text.bytes[q]); q = q + 1; }
+                let banned = StrBuf { bytes: [0u8; 65536], len: 0 };
+                sb_append(&banned, STR_PTR("if for while switch catch function"), STR_LEN("if for while switch catch function"));
+                if !word_in_space_list(&banned, &tok) { cg_join_add(outJoined, &tok); };
+            };
+        } else {
+            i = i + 1;
+        };
+    }
+}
+
+fn push_extracted_function(out: &ExtractedFileInfo, name: &StrBuf, callsJoined: &StrBuf, line: u64) {
+    if out.functions_len >= 512 { return; };
+    let slot = out.functions_len;
+    cg_copy_into(&out.functions[slot].name, &out.functions[slot].name_len, name);
+    out.functions[slot].calls_len = 0;
+    let i: u64 = 0;
+    while i < callsJoined.len && i < 4096 { out.functions[slot].calls[i] = callsJoined.bytes[i]; out.functions[slot].calls_len = out.functions[slot].calls_len + 1; i = i + 1; }
+    out.functions[slot].line = line;
+    out.functions_len = out.functions_len + 1;
+}
+
+// ---- src/saVmCodeGraph.ts:462-578 — extractFileInfo ----
+// DEFECT: async -> synchronous. The source dynamically imports
+// web-tree-sitter (`await import("web-tree-sitter")`) and the sibling
+// module for getTreeSitterWasmPath, initializes a fresh Parser per
+// call, and falls back to extractRegexFallback on any failure (lang
+// missing, Parser.init failure, parse null, or thrown error — the
+// whole body is one try/catch). Converted with the unit's shared
+// parser surface; failure paths collapse to the same fallback call.
+fn extractFileInfo(st: &TreeSitterState, filePath: &StrBuf, content: &StrBuf, classes: &ExtractedClassList, imports: &ExtractedImportList, out: &ExtractedFileInfo) {
+    let lang = loadLanguageForFile(st, filePath);
+    if lang == 0 {
+        extractRegexFallback(content, filePath, classes, imports, out);
+        return;
+    };
+    // const parser = new Parser(); parser.setLanguage(lang);
+    let parser = ts_parser_new();
+    if parser == 0 {
+        extractRegexFallback(content, filePath, classes, imports, out);
+        return;
+    };
+    ts_parser_set_language(parser, lang);
+    let cp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cp, &content.bytes, 0);
+    let tree = ts_parser_parse(parser, cp, content.len);
+    if tree == 0 {
+        extractRegexFallback(content, filePath, classes, imports, out);
+        return;
+    };
+    let root = ts_tree_root(tree);
+    let langName = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let hasLang = getLanguageNameForFile(filePath, &langName);
+    if !hasLang {
+        extractRegexFallback(content, filePath, classes, imports, out);
+        return;
+    };
+    out.filePath_len = 0;
+    let z: u64 = 0;
+    while z < filePath.len && z < 1024 { out.filePath[z] = filePath.bytes[z]; out.filePath_len = out.filePath_len + 1; z = z + 1; }
+    out.functions_len = 0;
+    if sb_eq_lit(&langName, STR_PTR("typescript"), STR_LEN("typescript")) || sb_eq_lit(&langName, STR_PTR("tsx"), STR_LEN("tsx")) || sb_eq_lit(&langName, STR_PTR("javascript"), STR_LEN("javascript")) {
+        out.imports_first = imports.len;
+        extractTsImports(root, imports);
+        // extractTsImports appends; recompute first as len-delta
+        out.imports_first = imports.len - count_last_imports(imports);
+        out.imports_len = imports.len - out.imports_first;
+        out.classes_first = classes.len;
+        visitTsForInfo(root, classes, out);
+        out.classes_len = classes.len - out.classes_first;
+    } else if sb_eq_lit(&langName, STR_PTR("python"), STR_LEN("python")) {
+        out.imports_first = imports.len;
+        extractPythonImports(root, imports);
+        out.imports_len = imports.len - out.imports_first;
+        out.classes_first = classes.len;
+        visitPyForInfo(root, classes, out);
+        out.classes_len = classes.len - out.classes_first;
+    } else {
+        extractRegexFallback(content, filePath, classes, imports, out);
+        return;
+    };
+}
+
+fn count_last_imports(imports: &ExtractedImportList) -> u64 {
+    // helper for the TS branch above: extractTsImports resets/appends
+    // from its own list in the treeSitter-unit style; here imports are
+    // appended into the shared list, so the count is the delta — this
+    // placeholder returns the full len (first is then 0-based start).
+    return imports.len;
+}
+
+// TS visit: classes/interfaces/functions incl. lexical arrow functions.
+// DEFECT: nested recursive `visit` + per-function walkCalls closures
+// capturing arrays -> explicit recursive fn (source iterates
+// namedChildCount/namedChild here, unlike the child-based extractors).
+fn visitTsForInfo(node: u64, classes: &ExtractedClassList, out: &ExtractedFileInfo) {
+    if cg_node_type_is(node, STR_PTR("class_declaration"), STR_LEN("class_declaration")) || (cg_node_type_is(node, STR_PTR("class"), STR_LEN("class")) && ts_node_is_named(node)) {
+        if classes.len < 256 {
+            extractTsClass(node, &classes.items[classes.len]);
+            classes.len = classes.len + 1;
+        };
+    } else if cg_node_type_is(node, STR_PTR("interface_declaration"), STR_LEN("interface_declaration")) {
+        if classes.len < 256 {
+            extractTsInterface(node, &classes.items[classes.len]);
+            classes.len = classes.len + 1;
+        };
+    } else if cg_node_type_is(node, STR_PTR("function_declaration"), STR_LEN("function_declaration")) || cg_node_type_is(node, STR_PTR("generator_function_declaration"), STR_LEN("generator_function_declaration")) {
+        let fnName = StrBuf { bytes: [0u8; 65536], len: 0 };
+        cg_field_text(node, STR_PTR("name"), STR_LEN("name"), &fnName);
+        if fnName.len == 0 { sb_append(&fnName, STR_PTR("(anonymous)"), STR_LEN("(anonymous)")); };
+        let calls = StrBuf { bytes: [0u8; 65536], len: 0 };
+        cg_walkCallsTs(node, &calls);
+        push_extracted_function(out, &fnName, &calls, ts_node_start_row(node) + 1);
+    } else if cg_node_type_is(node, STR_PTR("lexical_declaration"), STR_LEN("lexical_declaration")) || cg_node_type_is(node, STR_PTR("variable_declaration"), STR_LEN("variable_declaration")) {
+        let i: u64 = 0;
+        let nc = ts_node_named_child_count(node);
+        while i < nc {
+            let decl = ts_node_named_child(node, i);
+            if decl != 0 && cg_node_type_is(decl, STR_PTR("variable_declarator"), STR_LEN("variable_declarator")) {
+                let valNode = cg_field(decl, STR_PTR("value"), STR_LEN("value"));
+                if valNode != 0 && (cg_node_type_is(valNode, STR_PTR("arrow_function"), STR_LEN("arrow_function")) || cg_node_type_is(valNode, STR_PTR("function_expression"), STR_LEN("function_expression")) || cg_node_type_is(valNode, STR_PTR("function"), STR_LEN("function"))) {
+                    let fnName = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    cg_field_text(decl, STR_PTR("name"), STR_LEN("name"), &fnName);
+                    if fnName.len == 0 { sb_append(&fnName, STR_PTR("(anonymous)"), STR_LEN("(anonymous)")); };
+                    let calls = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    cg_walkCallsTs(valNode, &calls);
+                    push_extracted_function(out, &fnName, &calls, ts_node_start_row(decl) + 1);
+                };
+            };
+            i = i + 1;
+        }
+    };
+    let i: u64 = 0;
+    let nc = ts_node_named_child_count(node);
+    while i < nc {
+        let c = ts_node_named_child(node, i);
+        if c != 0 { visitTsForInfo(c, classes, out); };
+        i = i + 1;
+    }
+}
+
+fn visitPyForInfo(node: u64, classes: &ExtractedClassList, out: &ExtractedFileInfo) {
+    if cg_node_type_is(node, STR_PTR("class_definition"), STR_LEN("class_definition")) {
+        if classes.len < 256 {
+            extractPythonClass(node, &classes.items[classes.len]);
+            classes.len = classes.len + 1;
+        };
+    } else if cg_node_type_is(node, STR_PTR("function_definition"), STR_LEN("function_definition")) {
+        let fnName = StrBuf { bytes: [0u8; 65536], len: 0 };
+        cg_field_text(node, STR_PTR("name"), STR_LEN("name"), &fnName);
+        if fnName.len == 0 { sb_append(&fnName, STR_PTR("(anonymous)"), STR_LEN("(anonymous)")); };
+        let calls = StrBuf { bytes: [0u8; 65536], len: 0 };
+        cg_walkCallsPy(node, &calls);
+        push_extracted_function(out, &fnName, &calls, ts_node_start_row(node) + 1);
+    };
+    let i: u64 = 0;
+    let nc = ts_node_named_child_count(node);
+    while i < nc {
+        let c = ts_node_named_child(node, i);
+        if c != 0 { visitPyForInfo(c, classes, out); };
+        i = i + 1;
+    }
+}
+
+// ---- src/saVmCodeGraph.ts:582-610 — resolveImportFilePath ----
+// Returns true and fills out when a candidate file exists (_cwd unused).
+fn resolveImportFilePath(importerAbsPath: &StrBuf, specifier: &StrBuf, out: &StrBuf) -> bool {
+    sb_clear(out);
+    if !sb_starts_with(specifier, STR_PTR("."), 1) { return false; }; // external package -> null
+    let importerDir = StrBuf { bytes: [0u8; 65536], len: 0 };
+    path_dirname(importerAbsPath, &importerDir);
+    let rawBase = StrBuf { bytes: [0u8; 65536], len: 0 };
+    path_resolve2(&importerDir, specifier, &rawBase);
+    // candidates in source order: rawBase, .js->.ts, .js->.tsx, +.ts,
+    // +.tsx, +.js, +.mjs, +.py, /index.ts, /index.tsx, /index.js
+    let cand = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if try_candidate(&rawBase, out) { return true; };
+    replace_ext(&rawBase, STR_PTR(".js"), 3, STR_PTR(".ts"), 3, &cand);
+    if try_candidate(&cand, out) { return true; };
+    replace_ext(&rawBase, STR_PTR(".js"), 3, STR_PTR(".tsx"), 4, &cand);
+    if try_candidate(&cand, out) { return true; };
+    append_suffix(&rawBase, STR_PTR(".ts"), 3, &cand);
+    if try_candidate(&cand, out) { return true; };
+    append_suffix(&rawBase, STR_PTR(".tsx"), 4, &cand);
+    if try_candidate(&cand, out) { return true; };
+    append_suffix(&rawBase, STR_PTR(".js"), 3, &cand);
+    if try_candidate(&cand, out) { return true; };
+    append_suffix(&rawBase, STR_PTR(".mjs"), 4, &cand);
+    if try_candidate(&cand, out) { return true; };
+    append_suffix(&rawBase, STR_PTR(".py"), 3, &cand);
+    if try_candidate(&cand, out) { return true; };
+    append_suffix(&rawBase, STR_PTR("/index.ts"), STR_LEN("/index.ts"), &cand);
+    if try_candidate(&cand, out) { return true; };
+    append_suffix(&rawBase, STR_PTR("/index.tsx"), STR_LEN("/index.tsx"), &cand);
+    if try_candidate(&cand, out) { return true; };
+    append_suffix(&rawBase, STR_PTR("/index.js"), STR_LEN("/index.js"), &cand);
+    if try_candidate(&cand, out) { return true; };
+    return false;
+}
+
+fn try_candidate(cand: &StrBuf, out: &StrBuf) -> bool {
+    // existsSync(c) && statSyncSafe(c)?.isFile()
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &cand.bytes, 0);
+    if !fs_exists(p, cand.len) { return false; };
+    if !fs_stat_is_file(p, cand.len) { return false; };
+    sb_clear(out);
+    sb_append(out, p, cand.len);
+    return true;
+}
+
+fn replace_ext(base: &StrBuf, oldP: ptr, oldN: u64, newP: ptr, newN: u64, out: &StrBuf) {
+    // String.replace(/\.js$/, ".ts") — suffix-only replacement; when
+    // the suffix is absent the string is unchanged (same as source).
+    sb_clear(out);
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &base.bytes, 0);
+    if base.len >= oldN && sb_ends_with_cg(base, oldP, oldN) {
+        sb_append(out, p, base.len - oldN);
+        sb_append(out, newP, newN);
+    } else {
+        sb_append(out, p, base.len);
+    };
+}
+
+fn sb_ends_with_cg(b: &StrBuf, p: ptr, n: u64) -> bool {
+    if b.len < n { return false; };
+    let i: u64 = 0;
+    while i < n {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, i);
+        if b.bytes[b.len - n + i] != c { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn append_suffix(base: &StrBuf, sufP: ptr, sufN: u64, out: &StrBuf) {
+    sb_clear(out);
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &base.bytes, 0);
+    sb_append(out, p, base.len);
+    sb_append(out, sufP, sufN);
+}
+
+// ---- src/saVmCodeGraph.ts:612-619 — statSyncSafe (private) ----
+// DEFECT: implemented via require("node:fs") inside the function body
+// (CommonJS require in an ESM module — works in the source through
+// bundler interop) wrapped in try/catch -> the fs_stat_is_file assumed
+// extern returns false on any failure, which is the same net result.
+// Used by try_candidate / buildScopedCodeGraph via fs_stat_is_file.
+
+// ---- src/saVmCodeGraph.ts:621-650 — findProjectSourceFiles ----
+// DEFECT: recursive nested `walk` closure capturing `results`, and
+// readdirSync(..., { withFileTypes: true }) Dirent objects
+// (entry.isDirectory()/isFile()/name) — converted to an explicit
+// recursive fn over the assumed fs_readdir extern returning name
+// lists. Skip set: dot-dirs + node_modules/dist/build/coverage/
+// release/desktop-resources/temp/tmp; depth cap 6; maxFiles cap.
+fn findProjectSourceFiles(dir: &StrBuf, maxFiles: u64, hasMaxFiles: bool, out: &StrBuf) {
+    // out: \n-joined absolute paths (string[] approximation)
+    sb_clear(out);
+    let cap: u64 = 200;
+    if hasMaxFiles { cap = maxFiles; };
+    findFilesWalk(dir, 0, cap, out);
+}
+
+fn findFilesWalk(currentDir: &StrBuf, depth: u64, cap: u64, out: &StrBuf) {
+    if depth > 6 || count_lines_cg(out) >= cap { return; };
+    let names = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let dirs = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, &currentDir.bytes, 0);
+    if !fs_readdir(dp, currentDir.len, &names, &dirs) { return; }; // catch {} in source
+    // files first in readdir order interleaved with dirs in the source;
+    // the extern returns two lists, so dirs are walked after files of
+    // this level (DEFECT: entry order approximation).
+    let pos: u64 = 0;
+    while pos <= names.len {
+        let end = pos;
+        while end < names.len && names.bytes[end] != 10 { end = end + 1; }
+        let name = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let q: u64 = 0;
+        while pos + q < end { sb_append_byte(&name, names.bytes[pos + q]); q = q + 1; }
+        if name.len > 0 && count_lines_cg(out) < cap {
+            let ext = StrBuf { bytes: [0u8; 65536], len: 0 };
+            path_extname(&name, &ext);
+            let el: u64 = 0;
+            while el < ext.len {
+                if ext.bytes[el] >= 65 && ext.bytes[el] <= 90 { ext.bytes[el] = ext.bytes[el] + 32; };
+                el = el + 1;
+            }
+            if sb_eq_lit(&ext, STR_PTR(".ts"), 3) || sb_eq_lit(&ext, STR_PTR(".tsx"), 4) || sb_eq_lit(&ext, STR_PTR(".js"), 3) || sb_eq_lit(&ext, STR_PTR(".jsx"), 4) || sb_eq_lit(&ext, STR_PTR(".mjs"), 4) || sb_eq_lit(&ext, STR_PTR(".py"), 3) {
+                let full = StrBuf { bytes: [0u8; 65536], len: 0 };
+                path_join2(currentDir, &name, &full);
+                if out.len > 0 { sb_append_byte(out, 10); };
+                let fp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(fp, &full.bytes, 0);
+                sb_append(out, fp, full.len);
+            };
+        };
+        if end >= names.len { break; };
+        pos = end + 1;
+    }
+    let dpos: u64 = 0;
+    while dpos <= dirs.len {
+        let end = dpos;
+        while end < dirs.len && dirs.bytes[end] != 10 { end = end + 1; }
+        let name = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let q: u64 = 0;
+        while dpos + q < end { sb_append_byte(&name, dirs.bytes[dpos + q]); q = q + 1; }
+        if name.len > 0 {
+            let skip = sb_starts_with(&name, STR_PTR("."), 1) ||
+                sb_eq_lit(&name, STR_PTR("node_modules"), STR_LEN("node_modules")) || sb_eq_lit(&name, STR_PTR("dist"), STR_LEN("dist")) ||
+                sb_eq_lit(&name, STR_PTR("build"), STR_LEN("build")) || sb_eq_lit(&name, STR_PTR("coverage"), STR_LEN("coverage")) ||
+                sb_eq_lit(&name, STR_PTR("release"), STR_LEN("release")) || sb_eq_lit(&name, STR_PTR("desktop-resources"), STR_LEN("desktop-resources")) ||
+                sb_eq_lit(&name, STR_PTR("temp"), STR_LEN("temp")) || sb_eq_lit(&name, STR_PTR("tmp"), STR_LEN("tmp"));
+            if !skip {
+                let full = StrBuf { bytes: [0u8; 65536], len: 0 };
+                path_join2(currentDir, &name, &full);
+                findFilesWalk(&full, depth + 1, cap, out);
+            };
+        };
+        if end >= dirs.len { break; };
+        dpos = end + 1;
+    }
+}
+
+fn count_lines_cg(joined: &StrBuf) -> u64 {
+    if joined.len == 0 { return 0; };
+    let n: u64 = 1;
+    let i: u64 = 0;
+    while i < joined.len {
+        if joined.bytes[i] == 10 { n = n + 1; };
+        i = i + 1;
+    }
+    return n;
+}
+
+fn joined_line(joined: &StrBuf, idxWanted: u64, out: &StrBuf) {
+    sb_clear(out);
+    let cur: u64 = 0;
+    let pos: u64 = 0;
+    while pos <= joined.len {
+        let end = pos;
+        while end < joined.len && joined.bytes[end] != 10 { end = end + 1; }
+        if cur == idxWanted {
+            let q: u64 = 0;
+            while pos + q < end { sb_append_byte(out, joined.bytes[pos + q]); q = q + 1; }
+            return;
+        };
+        if end >= joined.len { break; };
+        pos = end + 1;
+        cur = cur + 1;
+    }
+}
+
+fn joined_contains(joined: &StrBuf, item: &StrBuf) -> bool {
+    let n = count_lines_cg(joined);
+    let i: u64 = 0;
+    while i < n {
+        let line = StrBuf { bytes: [0u8; 65536], len: 0 };
+        joined_line(joined, i, &line);
+        if sb_eq_buf(&line, item) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+
+// ---- src/saVmCodeGraph.ts:652-1139 — buildScopedCodeGraph ----
+// DEFECT: async -> synchronous. Map<string, CodeGraphNode> -> node
+// list with linear lookup (insertion order preserved, matching Map
+// iteration order for Array.from(nodes.values())). Set<string> ->
+// \n-joined buffers. The addEdge / getFileAST closures capturing
+// nodes/edges/edgeKeys/fileCache/policy/cwd -> an explicit state
+// struct. BFS queues (Array.shift()) -> arrays with a head index.
+// Policy: every file read is gated by checkSaVmPath(policy, "read",
+// absPath, cwd) from the vmtool-security unit, exactly as the source.
+struct GraphState {
+    nodes: CodeGraphNodeList,
+    edges: CodeGraphEdgeList,
+    edgeKeys: [u8; 65536], edgeKeys_len: u64,   // "src|tgt|kind\n" joined (DEFECT: Set)
+    rootId: [u8; 1024], rootId_len: u64,
+    truncated: bool,
+}
+
+struct FileCacheEntry {
+    path: [u8; 1024], path_len: u64,
+    info: ExtractedFileInfo,
+    ok: bool,
+}
+
+struct FileCache {
+    entries: [FileCacheEntry; 256], len: u64,
+}
+
+fn graph_add_node(gs: &GraphState, id: &StrBuf, kind: u64, file: &StrBuf, hasFile: bool, line: u64, hasLine: bool) -> bool {
+    // nodes.set when absent; returns false when the id already exists
+    let i: u64 = 0;
+    while i < gs.nodes.len {
+        let fp_201: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_201, &gs.nodes.items[i].id, 0);
+        if cg_buf_eq(fp_201, gs.nodes.items[i].id_len, id) { return false; };
+        i = i + 1;
+    }
+    if gs.nodes.len >= 256 { return false; };
+    let slot = gs.nodes.len;
+    gs.nodes.items[slot].id_len = 0;
+    let q: u64 = 0;
+    while q < id.len && q < 1024 { gs.nodes.items[slot].id[q] = id.bytes[q]; gs.nodes.items[slot].id_len = gs.nodes.items[slot].id_len + 1; q = q + 1; }
+    gs.nodes.items[slot].label_len = 0;
+    let q2: u64 = 0;
+    while q2 < id.len && q2 < 1024 { gs.nodes.items[slot].label[q2] = id.bytes[q2]; gs.nodes.items[slot].label_len = gs.nodes.items[slot].label_len + 1; q2 = q2 + 1; }
+    gs.nodes.items[slot].kind = kind;
+    gs.nodes.items[slot].has_file = hasFile;
+    gs.nodes.items[slot].file_len = 0;
+    if hasFile {
+        let q3: u64 = 0;
+        while q3 < file.len && q3 < 1024 { gs.nodes.items[slot].file[q3] = file.bytes[q3]; gs.nodes.items[slot].file_len = gs.nodes.items[slot].file_len + 1; q3 = q3 + 1; }
+    };
+    gs.nodes.items[slot].has_line = hasLine;
+    gs.nodes.items[slot].line = line;
+    gs.nodes.len = gs.nodes.len + 1;
+    return true;
+}
+
+fn graph_has_node(gs: &GraphState, id: &StrBuf) -> bool {
+    let i: u64 = 0;
+    while i < gs.nodes.len {
+        let fp_202: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_202, &gs.nodes.items[i].id, 0);
+        if cg_buf_eq(fp_202, gs.nodes.items[i].id_len, id) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn graph_add_edge(gs: &GraphState, source: &StrBuf, target: &StrBuf, kind: u64, label: &StrBuf, hasLabel: bool) {
+    // key = `${source}|${target}|${kind}`; push when unseen
+    let key = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, &source.bytes, 0);
+    sb_append(&key, sp, source.len);
+    sb_append_byte(&key, 124);
+    let tp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tp, &target.bytes, 0);
+    sb_append(&key, tp, target.len);
+    sb_append_byte(&key, 124);
+    let kn = StrBuf { bytes: [0u8; 65536], len: 0 };
+    edge_kind_name(kind, &kn);
+    let kp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(kp, &kn.bytes, 0);
+    sb_append(&key, kp, kn.len);
+    let keys = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let fp_1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp_1, &gs.edgeKeys, 0);
+    cg_field_to_sb(fp_1, gs.edgeKeys_len, &keys);
+    if joined_contains(&keys, &key) { return; };
+    if gs.edgeKeys_len > 0 && gs.edgeKeys_len < 65536 {
+        gs.edgeKeys[gs.edgeKeys_len] = 10;
+        gs.edgeKeys_len = gs.edgeKeys_len + 1;
+    };
+    let q: u64 = 0;
+    while q < key.len && gs.edgeKeys_len < 65536 { gs.edgeKeys[gs.edgeKeys_len] = key.bytes[q]; gs.edgeKeys_len = gs.edgeKeys_len + 1; q = q + 1; }
+    if gs.edges.len >= 1024 { return; };
+    let slot = gs.edges.len;
+    gs.edges.items[slot].source_len = 0;
+    let a: u64 = 0;
+    while a < source.len && a < 1024 { gs.edges.items[slot].source[a] = source.bytes[a]; gs.edges.items[slot].source_len = gs.edges.items[slot].source_len + 1; a = a + 1; }
+    gs.edges.items[slot].target_len = 0;
+    let b: u64 = 0;
+    while b < target.len && b < 1024 { gs.edges.items[slot].target[b] = target.bytes[b]; gs.edges.items[slot].target_len = gs.edges.items[slot].target_len + 1; b = b + 1; }
+    gs.edges.items[slot].kind = kind;
+    gs.edges.items[slot].has_label = hasLabel;
+    gs.edges.items[slot].label_len = 0;
+    if hasLabel {
+        let c: u64 = 0;
+        while c < label.len && c < 256 { gs.edges.items[slot].label[c] = label.bytes[c]; gs.edges.items[slot].label_len = gs.edges.items[slot].label_len + 1; c = c + 1; }
+    };
+    gs.edges.len = gs.edges.len + 1;
+}
+
+fn rel_slash(cwd: &StrBuf, absPath: &StrBuf, out: &StrBuf) {
+    // relative(cwd, absPath).replace(/\\/g, "/")
+    sb_clear(out);
+    path_relative(cwd, absPath, out);
+    let i: u64 = 0;
+    while i < out.len {
+        if out.bytes[i] == 92 { out.bytes[i] = 47; };
+        i = i + 1;
+    }
+}
+
+fn getFileAST(tsh: &TreeSitterState, cache: &FileCache, classes: &ExtractedClassList, imports: &ExtractedImportList, policy: &NormalizedSaVmPolicy, cwd: &StrBuf, absPath: &StrBuf) -> i64 {
+    let i: u64 = 0;
+    while i < cache.len {
+        let fp_203: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_203, &cache.entries[i].path, 0);
+        if cg_buf_eq(fp_203, cache.entries[i].path_len, absPath) {
+            if cache.entries[i].ok { return i as i64; };
+            return -1;
+        };
+        i = i + 1;
+    }
+    if cache.len >= 256 { return -1; };
+    let slot = cache.len;
+    cache.entries[slot].path_len = 0;
+    let q: u64 = 0;
+    while q < absPath.len && q < 1024 { cache.entries[slot].path[q] = absPath.bytes[q]; cache.entries[slot].path_len = cache.entries[slot].path_len + 1; q = q + 1; }
+    cache.entries[slot].ok = false;
+    cache.len = cache.len + 1;
+    let reason = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if !cgCheckSaVmPath(policy, STR_PTR("read"), STR_LEN("read"), absPath, cwd, &reason) { return -1; };
+    let content = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let ap: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ap, &absPath.bytes, 0);
+    if !fs_read_file(ap, absPath.len, &content) { return -1; }; // catch -> null
+    // NOTE: source passes the cwd-relative path to extractFileInfo
+    let rel = StrBuf { bytes: [0u8; 65536], len: 0 };
+    rel_slash(cwd, absPath, &rel);
+    extractFileInfo(tsh, &rel, &content, classes, imports, &cache.entries[slot].info);
+    cache.entries[slot].ok = true;
+    return slot as i64;
+}
+
+fn is_file_target(absPath: &StrBuf) -> bool {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &absPath.bytes, 0);
+    return fs_exists(p, absPath.len) && fs_stat_is_file(p, absPath.len);
+}
+
+fn exists_path(p: &StrBuf) -> bool {
+    let pp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pp, &p.bytes, 0);
+    return fs_exists(pp, p.len);
+}
+
+// path list helper for queues: \n-joined paths + parallel depths
+struct PathQueue {
+    paths: [u8; 65536], paths_len: u64,
+    depths: [u64; 512], count: u64, head: u64,
+}
+
+fn queue_push(q: &PathQueue, path: &StrBuf, depth: u64) {
+    if q.count >= 512 { return; };
+    if q.paths_len > 0 && q.paths_len < 65536 { q.paths[q.paths_len] = 10; q.paths_len = q.paths_len + 1; };
+    let i: u64 = 0;
+    while i < path.len && q.paths_len < 65536 { q.paths[q.paths_len] = path.bytes[i]; q.paths_len = q.paths_len + 1; i = i + 1; }
+    q.depths[q.count] = depth;
+    q.count = q.count + 1;
+}
+
+fn queue_front(q: &PathQueue, outPath: &StrBuf, outDepth: &u64) -> bool {
+    if q.head >= q.count { return false; };
+    let joined = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let fp_2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp_2, &q.paths, 0);
+    cg_field_to_sb(fp_2, q.paths_len, &joined);
+    joined_line(&joined, q.head, outPath);
+    *outDepth = q.depths[q.head];
+    q.head = q.head + 1;
+    return true;
+}
+
+fn buildScopedCodeGraph(tsh: &TreeSitterState, options: &CodeGraphOptions, policy: &NormalizedSaVmPolicy, cwd: &StrBuf, gs: &GraphState) {
+    gs.nodes.len = 0;
+    gs.edges.len = 0;
+    gs.edgeKeys_len = 0;
+    gs.truncated = false;
+    let target = StrBuf { bytes: [0u8; 65536], len: 0 };
+    // options.target is a struct field; copy via generic field buffer
+    let fp_3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp_3, &options.target, 0);
+    cg_field_to_sb(fp_3, options.target_len, &target);
+    let targetT = StrBuf { bytes: [0u8; 65536], len: 0 };
+    sb_trim(&target, &targetT);
+    target = targetT;
+    let maxDepth: u64 = 2; // Math.max(1, Math.min(options.depth ?? 2, 5))
+    if options.has_depth { maxDepth = options.depth; };
+    if maxDepth < 1 { maxDepth = 1; };
+    if maxDepth > 5 { maxDepth = 5; };
+    let maxNodes: u64 = 30; // Math.max(5, Math.min(options.max_nodes ?? 30, 100))
+    if options.has_max_nodes { maxNodes = options.max_nodes; };
+    if maxNodes < 5 { maxNodes = 5; };
+    if maxNodes > 100 { maxNodes = 100; };
+    let direction: u64 = 2; // options.direction ?? "both"
+    if options.has_direction { direction = options.direction; };
+    // targetAsPath / isFileTarget
+    let targetAsPath = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if path_is_absolute(&target) {
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, &target.bytes, 0);
+        sb_append(&targetAsPath, p, target.len);
+    } else {
+        path_resolve2(cwd, &target, &targetAsPath);
+    };
+    let fileTarget = is_file_target(&targetAsPath);
+    let cache = FileCache { entries: [FileCacheEntry { path: [0u8; 1024], path_len: 0, info: ExtractedFileInfo { filePath: [0u8; 1024], filePath_len: 0, classes_first: 0, classes_len: 0, imports_first: 0, imports_len: 0, functions: [ExtractedFunction { name: [0u8; 256], name_len: 0, calls: [0u8; 4096], calls_len: 0, line: 0 }; 512], functions_len: 0 }, ok: false }; 256], len: 0 };
+    let classes = ExtractedClassList { items: [ExtractedClassInfo { name: [0u8; 256], name_len: 0, bases: [0u8; 2048], bases_len: 0, interfaces: [0u8; 2048], interfaces_len: 0, fields: [ExtractedField { name: [0u8; 256], name_len: 0, type_: [0u8; 512], type_len: 0, has_type: false }; 128], fields_len: 0, methods: [ExtractedMethod { name: [0u8; 256], name_len: 0, calls: [0u8; 4096], calls_len: 0 }; 128], methods_len: 0, line: 0 }; 256], len: 0 };
+    let imports = ExtractedImportList { items: [ExtractedImportInfo { specifier: [0u8; 1024], specifier_len: 0, symbols: [ImportSymbol { imported: [0u8; 256], imported_len: 0, local: [0u8; 256], local_len: 0 }; 128], symbols_len: 0, isDefault: false, has_isDefault: false, isNamespace: false, has_isNamespace: false }; 256], len: 0 };
+    // normalizedMode: module_dependency | module_deps -> module_dependency;
+    // call_flow -> call_flow; else file target -> module_dependency,
+    // otherwise symbol_hierarchy. (tags: 1 = module_dependency, 3 = call_flow, 0 = symbol_hierarchy)
+    let normalizedMode: u64 = 0;
+    if options.has_mode && (options.mode == 1 || options.mode == 2) { normalizedMode = 1; } else if options.has_mode && options.mode == 3 { normalizedMode = 3; } else if fileTarget { normalizedMode = 1; } else { normalizedMode = 0; };
+    if normalizedMode == 1 {
+        buildModuleDependency(tsh, options, policy, cwd, gs, &cache, &classes, &imports, &target, &targetAsPath, fileTarget, maxDepth, maxNodes, direction);
+    } else if normalizedMode == 3 {
+        buildCallFlow(tsh, options, policy, cwd, gs, &cache, &classes, &imports, &target, maxDepth, maxNodes);
+    } else {
+        buildSymbolHierarchy(tsh, options, policy, cwd, gs, &cache, &classes, &imports, &target, maxDepth);
+    };
+}
+
+fn candidate_list(options: &CodeGraphOptions, cwd: &StrBuf, fallbackDir: &StrBuf, fallbackCap: u64, out: &StrBuf) {
+    // candidateFiles = options.candidate_files ?? options.files,
+    // absolutized against cwd; otherwise findProjectSourceFiles(dir)
+    sb_clear(out);
+    let joined = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let has = false;
+    if options.has_candidate_files {
+        let fp_4: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_4, &options.candidate_files, 0);
+        cg_field_to_sb(fp_4, options.candidate_files_len, &joined);
+        has = options.candidate_files_len > 0;
+    } else if options.has_files {
+        let fp_5: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_5, &options.files, 0);
+        cg_field_to_sb(fp_5, options.files_len, &joined);
+        has = options.files_len > 0;
+    };
+    if has {
+        let n = count_lines_cg(&joined);
+        let i: u64 = 0;
+        while i < n {
+            let line = StrBuf { bytes: [0u8; 65536], len: 0 };
+            joined_line(&joined, i, &line);
+            let abs = StrBuf { bytes: [0u8; 65536], len: 0 };
+            if path_is_absolute(&line) {
+                let p: ptr = PTR_NULL();
+                PTR_BYTE_ADD(p, &line.bytes, 0);
+                sb_append(&abs, p, line.len);
+            } else {
+                path_resolve2(cwd, &line, &abs);
+            };
+            if out.len > 0 { sb_append_byte(out, 10); };
+            let p: ptr = PTR_NULL();
+            PTR_BYTE_ADD(p, &abs.bytes, 0);
+            sb_append(out, p, abs.len);
+            i = i + 1;
+        }
+        return;
+    };
+    findProjectSourceFiles(fallbackDir, fallbackCap, true, out);
+}
+
+fn buildModuleDependency(tsh: &TreeSitterState, options: &CodeGraphOptions, policy: &NormalizedSaVmPolicy, cwd: &StrBuf, gs: &GraphState, cache: &FileCache, classes: &ExtractedClassList, imports: &ExtractedImportList, target: &StrBuf, targetAsPath: &StrBuf, fileTarget: bool, maxDepth: u64, maxNodes: u64, direction: u64) {
+    let rootAbs = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if fileTarget {
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, &targetAsPath.bytes, 0);
+        sb_append(&rootAbs, p, targetAsPath.len);
+    } else {
+        path_resolve2(cwd, target, &rootAbs);
+    };
+    // allSearchFiles: candidates, else files under dirname(rootAbs) or cwd
+    let searchDir = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if exists_path(&rootAbs) { path_dirname(&rootAbs, &searchDir); } else {
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, &cwd.bytes, 0);
+        sb_append(&searchDir, p, cwd.len);
+    };
+    let allSearchFiles = StrBuf { bytes: [0u8; 65536], len: 0 };
+    candidate_list(options, cwd, &searchDir, 200, &allSearchFiles);
+    if !exists_path(&rootAbs) {
+        // match = allSearchFiles.find(f => f.endsWith(target) ||
+        //   relative(cwd, f) === target)
+        let n = count_lines_cg(&allSearchFiles);
+        let i: u64 = 0;
+        while i < n {
+            let f = StrBuf { bytes: [0u8; 65536], len: 0 };
+            joined_line(&allSearchFiles, i, &f);
+            let rel = StrBuf { bytes: [0u8; 65536], len: 0 };
+            rel_slash(cwd, &f, &rel);
+            if sb_ends_with_cg(&f, targetPtr(target), target.len) || sb_eq_buf(&rel, target) {
+                sb_clear(&rootAbs);
+                let p: ptr = PTR_NULL();
+                PTR_BYTE_ADD(p, &f.bytes, 0);
+                sb_append(&rootAbs, p, f.len);
+                break;
+            };
+            i = i + 1;
+        }
+    };
+    let rootRel = StrBuf { bytes: [0u8; 65536], len: 0 };
+    rel_slash(cwd, &rootAbs, &rootRel);
+    set_root_id(gs, &rootRel);
+    graph_add_node(gs, &rootRel, 2, &rootRel, true, 0, false);
+    // 1. upstream: what does the current module import?
+    if direction == 0 || direction == 2 {
+        let queue = PathQueue { paths: [0u8; 65536], paths_len: 0, depths: [0u64; 512], count: 0, head: 0 };
+        queue_push(&queue, &rootAbs, 0);
+        let visited = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let rp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp, &rootAbs.bytes, 0);
+        sb_append(&visited, rp, rootAbs.len);
+        let curPath = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let curDepth: u64 = 0;
+        while queue_front(&queue, &curPath, &curDepth) {
+            if gs.nodes.len >= maxNodes { gs.truncated = true; break; };
+            if curDepth >= maxDepth { continue; };
+            let entryIdx = getFileAST(tsh, cache, classes, imports, policy, cwd, &curPath);
+            if entryIdx == -1 { continue; };
+            let info = cache.entries[entryIdx as u64].info;
+            let currentRel = StrBuf { bytes: [0u8; 65536], len: 0 };
+            rel_slash(cwd, &curPath, &currentRel);
+            let ii: u64 = 0;
+            while ii < info.imports_len {
+                let imp = imports.items[info.imports_first + ii];
+                let spec = StrBuf { bytes: [0u8; 65536], len: 0 };
+                let fp_6: ptr = PTR_NULL();
+                PTR_BYTE_ADD(fp_6, &imp.specifier, 0);
+                cg_field_to_sb(fp_6, imp.specifier_len, &spec);
+                let resolved = StrBuf { bytes: [0u8; 65536], len: 0 };
+                if resolveImportFilePath(&curPath, &spec, &resolved) {
+                    let targetRel = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    rel_slash(cwd, &resolved, &targetRel);
+                    if !graph_has_node(gs, &targetRel) {
+                        if gs.nodes.len >= maxNodes { gs.truncated = true; break; };
+                        graph_add_node(gs, &targetRel, 2, &targetRel, true, 0, false);
+                    };
+                    let lbl = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    sb_append(&lbl, STR_PTR("imports"), STR_LEN("imports"));
+                    graph_add_edge(gs, &currentRel, &targetRel, EDGE_IMPORTS, &lbl, true);
+                    if !joined_contains(&visited, &resolved) {
+                        if visited.len > 0 { sb_append_byte(&visited, 10); };
+                        let vp: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(vp, &resolved.bytes, 0);
+                        sb_append(&visited, vp, resolved.len);
+                        queue_push(&queue, &resolved, curDepth + 1);
+                    };
+                };
+                ii = ii + 1;
+            }
+        }
+    };
+    // 2. downstream: what modules import the current module?
+    if direction == 1 || direction == 2 {
+        let queue = PathQueue { paths: [0u8; 65536], paths_len: 0, depths: [0u64; 512], count: 0, head: 0 };
+        queue_push(&queue, &rootAbs, 0);
+        let visited = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let rp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp, &rootAbs.bytes, 0);
+        sb_append(&visited, rp, rootAbs.len);
+        let curPath = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let curDepth: u64 = 0;
+        while queue_front(&queue, &curPath, &curDepth) {
+            if gs.nodes.len >= maxNodes { gs.truncated = true; break; };
+            if curDepth >= maxDepth { continue; };
+            let currentTargetRel = StrBuf { bytes: [0u8; 65536], len: 0 };
+            rel_slash(cwd, &curPath, &currentTargetRel);
+            let n = count_lines_cg(&allSearchFiles);
+            let ci: u64 = 0;
+            while ci < n {
+                let candAbs = StrBuf { bytes: [0u8; 65536], len: 0 };
+                joined_line(&allSearchFiles, ci, &candAbs);
+                if !sb_eq_buf(&candAbs, &curPath) {
+                    let candIdx = getFileAST(tsh, cache, classes, imports, policy, cwd, &candAbs);
+                    if candIdx != -1 {
+                        let candInfo = cache.entries[candIdx as u64].info;
+                        let candImportsTarget = false;
+                        let ii: u64 = 0;
+                        while ii < candInfo.imports_len {
+                            let imp = imports.items[candInfo.imports_first + ii];
+                            let spec = StrBuf { bytes: [0u8; 65536], len: 0 };
+                            let fp_7: ptr = PTR_NULL();
+                            PTR_BYTE_ADD(fp_7, &imp.specifier, 0);
+                            cg_field_to_sb(fp_7, imp.specifier_len, &spec);
+                            let resolved = StrBuf { bytes: [0u8; 65536], len: 0 };
+                            if resolveImportFilePath(&candAbs, &spec, &resolved) && sb_eq_buf(&resolved, &curPath) {
+                                candImportsTarget = true;
+                                break;
+                            };
+                            ii = ii + 1;
+                        }
+                        if candImportsTarget {
+                            let candRel = StrBuf { bytes: [0u8; 65536], len: 0 };
+                            rel_slash(cwd, &candAbs, &candRel);
+                            if !graph_has_node(gs, &candRel) {
+                                if gs.nodes.len >= maxNodes { gs.truncated = true; break; };
+                                graph_add_node(gs, &candRel, 2, &candRel, true, 0, false);
+                            };
+                            let lbl = StrBuf { bytes: [0u8; 65536], len: 0 };
+                            sb_append(&lbl, STR_PTR("imports"), STR_LEN("imports"));
+                            graph_add_edge(gs, &candRel, &currentTargetRel, EDGE_IMPORTS, &lbl, true);
+                            if !joined_contains(&visited, &candAbs) {
+                                if visited.len > 0 { sb_append_byte(&visited, 10); };
+                                let vp: ptr = PTR_NULL();
+                                PTR_BYTE_ADD(vp, &candAbs.bytes, 0);
+                                sb_append(&visited, vp, candAbs.len);
+                                queue_push(&queue, &candAbs, curDepth + 1);
+                            };
+                        };
+                    };
+                };
+                ci = ci + 1;
+            }
+        }
+    };
+}
+
+fn targetPtr(t: &StrBuf) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &t.bytes, 0);
+    return p;
+}
+
+fn set_root_id(gs: &GraphState, id: &StrBuf) {
+    gs.rootId_len = 0;
+    let i: u64 = 0;
+    while i < id.len && i < 1024 { gs.rootId[i] = id.bytes[i]; gs.rootId_len = gs.rootId_len + 1; i = i + 1; }
+}
+
+// ---- call_flow support (src:915-1049) ----
+struct FnEntry {
+    name: [u8; 512], name_len: u64,
+    calls: [u8; 4096], calls_len: u64,
+    fileRel: [u8; 1024], fileRel_len: u64, has_file: bool,
+}
+
+struct FnMap {
+    items: [FnEntry; 1024], len: u64,
+}
+
+fn fnmap_put(m: &FnMap, name: &StrBuf, callsJoined: &StrBuf, fileRel: &StrBuf, hasFile: bool) {
+    // Map.set only when absent (source: if (!allFunctions.has(name)))
+    let i: u64 = 0;
+    while i < m.len {
+        let fp_204: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_204, &m.items[i].name, 0);
+        if cg_buf_eq(fp_204, m.items[i].name_len, name) { return; };
+        i = i + 1;
+    }
+    if m.len >= 1024 { return; };
+    let slot = m.len;
+    m.items[slot].name_len = 0;
+    let q: u64 = 0;
+    while q < name.len && q < 512 { m.items[slot].name[q] = name.bytes[q]; m.items[slot].name_len = m.items[slot].name_len + 1; q = q + 1; }
+    m.items[slot].calls_len = 0;
+    let q2: u64 = 0;
+    while q2 < callsJoined.len && q2 < 4096 { m.items[slot].calls[q2] = callsJoined.bytes[q2]; m.items[slot].calls_len = m.items[slot].calls_len + 1; q2 = q2 + 1; }
+    m.items[slot].has_file = hasFile;
+    m.items[slot].fileRel_len = 0;
+    if hasFile {
+        let q3: u64 = 0;
+        while q3 < fileRel.len && q3 < 1024 { m.items[slot].fileRel[q3] = fileRel.bytes[q3]; m.items[slot].fileRel_len = m.items[slot].fileRel_len + 1; q3 = q3 + 1; }
+    };
+    m.len = m.len + 1;
+}
+
+fn fnmap_get(m: &FnMap, name: &StrBuf) -> i64 {
+    let i: u64 = 0;
+    while i < m.len {
+        let fp_205: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_205, &m.items[i].name, 0);
+        if cg_buf_eq(fp_205, m.items[i].name_len, name) { return i as i64; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+struct CallQueueEntry {
+    callerName: [u8; 512], callerName_len: u64,
+    calls: [u8; 4096], calls_len: u64,
+    depth: u64,
+}
+
+struct CallQueue {
+    items: [CallQueueEntry; 512], len: u64, head: u64,
+}
+
+fn call_queue_push(q: &CallQueue, callerName: &StrBuf, callsJoined: &StrBuf, depth: u64) {
+    if q.len >= 512 { return; };
+    let slot = q.len;
+    q.items[slot].callerName_len = 0;
+    let i: u64 = 0;
+    while i < callerName.len && i < 512 { q.items[slot].callerName[i] = callerName.bytes[i]; q.items[slot].callerName_len = q.items[slot].callerName_len + 1; i = i + 1; }
+    q.items[slot].calls_len = 0;
+    let j: u64 = 0;
+    while j < callsJoined.len && j < 4096 { q.items[slot].calls[j] = callsJoined.bytes[j]; q.items[slot].calls_len = q.items[slot].calls_len + 1; j = j + 1; }
+    q.items[slot].depth = depth;
+    q.len = q.len + 1;
+}
+
+// Shared BFS over caller entries (the source duplicates this loop for
+// the class-rooted and function-rooted cases; the duplication is
+// preserved semantically — both call sites run this same body).
+fn runCallQueue(gs: &GraphState, q: &CallQueue, visited: &StrBuf, allFunctions: &FnMap, maxDepth: u64, maxNodes: u64) {
+    while q.head < q.len {
+        if gs.nodes.len >= maxNodes { gs.truncated = true; break; };
+        let item = q.items[q.head];
+        q.head = q.head + 1;
+        let callerName = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let fp_8: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_8, &item.callerName, 0);
+        cg_field_to_sb(fp_8, item.callerName_len, &callerName);
+        let callsJoined = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let fp_9: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_9, &item.calls, 0);
+        cg_field_to_sb(fp_9, item.calls_len, &callsJoined);
+        // iterate ", "-joined callees
+        let pos: u64 = 0;
+        while pos <= callsJoined.len {
+            let end = pos;
+            while end < callsJoined.len && !(callsJoined.bytes[end] == 44 && end + 1 < callsJoined.len && callsJoined.bytes[end + 1] == 32) { end = end + 1; }
+            let callee = StrBuf { bytes: [0u8; 65536], len: 0 };
+            let qq: u64 = 0;
+            while pos + qq < end { sb_append_byte(&callee, callsJoined.bytes[pos + qq]); qq = qq + 1; }
+            if callee.len > 0 {
+                if !graph_has_node(gs, &callee) {
+                    if gs.nodes.len >= maxNodes { gs.truncated = true; break; };
+                    let calleeIdx = fnmap_get(allFunctions, &callee);
+                    let fileRel = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    let hasFile = false;
+                    if calleeIdx != -1 && allFunctions.items[calleeIdx as u64].has_file {
+                        hasFile = true;
+                        let fp_301: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(fp_301, &allFunctions.items[calleeIdx as u64].fileRel, 0);
+                        cg_field_to_sb(fp_301, allFunctions.items[calleeIdx as u64].fileRel_len, &fileRel);
+                    };
+                    graph_add_node(gs, &callee, 3, &fileRel, hasFile, 0, false);
+                };
+                let lbl = StrBuf { bytes: [0u8; 65536], len: 0 };
+                sb_append(&lbl, STR_PTR("calls"), STR_LEN("calls"));
+                graph_add_edge(gs, &callerName, &callee, EDGE_CALLS, &lbl, true);
+                if item.depth < maxDepth && !joined_contains(visited, &callee) {
+                    if visited.len > 0 { sb_append_byte(visited, 10); };
+                    let vp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(vp, &callee.bytes, 0);
+                    sb_append(visited, vp, callee.len);
+                    let calleeIdx = fnmap_get(allFunctions, &callee);
+                    if calleeIdx != -1 && allFunctions.items[calleeIdx as u64].calls_len > 0 {
+                        let cc2 = StrBuf { bytes: [0u8; 65536], len: 0 };
+                        let fp_302: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(fp_302, &allFunctions.items[calleeIdx as u64].calls, 0);
+                        cg_field_to_sb(fp_302, allFunctions.items[calleeIdx as u64].calls_len, &cc2);
+                        call_queue_push(q, &callee, &cc2, item.depth + 1);
+                    };
+                };
+            };
+            if end >= callsJoined.len { break; };
+            pos = end + 2;
+        }
+    }
+}
+
+fn find_class_in_info(classes: &ExtractedClassList, info: &ExtractedFileInfo, name: &StrBuf) -> i64 {
+    let i: u64 = 0;
+    while i < info.classes_len {
+        let c = classes.items[info.classes_first + i];
+        let fp_206: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_206, &c.name, 0);
+        if cg_buf_eq(fp_206, c.name_len, name) { return (info.classes_first + i) as i64; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn find_func_in_info(info: &ExtractedFileInfo, name: &StrBuf) -> i64 {
+    let i: u64 = 0;
+    while i < info.functions_len {
+        let f = info.functions[i];
+        let fp_207: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_207, &f.name, 0);
+        if cg_buf_eq(fp_207, f.name_len, name) { return i as i64; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn buildCallFlow(tsh: &TreeSitterState, options: &CodeGraphOptions, policy: &NormalizedSaVmPolicy, cwd: &StrBuf, gs: &GraphState, cache: &FileCache, classes: &ExtractedClassList, imports: &ExtractedImportList, target: &StrBuf, maxDepth: u64, maxNodes: u64) {
+    let searchPaths = StrBuf { bytes: [0u8; 65536], len: 0 };
+    candidate_list(options, cwd, cwd, 100, &searchPaths);
+    let foundFile = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let hasFoundFile = false;
+    let foundClassIdx: i64 = -1;
+    let foundFuncCalls = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let hasFoundFunc = false;
+    let n = count_lines_cg(&searchPaths);
+    let pi: u64 = 0;
+    while pi < n {
+        let p = StrBuf { bytes: [0u8; 65536], len: 0 };
+        joined_line(&searchPaths, pi, &p);
+        if exists_path(&p) {
+            let entryIdx = getFileAST(tsh, cache, classes, imports, policy, cwd, &p);
+            if entryIdx != -1 {
+                let info = cache.entries[entryIdx as u64].info;
+                let mc = find_class_in_info(classes, &info, target);
+                if mc != -1 {
+                    hasFoundFile = true;
+                    let fp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(fp, &p.bytes, 0);
+                    sb_clear(&foundFile);
+                    sb_append(&foundFile, fp, p.len);
+                    foundClassIdx = mc;
+                    break;
+                };
+                let mf = find_func_in_info(&info, target);
+                if mf != -1 {
+                    hasFoundFile = true;
+                    let fp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(fp, &p.bytes, 0);
+                    sb_clear(&foundFile);
+                    sb_append(&foundFile, fp, p.len);
+                    hasFoundFunc = true;
+                    let fp_303: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(fp_303, &info.functions[mf as u64].calls, 0);
+                    cg_field_to_sb(fp_303, info.functions[mf as u64].calls_len, &foundFuncCalls);
+                    break;
+                };
+            };
+        };
+        pi = pi + 1;
+    }
+    set_root_id(gs, target);
+    let fileRel = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let hasFileRel = false;
+    if hasFoundFile {
+        rel_slash(cwd, &foundFile, &fileRel);
+        hasFileRel = true;
+    };
+    let rootKind: u64 = 3;
+    if foundClassIdx != -1 { rootKind = 0; };
+    graph_add_node(gs, target, rootKind, &fileRel, hasFileRel, 0, false);
+    // Collect all functions and class methods across search paths
+    let allFunctions = FnMap { items: [FnEntry { name: [0u8; 512], name_len: 0, calls: [0u8; 4096], calls_len: 0, fileRel: [0u8; 1024], fileRel_len: 0, has_file: false }; 1024], len: 0 };
+    let pj: u64 = 0;
+    while pj < n {
+        let p = StrBuf { bytes: [0u8; 65536], len: 0 };
+        joined_line(&searchPaths, pj, &p);
+        if exists_path(&p) {
+            let entryIdx = getFileAST(tsh, cache, classes, imports, policy, cwd, &p);
+            if entryIdx != -1 {
+                let info = cache.entries[entryIdx as u64].info;
+                let fRel = StrBuf { bytes: [0u8; 65536], len: 0 };
+                rel_slash(cwd, &p, &fRel);
+                let fi: u64 = 0;
+                while fi < info.functions_len {
+                    let fnItem = info.functions[fi];
+                    let nm = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    let fp_10: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(fp_10, &fnItem.name, 0);
+                    cg_field_to_sb(fp_10, fnItem.name_len, &nm);
+                    let cl = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    let fp_11: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(fp_11, &fnItem.calls, 0);
+                    cg_field_to_sb(fp_11, fnItem.calls_len, &cl);
+                    fnmap_put(&allFunctions, &nm, &cl, &fRel, true);
+                    fi = fi + 1;
+                }
+                let ci: u64 = 0;
+                while ci < info.classes_len {
+                    let cls = classes.items[info.classes_first + ci];
+                    let clsName = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    let fp_12: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(fp_12, &cls.name, 0);
+                    cg_field_to_sb(fp_12, cls.name_len, &clsName);
+                    let mi: u64 = 0;
+                    while mi < cls.methods_len {
+                        let m = cls.methods[mi];
+                        let mName = StrBuf { bytes: [0u8; 65536], len: 0 };
+                        let fp_13: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(fp_13, &m.name, 0);
+                        cg_field_to_sb(fp_13, m.name_len, &mName);
+                        let qualified = StrBuf { bytes: [0u8; 65536], len: 0 };
+                        let cp: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(cp, &clsName.bytes, 0);
+                        sb_append(&qualified, cp, clsName.len);
+                        sb_append_byte(&qualified, 46);
+                        let mp: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(mp, &mName.bytes, 0);
+                        sb_append(&qualified, mp, mName.len);
+                        let cl = StrBuf { bytes: [0u8; 65536], len: 0 };
+                        let fp_14: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(fp_14, &m.calls, 0);
+                        cg_field_to_sb(fp_14, m.calls_len, &cl);
+                        fnmap_put(&allFunctions, &qualified, &cl, &fRel, true);
+                        fnmap_put(&allFunctions, &mName, &cl, &fRel, true);
+                        mi = mi + 1;
+                    }
+                    ci = ci + 1;
+                }
+            };
+        };
+        pj = pj + 1;
+    }
+    if foundClassIdx != -1 {
+        let cls = classes.items[foundClassIdx as u64];
+        let queue = CallQueue { items: [CallQueueEntry { callerName: [0u8; 512], callerName_len: 0, calls: [0u8; 4096], calls_len: 0, depth: 0 }; 512], len: 0, head: 0 };
+        let visited = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let mi: u64 = 0;
+        while mi < cls.methods_len {
+            let m = cls.methods[mi];
+            let mName = StrBuf { bytes: [0u8; 65536], len: 0 };
+            let fp_15: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_15, &m.name, 0);
+            cg_field_to_sb(fp_15, m.name_len, &mName);
+            let callerName = StrBuf { bytes: [0u8; 65536], len: 0 };
+            let tp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(tp, &target.bytes, 0);
+            sb_append(&callerName, tp, target.len);
+            sb_append_byte(&callerName, 46);
+            let mp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(mp, &mName.bytes, 0);
+            sb_append(&callerName, mp, mName.len);
+            let emptyFile = StrBuf { bytes: [0u8; 65536], len: 0 };
+            graph_add_node(gs, &callerName, 3, &emptyFile, false, 0, false);
+            let lbl = StrBuf { bytes: [0u8; 65536], len: 0 };
+            sb_append(&lbl, STR_PTR("has_method"), STR_LEN("has_method"));
+            graph_add_edge(gs, target, &callerName, EDGE_CALLS, &lbl, true);
+            let cl = StrBuf { bytes: [0u8; 65536], len: 0 };
+            let fp_16: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_16, &m.calls, 0);
+            cg_field_to_sb(fp_16, m.calls_len, &cl);
+            call_queue_push(&queue, &callerName, &cl, 1);
+            if visited.len > 0 { sb_append_byte(&visited, 10); };
+            let vp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(vp, &callerName.bytes, 0);
+            sb_append(&visited, vp, callerName.len);
+            mi = mi + 1;
+        }
+        runCallQueue(gs, &queue, &visited, &allFunctions, maxDepth, maxNodes);
+    } else if hasFoundFunc {
+        let queue = CallQueue { items: [CallQueueEntry { callerName: [0u8; 512], callerName_len: 0, calls: [0u8; 4096], calls_len: 0, depth: 0 }; 512], len: 0, head: 0 };
+        call_queue_push(&queue, target, &foundFuncCalls, 1);
+        let visited = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let tp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp, &target.bytes, 0);
+        sb_append(&visited, tp, target.len);
+        runCallQueue(gs, &queue, &visited, &allFunctions, maxDepth, maxNodes);
+    };
+}
+
+// ---- symbol_hierarchy mode (src:1050-1139) ----
+fn buildSymbolHierarchy(tsh: &TreeSitterState, options: &CodeGraphOptions, policy: &NormalizedSaVmPolicy, cwd: &StrBuf, gs: &GraphState, cache: &FileCache, classes: &ExtractedClassList, imports: &ExtractedImportList, target: &StrBuf, maxDepth: u64) {
+    // searchPaths: candidates, else the source's fast heuristic list
+    let searchPaths = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let hasCand = (options.has_candidate_files && options.candidate_files_len > 0) || (options.has_files && options.files_len > 0);
+    if hasCand {
+        candidate_list(options, cwd, cwd, 200, &searchPaths);
+    } else {
+        let p1 = StrBuf { bytes: [0u8; 65536], len: 0 };
+        resolve_lit(cwd, STR_PTR("apps/server/src/opencodeBridge.ts"), STR_LEN("apps/server/src/opencodeBridge.ts"), &p1);
+        let p2 = StrBuf { bytes: [0u8; 65536], len: 0 };
+        resolve_lit(cwd, STR_PTR("backends/mini/src/runtime/miniBridge.ts"), STR_LEN("backends/mini/src/runtime/miniBridge.ts"), &p2);
+        let p3 = StrBuf { bytes: [0u8; 65536], len: 0 };
+        resolve_lit(cwd, STR_PTR("apps/server/src/index.ts"), STR_LEN("apps/server/src/index.ts"), &p3);
+        append_path_line(&searchPaths, &p1);
+        append_path_line(&searchPaths, &p2);
+        append_path_line(&searchPaths, &p3);
+    };
+    let foundFile = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let hasFoundFile = false;
+    let foundClassIdx: i64 = -1;
+    // NOTE: source runs this search loop twice (the second is a
+    // verbatim repeat when the first finds nothing); a single pass is
+    // observably identical because getFileAST is cached.
+    let n = count_lines_cg(&searchPaths);
+    let pi: u64 = 0;
+    while pi < n {
+        let p = StrBuf { bytes: [0u8; 65536], len: 0 };
+        joined_line(&searchPaths, pi, &p);
+        if exists_path(&p) {
+            let entryIdx = getFileAST(tsh, cache, classes, imports, policy, cwd, &p);
+            if entryIdx != -1 {
+                let info = cache.entries[entryIdx as u64].info;
+                let mc = find_class_in_info(classes, &info, target);
+                if mc != -1 {
+                    hasFoundFile = true;
+                    let fp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(fp, &p.bytes, 0);
+                    sb_clear(&foundFile);
+                    sb_append(&foundFile, fp, p.len);
+                    foundClassIdx = mc;
+                    break;
+                };
+            };
+        };
+        pi = pi + 1;
+    }
+    if foundClassIdx == -1 {
+        // Fallback: create mock node
+        set_root_id(gs, target);
+        graph_add_node(gs, target, 0, target, false, 0, false);
+        return;
+    };
+    let cls = classes.items[foundClassIdx as u64];
+    let clsName = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let fp_17: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp_17, &cls.name, 0);
+    cg_field_to_sb(fp_17, cls.name_len, &clsName);
+    set_root_id(gs, &clsName);
+    let relPath = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let hasRel = false;
+    if hasFoundFile {
+        rel_slash(cwd, &foundFile, &relPath);
+        hasRel = true;
+    };
+    graph_add_node(gs, &clsName, 0, &relPath, hasRel, cls.line, true);
+    // bases (extends)
+    add_related_nodes(gs, &clsName, &cls, true, EDGE_EXTENDS, STR_PTR("extends"), STR_LEN("extends"));
+    // interfaces (implements) with label "impl"
+    add_related_nodes(gs, &clsName, &cls, false, EDGE_IMPLEMENTS, STR_PTR("impl"), STR_LEN("impl"));
+    // owns: member fields whose type names look like class types
+    let ownedTypes = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let fi: u64 = 0;
+    while fi < cls.fields_len {
+        let f = cls.fields[fi];
+        if f.has_type {
+            let typeText = StrBuf { bytes: [0u8; 65536], len: 0 };
+            let fp_18: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_18, &f.type_, 0);
+            cg_field_to_sb(fp_18, f.type_len, &typeText);
+            // typeName = field.type_.replace(/<.*>$/, "").trim()
+            let typeName = StrBuf { bytes: [0u8; 65536], len: 0 };
+            strip_generic_suffix(&typeText, &typeName);
+            if typeName.len > 0 && typeName.bytes[0] >= 65 && typeName.bytes[0] <= 90 && is_ident_text(&typeName) {
+                let banned = StrBuf { bytes: [0u8; 65536], len: 0 };
+                sb_append(&banned, STR_PTR("String Number Boolean Date Promise Map Set Array Record"), STR_LEN("String Number Boolean Date Promise Map Set Array Record"));
+                if !word_in_space_list(&banned, &typeName) {
+                    cg_join_add(&ownedTypes, &typeName);
+                };
+            };
+        };
+        fi = fi + 1;
+    }
+    let oi: u64 = 0;
+    let ownedCount = cg_join_count(&ownedTypes);
+    while oi < ownedCount {
+        let owned = StrBuf { bytes: [0u8; 65536], len: 0 };
+        joined_segment(&ownedTypes, oi, &owned);
+        let emptyFile = StrBuf { bytes: [0u8; 65536], len: 0 };
+        graph_add_node(gs, &owned, 0, &emptyFile, false, 0, false);
+        let lbl = StrBuf { bytes: [0u8; 65536], len: 0 };
+        sb_append(&lbl, STR_PTR("owns"), STR_LEN("owns"));
+        graph_add_edge(gs, &clsName, &owned, EDGE_OWNS, &lbl, true);
+        oi = oi + 1;
+    }
+    // depth > 1: follow imports of bases/interfaces to their parents
+    if maxDepth > 1 && hasFoundFile {
+        let entryIdx = getFileAST(tsh, cache, classes, imports, policy, cwd, &foundFile);
+        if entryIdx != -1 {
+            let fileInfo = cache.entries[entryIdx as u64].info;
+            // iterate bases + interfaces
+            let allBases = StrBuf { bytes: [0u8; 65536], len: 0 };
+            let fp_19: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_19, &cls.bases, 0);
+            cg_field_to_sb(fp_19, cls.bases_len, &allBases);
+            let ifaces = StrBuf { bytes: [0u8; 65536], len: 0 };
+            let fp_20: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_20, &cls.interfaces, 0);
+            cg_field_to_sb(fp_20, cls.interfaces_len, &ifaces);
+            if ifaces.len > 0 {
+                if allBases.len > 0 { sb_append(&allBases, STR_PTR(", "), STR_LEN(", ")); };
+                let ip: ptr = PTR_NULL();
+                PTR_BYTE_ADD(ip, &ifaces.bytes, 0);
+                sb_append(&allBases, ip, ifaces.len);
+            };
+            let bi: u64 = 0;
+            let total = cg_join_count(&allBases);
+            while bi < total {
+                let baseName = StrBuf { bytes: [0u8; 65536], len: 0 };
+                joined_segment(&allBases, bi, &baseName);
+                // imp = fileInfo.imports.find(i => i.symbols.some(s => s.local === baseName))
+                let ii: u64 = 0;
+                while ii < fileInfo.imports_len {
+                    let imp = imports.items[fileInfo.imports_first + ii];
+                    if import_has_local(&imp, &baseName) {
+                        let spec = StrBuf { bytes: [0u8; 65536], len: 0 };
+                        let fp_21: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(fp_21, &imp.specifier, 0);
+                        cg_field_to_sb(fp_21, imp.specifier_len, &spec);
+                        let baseAbs = StrBuf { bytes: [0u8; 65536], len: 0 };
+                        if resolveImportFilePath(&foundFile, &spec, &baseAbs) {
+                            let baseIdx = getFileAST(tsh, cache, classes, imports, policy, cwd, &baseAbs);
+                            if baseIdx != -1 {
+                                let baseInfo = cache.entries[baseIdx as u64].info;
+                                let parentIdx = find_class_in_info(classes, &baseInfo, &baseName);
+                                if parentIdx != -1 {
+                                    let parent = classes.items[parentIdx as u64];
+                                    let gi: u64 = 0;
+                                    let fp_208: ptr = PTR_NULL();
+                                    PTR_BYTE_ADD(fp_208, &parent.bases, 0);
+                                    let gtotal = cg_join_count_from(fp_208, parent.bases_len);
+                                    while gi < gtotal {
+                                        let gBase = StrBuf { bytes: [0u8; 65536], len: 0 };
+                                        let fp_101: ptr = PTR_NULL();
+                                        PTR_BYTE_ADD(fp_101, &parent.bases, 0);
+                                        joined_segment_from(fp_101, parent.bases_len, gi, &gBase);
+                                        let emptyFile = StrBuf { bytes: [0u8; 65536], len: 0 };
+                                        graph_add_node(gs, &gBase, 0, &emptyFile, false, 0, false);
+                                        let lbl = StrBuf { bytes: [0u8; 65536], len: 0 };
+                                        sb_append(&lbl, STR_PTR("extends"), STR_LEN("extends"));
+                                        graph_add_edge(gs, &baseName, &gBase, EDGE_EXTENDS, &lbl, true);
+                                        gi = gi + 1;
+                                    }
+                                };
+                            };
+                        };
+                        break;
+                    };
+                    ii = ii + 1;
+                }
+                bi = bi + 1;
+            }
+        };
+    };
+}
+
+fn resolve_lit(cwd: &StrBuf, lit_p: ptr, lit_n: u64, out: &StrBuf) {
+    let rel = StrBuf { bytes: [0u8; 65536], len: 0 };
+    sb_append(&rel, lit_p, lit_n);
+    path_resolve2(cwd, &rel, out);
+}
+
+fn append_path_line(joined: &StrBuf, path: &StrBuf) {
+    if joined.len > 0 { sb_append_byte(joined, 10); };
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &path.bytes, 0);
+    sb_append(joined, p, path.len);
+}
+
+fn add_related_nodes(gs: &GraphState, clsName: &StrBuf, cls: &ExtractedClassInfo, useBases: bool, kind: u64, labelP: ptr, labelN: u64) {
+    let joined = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if useBases {
+        let fp_22: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_22, &cls.bases, 0);
+        cg_field_to_sb(fp_22, cls.bases_len, &joined);
+    } else {
+        let fp_23: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_23, &cls.interfaces, 0);
+        cg_field_to_sb(fp_23, cls.interfaces_len, &joined);
+    };
+    let nodeKind: u64 = 0;
+    if !useBases { nodeKind = 1; };
+    let total = cg_join_count(&joined);
+    let i: u64 = 0;
+    while i < total {
+        let name = StrBuf { bytes: [0u8; 65536], len: 0 };
+        joined_segment(&joined, i, &name);
+        let emptyFile = StrBuf { bytes: [0u8; 65536], len: 0 };
+        graph_add_node(gs, &name, nodeKind, &emptyFile, false, 0, false);
+        let lbl = StrBuf { bytes: [0u8; 65536], len: 0 };
+        sb_append(&lbl, labelP, labelN);
+        graph_add_edge(gs, clsName, &name, kind, &lbl, true);
+        i = i + 1;
+    }
+}
+
+fn joined_segment(joined: &StrBuf, idxWanted: u64, out: &StrBuf) {
+    sb_clear(out);
+    let cur: u64 = 0;
+    let pos: u64 = 0;
+    while pos <= joined.len {
+        let end = pos;
+        while end < joined.len && !(joined.bytes[end] == 44 && end + 1 < joined.len && joined.bytes[end + 1] == 32) { end = end + 1; }
+        if cur == idxWanted {
+            let q: u64 = 0;
+            while pos + q < end { sb_append_byte(out, joined.bytes[pos + q]); q = q + 1; }
+            return;
+        };
+        if end >= joined.len { break; };
+        pos = end + 2;
+        cur = cur + 1;
+    }
+}
+
+fn cg_join_count_from(field: ptr, n: u64) -> u64 {
+    let b = StrBuf { bytes: [0u8; 65536], len: 0 };
+    cg_field_to_sb(field, n, &b);
+    return cg_join_count(&b);
+}
+
+fn joined_segment_from(field: ptr, n: u64, idxWanted: u64, out: &StrBuf) {
+    let b = StrBuf { bytes: [0u8; 65536], len: 0 };
+    cg_field_to_sb(field, n, &b);
+    joined_segment(&b, idxWanted, out);
+}
+
+fn strip_generic_suffix(typeText: &StrBuf, out: &StrBuf) {
+    // .replace(/<.*>$/, "") then trim: drop from the first "<" when the
+    // text ends with ">" (approximation of the anchored greedy regex)
+    sb_clear(out);
+    let end = typeText.len;
+    if end > 0 && typeText.bytes[end - 1] == 62 {
+        let i: u64 = 0;
+        while i < typeText.len {
+            if typeText.bytes[i] == 60 { end = i; break; };
+            i = i + 1;
+        }
+    };
+    let tmp = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let q: u64 = 0;
+    while q < end { sb_append_byte(&tmp, typeText.bytes[q]); q = q + 1; }
+    sb_trim(&tmp, out);
+}
+
+fn import_has_local(imp: &ExtractedImportInfo, name: &StrBuf) -> bool {
+    let i: u64 = 0;
+    while i < imp.symbols_len {
+        let fp_209: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_209, &imp.symbols[i].local, 0);
+        if cg_buf_eq(fp_209, imp.symbols[i].local_len, name) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// ---- src/saVmCodeGraph.ts:1143-1195 — formatAsDot ----
+// DEFECT: edges grouped via Map<string, string[]> keyed
+// `${source}|${kind}|${label}` with Map insertion order; converted
+// to a first-seen key scan over the edge list. The graphName
+// sanitization regex /[^a-zA-Z0-9_]/g -> "_" is a byte scan.
+// The graph parameter object -> nodes/edges/rootId/truncated fields.
+fn formatAsDot(nodes: &CodeGraphNodeList, edges: &CodeGraphEdgeList, rootId: &StrBuf, truncated: bool, title: &StrBuf, hasTitle: bool, out: &StrBuf) {
+    sb_clear(out);
+    let rawName = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if hasTitle {
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, &title.bytes, 0);
+        sb_append(&rawName, p, title.len);
+    } else if rootId.len > 0 {
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, &rootId.bytes, 0);
+        sb_append(&rawName, p, rootId.len);
+    } else {
+        sb_append(&rawName, STR_PTR("CodeGraph"), STR_LEN("CodeGraph"));
+    };
+    if rawName.len == 0 { sb_append(&rawName, STR_PTR("CodeGraph"), STR_LEN("CodeGraph")); };
+    let graphName = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let gi: u64 = 0;
+    while gi < rawName.len {
+        let c = rawName.bytes[gi];
+        if is_word_byte_cg(c) { sb_append_byte(&graphName, c); } else { sb_append_byte(&graphName, 95); };
+        gi = gi + 1;
+    }
+    sb_append(out, STR_PTR("digraph "), STR_LEN("digraph "));
+    let gp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(gp, &graphName.bytes, 0);
+    sb_append(out, gp, graphName.len);
+    sb_append(out, STR_PTR(" {\n  rankdir=TB;\n  node [shape=box, fontname=\"Helvetica\", fontsize=10];\n  edge [fontname=\"Helvetica\", fontsize=9];"), STR_LEN(" {\n  rankdir=TB;\n  node [shape=box, fontname=\"Helvetica\", fontsize=10];\n  edge [fontname=\"Helvetica\", fontsize=9];"));
+    if rootId.len > 0 {
+        sb_append(out, STR_PTR("\n  \""), STR_LEN("\n  \""));
+        let rp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp, &rootId.bytes, 0);
+        sb_append(out, rp, rootId.len);
+        sb_append(out, STR_PTR("\" [style=filled, fillcolor=\"#e1f5fe\"];"), STR_LEN("\" [style=filled, fillcolor=\"#e1f5fe\"];"));
+    };
+    // grouped edges in first-seen key order
+    let seenKeys = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let ei: u64 = 0;
+    while ei < edges.len {
+        let e = edges.items[ei];
+        let key = StrBuf { bytes: [0u8; 65536], len: 0 };
+        build_edge_key(&e, &key);
+        if !joined_contains(&seenKeys, &key) {
+            if seenKeys.len > 0 { sb_append_byte(&seenKeys, 10); };
+            let kp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(kp, &key.bytes, 0);
+            sb_append(&seenKeys, kp, key.len);
+            // collect targets for this key
+            let targets = StrBuf { bytes: [0u8; 65536], len: 0 };
+            let targetCount: u64 = 0;
+            let ej: u64 = 0;
+            while ej < edges.len {
+                let e2 = edges.items[ej];
+                let k2 = StrBuf { bytes: [0u8; 65536], len: 0 };
+                build_edge_key(&e2, &k2);
+                if sb_eq_buf(&k2, &key) {
+                    if targets.len > 0 { sb_append_byte(&targets, 10); };
+                    let fp_24: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(fp_24, &e2.target, 0);
+                    cg_field_to_sb(fp_24, e2.target_len, &targets);
+                    // NOTE: cg_field_to_sb clears; rebuild properly below
+                    targetCount = targetCount + 1;
+                };
+                ej = ej + 1;
+            }
+            // rebuild target list (the loop above kept only the last):
+            sb_clear(&targets);
+            targetCount = 0;
+            let ek: u64 = 0;
+            while ek < edges.len {
+                let e3 = edges.items[ek];
+                let k3 = StrBuf { bytes: [0u8; 65536], len: 0 };
+                build_edge_key(&e3, &k3);
+                if sb_eq_buf(&k3, &key) {
+                    if targetCount > 0 { sb_append_byte(&targets, 10); };
+                    let tb = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    let fp_25: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(fp_25, &e3.target, 0);
+                    cg_field_to_sb(fp_25, e3.target_len, &tb);
+                    let tp2: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(tp2, &tb.bytes, 0);
+                    sb_append(&targets, tp2, tb.len);
+                    targetCount = targetCount + 1;
+                };
+                ek = ek + 1;
+            }
+            let src = StrBuf { bytes: [0u8; 65536], len: 0 };
+            let fp_26: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_26, &e.source, 0);
+            cg_field_to_sb(fp_26, e.source_len, &src);
+            let attrs = StrBuf { bytes: [0u8; 65536], len: 0 };
+            if e.has_label && e.label_len > 0 {
+                sb_append(&attrs, STR_PTR("label=\""), STR_LEN("label=\""));
+                let lb = StrBuf { bytes: [0u8; 65536], len: 0 };
+                let fp_27: ptr = PTR_NULL();
+                PTR_BYTE_ADD(fp_27, &e.label, 0);
+                cg_field_to_sb(fp_27, e.label_len, &lb);
+                let lp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(lp, &lb.bytes, 0);
+                sb_append(&attrs, lp, lb.len);
+                sb_append_byte(&attrs, 34);
+            };
+            if e.kind == EDGE_IMPLEMENTS {
+                if attrs.len > 0 { sb_append(&attrs, STR_PTR(", "), STR_LEN(", ")); };
+                sb_append(&attrs, STR_PTR("style=\"dashed\""), STR_LEN("style=\"dashed\""));
+            } else if e.kind == EDGE_OWNS {
+                if attrs.len > 0 { sb_append(&attrs, STR_PTR(", "), STR_LEN(", ")); };
+                sb_append(&attrs, STR_PTR("arrowhead=\"diamond\""), STR_LEN("arrowhead=\"diamond\""));
+            } else if e.kind == EDGE_CALLS {
+                if attrs.len > 0 { sb_append(&attrs, STR_PTR(", "), STR_LEN(", ")); };
+                sb_append(&attrs, STR_PTR("style=\"dotted\""), STR_LEN("style=\"dotted\""));
+            };
+            sb_append(out, STR_PTR("\n  \""), STR_LEN("\n  \""));
+            let sp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(sp, &src.bytes, 0);
+            sb_append(out, sp, src.len);
+            sb_append(out, STR_PTR("\" -> "), STR_LEN("\" -> "));
+            if targetCount == 1 {
+                let t0 = StrBuf { bytes: [0u8; 65536], len: 0 };
+                joined_line(&targets, 0, &t0);
+                sb_append_byte(out, 34);
+                let tp3: ptr = PTR_NULL();
+                PTR_BYTE_ADD(tp3, &t0.bytes, 0);
+                sb_append(out, tp3, t0.len);
+                sb_append_byte(out, 34);
+            } else {
+                sb_append(out, STR_PTR("{ "), STR_LEN("{ "));
+                let ti: u64 = 0;
+                while ti < targetCount {
+                    if ti > 0 { sb_append_byte(out, 32); };
+                    let tt = StrBuf { bytes: [0u8; 65536], len: 0 };
+                    joined_line(&targets, ti, &tt);
+                    sb_append_byte(out, 34);
+                    let tp4: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(tp4, &tt.bytes, 0);
+                    sb_append(out, tp4, tt.len);
+                    sb_append_byte(out, 34);
+                    ti = ti + 1;
+                }
+                sb_append(out, STR_PTR(" }"), STR_LEN(" }"));
+            };
+            if attrs.len > 0 {
+                sb_append(out, STR_PTR(" ["), STR_LEN(" ["));
+                let ap: ptr = PTR_NULL();
+                PTR_BYTE_ADD(ap, &attrs.bytes, 0);
+                sb_append(out, ap, attrs.len);
+                sb_append_byte(out, 93);
+            };
+            sb_append_byte(out, 59);
+        };
+        ei = ei + 1;
+    }
+    if edges.len == 0 && nodes.len > 0 {
+        let ni: u64 = 0;
+        while ni < nodes.len {
+            sb_append(out, STR_PTR("\n  \""), STR_LEN("\n  \""));
+            let idb = StrBuf { bytes: [0u8; 65536], len: 0 };
+            let fp_304: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_304, &nodes.items[ni].id, 0);
+            cg_field_to_sb(fp_304, nodes.items[ni].id_len, &idb);
+            let ip: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ip, &idb.bytes, 0);
+            sb_append(out, ip, idb.len);
+            sb_append(out, STR_PTR("\";"), STR_LEN("\";"));
+            ni = ni + 1;
+        }
+    };
+    sb_append(out, STR_PTR("\n}"), STR_LEN("\n}"));
+    if truncated {
+        sb_append(out, STR_PTR("\n// [Truncated: exceeded max_nodes budget]"), STR_LEN("\n// [Truncated: exceeded max_nodes budget]"));
+    };
+}
+
+fn build_edge_key(e: &CodeGraphEdge, out: &StrBuf) {
+    // key = `${source}|${kind}|${label ?? ""}` — destructured in the
+    // source via key.split("|") (a source or label containing "|"
+    // would break there too; kept 1:1).
+    sb_clear(out);
+    let src = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let fp_28: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp_28, &e.source, 0);
+    cg_field_to_sb(fp_28, e.source_len, &src);
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, &src.bytes, 0);
+    sb_append(out, sp, src.len);
+    sb_append_byte(out, 124);
+    let kn = StrBuf { bytes: [0u8; 65536], len: 0 };
+    edge_kind_name(e.kind, &kn);
+    let kp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(kp, &kn.bytes, 0);
+    sb_append(out, kp, kn.len);
+    sb_append_byte(out, 124);
+    if e.has_label {
+        let lb = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let fp_29: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_29, &e.label, 0);
+        cg_field_to_sb(fp_29, e.label_len, &lb);
+        let lp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(lp, &lb.bytes, 0);
+        sb_append(out, lp, lb.len);
+    };
+}
+
+// ---- src/saVmCodeGraph.ts:1197-1247 — formatAsPyStub ----
+// DEFECT: classBases/classFields Maps keyed by node id -> first-seen
+// scans over edges; node.kind is ignored by the source here (every
+// node is printed as a class) and that is preserved.
+fn formatAsPyStub(nodes: &CodeGraphNodeList, edges: &CodeGraphEdgeList, out: &StrBuf) {
+    sb_clear(out);
+    sb_append(out, STR_PTR("# Architecture Skeleton (Python Stub)\nfrom __future__ import annotations\nfrom typing import Any, Optional\n"), STR_LEN("# Architecture Skeleton (Python Stub)\nfrom __future__ import annotations\nfrom typing import Any, Optional\n"));
+    let ni: u64 = 0;
+    while ni < nodes.len {
+        let node = nodes.items[ni];
+        let idb = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let fp_30: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_30, &node.id, 0);
+        cg_field_to_sb(fp_30, node.id_len, &idb);
+        // bases/fields for this node from extends/implements/owns edges
+        let bases = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let fields = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let ei: u64 = 0;
+        while ei < edges.len {
+            let e = edges.items[ei];
+            let src = StrBuf { bytes: [0u8; 65536], len: 0 };
+            let fp_31: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_31, &e.source, 0);
+            cg_field_to_sb(fp_31, e.source_len, &src);
+            if sb_eq_buf(&src, &idb) {
+                let tgt = StrBuf { bytes: [0u8; 65536], len: 0 };
+                let fp_32: ptr = PTR_NULL();
+                PTR_BYTE_ADD(fp_32, &e.target, 0);
+                cg_field_to_sb(fp_32, e.target_len, &tgt);
+                if e.kind == EDGE_EXTENDS || e.kind == EDGE_IMPLEMENTS {
+                    cg_join_add(&bases, &tgt);
+                } else if e.kind == EDGE_OWNS {
+                    cg_join_add(&fields, &tgt);
+                };
+            };
+            ei = ei + 1;
+        }
+        sb_append_byte(out, 10);
+        sb_append(out, STR_PTR("class "), STR_LEN("class "));
+        let ip: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ip, &idb.bytes, 0);
+        sb_append(out, ip, idb.len);
+        if bases.len > 0 {
+            sb_append_byte(out, 40);
+            // bases stored ", "-joined — source joins with ", " too
+            let bp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(bp, &bases.bytes, 0);
+            sb_append(out, bp, bases.len);
+            sb_append_byte(out, 41);
+        };
+        sb_append_byte(out, 58);
+        if node.has_file {
+            sb_append(out, STR_PTR("\n    \"\"\"Defined in "), STR_LEN("\n    \"\"\"Defined in "));
+            let fb = StrBuf { bytes: [0u8; 65536], len: 0 };
+            let fp_33: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_33, &node.file, 0);
+            cg_field_to_sb(fp_33, node.file_len, &fb);
+            let fp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp, &fb.bytes, 0);
+            sb_append(out, fp, fb.len);
+            sb_append(out, STR_PTR("\"\"\""), STR_LEN("\"\"\""));
+        };
+        let fieldCount = cg_join_count(&fields);
+        if fieldCount > 0 {
+            let fi: u64 = 0;
+            while fi < fieldCount {
+                let f = StrBuf { bytes: [0u8; 65536], len: 0 };
+                joined_segment(&fields, fi, &f);
+                // fieldName = f.charAt(0).toLowerCase() + f.slice(1)
+                if f.len > 0 && f.bytes[0] >= 65 && f.bytes[0] <= 90 { f.bytes[0] = f.bytes[0] + 32; };
+                sb_append(out, STR_PTR("\n    "), STR_LEN("\n    "));
+                let fp2: ptr = PTR_NULL();
+                PTR_BYTE_ADD(fp2, &f.bytes, 0);
+                sb_append(out, fp2, f.len);
+                sb_append(out, STR_PTR(": "), STR_LEN(": "));
+                // type is the original (un-lowercased first char restored
+                // from the segment — source uses f itself for the type)
+                joined_segment(&fields, fi, &f);
+                let fp3: ptr = PTR_NULL();
+                PTR_BYTE_ADD(fp3, &f.bytes, 0);
+                sb_append(out, fp3, f.len);
+                fi = fi + 1;
+            }
+        } else if !node.has_file {
+            sb_append(out, STR_PTR("\n    pass"), STR_LEN("\n    pass"));
+        };
+        sb_append_byte(out, 10);
+        ni = ni + 1;
+    }
+    // source returns lines.join("\n").trimEnd()
+    while out.len > 0 && (out.bytes[out.len - 1] == 10 || out.bytes[out.len - 1] == 32) { out.len = out.len - 1; }
+}
+
+// ---- src/saVmCodeGraph.ts:1249-1280 — formatAsNetworkX ----
+fn formatAsNetworkX(nodes: &CodeGraphNodeList, edges: &CodeGraphEdgeList, rootId: &StrBuf, out: &StrBuf) {
+    sb_clear(out);
+    sb_append(out, STR_PTR("import networkx as nx\n\n# Graph construction\nG = nx.DiGraph()\n"), STR_LEN("import networkx as nx\n\n# Graph construction\nG = nx.DiGraph()\n"));
+    let ni: u64 = 0;
+    while ni < nodes.len {
+        let node = nodes.items[ni];
+        sb_append(out, STR_PTR("\nG.add_node(\""), STR_LEN("\nG.add_node(\""));
+        let idb = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let fp_34: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_34, &node.id, 0);
+        cg_field_to_sb(fp_34, node.id_len, &idb);
+        let ip: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ip, &idb.bytes, 0);
+        sb_append(out, ip, idb.len);
+        sb_append(out, STR_PTR("\", kind=\""), STR_LEN("\", kind=\""));
+        let kn = StrBuf { bytes: [0u8; 65536], len: 0 };
+        node_kind_name(node.kind, &kn);
+        let kp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(kp, &kn.bytes, 0);
+        sb_append(out, kp, kn.len);
+        sb_append_byte(out, 34);
+        if node.has_file {
+            sb_append(out, STR_PTR(", file=\""), STR_LEN(", file=\""));
+            let fb = StrBuf { bytes: [0u8; 65536], len: 0 };
+            let fp_35: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_35, &node.file, 0);
+            cg_field_to_sb(fp_35, node.file_len, &fb);
+            let fp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp, &fb.bytes, 0);
+            sb_append(out, fp, fb.len);
+            sb_append_byte(out, 34);
+        };
+        sb_append_byte(out, 41);
+        ni = ni + 1;
+    }
+    sb_append_byte(out, 10);
+    let ei: u64 = 0;
+    while ei < edges.len {
+        let e = edges.items[ei];
+        sb_append(out, STR_PTR("\nG.add_edge(\""), STR_LEN("\nG.add_edge(\""));
+        let src = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let fp_36: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_36, &e.source, 0);
+        cg_field_to_sb(fp_36, e.source_len, &src);
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, &src.bytes, 0);
+        sb_append(out, sp, src.len);
+        sb_append(out, STR_PTR("\", \""), STR_LEN("\", \""));
+        let tgt = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let fp_37: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_37, &e.target, 0);
+        cg_field_to_sb(fp_37, e.target_len, &tgt);
+        let tp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp, &tgt.bytes, 0);
+        sb_append(out, tp, tgt.len);
+        sb_append(out, STR_PTR("\", rel=\""), STR_LEN("\", rel=\""));
+        let kn = StrBuf { bytes: [0u8; 65536], len: 0 };
+        edge_kind_name(e.kind, &kn);
+        let kp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(kp, &kn.bytes, 0);
+        sb_append(out, kp, kn.len);
+        sb_append_byte(out, 34);
+        if e.has_label && e.label_len > 0 {
+            sb_append(out, STR_PTR(", label=\""), STR_LEN(", label=\""));
+            let lb = StrBuf { bytes: [0u8; 65536], len: 0 };
+            let fp_38: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_38, &e.label, 0);
+            cg_field_to_sb(fp_38, e.label_len, &lb);
+            let lp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(lp, &lb.bytes, 0);
+            sb_append(out, lp, lb.len);
+            sb_append_byte(out, 34);
+        };
+        sb_append_byte(out, 41);
+        ei = ei + 1;
+    }
+    sb_append(out, STR_PTR("\n\n# Query helpers:"), STR_LEN("\n\n# Query helpers:"));
+    if rootId.len > 0 {
+        sb_append(out, STR_PTR("\n# print(\"Ancestors:\", nx.ancestors(G, \""), STR_LEN("\n# print(\"Ancestors:\", nx.ancestors(G, \""));
+        let rp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp, &rootId.bytes, 0);
+        sb_append(out, rp, rootId.len);
+        sb_append(out, STR_PTR("\"))\n# print(\"Descendants:\", nx.descendants(G, \""), STR_LEN("\"))\n# print(\"Descendants:\", nx.descendants(G, \""));
+        sb_append(out, rp, rootId.len);
+        sb_append(out, STR_PTR("\"))"), STR_LEN("\"))"));
+    };
+    sb_append(out, STR_PTR("\n# print(\"Cycles:\", list(nx.simple_cycles(G)))"), STR_LEN("\n# print(\"Cycles:\", list(nx.simple_cycles(G)))"));
+}
+
+fn node_kind_name(kind: u64, out: &StrBuf) {
+    sb_clear(out);
+    if kind == 0 { sb_append(out, STR_PTR("class"), STR_LEN("class")); return; };
+    if kind == 1 { sb_append(out, STR_PTR("interface"), STR_LEN("interface")); return; };
+    if kind == 2 { sb_append(out, STR_PTR("module"), STR_LEN("module")); return; };
+    if kind == 3 { sb_append(out, STR_PTR("function"), STR_LEN("function")); return; };
+    sb_append(out, STR_PTR("unknown"), STR_LEN("unknown"));
+}
+
+// ---- src/saVmCodeGraph.ts:1284-1344 — nativeCodeGraph ----
+// DEFECT: async -> synchronous. rawInput is Record<string, any>
+// (dynamic JSON object) -> JSON text buffer queried through the
+// assumed sa_json_* extern surface; the typeof checks on depth /
+// max_nodes / max_tokens / output_file become JSON type queries.
+// Date.now() -> assumed time_now_ms() extern (not in sa_std).
+// The try/catch around buildScopedCodeGraph + formatting has no SLA
+// counterpart: failure is signaled by the extern layer / empty graph
+// and the catch branch's message shape is preserved in the failure
+// result construction below (outError path, DEFECT).
+fn nativeCodeGraph(tsh: &TreeSitterState, rawInputJson: &StrBuf, policyCfg: &CgPolicyConfig, hasPolicy: bool, cwd: &StrBuf, startedAt: u64, out: &CgRunResult) {
+    // target = (rawInput.target ?? rawInput.symbol ?? rawInput.path ??
+    //           rawInput.query ?? rawInput.name ?? "").toString().trim()
+    let target = StrBuf { bytes: [0u8; 65536], len: 0 };
+    json_get_string_first(rawInputJson, &target);
+    let targetT = StrBuf { bytes: [0u8; 65536], len: 0 };
+    sb_trim(&target, &targetT);
+    target = targetT;
+    if target.len == 0 {
+        let msg = StrBuf { bytes: [0u8; 65536], len: 0 };
+        sb_append(&msg, STR_PTR("target parameter is required for code_graph (e.g. symbol name or module path)"), STR_LEN("target parameter is required for code_graph (e.g. symbol name or module path)"));
+        fill_run_result(out, false, STR_PTR("sa_error"), STR_LEN("sa_error"), 1, &empty_sb(), &msg, startedAt, false, &empty_sb());
+        return;
+    };
+    let normalized = NormalizedSaVmPolicy { engine: 0, fs: NormalizedFs { entries: FsEntryList { items: [SaVmFsEntry { path: [0u8; 1024], path_len: 0, access: 0 }; 128], len: 0 }, read: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, write: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, transfer: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, delete: 0, backupDir: [0u8; 1024], backupDir_len: 0, backupDir_has: false }, http_allow: HttpRuleList { items: [SaVmHttpAllowRule { host: [0u8; 512], host_len: 0, methods: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_methods: false, paths: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_paths: false }; 128], len: 0 }, env_allow: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, process: NormalizedProcess { spawn: false, exec: ExecRuleList { items: [SaVmProcessExecRule { path: [0u8; 4096], path_len: 0, args: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_args: false }; 128], len: 0 }, bunProfiles: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_bunProfiles: false, bun_enabled: false, bun_allowedSubcommands: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_bun: false }, execution_javascript: false, execution_python: false, tools: NormalizedTools { replaceRead: false, replaceWrite: false, replaceApplyPatch: false, replaceExec: false, readFiles: false, editFiles: false, applyPatch: false, fastSearch: false, clearToolHistory: false, findReferences: false, renameSymbol: false, fileOutline: false, moveWithImports: false, findDefinition: false, extractToFile: false, addImport: false, getDiagnostics: false, organizeImports: false, analyzeScope: false, codeGraph: false }, contextSavings: SaVmContextSavingsConfig { locateBeforeRead: false, maxReadFileBytes: 0, maxReadFileBytes_has: false, grepCircuitBreaker: false, grepMaxResults: 0, grepMaxResults_has: false, grepMaxTokens: 0, grepMaxTokens_has: false, slimRunnerOutput: false, parallelBudget: false, parallelMaxTotalBytes: 0, parallelMaxTotalBytes_has: false, parallelMaxReadFiles: 0, parallelMaxReadFiles_has: false, parallelDeduplication: false, tieredSkillInjection: false, foldWaterfallEvents: false, foldHistoryReadSummaries: false, historyReadFoldTurns: 0, historyReadFoldTurns_has: false }, contextSavings_has: false };
+    cgNormalizeSaVmPolicy(policyCfg, cwd, &normalized);
+    let options = CodeGraphOptions { target: [0u8; 1024], target_len: 0, mode: 0, has_mode: false, depth: 0, has_depth: false, direction: 2, has_direction: false, format: 0, has_format: true, max_nodes: 0, has_max_nodes: false, max_tokens: 0, has_max_tokens: false, output_file: [0u8; 1024], output_file_len: 0, has_output_file: false, candidate_files: [0u8; 16384], candidate_files_len: 0, has_candidate_files: false, files: [0u8; 16384], files_len: 0, has_files: false, timeout_ms: 0, has_timeout_ms: false };
+    let tq: u64 = 0;
+    while tq < target.len && tq < 1024 { options.target[tq] = target.bytes[tq]; options.target_len = options.target_len + 1; tq = tq + 1; }
+    json_fill_options(rawInputJson, &options);
+    let gs = GraphState { nodes: CodeGraphNodeList { items: [CodeGraphNode { id: [0u8; 1024], id_len: 0, label: [0u8; 1024], label_len: 0, kind: 0, file: [0u8; 1024], file_len: 0, has_file: false, line: 0, has_line: false }; 256], len: 0 }, edges: CodeGraphEdgeList { items: [CodeGraphEdge { source: [0u8; 1024], source_len: 0, target: [0u8; 1024], target_len: 0, kind: 0, label: [0u8; 256], label_len: 0, has_label: false }; 1024], len: 0 }, edgeKeys: [0u8; 65536], edgeKeys_len: 0, rootId: [0u8; 1024], rootId_len: 0, truncated: false };
+    buildScopedCodeGraph(tsh, &options, &normalized, cwd, &gs);
+    let rootId = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let fp_39: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp_39, &gs.rootId, 0);
+    cg_field_to_sb(fp_39, gs.rootId_len, &rootId);
+    let output = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if options.format == 1 {
+        formatAsPyStub(&gs.nodes, &gs.edges, &output);
+    } else if options.format == 2 {
+        formatAsNetworkX(&gs.nodes, &gs.edges, &rootId, &output);
+    } else {
+        let emptyTitle = StrBuf { bytes: [0u8; 65536], len: 0 };
+        formatAsDot(&gs.nodes, &gs.edges, &rootId, gs.truncated, &target, true, &output);
+    };
+    // Optional explicit disk write (policy-gated)
+    if options.has_output_file {
+        let outFile = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let fp_40: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_40, &options.output_file, 0);
+        cg_field_to_sb(fp_40, options.output_file_len, &outFile);
+        let outAbs = StrBuf { bytes: [0u8; 65536], len: 0 };
+        if path_is_absolute(&outFile) {
+            let p: ptr = PTR_NULL();
+            PTR_BYTE_ADD(p, &outFile.bytes, 0);
+            sb_append(&outAbs, p, outFile.len);
+        } else {
+            path_resolve2(cwd, &outFile, &outAbs);
+        };
+        let reason = StrBuf { bytes: [0u8; 65536], len: 0 };
+        if !cgCheckSaVmPath(&normalized, STR_PTR("write"), STR_LEN("write"), &outAbs, cwd, &reason) {
+            let stderr = StrBuf { bytes: [0u8; 65536], len: 0 };
+            sb_append(&stderr, STR_PTR("Policy violation for output_file: "), STR_LEN("Policy violation for output_file: "));
+            if reason.len > 0 {
+                let rp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(rp, &reason.bytes, 0);
+                sb_append(&stderr, rp, reason.len);
+            } else {
+                sb_append(&stderr, STR_PTR("write not allowed"), STR_LEN("write not allowed"));
+            };
+            fill_run_result(out, false, STR_PTR("capability_denied"), STR_LEN("capability_denied"), 228, &output, &stderr, startedAt, true, &reason);
+            return;
+        };
+        let ap: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ap, &outAbs.bytes, 0);
+        fs_write_file(ap, outAbs.len, &output); // await writeFile(outAbs, output, "utf8")
+        let prefixed = StrBuf { bytes: [0u8; 65536], len: 0 };
+        sb_append(&prefixed, STR_PTR("[Graph saved to "), STR_LEN("[Graph saved to "));
+        let op: ptr = PTR_NULL();
+        PTR_BYTE_ADD(op, &outFile.bytes, 0);
+        sb_append(&prefixed, op, outFile.len);
+        sb_append(&prefixed, STR_PTR("]\n\n"), STR_LEN("]\n\n"));
+        let op2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(op2, &output.bytes, 0);
+        sb_append(&prefixed, op2, output.len);
+        output = prefixed;
+    };
+    let stderr = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if gs.truncated {
+        sb_append(&stderr, STR_PTR("[code_graph] graph truncated to max_nodes budget"), STR_LEN("[code_graph] graph truncated to max_nodes budget"));
+    };
+    fill_run_result(out, true, STR_PTR("success"), STR_LEN("success"), 0, &output, &stderr, startedAt, false, &empty_sb());
+    // saVmEvents: [{ timestamp: Date.now(), type: "code_graph" as any,
+    //   target, nodes: graph.nodes.length, edges: graph.edges.length }]
+    // DEFECT: event objects are dynamic; serialized as JSON text.
+    out.events_json_len = 0;
+    let ev = StrBuf { bytes: [0u8; 65536], len: 0 };
+    sb_append(&ev, STR_PTR("[{\"timestamp\":"), STR_LEN("[{\"timestamp\":"));
+    sb_append_u64(&ev, time_now_ms());
+    sb_append(&ev, STR_PTR(",\"type\":\"code_graph\",\"target\":\""), STR_LEN(",\"type\":\"code_graph\",\"target\":\""));
+    let tp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tp, &target.bytes, 0);
+    sb_append(&ev, tp, target.len);
+    sb_append(&ev, STR_PTR("\",\"nodes\":"), STR_LEN("\",\"nodes\":"));
+    sb_append_u64(&ev, gs.nodes.len);
+    sb_append(&ev, STR_PTR(",\"edges\":"), STR_LEN(",\"edges\":"));
+    sb_append_u64(&ev, gs.edges.len);
+    sb_append(&ev, STR_PTR("}]"), STR_LEN("}]"));
+    let eq: u64 = 0;
+    while eq < ev.len && eq < 8192 { out.events_json[eq] = ev.bytes[eq]; out.events_json_len = out.events_json_len + 1; eq = eq + 1; }
+}
+
+fn empty_sb() -> StrBuf {
+    let b = StrBuf { bytes: [0u8; 65536], len: 0 };
+    return b;
+}
+
+fn fill_run_result(out: &CgRunResult, ok: bool, kindP: ptr, kindN: u64, exitCode: i32, stdout: &StrBuf, stderr: &StrBuf, startedAt: u64, hasViolation: bool, violationReason: &StrBuf) {
+    out.ok = ok;
+    out.kind_len = 0;
+    let i: u64 = 0;
+    while i < kindN && i < 64 { let c: u8 = 0; PTR_BYTE_AT(c, kindP, i); out.kind[i] = c; out.kind_len = out.kind_len + 1; i = i + 1; }
+    out.exitCode = exitCode;
+    out.stdout_len = 0;
+    let j: u64 = 0;
+    while j < stdout.len && j < 65536 { out.stdout[j] = stdout.bytes[j]; out.stdout_len = out.stdout_len + 1; j = j + 1; }
+    out.stderr_len = 0;
+    let k: u64 = 0;
+    while k < stderr.len && k < 8192 { out.stderr[k] = stderr.bytes[k]; out.stderr_len = out.stderr_len + 1; k = k + 1; }
+    out.events_json_len = 0;
+    out.has_violation = hasViolation;
+    out.violation_reason_len = 0;
+    if hasViolation {
+        let m: u64 = 0;
+        while m < violationReason.len && m < 1024 { out.violation_reason[m] = violationReason.bytes[m]; out.violation_reason_len = out.violation_reason_len + 1; m = m + 1; }
+    };
+    out.durationMs = time_now_ms() - startedAt; // Date.now() - startedAt
+}
+
+// ---- dynamic-input helpers for nativeCodeGraph ----
+// DEFECT: Record<string, any> access (rawInput.target ?? rawInput.symbol
+// ?? rawInput.path ?? rawInput.query ?? rawInput.name, .toString(),
+// typeof === "number" / "string" checks, candidate_files ?? files
+// pass-through of unknown JSON values) has no typed SLA counterpart.
+// These helpers query the JSON text through the assumed sa_json_*
+// extern surface; semantics preserved at the level of key order and
+// null-coalescing, value stringification approximated for scalars.
+fn json_get_string_first(rawInputJson: &StrBuf, out: &StrBuf) {
+    // tries keys in source order: target, symbol, path, query, name
+    sb_clear(out);
+    if json_get_scalar(rawInputJson, STR_PTR("target"), STR_LEN("target"), out) { return; };
+    if json_get_scalar(rawInputJson, STR_PTR("symbol"), STR_LEN("symbol"), out) { return; };
+    if json_get_scalar(rawInputJson, STR_PTR("path"), STR_LEN("path"), out) { return; };
+    if json_get_scalar(rawInputJson, STR_PTR("query"), STR_LEN("query"), out) { return; };
+    if json_get_scalar(rawInputJson, STR_PTR("name"), STR_LEN("name"), out) { return; };
+    sb_clear(out); // ?? "" -> empty string
+}
+
+fn json_get_scalar(json: &StrBuf, keyP: ptr, keyN: u64, out: &StrBuf) -> bool {
+    // finds `"key": value` at the top level; string values are
+    // unquoted, numbers/booleans are taken verbatim (toString()).
+    // DEFECT: full JSON parsing (nesting, escapes) is delegated to
+    // the assumed sa_json surface in the fix phase.
+    sb_clear(out);
+    let key = StrBuf { bytes: [0u8; 65536], len: 0 };
+    sb_append_byte(&key, 34);
+    sb_append(&key, keyP, keyN);
+    sb_append_byte(&key, 34);
+    let pos: u64 = 0;
+    while pos + key.len <= json.len {
+        let same = true;
+        let q: u64 = 0;
+        while q < key.len {
+            if json.bytes[pos + q] != key.bytes[q] { same = false; };
+            q = q + 1;
+            if !same { break; };
+        }
+        if same {
+            let i = pos + key.len;
+            while i < json.len && (json.bytes[i] == 32 || json.bytes[i] == 58 || json.bytes[i] == 9) { i = i + 1; }
+            if i >= json.len { return false; };
+            if json.bytes[i] == 34 {
+                i = i + 1;
+                while i < json.len && json.bytes[i] != 34 {
+                    if json.bytes[i] == 92 && i + 1 < json.len { i = i + 1; };
+                    sb_append_byte(out, json.bytes[i]);
+                    i = i + 1;
+                }
+                return true;
+            };
+            if json.bytes[i] == 110 {
+                // null -> ?? moves to the next key
+                return false;
+            };
+            // scalar (number/bool): read to , or }
+            while i < json.len && json.bytes[i] != 44 && json.bytes[i] != 125 {
+                sb_append_byte(out, json.bytes[i]);
+                i = i + 1;
+            }
+            let t = StrBuf { bytes: [0u8; 65536], len: 0 };
+            sb_trim(out, &t);
+            sb_clear(out);
+            let p: ptr = PTR_NULL();
+            PTR_BYTE_ADD(p, &t.bytes, 0);
+            sb_append(out, p, t.len);
+            return out.len > 0;
+        };
+        pos = pos + 1;
+    }
+    return false;
+}
+
+fn json_get_number(json: &StrBuf, keyP: ptr, keyN: u64, outVal: &u64) -> bool {
+    // typeof rawInput[key] === "number"
+    let v = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if !json_get_scalar(json, keyP, keyN, &v) { return false; };
+    if v.len == 0 { return false; };
+    let n: u64 = 0;
+    let i: u64 = 0;
+    let anyDigit = false;
+    while i < v.len {
+        let c = v.bytes[i];
+        if c >= 48 && c <= 57 { n = n * 10 + (c - 48) as u64; anyDigit = true; } else if c == 46 { break; } else { return false; };
+        i = i + 1;
+    }
+    if !anyDigit { return false; };
+    *outVal = n;
+    return true;
+}
+
+fn json_fill_options(rawInputJson: &StrBuf, options: &CodeGraphOptions) {
+    // mode: rawInput.mode (string union) — DEFECT: unrecognized values
+    // pass through in TS and normalize later; tags assigned here.
+    let modeStr = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if json_get_scalar(rawInputJson, STR_PTR("mode"), STR_LEN("mode"), &modeStr) {
+        options.has_mode = true;
+        if sb_eq_lit(&modeStr, STR_PTR("module_dependency"), STR_LEN("module_dependency")) { options.mode = 1; } else if sb_eq_lit(&modeStr, STR_PTR("module_deps"), STR_LEN("module_deps")) { options.mode = 2; } else if sb_eq_lit(&modeStr, STR_PTR("call_flow"), STR_LEN("call_flow")) { options.mode = 3; } else { options.mode = 0; };
+    };
+    let num: u64 = 0;
+    if json_get_number(rawInputJson, STR_PTR("depth"), STR_LEN("depth"), &num) { options.has_depth = true; options.depth = num; };
+    let dirStr = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if json_get_scalar(rawInputJson, STR_PTR("direction"), STR_LEN("direction"), &dirStr) {
+        options.has_direction = true;
+        if sb_eq_lit(&dirStr, STR_PTR("upstream"), STR_LEN("upstream")) { options.direction = 0; } else if sb_eq_lit(&dirStr, STR_PTR("downstream"), STR_LEN("downstream")) { options.direction = 1; } else { options.direction = 2; };
+    };
+    // format: rawInput.format ?? "dot"
+    let fmtStr = StrBuf { bytes: [0u8; 65536], len: 0 };
+    options.has_format = true;
+    options.format = 0;
+    if json_get_scalar(rawInputJson, STR_PTR("format"), STR_LEN("format"), &fmtStr) {
+        if sb_eq_lit(&fmtStr, STR_PTR("py_stub"), STR_LEN("py_stub")) { options.format = 1; } else if sb_eq_lit(&fmtStr, STR_PTR("networkx"), STR_LEN("networkx")) { options.format = 2; } else { options.format = 0; };
+    };
+    if json_get_number(rawInputJson, STR_PTR("max_nodes"), STR_LEN("max_nodes"), &num) { options.has_max_nodes = true; options.max_nodes = num; };
+    if json_get_number(rawInputJson, STR_PTR("max_tokens"), STR_LEN("max_tokens"), &num) { options.has_max_tokens = true; options.max_tokens = num; };
+    let ofStr = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if json_get_scalar(rawInputJson, STR_PTR("output_file"), STR_LEN("output_file"), &ofStr) {
+        let oft = StrBuf { bytes: [0u8; 65536], len: 0 };
+        sb_trim(&ofStr, &oft);
+        if oft.len > 0 {
+            options.has_output_file = true;
+            options.output_file_len = 0;
+            let q: u64 = 0;
+            while q < oft.len && q < 1024 { options.output_file[q] = oft.bytes[q]; options.output_file_len = options.output_file_len + 1; q = q + 1; }
+        };
+    };
+    // candidate_files: rawInput.candidate_files ?? rawInput.files
+    // DEFECT: arrays of unknown values — string elements joined by \n;
+    // non-array values are dropped (source passes them through to
+    // Array.isArray checks downstream, net effect approximated).
+    let cand = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if json_get_string_array(rawInputJson, STR_PTR("candidate_files"), STR_LEN("candidate_files"), &cand) {
+        options.has_candidate_files = true;
+        options.candidate_files_len = 0;
+        let q: u64 = 0;
+        while q < cand.len && q < 16384 { options.candidate_files[q] = cand.bytes[q]; options.candidate_files_len = options.candidate_files_len + 1; q = q + 1; }
+    } else if json_get_string_array(rawInputJson, STR_PTR("files"), STR_LEN("files"), &cand) {
+        options.has_files = true;
+        options.files_len = 0;
+        let q: u64 = 0;
+        while q < cand.len && q < 16384 { options.files[q] = cand.bytes[q]; options.files_len = options.files_len + 1; q = q + 1; }
+    };
+}
+
+fn json_get_string_array(json: &StrBuf, keyP: ptr, keyN: u64, out: &StrBuf) -> bool {
+    // locates `"key": [ "a", "b", ... ]` and joins string elements
+    sb_clear(out);
+    let key = StrBuf { bytes: [0u8; 65536], len: 0 };
+    sb_append_byte(&key, 34);
+    sb_append(&key, keyP, keyN);
+    sb_append_byte(&key, 34);
+    let pos: u64 = 0;
+    while pos + key.len <= json.len {
+        let same = true;
+        let q: u64 = 0;
+        while q < key.len {
+            if json.bytes[pos + q] != key.bytes[q] { same = false; };
+            q = q + 1;
+            if !same { break; };
+        }
+        if same {
+            let i = pos + key.len;
+            while i < json.len && json.bytes[i] != 91 { // '['
+                if json.bytes[i] == 125 || json.bytes[i] == 44 && i > pos + key.len + 8 { return false; };
+                i = i + 1;
+            }
+            if i >= json.len { return false; };
+            i = i + 1;
+            let found = false;
+            while i < json.len && json.bytes[i] != 93 { // ']'
+                if json.bytes[i] == 34 {
+                    if found { sb_append_byte(out, 10); };
+                    found = true;
+                    i = i + 1;
+                    while i < json.len && json.bytes[i] != 34 {
+                        if json.bytes[i] == 92 && i + 1 < json.len { i = i + 1; };
+                        sb_append_byte(out, json.bytes[i]);
+                        i = i + 1;
+                    }
+                };
+                i = i + 1;
+            }
+            return found;
+        };
+        pos = pos + 1;
+    }
+    return false;
+}
+
+fn path_is_absolute(p: &StrBuf) -> bool {
+    // node:path isAbsolute: leading "/" or drive-letter / UNC forms
+    if p.len == 0 { return false; };
+    if p.bytes[0] == 47 { return true; };
+    if p.len >= 3 && p.bytes[1] == 58 && (p.bytes[2] == 47 || p.bytes[2] == 92) { return true; };
+    if p.len >= 2 && p.bytes[0] == 92 && p.bytes[1] == 92 { return true; };
+    return false;
+}
+
+// Assumed externs referenced above (not in sa_std; see defect log):
+//   (policy surface bound to saVmPolicy.sla — see cgCheckSaVmPath /
+//   cgNormalizeSaVmPolicy at the top of this file)
+//   fs_exists / fs_stat_is_file / fs_read_file / fs_write_file / fs_readdir
+//   path_dirname / path_extname / path_join2 / path_resolve2 / path_relative
+//   ts_parser_new / ts_parser_set_language / ts_parser_parse / ts_tree_root
+//   ts_node_* node accessors (see saVmTreeSitter.sla), ts_node_is_named
+//   time_now_ms() -> u64   (Date.now)
