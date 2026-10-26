@@ -8256,6 +8256,7 @@ struct MiniBridgeState {
     child_fired: u64,
     child_queue: u64,
     child_in_flight: u64,
+    pending_runs: u64,
     status_phase: MbStr,
     status_message: MbStr,
     opt_has_policy_resolver: bool,
@@ -8285,6 +8286,7 @@ fn MiniBridge_new(skill_roots: u64, out: &MiniBridgeState) -> void {
     out.child_fired = mb_new_obj();
     out.child_queue = mb_new_arr();
     out.child_in_flight = 0;
+    out.pending_runs = mb_new_arr();
     out.status_phase = MbStr { bytes: [0u8; 8192], len: 0 };
     mb_sassign(&out.status_phase, STR_PTR("ready"), STR_LEN("ready"));
     out.status_message = MbStr { bytes: [0u8; 8192], len: 0 };
@@ -10133,4 +10135,1703 @@ fn MiniBridge_resize_exec(b: &MiniBridgeState, r: u64, out: &u64, out_err: &MbJs
     };
     // Short-lived exec has no PTY: accept-and-ignore (TS comment verbatim).
     *out = mb_new_obj();
+}
+
+// =====================================================================
+// B8 (TS 5431-7630): MiniBridge.request dispatch + class lifecycle core.
+// ASYNC landing (registered, ASYNC_MODEL blocking-contract family): TS
+// fire-and-forget runs (void this.runMiniTurn(...).catch(...)) and awaited
+// runs cannot start concurrent tasks in the blocking port. request() and
+// the lifecycle methods perform every synchronous step (session mutation,
+// emits, persist) and enqueue a run record {kind, threadId, turnId, prompt,
+// opts} into b.pending_runs; the host drains it via
+// MiniBridge_dispatch_pending_runs (B9), which performs the TS catch
+// mapping (message === "interrupted" -> interruptTurn, else failTurn).
+// Kinds: "turn" (runMiniTurn), "compact" (compactSession), "status"
+// (answerStatus).
+// =====================================================================
+
+fn mb_throw(out_err: &MbJson, out_throw: &bool, p: ptr, n: u64) -> void {
+    mb_jassign(out_err, p, n);
+    *out_throw = true;
+}
+fn mb_throw_j(out_err: &MbJson, out_throw: &bool, j: &MbJson) -> void {
+    mb_jassign_j(out_err, j);
+    *out_throw = true;
+}
+fn mb_key2(a_p: ptr, a_n: u64, sep: u8, b_p: ptr, b_n: u64, out: &MbJson) -> void {
+    mb_jclear(out);
+    mb_jappend(out, a_p, a_n);
+    mb_jpush(out, sep);
+    mb_jappend(out, b_p, b_n);
+}
+// Session-doc field helpers (session = JSON object doc, path-addressed).
+fn mb_sess_turn(s: u64, turn_p: ptr, turn_n: u64) -> u64 {
+    let turns: u64 = mb_g_node(s, STR_PTR("turns"), STR_LEN("turns"));
+    if turns == 0 { return 0; };
+    let count: u64 = mb_n_count(turns);
+    let i: u64 = 0;
+    while i < count {
+        let t: u64 = mb_a_at(turns, i);
+        let id = MbStr { bytes: [0u8; 8192], len: 0 };
+        if mb_g_str(t, STR_PTR("id"), STR_LEN("id"), &id) && mb_bytes_eq(mb_sp(&id), id.len, turn_p, turn_n) { return t; };
+        i = i + 1;
+    }
+    return 0;
+}
+fn mb_sess_clear_active(s: u64) -> void {
+    let rc: i32 = mb_o_remove(s, STR_PTR("activeTurnId"), STR_LEN("activeTurnId"));
+    rc = mb_o_remove(s, STR_PTR("activeMaxRetries"), STR_LEN("activeMaxRetries"));
+    rc = mb_o_remove(s, STR_PTR("activeAbort"), STR_LEN("activeAbort"));
+    rc = mb_o_remove(s, STR_PTR("pendingSteers"), STR_LEN("pendingSteers"));
+    rc = mb_o_remove(s, STR_PTR("steerTurnId"), STR_LEN("steerTurnId"));
+}
+fn mb_sess_cancel_turn(s: u64, turn_p: ptr, turn_n: u64) -> void {
+    let ids: u64 = mb_g_node(s, STR_PTR("cancelledTurnIds"), STR_LEN("cancelledTurnIds"));
+    if ids == 0 || mb_kind(ids) != MB_JK_ARRAY {
+        ids = mb_new_arr();
+        let rc: i32 = mb_s_node(s, STR_PTR("cancelledTurnIds"), STR_LEN("cancelledTurnIds"), ids);
+    };
+    if !mb_str_in_arr(ids, turn_p, turn_n, false) {
+        let rc2: i32 = mb_a_push_str(ids, turn_p, turn_n);
+    };
+}
+fn mb_note(method_p: ptr, method_n: u64, params: u64) -> u64 {
+    let o: u64 = mb_new_obj();
+    let rc: i32 = mb_s_str(o, STR_PTR("method"), STR_LEN("method"), method_p, method_n);
+    rc = mb_s_node(o, STR_PTR("params"), STR_LEN("params"), params);
+    return o;
+}
+fn mb_turn_params(s: u64, turn_p: ptr, turn_n: u64) -> u64 {
+    let p: u64 = mb_new_obj();
+    let tid = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_tid: bool = mb_g_str(s, STR_PTR("threadId"), STR_LEN("threadId"), &tid);
+    let rc: i32 = mb_s_str(p, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&tid), tid.len);
+    let par = MbStr { bytes: [0u8; 8192], len: 0 };
+    if mb_g_str(s, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), &par) {
+        rc = mb_s_str(p, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), mb_sp(&par), par.len);
+    };
+    rc = mb_s_str(p, STR_PTR("turnId"), STR_LEN("turnId"), turn_p, turn_n);
+    return p;
+}
+fn mb_emit_note(b: &MiniBridgeState, method_p: ptr, method_n: u64, params: u64) -> void {
+    let n: u64 = mb_note(method_p, method_n, params);
+    let sent: bool = MiniBridge_emit_notification(b, n);
+}
+fn mb_emit_turn_settled(b: &MiniBridgeState, s: u64, turn_p: ptr, turn_n: u64, method_p: ptr, method_n: u64, status_p: ptr, status_n: u64) -> void {
+    let params: u64 = mb_turn_params(s, turn_p, turn_n);
+    let turn: u64 = mb_new_obj();
+    let tid = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_tid: bool = mb_g_str(s, STR_PTR("threadId"), STR_LEN("threadId"), &tid);
+    let rc: i32 = mb_s_str(turn, STR_PTR("id"), STR_LEN("id"), turn_p, turn_n);
+    rc = mb_s_str(turn, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&tid), tid.len);
+    let par = MbStr { bytes: [0u8; 8192], len: 0 };
+    if mb_g_str(s, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), &par) {
+        rc = mb_s_str(turn, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), mb_sp(&par), par.len);
+    };
+    rc = mb_s_str(turn, STR_PTR("status"), STR_LEN("status"), status_p, status_n);
+    rc = mb_s_i64(turn, STR_PTR("completedAt"), STR_LEN("completedAt"), mb_now_ms() / 1000);
+    rc = mb_s_node(params, STR_PTR("turn"), STR_LEN("turn"), turn);
+    mb_emit_note(b, method_p, method_n, params);
+}
+// Fixed-array field setters for the hook detail structs.
+fn mb_set_a16(dst: &[u8; 16], dst_len: &u64, p: ptr, n: u64) -> void {
+    *dst_len = 0;
+    for i in 0..n { if *dst_len < 16 { let b: u8 = 0; PTR_BYTE_AT(b, p, i); dst[*dst_len] = b; let v: u64 = *dst_len; *dst_len = v + 1; }; }
+}
+fn mb_set_a32(dst: &[u8; 32], dst_len: &u64, p: ptr, n: u64) -> void {
+    *dst_len = 0;
+    for i in 0..n { if *dst_len < 32 { let b: u8 = 0; PTR_BYTE_AT(b, p, i); dst[*dst_len] = b; let v: u64 = *dst_len; *dst_len = v + 1; }; }
+}
+fn mb_set_a128(dst: &[u8; 128], dst_len: &u64, p: ptr, n: u64) -> void {
+    *dst_len = 0;
+    for i in 0..n { if *dst_len < 128 { let b: u8 = 0; PTR_BYTE_AT(b, p, i); dst[*dst_len] = b; let v: u64 = *dst_len; *dst_len = v + 1; }; }
+}
+fn mb_set_a256(dst: &[u8; 256], dst_len: &u64, p: ptr, n: u64) -> void {
+    *dst_len = 0;
+    for i in 0..n { if *dst_len < 256 { let b: u8 = 0; PTR_BYTE_AT(b, p, i); dst[*dst_len] = b; let v: u64 = *dst_len; *dst_len = v + 1; }; }
+}
+fn mb_set_a1024(dst: &[u8; 1024], dst_len: &u64, p: ptr, n: u64) -> void {
+    *dst_len = 0;
+    for i in 0..n { if *dst_len < 1024 { let b: u8 = 0; PTR_BYTE_AT(b, p, i); dst[*dst_len] = b; let v: u64 = *dst_len; *dst_len = v + 1; }; }
+}
+fn mb_set_a8192(dst: &[u8; 8192], dst_len: &u64, p: ptr, n: u64) -> void {
+    *dst_len = 0;
+    for i in 0..n { if *dst_len < 8192 { let b: u8 = 0; PTR_BYTE_AT(b, p, i); dst[*dst_len] = b; let v: u64 = *dst_len; *dst_len = v + 1; }; }
+}
+// TS: void fireMiniTurnFinishHook({...}) — handlers come from the host-owned
+// ServerHookHandlers (miniServerHooks sibling); result discarded like TS.
+fn mb_fire_finish_hook(handlers: &ServerHookHandlers, s: u64, turn_p: ptr, turn_n: u64, status_p: ptr, status_n: u64, summary_p: ptr, summary_n: u64) -> void {
+    let detail = MiniTurnFinishDetail { threadId: [0; 128], threadId_len: 0, turnId: [0; 128], turnId_len: 0, has_turnId: true, parentThreadId: [0; 128], parentThreadId_len: 0, has_parentThreadId: false, cwd: [0; 1024], cwd_len: 0, model: [0; 256], model_len: 0, has_model: false, status: [0; 32], status_len: 0, summary: [0; 8192], summary_len: 0, has_summary: true, toolCallCount: 0, has_toolCallCount: false, agentName: [0; 256], agentName_len: 0, has_agentName: false, ultraHome: [0; 1024], ultraHome_len: 0, has_ultraHome: false };
+    let v = MbStr { bytes: [0u8; 8192], len: 0 };
+    if mb_g_str(s, STR_PTR("threadId"), STR_LEN("threadId"), &v) { mb_set_a128(&detail.threadId, &detail.threadId_len, mb_sp(&v), v.len); };
+    mb_set_a128(&detail.turnId, &detail.turnId_len, turn_p, turn_n);
+    if mb_g_str(s, STR_PTR("cwd"), STR_LEN("cwd"), &v) { mb_set_a1024(&detail.cwd, &detail.cwd_len, mb_sp(&v), v.len); };
+    if mb_g_str(s, STR_PTR("model"), STR_LEN("model"), &v) { mb_set_a256(&detail.model, &detail.model_len, mb_sp(&v), v.len); detail.has_model = true; };
+    let par = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_par: bool = mb_g_str(s, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), &par);
+    if has_par {
+        mb_set_a128(&detail.parentThreadId, &detail.parentThreadId_len, mb_sp(&par), par.len);
+        detail.has_parentThreadId = true;
+        if mb_g_str(s, STR_PTR("agentType"), STR_LEN("agentType"), &v) { mb_set_a256(&detail.agentName, &detail.agentName_len, mb_sp(&v), v.len); detail.has_agentName = true; };
+    };
+    mb_set_a32(&detail.status, &detail.status_len, status_p, status_n);
+    mb_set_a8192(&detail.summary, &detail.summary_len, summary_p, summary_n);
+    let res = MiniTurnFinishResult { event: [0; 32], event_len: 0, handlers: 0, completed: 0, failed: 0, blocked: 0, additionalContexts: [0; 65536], additionalContexts_lens: [0; 16], additionalContexts_len: 0 };
+    let rc: i32 = fireMiniTurnFinishHook(handlers, &detail, &res);
+}
+fn mb_fire_session_end_hook(handlers: &ServerHookHandlers, s: u64, reason_p: ptr, reason_n: u64) -> void {
+    let detail = MiniSessionEndDetail { threadId: [0; 128], threadId_len: 0, cwd: [0; 1024], cwd_len: 0, model: [0; 256], model_len: 0, has_model: false, reason: [0; 16], reason_len: 0, ultraHome: [0; 1024], ultraHome_len: 0, has_ultraHome: false };
+    let v = MbStr { bytes: [0u8; 8192], len: 0 };
+    if mb_g_str(s, STR_PTR("threadId"), STR_LEN("threadId"), &v) { mb_set_a128(&detail.threadId, &detail.threadId_len, mb_sp(&v), v.len); };
+    if mb_g_str(s, STR_PTR("cwd"), STR_LEN("cwd"), &v) { mb_set_a1024(&detail.cwd, &detail.cwd_len, mb_sp(&v), v.len); };
+    if mb_g_str(s, STR_PTR("model"), STR_LEN("model"), &v) { mb_set_a256(&detail.model, &detail.model_len, mb_sp(&v), v.len); detail.has_model = true; };
+    mb_set_a16(&detail.reason, &detail.reason_len, reason_p, reason_n);
+    let res = MiniTurnFinishResult { event: [0; 32], event_len: 0, handlers: 0, completed: 0, failed: 0, blocked: 0, additionalContexts: [0; 65536], additionalContexts_lens: [0; 16], additionalContexts_len: 0 };
+    let rc: i32 = fireMiniSessionEndHook(handlers, &detail, &res);
+}
+// Run-queue: enqueue a deferred run record (see the B8 header note).
+fn mb_enqueue_run(b: &MiniBridgeState, kind_p: ptr, kind_n: u64, thread_p: ptr, thread_n: u64, turn_p: ptr, turn_n: u64, prompt_p: ptr, prompt_n: u64, opts: u64) -> void {
+    let rec: u64 = mb_new_obj();
+    let rc: i32 = mb_s_str(rec, STR_PTR("kind"), STR_LEN("kind"), kind_p, kind_n);
+    rc = mb_s_str(rec, STR_PTR("threadId"), STR_LEN("threadId"), thread_p, thread_n);
+    rc = mb_s_str(rec, STR_PTR("turnId"), STR_LEN("turnId"), turn_p, turn_n);
+    rc = mb_s_str(rec, STR_PTR("prompt"), STR_LEN("prompt"), prompt_p, prompt_n);
+    if opts != 0 { rc = mb_s_node(rec, STR_PTR("opts"), STR_LEN("opts"), mb_clone_node(opts)); };
+    rc = mb_a_push_node(b.pending_runs, rec);
+}
+// TS: private flushMiniDeltas(threadId, turnId) — the setTimeout deadline
+// lands as b.delta_deadlines (ms epoch); the host drains due flushes via
+// MiniBridge_flush_due_deltas (host seam, order preserved per turn key).
+fn MiniBridge_flush_deltas(b: &MiniBridgeState, thread_p: ptr, thread_n: u64, turn_p: ptr, turn_n: u64) -> void {
+    let key = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_key2(thread_p, thread_n, 58, turn_p, turn_n, &key);
+    let rc: i32 = mb_o_remove(b.delta_deadlines, mb_jp(&key), key.len);
+    let pend: u64 = mb_g_node(b.pending_deltas, mb_jp(&key), key.len);
+    if pend == 0 { return; };
+    rc = mb_o_remove(b.pending_deltas, mb_jp(&key), key.len);
+    let s: u64 = MiniBridge_get_session(b, thread_p, thread_n);
+    if s != 0 && isMiniTurnEventStale(s, turn_p, turn_n) { return; };
+    let par = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_par: bool = false;
+    if s != 0 { has_par = mb_g_str(s, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), &par); };
+    let count: u64 = mb_n_count(pend);
+    let i: u64 = 0;
+    while i < count {
+        let kp: ptr = PTR_NULL();
+        let kn: u64 = 0;
+        if mb_key_at(pend, i, &kp, &kn) {
+            let rec: u64 = mb_g_node(pend, kp, kn);
+            if rec != 0 {
+                let m = MbStr { bytes: [0u8; 8192], len: 0 };
+                let iid = MbStr { bytes: [0u8; 8192], len: 0 };
+                let d = MbStr { bytes: [0u8; 8192], len: 0 };
+                let ok_m: bool = mb_g_str(rec, STR_PTR("method"), STR_LEN("method"), &m);
+                let ok_i: bool = mb_g_str(rec, STR_PTR("itemId"), STR_LEN("itemId"), &iid);
+                let ok_d: bool = mb_g_str(rec, STR_PTR("delta"), STR_LEN("delta"), &d);
+                let params: u64 = mb_new_obj();
+                let rc2: i32 = mb_s_str(params, STR_PTR("threadId"), STR_LEN("threadId"), thread_p, thread_n);
+                if has_par { rc2 = mb_s_str(params, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), mb_sp(&par), par.len); };
+                rc2 = mb_s_str(params, STR_PTR("turnId"), STR_LEN("turnId"), turn_p, turn_n);
+                rc2 = mb_s_str(params, STR_PTR("itemId"), STR_LEN("itemId"), mb_sp(&iid), iid.len);
+                rc2 = mb_s_str(params, STR_PTR("delta"), STR_LEN("delta"), mb_sp(&d), d.len);
+                mb_emit_note(b, mb_sp(&m), m.len, params);
+            };
+        };
+        i = i + 1;
+    }
+}
+fn MiniBridge_flush_due_deltas(b: &MiniBridgeState) -> void {
+    let guard: u64 = 0;
+    while guard < 4096 {
+        guard = guard + 1;
+        let count: u64 = mb_n_count(b.delta_deadlines);
+        if count == 0 { return; };
+        let now: i64 = mb_now_ms();
+        let found: bool = false;
+        let fkey = MbJson { bytes: [0u8; 262144], len: 0 };
+        let i: u64 = 0;
+        while i < count && !found {
+            let kp: ptr = PTR_NULL();
+            let kn: u64 = 0;
+            if mb_key_at(b.delta_deadlines, i, &kp, &kn) {
+                let dl: i64 = 0;
+                let node: u64 = mb_g_node(b.delta_deadlines, kp, kn);
+                if mb_n_i64(node, &dl) && dl <= now {
+                    mb_jassign(&fkey, kp, kn);
+                    found = true;
+                };
+            };
+            i = i + 1;
+        }
+        if !found { return; };
+        // key is `${threadId}:${turnId}`; thread/turn ids contain no ':'.
+        let colon: i64 = mb_index_of(mb_jp(&fkey), fkey.len, STR_PTR(":"), STR_LEN(":"));
+        if colon < 0 { return; };
+        let tp = MbStr { bytes: [0u8; 8192], len: 0 };
+        let up = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_slice_to_s(mb_jp(&fkey), fkey.len, 0, colon as u64, &tp);
+        mb_slice_to_s(mb_jp(&fkey), fkey.len, (colon as u64) + 1, fkey.len, &up);
+        MiniBridge_flush_deltas(b, mb_sp(&tp), tp.len, mb_sp(&up), up.len);
+    }
+}
+// TS: private queueMiniDelta(method, s, turnId, itemId, delta).
+fn MiniBridge_queue_delta(b: &MiniBridgeState, method_p: ptr, method_n: u64, s: u64, turn_p: ptr, turn_n: u64, item_p: ptr, item_n: u64, delta_p: ptr, delta_n: u64) -> void {
+    if delta_n == 0 { return; };
+    if isMiniTurnEventStale(s, turn_p, turn_n) { return; };
+    let tid = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_tid: bool = mb_g_str(s, STR_PTR("threadId"), STR_LEN("threadId"), &tid);
+    let key = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_key2(mb_sp(&tid), tid.len, 58, turn_p, turn_n, &key);
+    let pend: u64 = mb_g_node(b.pending_deltas, mb_jp(&key), key.len);
+    if pend == 0 {
+        pend = mb_new_obj();
+        let rc0: i32 = mb_s_node(b.pending_deltas, mb_jp(&key), key.len, pend);
+    };
+    let ikey = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_key2(method_p, method_n, 58, item_p, item_n, &ikey);
+    let combined = MbJson { bytes: [0u8; 262144], len: 0 };
+    let prev: u64 = mb_g_node(pend, mb_jp(&ikey), ikey.len);
+    if prev != 0 {
+        let pd = MbStr { bytes: [0u8; 8192], len: 0 };
+        if mb_g_str(prev, STR_PTR("delta"), STR_LEN("delta"), &pd) { mb_jappend(&combined, mb_sp(&pd), pd.len); };
+    };
+    mb_jappend(&combined, delta_p, delta_n);
+    let rec: u64 = mb_new_obj();
+    let rc: i32 = mb_s_str(rec, STR_PTR("method"), STR_LEN("method"), method_p, method_n);
+    rc = mb_s_str(rec, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&tid), tid.len);
+    rc = mb_s_str(rec, STR_PTR("turnId"), STR_LEN("turnId"), turn_p, turn_n);
+    rc = mb_s_str(rec, STR_PTR("itemId"), STR_LEN("itemId"), item_p, item_n);
+    rc = mb_s_str(rec, STR_PTR("delta"), STR_LEN("delta"), mb_jp(&combined), combined.len);
+    rc = mb_s_node(pend, mb_jp(&ikey), ikey.len, rec);
+    if mb_g_node(b.delta_deadlines, mb_jp(&key), key.len) == 0 {
+        rc = mb_s_i64(b.delta_deadlines, mb_jp(&key), key.len, mb_now_ms() + (MINI_DELTA_FLUSH_MS() as i64));
+    };
+}
+fn MiniBridge_emit_agent_delta(b: &MiniBridgeState, s: u64, turn_p: ptr, turn_n: u64, item_p: ptr, item_n: u64, delta_p: ptr, delta_n: u64) -> void {
+    MiniBridge_queue_delta(b, STR_PTR("item/agentMessage/delta"), STR_LEN("item/agentMessage/delta"), s, turn_p, turn_n, item_p, item_n, delta_p, delta_n);
+}
+fn MiniBridge_emit_reason_delta(b: &MiniBridgeState, s: u64, turn_p: ptr, turn_n: u64, item_p: ptr, item_n: u64, delta_p: ptr, delta_n: u64) -> void {
+    MiniBridge_queue_delta(b, STR_PTR("item/reasoning/textDelta"), STR_LEN("item/reasoning/textDelta"), s, turn_p, turn_n, item_p, item_n, delta_p, delta_n);
+}
+// TS: private emitMiniItemStarted / emitMiniItemCompleted.
+fn MiniBridge_emit_item_started(b: &MiniBridgeState, s: u64, turn_p: ptr, turn_n: u64, item: u64) -> void {
+    if isMiniTurnEventStale(s, turn_p, turn_n) { return; };
+    let params: u64 = mb_turn_params(s, turn_p, turn_n);
+    let rc: i32 = mb_s_node(params, STR_PTR("item"), STR_LEN("item"), mb_clone_node(item));
+    mb_emit_note(b, STR_PTR("item/started"), STR_LEN("item/started"), params);
+}
+fn MiniBridge_emit_item_completed(b: &MiniBridgeState, s: u64, turn_p: ptr, turn_n: u64, item: u64) -> void {
+    if isMiniTurnEventStale(s, turn_p, turn_n) { return; };
+    let tid = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_tid: bool = mb_g_str(s, STR_PTR("threadId"), STR_LEN("threadId"), &tid);
+    MiniBridge_flush_deltas(b, mb_sp(&tid), tid.len, turn_p, turn_n);
+    let params: u64 = mb_turn_params(s, turn_p, turn_n);
+    let rc: i32 = mb_s_node(params, STR_PTR("item"), STR_LEN("item"), mb_clone_node(item));
+    mb_emit_note(b, STR_PTR("item/completed"), STR_LEN("item/completed"), params);
+}
+// TS: private rollbackMiniRoundLiveSegments / retireMiniSegments.
+fn MiniBridge_rollback_round_live_segments(b: &MiniBridgeState, s: u64, turn_p: ptr, turn_n: u64, base_p: ptr, base_n: u64, seg_index_before: f64, allow_steering: bool) -> void {
+    if isMiniTurnEventStale(s, turn_p, turn_n) && !(isMiniTurnSteering(s, turn_p, turn_n) || allow_steering) { return; };
+    let tid = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_tid: bool = mb_g_str(s, STR_PTR("threadId"), STR_LEN("threadId"), &tid);
+    MiniBridge_flush_deltas(b, mb_sp(&tid), tid.len, turn_p, turn_n);
+    let messages: u64 = mb_g_node(s, STR_PTR("messages"), STR_LEN("messages"));
+    let ids: u64 = 0;
+    miniRoundLiveSegmentIds(messages, base_p, base_n, seg_index_before, &ids);
+    let rolled: u64 = 0;
+    rollbackMiniRoundLiveSegments(messages, base_p, base_n, seg_index_before, &rolled);
+    let rc: i32 = mb_s_node(s, STR_PTR("messages"), STR_LEN("messages"), rolled);
+    if ids != 0 && mb_n_count(ids) > 0 {
+        let params: u64 = mb_turn_params(s, turn_p, turn_n);
+        rc = mb_s_node(params, STR_PTR("itemIds"), STR_LEN("itemIds"), ids);
+        mb_emit_note(b, STR_PTR("mini/item/rollback"), STR_LEN("mini/item/rollback"), params);
+    };
+}
+fn MiniBridge_retire_segments(b: &MiniBridgeState, s: u64, turn_p: ptr, turn_n: u64, ids: u64) -> void {
+    let tid = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_tid: bool = mb_g_str(s, STR_PTR("threadId"), STR_LEN("threadId"), &tid);
+    MiniBridge_flush_deltas(b, mb_sp(&tid), tid.len, turn_p, turn_n);
+    let messages: u64 = mb_g_node(s, STR_PTR("messages"), STR_LEN("messages"));
+    // TS: retired = itemIds.filter(id => messages.some(m => idOf(m) === id)).
+    let retired: u64 = mb_new_arr();
+    let id_count: u64 = mb_n_count(ids);
+    let j: u64 = 0;
+    while j < id_count {
+        let want = MbStr { bytes: [0u8; 8192], len: 0 };
+        if mb_n_str(mb_a_at(ids, j), &want) {
+            let present: bool = false;
+            let count0: u64 = mb_n_count(messages);
+            let i0: u64 = 0;
+            while i0 < count0 && !present {
+                let mid = MbStr { bytes: [0u8; 8192], len: 0 };
+                if mb_g_str(mb_a_at(messages, i0), STR_PTR("id"), STR_LEN("id"), &mid) && mb_bytes_eq(mb_sp(&mid), mid.len, mb_sp(&want), want.len) { present = true; };
+                i0 = i0 + 1;
+            }
+            if present { let rc0: i32 = mb_a_push_str(retired, mb_sp(&want), want.len); };
+        };
+        j = j + 1;
+    }
+    if mb_n_count(retired) == 0 { return; };
+    let kept: u64 = mb_new_arr();
+    let count: u64 = mb_n_count(messages);
+    let i: u64 = 0;
+    while i < count {
+        let m: u64 = mb_a_at(messages, i);
+        let id = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_id: bool = mb_g_str(m, STR_PTR("id"), STR_LEN("id"), &id);
+        if !(has_id && mb_str_in_arr(retired, mb_sp(&id), id.len, false)) {
+            let rc3: i32 = mb_a_push_node(kept, mb_clone_node(m));
+        };
+        i = i + 1;
+    }
+    let rc: i32 = mb_s_node(s, STR_PTR("messages"), STR_LEN("messages"), kept);
+    let params: u64 = mb_turn_params(s, turn_p, turn_n);
+    rc = mb_s_node(params, STR_PTR("itemIds"), STR_LEN("itemIds"), retired);
+    mb_emit_note(b, STR_PTR("mini/item/rollback"), STR_LEN("mini/item/rollback"), params);
+}
+
+// TS: private cancelQueuedMiniChildTurn / pumpMiniChildTurnQueue /
+// enqueueMiniChildTurn — the FIFO queue entries are docs in b.child_queue
+// ({childId, turnId, prompt, cancelled}); pump moves runnable entries into
+// b.pending_runs (kind "turn", opts.childRun) under the concurrency cap.
+fn MiniBridge_cancel_queued_child_turn(b: &MiniBridgeState, child: u64, turn_p: ptr, turn_n: u64, has_turn: bool) -> void {
+    let tid = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_tid: bool = mb_g_str(child, STR_PTR("threadId"), STR_LEN("threadId"), &tid);
+    let count: u64 = mb_n_count(b.child_queue);
+    let i: u64 = 0;
+    while i < count {
+        let e: u64 = mb_a_at(b.child_queue, i);
+        let cid = MbStr { bytes: [0u8; 8192], len: 0 };
+        let match_id: bool = mb_g_str(e, STR_PTR("childId"), STR_LEN("childId"), &cid) && mb_bytes_eq(mb_sp(&cid), cid.len, mb_sp(&tid), tid.len);
+        if match_id {
+            let match_turn: bool = true;
+            if has_turn {
+                let et = MbStr { bytes: [0u8; 8192], len: 0 };
+                match_turn = mb_g_str(e, STR_PTR("turnId"), STR_LEN("turnId"), &et) && mb_bytes_eq(mb_sp(&et), et.len, turn_p, turn_n);
+            };
+            if match_turn { let rc: i32 = mb_s_bool(e, STR_PTR("cancelled"), STR_LEN("cancelled"), true); };
+        };
+        i = i + 1;
+    }
+}
+fn MiniBridge_pump_child_queue(b: &MiniBridgeState) -> void {
+    let limit: u64 = miniChildTurnConcurrency();
+    while b.child_in_flight < limit && mb_n_count(b.child_queue) > 0 {
+        let first: u64 = mb_a_at(b.child_queue, 0);
+        mb_arr_remove_at(&b.child_queue, 0);
+        let cancelled: bool = false;
+        let ok_c: bool = mb_g_bool(first, STR_PTR("cancelled"), STR_LEN("cancelled"), &cancelled);
+        if cancelled { continue; };
+        let cid = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ok_id: bool = mb_g_str(first, STR_PTR("childId"), STR_LEN("childId"), &cid);
+        let child: u64 = MiniBridge_get_session(b, mb_sp(&cid), cid.len);
+        if child == 0 { continue; };
+        let et = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ok_t: bool = mb_g_str(first, STR_PTR("turnId"), STR_LEN("turnId"), &et);
+        let active = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_active: bool = mb_g_str(child, STR_PTR("activeTurnId"), STR_LEN("activeTurnId"), &active);
+        if !has_active || !mb_bytes_eq(mb_sp(&active), active.len, mb_sp(&et), et.len) { continue; };
+        let prompt = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ok_p: bool = mb_g_str(first, STR_PTR("prompt"), STR_LEN("prompt"), &prompt);
+        let opts: u64 = mb_new_obj();
+        let rc: i32 = mb_s_bool(opts, STR_PTR("childRun"), STR_LEN("childRun"), true);
+        b.child_in_flight = b.child_in_flight + 1;
+        mb_enqueue_run(b, STR_PTR("turn"), STR_LEN("turn"), mb_sp(&cid), cid.len, mb_sp(&et), et.len, mb_sp(&prompt), prompt.len, opts);
+    }
+}
+fn MiniBridge_enqueue_child_turn(b: &MiniBridgeState, child: u64, turn_p: ptr, turn_n: u64, prompt_p: ptr, prompt_n: u64) -> void {
+    let tid = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_tid: bool = mb_g_str(child, STR_PTR("threadId"), STR_LEN("threadId"), &tid);
+    let e: u64 = mb_new_obj();
+    let rc: i32 = mb_s_str(e, STR_PTR("childId"), STR_LEN("childId"), mb_sp(&tid), tid.len);
+    rc = mb_s_str(e, STR_PTR("turnId"), STR_LEN("turnId"), turn_p, turn_n);
+    rc = mb_s_str(e, STR_PTR("prompt"), STR_LEN("prompt"), prompt_p, prompt_n);
+    rc = mb_s_bool(e, STR_PTR("cancelled"), STR_LEN("cancelled"), false);
+    rc = mb_a_push_node(b.child_queue, e);
+    MiniBridge_pump_child_queue(b);
+}
+// TS: private startMiniChildTurn(child, promptText).
+// DEFECT(host): options.startSubagentTurn is a host callback — fn values
+// cannot be stored/invoked in SLA (FIX_PHASE1 §9); unwired in TS too unless
+// the host registers one, so the embedded FIFO queue path is the landing.
+fn MiniBridge_start_child_turn(b: &MiniBridgeState, child: u64, prompt_p: ptr, prompt_n: u64) -> void {
+    let turn = MbStr { bytes: [0u8; 8192], len: 0 };
+    mb_new_uuid(&turn);
+    let tid = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_tid: bool = mb_g_str(child, STR_PTR("threadId"), STR_LEN("threadId"), &tid);
+    let user_item: u64 = mb_new_obj();
+    let rc: i32 = mb_s_str(user_item, STR_PTR("type"), STR_LEN("type"), STR_PTR("userMessage"), STR_LEN("userMessage"));
+    let iid = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_jassign(&iid, STR_PTR("mini-user-"), STR_LEN("mini-user-"));
+    mb_jappend(&iid, mb_sp(&turn), turn.len);
+    rc = mb_s_str(user_item, STR_PTR("id"), STR_LEN("id"), mb_jp(&iid), iid.len);
+    rc = mb_s_str(user_item, STR_PTR("turnId"), STR_LEN("turnId"), mb_sp(&turn), turn.len);
+    rc = mb_s_str(user_item, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&tid), tid.len);
+    rc = mb_s_str(user_item, STR_PTR("text"), STR_LEN("text"), prompt_p, prompt_n);
+    let content: u64 = mb_new_arr();
+    let block: u64 = mb_new_obj();
+    rc = mb_s_str(block, STR_PTR("type"), STR_LEN("type"), STR_PTR("text"), STR_LEN("text"));
+    rc = mb_s_str(block, STR_PTR("text"), STR_LEN("text"), prompt_p, prompt_n);
+    rc = mb_a_push_node(content, block);
+    rc = mb_s_node(user_item, STR_PTR("content"), STR_LEN("content"), content);
+    rc = mb_s_str(user_item, STR_PTR("role"), STR_LEN("role"), STR_PTR("user"), STR_LEN("user"));
+    rc = mb_s_str(user_item, STR_PTR("status"), STR_LEN("status"), STR_PTR("completed"), STR_LEN("completed"));
+    let messages: u64 = mb_g_node(child, STR_PTR("messages"), STR_LEN("messages"));
+    rc = mb_a_push_node(messages, user_item);
+    let turn_rec: u64 = mb_new_obj();
+    rc = mb_s_str(turn_rec, STR_PTR("id"), STR_LEN("id"), mb_sp(&turn), turn.len);
+    rc = mb_s_str(turn_rec, STR_PTR("status"), STR_LEN("status"), STR_PTR("inProgress"), STR_LEN("inProgress"));
+    rc = mb_s_i64(turn_rec, STR_PTR("createdAt"), STR_LEN("createdAt"), mb_now_ms());
+    let turns: u64 = mb_g_node(child, STR_PTR("turns"), STR_LEN("turns"));
+    rc = mb_a_push_node(turns, turn_rec);
+    rc = mb_s_str(child, STR_PTR("activeTurnId"), STR_LEN("activeTurnId"), mb_sp(&turn), turn.len);
+    rc = mb_s_bool(child, STR_PTR("aborted"), STR_LEN("aborted"), false);
+    rc = mb_s_bool(child, STR_PTR("activeAbort"), STR_LEN("activeAbort"), true);
+    rc = mb_s_str(child, STR_PTR("subStatus"), STR_LEN("subStatus"), STR_PTR("running"), STR_LEN("running"));
+    if !mb_g_has(child, STR_PTR("preview"), STR_LEN("preview")) {
+        let prev = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_slice_to_s(prompt_p, prompt_n, 0, 80, &prev);
+        rc = mb_s_str(child, STR_PTR("preview"), STR_LEN("preview"), mb_sp(&prev), prev.len);
+    };
+    MiniBridge_persist(b, child);
+    let fired: u64 = MiniBridge_notify_child(b, mb_sp(&tid), tid.len);
+    let params: u64 = mb_turn_params(child, mb_sp(&turn), turn.len);
+    let turn_obj: u64 = mb_new_obj();
+    rc = mb_s_str(turn_obj, STR_PTR("id"), STR_LEN("id"), mb_sp(&turn), turn.len);
+    rc = mb_s_str(turn_obj, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&tid), tid.len);
+    let par = MbStr { bytes: [0u8; 8192], len: 0 };
+    if mb_g_str(child, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), &par) {
+        rc = mb_s_str(turn_obj, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), mb_sp(&par), par.len);
+    };
+    rc = mb_s_str(turn_obj, STR_PTR("status"), STR_LEN("status"), STR_PTR("inProgress"), STR_LEN("inProgress"));
+    rc = mb_s_node(params, STR_PTR("turn"), STR_LEN("turn"), turn_obj);
+    mb_emit_note(b, STR_PTR("turn/started"), STR_LEN("turn/started"), params);
+    let params2: u64 = mb_turn_params(child, mb_sp(&turn), turn.len);
+    rc = mb_s_node(params2, STR_PTR("item"), STR_LEN("item"), mb_clone_node(user_item));
+    mb_emit_note(b, STR_PTR("item/completed"), STR_LEN("item/completed"), params2);
+    MiniBridge_enqueue_child_turn(b, child, mb_sp(&turn), turn.len, prompt_p, prompt_n);
+}
+// TS: private drainMiniSubagentQueue(child).
+fn MiniBridge_drain_subagent_queue(b: &MiniBridgeState, child: u64) -> void {
+    if mb_g_has(child, STR_PTR("activeTurnId"), STR_LEN("activeTurnId")) { return; };
+    let inputs: u64 = mb_g_node(child, STR_PTR("pendingInputs"), STR_LEN("pendingInputs"));
+    if inputs == 0 || mb_n_count(inputs) == 0 { return; };
+    let next = MbStr { bytes: [0u8; 8192], len: 0 };
+    let ok: bool = mb_n_str(mb_a_at(inputs, 0), &next);
+    let rest: u64 = inputs;
+    mb_arr_remove_at(&rest, 0);
+    let rc: i32 = mb_s_node(child, STR_PTR("pendingInputs"), STR_LEN("pendingInputs"), rest);
+    MiniBridge_persist(b, child);
+    MiniBridge_start_child_turn(b, child, mb_sp(&next), next.len);
+}
+// TS: private finishMiniSubagent(child, status, report).
+fn MiniBridge_finish_subagent(b: &MiniBridgeState, handlers: &ServerHookHandlers, child: u64, status_p: ptr, status_n: u64, report_p: ptr, report_n: u64) -> void {
+    let tid = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_tid: bool = mb_g_str(child, STR_PTR("threadId"), STR_LEN("threadId"), &tid);
+    let cur: u64 = MiniBridge_get_session(b, mb_sp(&tid), tid.len);
+    if cur == 0 || cur != child { return; };
+    let rc: i32 = mb_s_str(child, STR_PTR("subStatus"), STR_LEN("subStatus"), status_p, status_n);
+    if report_n > 0 {
+        let rep = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_slice_to_s(report_p, report_n, 0, 8000, &rep);
+        rc = mb_s_str(child, STR_PTR("finalReport"), STR_LEN("finalReport"), mb_sp(&rep), rep.len);
+    } else if mb_bytes_eq(status_p, status_n, STR_PTR("completed"), STR_LEN("completed")) && !mb_g_has(child, STR_PTR("finalReport"), STR_LEN("finalReport")) {
+        rc = mb_s_str(child, STR_PTR("finalReport"), STR_LEN("finalReport"), STR_PTR(""), STR_LEN(""));
+    };
+    MiniBridge_persist(b, child);
+    let completed_report = MbStr { bytes: [0u8; 8192], len: 0 };
+    if mb_g_str(child, STR_PTR("finalReport"), STR_LEN("finalReport"), &completed_report) && completed_report.len > 8000 {
+        mb_slice_to_s(mb_sp(&completed_report), completed_report.len, 0, 8000, &completed_report);
+    };
+    let par = MbStr { bytes: [0u8; 8192], len: 0 };
+    if mb_g_str(child, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), &par) {
+        let params: u64 = mb_new_obj();
+        rc = mb_s_str(params, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), mb_sp(&par), par.len);
+        rc = mb_s_str(params, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&tid), tid.len);
+        rc = mb_s_str(params, STR_PTR("agent_id"), STR_LEN("agent_id"), mb_sp(&tid), tid.len);
+        let task_name = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_tn: bool = mb_g_str(child, STR_PTR("taskName"), STR_LEN("taskName"), &task_name);
+        rc = mb_s_str(params, STR_PTR("task_name"), STR_LEN("task_name"), mb_sp(&task_name), task_name.len);
+        rc = mb_s_str(params, STR_PTR("status"), STR_LEN("status"), status_p, status_n);
+        rc = mb_s_bool(params, STR_PTR("has_report"), STR_LEN("has_report"), completed_report.len > 0);
+        rc = mb_s_i64(params, STR_PTR("report_bytes"), STR_LEN("report_bytes"), completed_report.len as i64);
+        let preview = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_slice_to_s(mb_sp(&completed_report), completed_report.len, 0, 500, &preview);
+        rc = mb_s_str(params, STR_PTR("report_preview"), STR_LEN("report_preview"), mb_sp(&preview), preview.len);
+        rc = mb_s_str(params, STR_PTR("report"), STR_LEN("report"), mb_sp(&completed_report), completed_report.len);
+        mb_emit_note(b, STR_PTR("agent/completed"), STR_LEN("agent/completed"), params);
+        let params2: u64 = mb_new_obj();
+        rc = mb_s_str(params2, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&tid), tid.len);
+        rc = mb_s_str(params2, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), mb_sp(&par), par.len);
+        rc = mb_s_str(params2, STR_PTR("status"), STR_LEN("status"), status_p, status_n);
+        let rep2 = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_slice_to_s(mb_sp(&completed_report), completed_report.len, 0, 2000, &rep2);
+        rc = mb_s_str(params2, STR_PTR("report"), STR_LEN("report"), mb_sp(&rep2), rep2.len);
+        mb_emit_note(b, STR_PTR("agent/status/updated"), STR_LEN("agent/status/updated"), params2);
+        let parent: u64 = MiniBridge_get_session(b, mb_sp(&par), par.len);
+        if parent != 0 {
+            let marker_text = MbJson { bytes: [0u8; 262144], len: 0 };
+            mb_jassign(&marker_text, mb_sp(&completed_report), completed_report.len);
+            if heuristicMiniTokens(mb_jp(&marker_text), marker_text.len) > 900 {
+                let budget: u64 = marker_text.len;
+                if budget > 3600 { budget = 3600; };
+                while budget > 0 {
+                    let slice = MbStr { bytes: [0u8; 8192], len: 0 };
+                    mb_slice_to_s(mb_jp(&marker_text), marker_text.len, 0, budget, &slice);
+                    if heuristicMiniTokens(mb_sp(&slice), slice.len) <= 900 { break; };
+                    budget = (budget * 4) / 5;
+                }
+                let trimmed = MbStr { bytes: [0u8; 8192], len: 0 };
+                let slice2 = MbStr { bytes: [0u8; 8192], len: 0 };
+                mb_slice_to_s(mb_jp(&marker_text), marker_text.len, 0, budget, &slice2);
+                mb_trim_to(mb_sp(&slice2), slice2.len, &trimmed);
+                mb_jclear(&marker_text);
+                mb_jappend(&marker_text, mb_sp(&trimmed), trimmed.len);
+                mb_jappend(&marker_text, STR_PTR("…[truncated to ~1000 tokens; use read_agent_report for the full report]"), STR_LEN("…[truncated to ~1000 tokens; use read_agent_report for the full report]"));
+            };
+            let marker = MbJson { bytes: [0u8; 262144], len: 0 };
+            mb_jassign(&marker, STR_PTR("[sub-agent "), STR_LEN("[sub-agent "));
+            let tn2 = MbStr { bytes: [0u8; 8192], len: 0 };
+            if mb_g_str(child, STR_PTR("taskName"), STR_LEN("taskName"), &tn2) { mb_jappend(&marker, mb_sp(&tn2), tn2.len); } else { mb_jappend(&marker, mb_sp(&tid), tid.len); };
+            mb_jpush(&marker, 32);
+            mb_jappend(&marker, status_p, status_n);
+            mb_jappend(&marker, STR_PTR("]: "), STR_LEN("]: "));
+            mb_jappend(&marker, mb_jp(&marker_text), marker_text.len);
+            let mitem: u64 = mb_new_obj();
+            rc = mb_s_str(mitem, STR_PTR("type"), STR_LEN("type"), STR_PTR("userMessage"), STR_LEN("userMessage"));
+            let uuid = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_new_uuid(&uuid);
+            let mid = MbJson { bytes: [0u8; 262144], len: 0 };
+            mb_jassign(&mid, STR_PTR("mini-agent-done-"), STR_LEN("mini-agent-done-"));
+            mb_jappend(&mid, mb_sp(&uuid), 8);
+            rc = mb_s_str(mitem, STR_PTR("id"), STR_LEN("id"), mb_jp(&mid), mid.len);
+            let pturn = MbStr { bytes: [0u8; 8192], len: 0 };
+            if !mb_g_str(parent, STR_PTR("activeTurnId"), STR_LEN("activeTurnId"), &pturn) {
+                let ext = MbJson { bytes: [0u8; 262144], len: 0 };
+                mb_jassign(&ext, STR_PTR("mini-external-"), STR_LEN("mini-external-"));
+                let now_s = MbStr { bytes: [0u8; 8192], len: 0 };
+                mb_i64_to_s(mb_now_ms(), &now_s);
+                mb_jappend(&ext, mb_sp(&now_s), now_s.len);
+                mb_sassign(&pturn, mb_jp(&ext), ext.len);
+            };
+            rc = mb_s_str(mitem, STR_PTR("turnId"), STR_LEN("turnId"), mb_sp(&pturn), pturn.len);
+            let ptid = MbStr { bytes: [0u8; 8192], len: 0 };
+            let has_ptid: bool = mb_g_str(parent, STR_PTR("threadId"), STR_LEN("threadId"), &ptid);
+            rc = mb_s_str(mitem, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&ptid), ptid.len);
+            rc = mb_s_str(mitem, STR_PTR("text"), STR_LEN("text"), mb_jp(&marker), marker.len);
+            let mcontent: u64 = mb_new_arr();
+            let mblock: u64 = mb_new_obj();
+            rc = mb_s_str(mblock, STR_PTR("type"), STR_LEN("type"), STR_PTR("text"), STR_LEN("text"));
+            rc = mb_s_str(mblock, STR_PTR("text"), STR_LEN("text"), mb_jp(&marker), marker.len);
+            rc = mb_a_push_node(mcontent, mblock);
+            rc = mb_s_node(mitem, STR_PTR("content"), STR_LEN("content"), mcontent);
+            rc = mb_s_str(mitem, STR_PTR("role"), STR_LEN("role"), STR_PTR("user"), STR_LEN("user"));
+            rc = mb_s_str(mitem, STR_PTR("status"), STR_LEN("status"), STR_PTR("completed"), STR_LEN("completed"));
+            let pmsgs: u64 = mb_g_node(parent, STR_PTR("messages"), STR_LEN("messages"));
+            rc = mb_a_push_node(pmsgs, mitem);
+            MiniBridge_persist(b, parent);
+        };
+    };
+    MiniBridge_drain_subagent_queue(b, child);
+    let fired: u64 = MiniBridge_notify_child(b, mb_sp(&tid), tid.len);
+}
+// TS: private applyGoalDirective(s, text).
+fn MiniBridge_apply_goal_directive(s: u64, text_p: ptr, text_n: u64, out: &MbJson) -> void {
+    mb_jassign(out, text_p, text_n);
+    let status = MbStr { bytes: [0u8; 8192], len: 0 };
+    if !mb_g_str(s, STR_PTR("goalStatus"), STR_LEN("goalStatus"), &status) { return; };
+    if !mb_bytes_eq(mb_sp(&status), status.len, STR_PTR("active"), STR_LEN("active")) { return; };
+    let objective = MbStr { bytes: [0u8; 8192], len: 0 };
+    if !mb_g_str(s, STR_PTR("goalObjective"), STR_LEN("goalObjective"), &objective) { return; };
+    let obj_trim = MbStr { bytes: [0u8; 8192], len: 0 };
+    mb_trim_to(mb_sp(&objective), objective.len, &obj_trim);
+    if obj_trim.len == 0 { return; };
+    if mb_contains(text_p, text_n, STR_PTR(GOAL_CONTINUATION_MARKER), STR_LEN(GOAL_CONTINUATION_MARKER)) { return; };
+    if isMiniContinuationNudge(text_p, text_n) {
+        mb_jclear(out);
+        mb_jappend(out, STR_PTR("<persisted-goal>\nThis conversation has a persisted /goal objective. Treat it as the acceptance criteria of your work:\n"), STR_LEN("<persisted-goal>\nThis conversation has a persisted /goal objective. Treat it as the acceptance criteria of your work:\n"));
+        mb_jappend(out, mb_sp(&obj_trim), obj_trim.len);
+        mb_jappend(out, STR_PTR("\nWhen the objective is fully achieved and verified by tool output, reply with exactly GOAL_COMPLETE on its own line and stop.\n</persisted-goal>\n\n"), STR_LEN("\nWhen the objective is fully achieved and verified by tool output, reply with exactly GOAL_COMPLETE on its own line and stop.\n</persisted-goal>\n\n"));
+        mb_jappend(out, text_p, text_n);
+    };
+}
+// TS: private parkGoalAfterFailedTurn(s, err).
+fn MiniBridge_park_goal_after_failed_turn(b: &MiniBridgeState, s: u64, err_p: ptr, err_n: u64) -> bool {
+    if mb_g_has(s, STR_PTR("parentThreadId"), STR_LEN("parentThreadId")) { return false; };
+    let status = MbStr { bytes: [0u8; 8192], len: 0 };
+    if !mb_g_str(s, STR_PTR("goalStatus"), STR_LEN("goalStatus"), &status) { return false; };
+    if !mb_bytes_eq(mb_sp(&status), status.len, STR_PTR("active"), STR_LEN("active")) { return false; };
+    let objective = MbStr { bytes: [0u8; 8192], len: 0 };
+    if !mb_g_str(s, STR_PTR("goalObjective"), STR_LEN("goalObjective"), &objective) { return false; };
+    let obj_trim = MbStr { bytes: [0u8; 8192], len: 0 };
+    mb_trim_to(mb_sp(&objective), objective.len, &obj_trim);
+    if obj_trim.len == 0 { return false; };
+    if mb_is_goal_usage_limit_error(err_p, err_n) {
+        let rc: i32 = mb_s_str(s, STR_PTR("goalStatus"), STR_LEN("goalStatus"), STR_PTR("usageLimited"), STR_LEN("usageLimited"));
+    } else {
+        let rc: i32 = mb_s_str(s, STR_PTR("goalStatus"), STR_LEN("goalStatus"), STR_PTR("blocked"), STR_LEN("blocked"));
+    };
+    let tid = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_tid: bool = mb_g_str(s, STR_PTR("threadId"), STR_LEN("threadId"), &tid);
+    MiniBridge_clear_goal_timer(b, mb_sp(&tid), tid.len);
+    let rc2: i32 = mb_o_remove(b.goal_counts, mb_sp(&tid), tid.len);
+    return true;
+}
+// TS: private failTurn(s, turnId, err).
+fn MiniBridge_fail_turn(b: &MiniBridgeState, handlers: &ServerHookHandlers, s: u64, turn_p: ptr, turn_n: u64, err_p: ptr, err_n: u64) -> void {
+    let turn: u64 = mb_sess_turn(s, turn_p, turn_n);
+    if turn == 0 { return; };
+    let tstatus = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_ts: bool = mb_g_str(turn, STR_PTR("status"), STR_LEN("status"), &tstatus);
+    if !mb_bytes_eq(mb_sp(&tstatus), tstatus.len, STR_PTR("inProgress"), STR_LEN("inProgress")) && !mb_bytes_eq(mb_sp(&tstatus), tstatus.len, STR_PTR("in_progress"), STR_LEN("in_progress")) { return; };
+    let active = MbStr { bytes: [0u8; 8192], len: 0 };
+    if !mb_g_str(s, STR_PTR("activeTurnId"), STR_LEN("activeTurnId"), &active) { return; };
+    if !mb_bytes_eq(mb_sp(&active), active.len, turn_p, turn_n) { return; };
+    let tid = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_tid: bool = mb_g_str(s, STR_PTR("threadId"), STR_LEN("threadId"), &tid);
+    MiniBridge_flush_deltas(b, mb_sp(&tid), tid.len, turn_p, turn_n);
+    let messages: u64 = mb_g_node(s, STR_PTR("messages"), STR_LEN("messages"));
+    let closed: u64 = 0;
+    closeMiniOpenSegments(messages, turn_p, turn_n, STR_PTR("failed"), STR_LEN("failed"), &closed);
+    let reason_item: u64 = mb_new_obj();
+    let rc: i32 = mb_s_str(reason_item, STR_PTR("type"), STR_LEN("type"), STR_PTR("reasoning"), STR_LEN("reasoning"));
+    let rid = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_jassign(&rid, STR_PTR("mini-reason-"), STR_LEN("mini-reason-"));
+    mb_jappend(&rid, turn_p, turn_n);
+    rc = mb_s_str(reason_item, STR_PTR("id"), STR_LEN("id"), mb_jp(&rid), rid.len);
+    rc = mb_s_str(reason_item, STR_PTR("status"), STR_LEN("status"), STR_PTR("failed"), STR_LEN("failed"));
+    let params0: u64 = mb_turn_params(s, turn_p, turn_n);
+    rc = mb_s_node(params0, STR_PTR("item"), STR_LEN("item"), reason_item);
+    mb_emit_note(b, STR_PTR("item/completed"), STR_LEN("item/completed"), params0);
+    let max_for_card: i64 = MINI_STREAM_RETRY_DEFAULT() as i64;
+    let ok_max: bool = mb_g_i64(s, STR_PTR("activeMaxRetries"), STR_LEN("activeMaxRetries"), &max_for_card);
+    let friendly = MbJson { bytes: [0u8; 262144], len: 0 };
+    formatMiniUpstreamError(err_p, err_n, max_for_card as u64, &friendly);
+    let err_item: u64 = mb_new_obj();
+    rc = mb_s_str(err_item, STR_PTR("type"), STR_LEN("type"), STR_PTR("error"), STR_LEN("error"));
+    let eid = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_jassign(&eid, STR_PTR("mini-err-"), STR_LEN("mini-err-"));
+    mb_jappend(&eid, turn_p, turn_n);
+    rc = mb_s_str(err_item, STR_PTR("id"), STR_LEN("id"), mb_jp(&eid), eid.len);
+    rc = mb_s_str(err_item, STR_PTR("title"), STR_LEN("title"), STR_PTR("Mini request failed"), STR_LEN("Mini request failed"));
+    rc = mb_s_str(err_item, STR_PTR("text"), STR_LEN("text"), mb_jp(&friendly), friendly.len);
+    rc = mb_s_str(err_item, STR_PTR("status"), STR_LEN("status"), STR_PTR("failed"), STR_LEN("failed"));
+    let payload: u64 = mb_new_obj();
+    rc = mb_s_bool(payload, STR_PTR("retryError"), STR_LEN("retryError"), true);
+    rc = mb_s_bool(payload, STR_PTR("exhausted"), STR_LEN("exhausted"), true);
+    rc = mb_s_str(payload, STR_PTR("retrySource"), STR_LEN("retrySource"), STR_PTR("mini"), STR_LEN("mini"));
+    rc = mb_s_i64(payload, STR_PTR("attempt"), STR_LEN("attempt"), max_for_card);
+    rc = mb_s_i64(payload, STR_PTR("max"), STR_LEN("max"), max_for_card);
+    rc = mb_s_node(err_item, STR_PTR("payload"), STR_LEN("payload"), payload);
+    rc = mb_a_push_node(messages, mb_clone_node(err_item));
+    rc = mb_s_str(turn, STR_PTR("status"), STR_LEN("status"), STR_PTR("failed"), STR_LEN("failed"));
+    mb_sess_clear_active(s);
+    // goalContinuationTurnKeys.delete(`${threadId}:${turnId}`)
+    let gkey = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_key2(mb_sp(&tid), tid.len, 58, turn_p, turn_n, &gkey);
+    let gcount: u64 = mb_n_count(b.goal_turn_keys);
+    let gi: u64 = 0;
+    while gi < gcount {
+        let entry = MbStr { bytes: [0u8; 8192], len: 0 };
+        if mb_n_str(mb_a_at(b.goal_turn_keys, gi), &entry) && mb_bytes_eq(mb_sp(&entry), entry.len, mb_jp(&gkey), gkey.len) {
+            mb_arr_remove_at(&b.goal_turn_keys, gi);
+            break;
+        };
+        gi = gi + 1;
+    }
+    rc = mb_s_bool(s, STR_PTR("aborted"), STR_LEN("aborted"), false);
+    let parked: bool = MiniBridge_park_goal_after_failed_turn(b, s, err_p, err_n);
+    MiniBridge_persist(b, s);
+    MiniBridge_fail_retry_notice(b, s, turn_p, turn_n);
+    let params1: u64 = mb_turn_params(s, turn_p, turn_n);
+    rc = mb_s_node(params1, STR_PTR("item"), STR_LEN("item"), err_item);
+    mb_emit_note(b, STR_PTR("item/completed"), STR_LEN("item/completed"), params1);
+    if parked {
+        let goal_text = MbJson { bytes: [0u8; 262144], len: 0 };
+        miniGoalState(s, &goal_text);
+        let gparams: u64 = mb_new_obj();
+        rc = mb_s_node(gparams, STR_PTR("goal"), STR_LEN("goal"), mb_parse(mb_jp(&goal_text), goal_text.len));
+        mb_emit_note(b, STR_PTR("thread/goal/updated"), STR_LEN("thread/goal/updated"), gparams);
+    };
+    // turn/failed: {turn: {...}, error: friendly}
+    let params2: u64 = mb_turn_params(s, turn_p, turn_n);
+    let turn_obj: u64 = mb_new_obj();
+    rc = mb_s_str(turn_obj, STR_PTR("id"), STR_LEN("id"), turn_p, turn_n);
+    rc = mb_s_str(turn_obj, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&tid), tid.len);
+    let par = MbStr { bytes: [0u8; 8192], len: 0 };
+    if mb_g_str(s, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), &par) {
+        rc = mb_s_str(turn_obj, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), mb_sp(&par), par.len);
+    };
+    rc = mb_s_str(turn_obj, STR_PTR("status"), STR_LEN("status"), STR_PTR("failed"), STR_LEN("failed"));
+    rc = mb_s_i64(turn_obj, STR_PTR("completedAt"), STR_LEN("completedAt"), mb_now_ms() / 1000);
+    rc = mb_s_node(params2, STR_PTR("turn"), STR_LEN("turn"), turn_obj);
+    rc = mb_s_str(params2, STR_PTR("error"), STR_LEN("error"), mb_jp(&friendly), friendly.len);
+    mb_emit_note(b, STR_PTR("turn/failed"), STR_LEN("turn/failed"), params2);
+    mb_fire_finish_hook(handlers, s, turn_p, turn_n, STR_PTR("failed"), STR_LEN("failed"), mb_jp(&friendly), friendly.len);
+    if mb_g_has(s, STR_PTR("parentThreadId"), STR_LEN("parentThreadId")) {
+        MiniBridge_finish_subagent(b, handlers, s, STR_PTR("failed"), STR_LEN("failed"), mb_jp(&friendly), friendly.len);
+    };
+}
+// TS: private interruptTurn(s, turnId).
+fn MiniBridge_interrupt_turn(b: &MiniBridgeState, handlers: &ServerHookHandlers, s: u64, turn_p: ptr, turn_n: u64) -> void {
+    let turn: u64 = mb_sess_turn(s, turn_p, turn_n);
+    if turn == 0 { return; };
+    let tstatus = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_ts: bool = mb_g_str(turn, STR_PTR("status"), STR_LEN("status"), &tstatus);
+    if !mb_bytes_eq(mb_sp(&tstatus), tstatus.len, STR_PTR("inProgress"), STR_LEN("inProgress")) && !mb_bytes_eq(mb_sp(&tstatus), tstatus.len, STR_PTR("in_progress"), STR_LEN("in_progress")) { return; };
+    let active = MbStr { bytes: [0u8; 8192], len: 0 };
+    if !mb_g_str(s, STR_PTR("activeTurnId"), STR_LEN("activeTurnId"), &active) { return; };
+    if !mb_bytes_eq(mb_sp(&active), active.len, turn_p, turn_n) { return; };
+    let tid = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_tid: bool = mb_g_str(s, STR_PTR("threadId"), STR_LEN("threadId"), &tid);
+    if mb_g_has(s, STR_PTR("parentThreadId"), STR_LEN("parentThreadId")) {
+        MiniBridge_cancel_queued_child_turn(b, s, turn_p, turn_n, true);
+    };
+    MiniBridge_flush_deltas(b, mb_sp(&tid), tid.len, turn_p, turn_n);
+    let messages: u64 = mb_g_node(s, STR_PTR("messages"), STR_LEN("messages"));
+    let closed: u64 = 0;
+    closeMiniOpenSegments(messages, turn_p, turn_n, STR_PTR("interrupted"), STR_LEN("interrupted"), &closed);
+    let reason_item: u64 = mb_new_obj();
+    let rc: i32 = mb_s_str(reason_item, STR_PTR("type"), STR_LEN("type"), STR_PTR("reasoning"), STR_LEN("reasoning"));
+    let rid = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_jassign(&rid, STR_PTR("mini-reason-"), STR_LEN("mini-reason-"));
+    mb_jappend(&rid, turn_p, turn_n);
+    rc = mb_s_str(reason_item, STR_PTR("id"), STR_LEN("id"), mb_jp(&rid), rid.len);
+    rc = mb_s_str(reason_item, STR_PTR("turnId"), STR_LEN("turnId"), turn_p, turn_n);
+    rc = mb_s_str(reason_item, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&tid), tid.len);
+    rc = mb_s_str(reason_item, STR_PTR("status"), STR_LEN("status"), STR_PTR("interrupted"), STR_LEN("interrupted"));
+    let params0: u64 = mb_turn_params(s, turn_p, turn_n);
+    rc = mb_s_node(params0, STR_PTR("item"), STR_LEN("item"), reason_item);
+    mb_emit_note(b, STR_PTR("item/completed"), STR_LEN("item/completed"), params0);
+    rc = mb_s_str(turn, STR_PTR("status"), STR_LEN("status"), STR_PTR("interrupted"), STR_LEN("interrupted"));
+    mb_sess_clear_active(s);
+    let gkey = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_key2(mb_sp(&tid), tid.len, 58, turn_p, turn_n, &gkey);
+    let gcount: u64 = mb_n_count(b.goal_turn_keys);
+    let gi: u64 = 0;
+    while gi < gcount {
+        let entry = MbStr { bytes: [0u8; 8192], len: 0 };
+        if mb_n_str(mb_a_at(b.goal_turn_keys, gi), &entry) && mb_bytes_eq(mb_sp(&entry), entry.len, mb_jp(&gkey), gkey.len) {
+            mb_arr_remove_at(&b.goal_turn_keys, gi);
+            break;
+        };
+        gi = gi + 1;
+    }
+    MiniBridge_persist(b, s);
+    MiniBridge_fail_retry_notice(b, s, turn_p, turn_n);
+    mb_emit_turn_settled(b, s, turn_p, turn_n, STR_PTR("turn/interrupted"), STR_LEN("turn/interrupted"), STR_PTR("interrupted"), STR_LEN("interrupted"));
+    mb_fire_finish_hook(handlers, s, turn_p, turn_n, STR_PTR("interrupted"), STR_LEN("interrupted"), STR_PTR(""), STR_LEN(""));
+    if mb_g_has(s, STR_PTR("parentThreadId"), STR_LEN("parentThreadId")) {
+        MiniBridge_finish_subagent(b, handlers, s, STR_PTR("interrupted"), STR_LEN("interrupted"), STR_PTR(""), STR_LEN(""));
+    };
+}
+
+// TS: private miniChildOwnerVisible(parent, childOwner) — child session doc
+// form (owner read from the child doc).
+fn MiniBridge_child_owner_visible(parent: u64, child: u64) -> bool {
+    let co = MbStr { bytes: [0u8; 8192], len: 0 };
+    if !mb_g_str(child, STR_PTR("ownerId"), STR_LEN("ownerId"), &co) { return true; };
+    if mb_bytes_eq(mb_sp(&co), co.len, STR_PTR("local"), STR_LEN("local")) { return true; };
+    let po = MbStr { bytes: [0u8; 8192], len: 0 };
+    if !mb_g_str(parent, STR_PTR("ownerId"), STR_LEN("ownerId"), &po) { return false; };
+    if mb_bytes_eq(mb_sp(&po), po.len, STR_PTR("local"), STR_LEN("local")) { return false; };
+    return mb_bytes_eq(mb_sp(&co), co.len, mb_sp(&po), po.len);
+}
+fn mb_req_trim_str(r: u64, key_p: ptr, key_n: u64, out: &MbStr) -> bool {
+    let raw = MbStr { bytes: [0u8; 8192], len: 0 };
+    if !mb_g_str(r, key_p, key_n, &raw) { return false; };
+    mb_trim_to(mb_sp(&raw), raw.len, out);
+    return out.len > 0;
+}
+// TS: String(r.threadId ?? "") — string as-is; other scalars via String().
+fn mb_req_id(r: u64, key_p: ptr, key_n: u64, out: &MbStr) -> void {
+    out.len = 0;
+    if mb_g_str(r, key_p, key_n, out) { return; };
+    let node: u64 = mb_g_node(r, key_p, key_n);
+    if node != 0 {
+        let text = MbJson { bytes: [0u8; 262144], len: 0 };
+        mb_json_scalar_text(node, &text);
+        mb_sassign(out, mb_jp(&text), text.len);
+    };
+}
+// Interrupt-or-abortPending block shared by thread/delete + thread/archive
+// (TS order: aborted, cancelledTurnIds.add, activeAbort.abort(),
+// abortPendingUserInput, pendingSteers/steerTurnId cleared, queuedTurns=[],
+// then interruptTurn when an active turn exists).
+fn mb_interrupt_session_for_removal(b: &MiniBridgeState, handlers: &ServerHookHandlers, s: u64) -> void {
+    let tid = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_tid: bool = mb_g_str(s, STR_PTR("threadId"), STR_LEN("threadId"), &tid);
+    let active = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_active: bool = mb_g_str(s, STR_PTR("activeTurnId"), STR_LEN("activeTurnId"), &active);
+    if has_active {
+        let rc: i32 = mb_s_bool(s, STR_PTR("aborted"), STR_LEN("aborted"), true);
+        mb_sess_cancel_turn(s, mb_sp(&active), active.len);
+        MiniBridge_abort_pending_user_input(b, mb_sp(&tid), tid.len);
+        rc = mb_o_remove(s, STR_PTR("pendingSteers"), STR_LEN("pendingSteers"));
+        rc = mb_o_remove(s, STR_PTR("steerTurnId"), STR_LEN("steerTurnId"));
+        rc = mb_s_node(s, STR_PTR("queuedTurns"), STR_LEN("queuedTurns"), mb_new_arr());
+        MiniBridge_interrupt_turn(b, handlers, s, mb_sp(&active), active.len);
+    } else {
+        MiniBridge_abort_pending_user_input(b, mb_sp(&tid), tid.len);
+    };
+}
+fn mb_collect_child_ids(b: &MiniBridgeState, parent_p: ptr, parent_n: u64, out: &u64) -> void {
+    let ids: u64 = mb_new_arr();
+    let count: u64 = mb_n_count(b.sessions);
+    let i: u64 = 0;
+    while i < count {
+        let kp: ptr = PTR_NULL();
+        let kn: u64 = 0;
+        if mb_key_at(b.sessions, i, &kp, &kn) {
+            let cs: u64 = mb_g_node(b.sessions, kp, kn);
+            if cs != 0 {
+                let par = MbStr { bytes: [0u8; 8192], len: 0 };
+                if mb_g_str(cs, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), &par) && mb_bytes_eq(mb_sp(&par), par.len, parent_p, parent_n) {
+                    let rc: i32 = mb_a_push_str(ids, kp, kn);
+                };
+            };
+        };
+        i = i + 1;
+    }
+    *out = ids;
+}
+// {thread: {id, cliBackend: "mini", status: {type: "idle"}, turns: []}, items: []}
+fn mb_sanitized_thread_result(thread_p: ptr, thread_n: u64, out: &u64) -> void {
+    let t: u64 = mb_new_obj();
+    let rc: i32 = mb_s_str(t, STR_PTR("id"), STR_LEN("id"), thread_p, thread_n);
+    rc = mb_s_str(t, STR_PTR("cliBackend"), STR_LEN("cliBackend"), STR_PTR("mini"), STR_LEN("mini"));
+    let st: u64 = mb_new_obj();
+    rc = mb_s_str(st, STR_PTR("type"), STR_LEN("type"), STR_PTR("idle"), STR_LEN("idle"));
+    rc = mb_s_node(t, STR_PTR("status"), STR_LEN("status"), st);
+    rc = mb_s_node(t, STR_PTR("turns"), STR_LEN("turns"), mb_new_arr());
+    let res: u64 = mb_new_obj();
+    rc = mb_s_node(res, STR_PTR("thread"), STR_LEN("thread"), t);
+    rc = mb_s_node(res, STR_PTR("items"), STR_LEN("items"), mb_new_arr());
+    *out = res;
+}
+// thread/read + thread/resume return projection.
+fn mb_thread_projection(s: u64, include_turns: bool, out: &u64) -> void {
+    let tid = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_tid: bool = mb_g_str(s, STR_PTR("threadId"), STR_LEN("threadId"), &tid);
+    let t: u64 = mb_new_obj();
+    let rc: i32 = mb_s_str(t, STR_PTR("id"), STR_LEN("id"), mb_sp(&tid), tid.len);
+    rc = mb_s_str(t, STR_PTR("cliBackend"), STR_LEN("cliBackend"), STR_PTR("mini"), STR_LEN("mini"));
+    rc = mb_s_str(t, STR_PTR("historyMode"), STR_LEN("historyMode"), STR_PTR("paginated"), STR_LEN("paginated"));
+    let v = MbStr { bytes: [0u8; 8192], len: 0 };
+    if mb_g_str(s, STR_PTR("cwd"), STR_LEN("cwd"), &v) { rc = mb_s_str(t, STR_PTR("cwd"), STR_LEN("cwd"), mb_sp(&v), v.len); };
+    let roots: u64 = mb_g_node(s, STR_PTR("additionalRoots"), STR_LEN("additionalRoots"));
+    if roots != 0 { rc = mb_s_node(t, STR_PTR("additionalRoots"), STR_LEN("additionalRoots"), mb_clone_node(roots)); } else { rc = mb_s_node(t, STR_PTR("additionalRoots"), STR_LEN("additionalRoots"), mb_new_arr()); };
+    let prov: u64 = mb_g_node(s, STR_PTR("providerId"), STR_LEN("providerId"));
+    if prov != 0 { rc = mb_s_node(t, STR_PTR("providerId"), STR_LEN("providerId"), mb_clone_node(prov)); } else { rc = mb_s_null(t, STR_PTR("providerId"), STR_LEN("providerId")); };
+    let grp: u64 = mb_g_node(s, STR_PTR("groupId"), STR_LEN("groupId"));
+    if grp != 0 { rc = mb_s_node(t, STR_PTR("groupId"), STR_LEN("groupId"), mb_clone_node(grp)); } else { rc = mb_s_null(t, STR_PTR("groupId"), STR_LEN("groupId")); };
+    if mb_g_str(s, STR_PTR("model"), STR_LEN("model"), &v) { rc = mb_s_str(t, STR_PTR("model"), STR_LEN("model"), mb_sp(&v), v.len); };
+    let name = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_name: bool = mb_g_str(s, STR_PTR("name"), STR_LEN("name"), &name);
+    if !has_name { has_name = mb_g_str(s, STR_PTR("preview"), STR_LEN("preview"), &name); };
+    if has_name { rc = mb_s_str(t, STR_PTR("name"), STR_LEN("name"), mb_sp(&name), name.len); } else { rc = mb_s_null(t, STR_PTR("name"), STR_LEN("name")); };
+    let eff = MbStr { bytes: [0u8; 8192], len: 0 };
+    if !mb_g_str(s, STR_PTR("effort"), STR_LEN("effort"), &eff) { mb_sassign(&eff, STR_PTR("medium"), STR_LEN("medium")); };
+    rc = mb_s_str(t, STR_PTR("reasoning_effort"), STR_LEN("reasoning_effort"), mb_sp(&eff), eff.len);
+    rc = mb_s_str(t, STR_PTR("effort"), STR_LEN("effort"), mb_sp(&eff), eff.len);
+    let sb: u64 = mb_g_node(s, STR_PTR("sandbox"), STR_LEN("sandbox"));
+    if sb != 0 { rc = mb_s_node(t, STR_PTR("sandbox"), STR_LEN("sandbox"), mb_clone_node(sb)); } else { rc = mb_s_null(t, STR_PTR("sandbox"), STR_LEN("sandbox")); };
+    let ap: u64 = mb_g_node(s, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"));
+    if ap != 0 { rc = mb_s_node(t, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"), mb_clone_node(ap)); } else { rc = mb_s_null(t, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy")); };
+    let par = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_par: bool = mb_g_str(s, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), &par);
+    if has_par { rc = mb_s_str(t, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), mb_sp(&par), par.len); } else { rc = mb_s_null(t, STR_PTR("parentThreadId"), STR_LEN("parentThreadId")); };
+    if has_par {
+        let role = MbStr { bytes: [0u8; 8192], len: 0 };
+        if !mb_g_str(s, STR_PTR("agentType"), STR_LEN("agentType"), &role) { mb_sassign(&role, STR_PTR("agent"), STR_LEN("agent")); };
+        rc = mb_s_str(t, STR_PTR("agentRole"), STR_LEN("agentRole"), mb_sp(&role), role.len);
+    } else {
+        rc = mb_s_null(t, STR_PTR("agentRole"), STR_LEN("agentRole"));
+    };
+    rc = mb_s_bool(t, STR_PTR("canAcceptDirectInput"), STR_LEN("canAcceptDirectInput"), !has_par);
+    let st: u64 = mb_new_obj();
+    let has_active: bool = mb_g_has(s, STR_PTR("activeTurnId"), STR_LEN("activeTurnId"));
+    rc = mb_s_str(st, STR_PTR("type"), STR_LEN("type"), if has_active { STR_PTR("running") } else { STR_PTR("idle") }, if has_active { STR_LEN("running") } else { STR_LEN("idle") });
+    rc = mb_s_node(t, STR_PTR("status"), STR_LEN("status"), st);
+    // turns projection: {...turn, threadId, items: messages of that turn}
+    let turns_out: u64 = mb_new_arr();
+    let messages: u64 = mb_g_node(s, STR_PTR("messages"), STR_LEN("messages"));
+    if include_turns {
+        let turns: u64 = mb_g_node(s, STR_PTR("turns"), STR_LEN("turns"));
+        let tc: u64 = mb_n_count(turns);
+        let i: u64 = 0;
+        while i < tc {
+            let turn: u64 = mb_a_at(turns, i);
+            let proj: u64 = mb_clone_node(turn);
+            rc = mb_s_str(proj, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&tid), tid.len);
+            let turn_id = MbStr { bytes: [0u8; 8192], len: 0 };
+            let has_turn_id: bool = mb_g_str(turn, STR_PTR("id"), STR_LEN("id"), &turn_id);
+            let items: u64 = mb_new_arr();
+            let mc: u64 = mb_n_count(messages);
+            let j: u64 = 0;
+            while j < mc {
+                let m: u64 = mb_a_at(messages, j);
+                if m != 0 {
+                    let mt = MbStr { bytes: [0u8; 8192], len: 0 };
+                    if mb_g_str(m, STR_PTR("turnId"), STR_LEN("turnId"), &mt) && mb_bytes_eq(mb_sp(&mt), mt.len, mb_sp(&turn_id), turn_id.len) {
+                        let rc2: i32 = mb_a_push_node(items, mb_clone_node(m));
+                    };
+                };
+                j = j + 1;
+            }
+            rc = mb_s_node(proj, STR_PTR("items"), STR_LEN("items"), items);
+            rc = mb_a_push_node(turns_out, proj);
+            i = i + 1;
+        }
+    };
+    rc = mb_s_node(t, STR_PTR("turns"), STR_LEN("turns"), turns_out);
+    let res: u64 = mb_new_obj();
+    rc = mb_s_node(res, STR_PTR("thread"), STR_LEN("thread"), t);
+    if include_turns && messages != 0 { rc = mb_s_node(res, STR_PTR("items"), STR_LEN("items"), mb_clone_node(messages)); } else { rc = mb_s_node(res, STR_PTR("items"), STR_LEN("items"), mb_new_arr()); };
+    *out = res;
+}
+// TS: async request(method, params) — part 1 (thread lifecycle cases).
+// Result/throw channel: *out = result doc; throw -> out_err text + flag.
+// DEFECT(host): options.loadMetadata is a host callback (fn values cannot
+// be stored/invoked, FIX_PHASE1 §9) — the metadata fast paths in
+// thread/read and turn/start are unwired, exactly like an options object
+// without loadMetadata in TS; the snapshot store (b.snapshots) is the
+// persistence landing for persist()/deleteSnapshot/setArchivedSnapshot.
+fn MiniBridge_request(b: &MiniBridgeState, cache: &MiniMcpCacheState, mstate: &MiniMcpModuleState, handlers: &ServerHookHandlers, method_p: ptr, method_n: u64, r: u64, default_cwd_p: ptr, default_cwd_n: u64, out: &u64, out_err: &MbJson, out_throw: &bool) -> void {
+    *out = 0;
+    *out_throw = false;
+    mb_jclear(out_err);
+    let rr: u64 = r;
+    if rr == 0 { rr = mb_new_obj(); };
+    if mb_bytes_eq(method_p, method_n, STR_PTR("thread/start"), STR_LEN("thread/start")) {
+        let thread = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_new_uuid(&thread);
+        let cwd = MbStr { bytes: [0u8; 8192], len: 0 };
+        if !mb_req_trim_str(rr, STR_PTR("cwd"), STR_LEN("cwd"), &cwd) { mb_sassign(&cwd, default_cwd_p, default_cwd_n); };
+        let s: u64 = mb_new_obj();
+        let rc: i32 = mb_s_str(s, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&thread), thread.len);
+        let v = MbStr { bytes: [0u8; 8192], len: 0 };
+        if mb_g_str(rr, STR_PTR("ownerId"), STR_LEN("ownerId"), &v) { rc = mb_s_str(s, STR_PTR("ownerId"), STR_LEN("ownerId"), mb_sp(&v), v.len); };
+        rc = mb_s_str(s, STR_PTR("cwd"), STR_LEN("cwd"), mb_sp(&cwd), cwd.len);
+        if !mb_g_str(rr, STR_PTR("model"), STR_LEN("model"), &v) { mb_sassign(&v, STR_PTR("gpt-5-mini"), STR_LEN("gpt-5-mini")); };
+        rc = mb_s_str(s, STR_PTR("model"), STR_LEN("model"), mb_sp(&v), v.len);
+        let roots: u64 = 0;
+        let has_roots: bool = false;
+        miniAdditionalRoots(rr, mb_sp(&cwd), cwd.len, &roots, &has_roots);
+        if has_roots { rc = mb_s_node(s, STR_PTR("additionalRoots"), STR_LEN("additionalRoots"), roots); };
+        if mb_g_str(rr, STR_PTR("providerId"), STR_LEN("providerId"), &v) { rc = mb_s_str(s, STR_PTR("providerId"), STR_LEN("providerId"), mb_sp(&v), v.len); };
+        if mb_g_str(rr, STR_PTR("groupId"), STR_LEN("groupId"), &v) { rc = mb_s_str(s, STR_PTR("groupId"), STR_LEN("groupId"), mb_sp(&v), v.len); };
+        let eff = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_eff: bool = false;
+        extractMiniEffort(rr, &eff, &has_eff);
+        if !has_eff { mb_sassign(&eff, STR_PTR("medium"), STR_LEN("medium")); };
+        rc = mb_s_str(s, STR_PTR("effort"), STR_LEN("effort"), mb_sp(&eff), eff.len);
+        let sb = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_sb: bool = false;
+        normalizeMiniSandbox(mb_g_node(rr, STR_PTR("sandbox"), STR_LEN("sandbox")), &sb, &has_sb);
+        if has_sb { rc = mb_s_str(s, STR_PTR("sandbox"), STR_LEN("sandbox"), mb_sp(&sb), sb.len); };
+        let ap = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_ap: bool = false;
+        normalizeMiniSandbox(mb_g_node(rr, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy")), &ap, &has_ap);
+        if has_ap { rc = mb_s_str(s, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"), mb_sp(&ap), ap.len); };
+        let pure: bool = false;
+        let ok_pure: bool = mb_g_bool(rr, STR_PTR("pureChat"), STR_LEN("pureChat"), &pure);
+        rc = mb_s_bool(s, STR_PTR("pureChat"), STR_LEN("pureChat"), pure);
+        rc = mb_s_i64(s, STR_PTR("createdAt"), STR_LEN("createdAt"), mb_now_ms());
+        rc = mb_s_node(s, STR_PTR("turns"), STR_LEN("turns"), mb_new_arr());
+        rc = mb_s_node(s, STR_PTR("messages"), STR_LEN("messages"), mb_new_arr());
+        MiniBridge_set_session(b, mb_sp(&thread), thread.len, s);
+        MiniBridge_persist(b, s);
+        bootstrapProjectSaVmAssets(mb_sp(&cwd), cwd.len, mb_sp(&thread), thread.len, true);
+        let tobj: u64 = mb_new_obj();
+        rc = mb_s_str(tobj, STR_PTR("id"), STR_LEN("id"), mb_sp(&thread), thread.len);
+        rc = mb_s_str(tobj, STR_PTR("cliBackend"), STR_LEN("cliBackend"), STR_PTR("mini"), STR_LEN("mini"));
+        rc = mb_s_str(tobj, STR_PTR("cwd"), STR_LEN("cwd"), mb_sp(&cwd), cwd.len);
+        let model = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_model: bool = mb_g_str(s, STR_PTR("model"), STR_LEN("model"), &model);
+        rc = mb_s_str(tobj, STR_PTR("model"), STR_LEN("model"), mb_sp(&model), model.len);
+        let sbn: u64 = mb_g_node(s, STR_PTR("sandbox"), STR_LEN("sandbox"));
+        if sbn != 0 { rc = mb_s_node(tobj, STR_PTR("sandbox"), STR_LEN("sandbox"), mb_clone_node(sbn)); } else { rc = mb_s_null(tobj, STR_PTR("sandbox"), STR_LEN("sandbox")); };
+        let apn: u64 = mb_g_node(s, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"));
+        if apn != 0 { rc = mb_s_node(tobj, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"), mb_clone_node(apn)); } else { rc = mb_s_null(tobj, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy")); };
+        rc = mb_s_str(tobj, STR_PTR("status"), STR_LEN("status"), STR_PTR("active"), STR_LEN("active"));
+        rc = mb_s_i64(tobj, STR_PTR("createdAt"), STR_LEN("createdAt"), mb_now_ms());
+        let res: u64 = mb_new_obj();
+        rc = mb_s_node(res, STR_PTR("thread"), STR_LEN("thread"), tobj);
+        rc = mb_s_str(res, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&thread), thread.len);
+        *out = res;
+        return;
+    };
+    if mb_bytes_eq(method_p, method_n, STR_PTR("thread/read"), STR_LEN("thread/read")) || mb_bytes_eq(method_p, method_n, STR_PTR("thread/resume"), STR_LEN("thread/resume")) {
+        let is_resume: bool = mb_bytes_eq(method_p, method_n, STR_PTR("thread/resume"), STR_LEN("thread/resume"));
+        let thread = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_req_id(rr, STR_PTR("threadId"), STR_LEN("threadId"), &thread);
+        let owner = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_owner: bool = mb_g_str(rr, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner);
+        let include_turns: bool = true;
+        let itv: bool = true;
+        if mb_g_bool(rr, STR_PTR("includeTurns"), STR_LEN("includeTurns"), &itv) { include_turns = itv; };
+        let s: u64 = 0;
+        let has_s: bool = false;
+        MiniBridge_get_or_restore_session(b, mb_sp(&thread), thread.len, mb_sp(&owner), owner.len, has_owner, &s, &has_s);
+        if !has_s {
+            if is_resume {
+                let msg = MbJson { bytes: [0u8; 262144], len: 0 };
+                mb_jassign(&msg, STR_PTR("thread/resume: thread not found or not owned by this session: "), STR_LEN("thread/resume: thread not found or not owned by this session: "));
+                mb_jappend(&msg, mb_sp(&thread), thread.len);
+                mb_throw_j(out_err, out_throw, &msg);
+                return;
+            };
+            if MiniBridge_get_session(b, mb_sp(&thread), thread.len) != 0 {
+                mb_sanitized_thread_result(mb_sp(&thread), thread.len, out);
+                return;
+            };
+            let msg2 = MbJson { bytes: [0u8; 262144], len: 0 };
+            mb_jassign(&msg2, STR_PTR("thread not found: "), STR_LEN("thread not found: "));
+            mb_jappend(&msg2, mb_sp(&thread), thread.len);
+            mb_throw_j(out_err, out_throw, &msg2);
+            return;
+        };
+        if is_resume {
+            let par = MbStr { bytes: [0u8; 8192], len: 0 };
+            if mb_g_str(s, STR_PTR("parentThreadId"), STR_LEN("parentThreadId"), &par) {
+                let parent: u64 = MiniBridge_get_session(b, mb_sp(&par), par.len);
+                if parent == 0 || !MiniBridge_child_owner_visible(parent, s) {
+                    let msg = MbJson { bytes: [0u8; 262144], len: 0 };
+                    mb_jassign(&msg, STR_PTR("cannot resume multi-agent v2 child "), STR_LEN("cannot resume multi-agent v2 child "));
+                    mb_jappend(&msg, mb_sp(&thread), thread.len);
+                    mb_jappend(&msg, STR_PTR(": parent ownership is unavailable; resume the parent first"), STR_LEN(": parent ownership is unavailable; resume the parent first"));
+                    mb_throw_j(out_err, out_throw, &msg);
+                    return;
+                };
+            };
+            let eff = MbStr { bytes: [0u8; 8192], len: 0 };
+            let has_eff: bool = false;
+            extractMiniEffort(rr, &eff, &has_eff);
+            if has_eff {
+                let rc: i32 = mb_s_str(s, STR_PTR("effort"), STR_LEN("effort"), mb_sp(&eff), eff.len);
+                MiniBridge_persist(b, s);
+            };
+            let sb = MbStr { bytes: [0u8; 8192], len: 0 };
+            let has_sb: bool = false;
+            normalizeMiniSandbox(mb_g_node(rr, STR_PTR("sandbox"), STR_LEN("sandbox")), &sb, &has_sb);
+            let ap = MbStr { bytes: [0u8; 8192], len: 0 };
+            let has_ap: bool = false;
+            normalizeMiniSandbox(mb_g_node(rr, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy")), &ap, &has_ap);
+            if has_sb || has_ap {
+                if has_sb { let rc2: i32 = mb_s_str(s, STR_PTR("sandbox"), STR_LEN("sandbox"), mb_sp(&sb), sb.len); };
+                if has_ap { let rc3: i32 = mb_s_str(s, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"), mb_sp(&ap), ap.len); };
+                MiniBridge_persist(b, s);
+            };
+        };
+        mb_thread_projection(s, include_turns, out);
+        return;
+    };
+    if mb_bytes_eq(method_p, method_n, STR_PTR("thread/list"), STR_LEN("thread/list")) {
+        let owner = MbStr { bytes: [0u8; 8192], len: 0 };
+        if !mb_g_str(rr, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner) { mb_sassign(&owner, STR_PTR("local"), STR_LEN("local")); };
+        let owner_is_local: bool = mb_bytes_eq(mb_sp(&owner), owner.len, STR_PTR("local"), STR_LEN("local"));
+        let threads: u64 = mb_new_arr();
+        let seen: u64 = mb_new_arr();
+        let count: u64 = mb_n_count(b.sessions);
+        let i: u64 = 0;
+        while i < count {
+            let kp: ptr = PTR_NULL();
+            let kn: u64 = 0;
+            if mb_key_at(b.sessions, i, &kp, &kn) {
+                let s: u64 = mb_g_node(b.sessions, kp, kn);
+                if s != 0 {
+                    let archived: bool = false;
+                    let ok_a: bool = mb_g_bool(s, STR_PTR("archived"), STR_LEN("archived"), &archived);
+                    if !archived {
+                        let visible: bool = owner_is_local;
+                        if !visible {
+                            let so = MbStr { bytes: [0u8; 8192], len: 0 };
+                            if !mb_g_str(s, STR_PTR("ownerId"), STR_LEN("ownerId"), &so) { visible = true; } else if mb_bytes_eq(mb_sp(&so), so.len, STR_PTR("local"), STR_LEN("local")) { visible = true; } else if mb_bytes_eq(mb_sp(&so), so.len, mb_sp(&owner), owner.len) { visible = true; };
+                        };
+                        if visible {
+                            let e: u64 = mb_new_obj();
+                            let rc: i32 = mb_s_str(e, STR_PTR("id"), STR_LEN("id"), kp, kn);
+                            rc = mb_s_str(e, STR_PTR("cliBackend"), STR_LEN("cliBackend"), STR_PTR("mini"), STR_LEN("mini"));
+                            let v = MbStr { bytes: [0u8; 8192], len: 0 };
+                            if mb_g_str(s, STR_PTR("cwd"), STR_LEN("cwd"), &v) { rc = mb_s_str(e, STR_PTR("cwd"), STR_LEN("cwd"), mb_sp(&v), v.len); };
+                            let roots: u64 = mb_g_node(s, STR_PTR("additionalRoots"), STR_LEN("additionalRoots"));
+                            if roots != 0 { rc = mb_s_node(e, STR_PTR("additionalRoots"), STR_LEN("additionalRoots"), mb_clone_node(roots)); } else { rc = mb_s_node(e, STR_PTR("additionalRoots"), STR_LEN("additionalRoots"), mb_new_arr()); };
+                            let prov: u64 = mb_g_node(s, STR_PTR("providerId"), STR_LEN("providerId"));
+                            if prov != 0 { rc = mb_s_node(e, STR_PTR("providerId"), STR_LEN("providerId"), mb_clone_node(prov)); } else { rc = mb_s_null(e, STR_PTR("providerId"), STR_LEN("providerId")); };
+                            let grp: u64 = mb_g_node(s, STR_PTR("groupId"), STR_LEN("groupId"));
+                            if grp != 0 { rc = mb_s_node(e, STR_PTR("groupId"), STR_LEN("groupId"), mb_clone_node(grp)); } else { rc = mb_s_null(e, STR_PTR("groupId"), STR_LEN("groupId")); };
+                            if mb_g_str(s, STR_PTR("model"), STR_LEN("model"), &v) { rc = mb_s_str(e, STR_PTR("model"), STR_LEN("model"), mb_sp(&v), v.len); };
+                            if mb_g_str(s, STR_PTR("name"), STR_LEN("name"), &v) { rc = mb_s_str(e, STR_PTR("name"), STR_LEN("name"), mb_sp(&v), v.len); } else { rc = mb_s_null(e, STR_PTR("name"), STR_LEN("name")); };
+                            if mb_g_str(s, STR_PTR("preview"), STR_LEN("preview"), &v) { rc = mb_s_str(e, STR_PTR("preview"), STR_LEN("preview"), mb_sp(&v), v.len); } else { rc = mb_s_null(e, STR_PTR("preview"), STR_LEN("preview")); };
+                            let has_active: bool = mb_g_has(s, STR_PTR("activeTurnId"), STR_LEN("activeTurnId"));
+                            rc = mb_s_str(e, STR_PTR("status"), STR_LEN("status"), if has_active { STR_PTR("running") } else { STR_PTR("idle") }, if has_active { STR_LEN("running") } else { STR_LEN("idle") });
+                            rc = mb_a_push_node(threads, e);
+                            rc = mb_a_push_str(seen, kp, kn);
+                        };
+                    };
+                };
+            };
+            i = i + 1;
+        }
+        // options.listSnapshots landing: the bridge snapshot store.
+        let scount: u64 = mb_n_count(b.snapshots);
+        let si: u64 = 0;
+        while si < scount {
+            let kp: ptr = PTR_NULL();
+            let kn: u64 = 0;
+            if mb_key_at(b.snapshots, si, &kp, &kn) {
+                let snap: u64 = mb_g_node(b.snapshots, kp, kn);
+                if snap != 0 && !mb_str_in_arr(seen, kp, kn, false) && !mb_g_has(snap, STR_PTR("parentThreadId"), STR_LEN("parentThreadId")) {
+                    let archived: bool = false;
+                    let ok_a: bool = mb_g_bool(snap, STR_PTR("archived"), STR_LEN("archived"), &archived);
+                    if !archived {
+                        let visible: bool = owner_is_local;
+                        if !visible {
+                            let so = MbStr { bytes: [0u8; 8192], len: 0 };
+                            if !mb_g_str(snap, STR_PTR("ownerId"), STR_LEN("ownerId"), &so) { visible = true; } else if mb_bytes_eq(mb_sp(&so), so.len, STR_PTR("local"), STR_LEN("local")) { visible = true; } else if mb_bytes_eq(mb_sp(&so), so.len, mb_sp(&owner), owner.len) { visible = true; };
+                        };
+                        if visible {
+                            let e: u64 = mb_new_obj();
+                            let rc: i32 = mb_s_str(e, STR_PTR("id"), STR_LEN("id"), kp, kn);
+                            rc = mb_s_str(e, STR_PTR("cliBackend"), STR_LEN("cliBackend"), STR_PTR("mini"), STR_LEN("mini"));
+                            let v = MbStr { bytes: [0u8; 8192], len: 0 };
+                            if mb_g_str(snap, STR_PTR("cwd"), STR_LEN("cwd"), &v) { rc = mb_s_str(e, STR_PTR("cwd"), STR_LEN("cwd"), mb_sp(&v), v.len); };
+                            let roots: u64 = mb_g_node(snap, STR_PTR("additionalRoots"), STR_LEN("additionalRoots"));
+                            if roots != 0 { rc = mb_s_node(e, STR_PTR("additionalRoots"), STR_LEN("additionalRoots"), mb_clone_node(roots)); } else { rc = mb_s_node(e, STR_PTR("additionalRoots"), STR_LEN("additionalRoots"), mb_new_arr()); };
+                            let prov: u64 = mb_g_node(snap, STR_PTR("providerId"), STR_LEN("providerId"));
+                            if prov != 0 { rc = mb_s_node(e, STR_PTR("providerId"), STR_LEN("providerId"), mb_clone_node(prov)); } else { rc = mb_s_null(e, STR_PTR("providerId"), STR_LEN("providerId")); };
+                            let grp: u64 = mb_g_node(snap, STR_PTR("groupId"), STR_LEN("groupId"));
+                            if grp != 0 { rc = mb_s_node(e, STR_PTR("groupId"), STR_LEN("groupId"), mb_clone_node(grp)); } else { rc = mb_s_null(e, STR_PTR("groupId"), STR_LEN("groupId")); };
+                            if !mb_g_str(snap, STR_PTR("model"), STR_LEN("model"), &v) { mb_sassign(&v, STR_PTR("gpt-5-mini"), STR_LEN("gpt-5-mini")); };
+                            rc = mb_s_str(e, STR_PTR("model"), STR_LEN("model"), mb_sp(&v), v.len);
+                            if mb_g_str(snap, STR_PTR("name"), STR_LEN("name"), &v) { rc = mb_s_str(e, STR_PTR("name"), STR_LEN("name"), mb_sp(&v), v.len); } else { rc = mb_s_null(e, STR_PTR("name"), STR_LEN("name")); };
+                            if mb_g_str(snap, STR_PTR("preview"), STR_LEN("preview"), &v) { rc = mb_s_str(e, STR_PTR("preview"), STR_LEN("preview"), mb_sp(&v), v.len); } else { rc = mb_s_null(e, STR_PTR("preview"), STR_LEN("preview")); };
+                            rc = mb_s_str(e, STR_PTR("status"), STR_LEN("status"), STR_PTR("idle"), STR_LEN("idle"));
+                            rc = mb_a_push_node(threads, e);
+                        };
+                    };
+                };
+            };
+            si = si + 1;
+        }
+        let res: u64 = mb_new_obj();
+        let rc: i32 = mb_s_node(res, STR_PTR("threads"), STR_LEN("threads"), threads);
+        *out = res;
+        return;
+    };
+    if mb_bytes_eq(method_p, method_n, STR_PTR("thread/turns/list"), STR_LEN("thread/turns/list")) || mb_bytes_eq(method_p, method_n, STR_PTR("thread/items/list"), STR_LEN("thread/items/list")) {
+        let thread = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_req_id(rr, STR_PTR("threadId"), STR_LEN("threadId"), &thread);
+        let owner = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_owner: bool = mb_g_str(rr, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner);
+        let s: u64 = 0;
+        let has_s: bool = false;
+        MiniBridge_get_or_restore_session(b, mb_sp(&thread), thread.len, mb_sp(&owner), owner.len, has_owner, &s, &has_s);
+        if !has_s {
+            if MiniBridge_get_session(b, mb_sp(&thread), thread.len) != 0 {
+                let res: u64 = mb_new_obj();
+                let rc: i32 = mb_s_node(res, STR_PTR("turns"), STR_LEN("turns"), mb_new_arr());
+                rc = mb_s_node(res, STR_PTR("data"), STR_LEN("data"), mb_new_arr());
+                rc = mb_s_null(res, STR_PTR("nextCursor"), STR_LEN("nextCursor"));
+                rc = mb_s_node(res, STR_PTR("items"), STR_LEN("items"), mb_new_arr());
+                *out = res;
+                return;
+            };
+            let msg = MbJson { bytes: [0u8; 262144], len: 0 };
+            mb_jassign(&msg, STR_PTR("thread not found: "), STR_LEN("thread not found: "));
+            mb_jappend(&msg, mb_sp(&thread), thread.len);
+            mb_throw_j(out_err, out_throw, &msg);
+            return;
+        };
+        let turns_node: u64 = mb_g_node(s, STR_PTR("turns"), STR_LEN("turns"));
+        let msgs_node: u64 = mb_g_node(s, STR_PTR("messages"), STR_LEN("messages"));
+        let turns_text = MbJson { bytes: [0u8; 262144], len: 0 };
+        let msgs_text = MbJson { bytes: [0u8; 262144], len: 0 };
+        let ok_t: bool = mb_stringify_node(turns_node, &turns_text);
+        let ok_m: bool = mb_stringify_node(msgs_node, &msgs_text);
+        let opts = PageOptions { has_cursor: false, cursor: [0; 128], cursor_len: 0, has_limit: true, limit: 32, ascending: false };
+        let cv = MbStr { bytes: [0u8; 8192], len: 0 };
+        if mb_g_str(rr, STR_PTR("cursor"), STR_LEN("cursor"), &cv) {
+            opts.has_cursor = true;
+            let ci: u64 = 0;
+            while ci < cv.len && ci < 128 {
+                let byte: u8 = 0;
+                PTR_BYTE_AT(byte, mb_sp(&cv), ci);
+                opts.cursor[ci] = byte;
+                ci = ci + 1;
+            }
+            opts.cursor_len = ci;
+        };
+        let lv: f64 = 0.0;
+        if mb_g_f64(rr, STR_PTR("limit"), STR_LEN("limit"), &lv) { opts.limit = lv as u64; };
+        let sd = MbStr { bytes: [0u8; 8192], len: 0 };
+        if !mb_g_str(rr, STR_PTR("sortDirection"), STR_LEN("sortDirection"), &sd) { mb_sassign(&sd, STR_PTR("desc"), STR_LEN("desc")); };
+        let sd_low = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_lower_into(mb_sp(&sd), sd.len, &sd_low);
+        opts.ascending = mb_bytes_eq(mb_sp(&sd_low), sd_low.len, STR_PTR("asc"), STR_LEN("asc"));
+        let pres = PageResult { page_json: [0; 262144], page_len: 0, has_nextCursor: false, nextCursor: [0; 128], nextCursor_len: 0 };
+        let prc: i32 = pageThreadHistory(mb_sp(&thread), thread.len, mb_jp(&turns_text), turns_text.len, mb_jp(&msgs_text), msgs_text.len, &opts, &pres);
+        let page_base: ptr = PTR_NULL();
+        PTR_BYTE_ADD(page_base, &pres.page_json, 0);
+        let page_doc: u64 = mb_parse(page_base, pres.page_len);
+        let res: u64 = mb_new_obj();
+        let rc: i32 = mb_s_node(res, STR_PTR("turns"), STR_LEN("turns"), mb_clone_node(page_doc));
+        rc = mb_s_node(res, STR_PTR("data"), STR_LEN("data"), mb_clone_node(page_doc));
+        if pres.has_nextCursor {
+            let nc_base: ptr = PTR_NULL();
+            PTR_BYTE_ADD(nc_base, &pres.nextCursor, 0);
+            rc = mb_s_str(res, STR_PTR("nextCursor"), STR_LEN("nextCursor"), nc_base, pres.nextCursor_len);
+        } else {
+            rc = mb_s_null(res, STR_PTR("nextCursor"), STR_LEN("nextCursor"));
+        };
+        rc = mb_s_node(res, STR_PTR("items"), STR_LEN("items"), page_doc);
+        *out = res;
+        return;
+    };
+    if mb_bytes_eq(method_p, method_n, STR_PTR("thread/compact/start"), STR_LEN("thread/compact/start")) {
+        let thread = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_req_id(rr, STR_PTR("threadId"), STR_LEN("threadId"), &thread);
+        let owner = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_owner: bool = mb_g_str(rr, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner);
+        let s: u64 = 0;
+        let has_s: bool = false;
+        MiniBridge_get_or_restore_session(b, mb_sp(&thread), thread.len, mb_sp(&owner), owner.len, has_owner, &s, &has_s);
+        if !has_s {
+            let res: u64 = mb_new_obj();
+            let rc0: i32 = mb_s_bool(res, STR_PTR("ok"), STR_LEN("ok"), false);
+            *out = res;
+            return;
+        };
+        let released: bool = MiniBridge_release_stale_active_slot(s);
+        if mb_g_has(s, STR_PTR("activeTurnId"), STR_LEN("activeTurnId")) {
+            mb_throw(out_err, out_throw, STR_PTR("Cannot compact while a turn is running"), STR_LEN("Cannot compact while a turn is running"));
+            return;
+        };
+        let turn = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_new_uuid(&turn);
+        let turn_rec: u64 = mb_new_obj();
+        let rc: i32 = mb_s_str(turn_rec, STR_PTR("id"), STR_LEN("id"), mb_sp(&turn), turn.len);
+        rc = mb_s_str(turn_rec, STR_PTR("status"), STR_LEN("status"), STR_PTR("inProgress"), STR_LEN("inProgress"));
+        rc = mb_s_i64(turn_rec, STR_PTR("createdAt"), STR_LEN("createdAt"), mb_now_ms());
+        let turns: u64 = mb_g_node(s, STR_PTR("turns"), STR_LEN("turns"));
+        rc = mb_a_push_node(turns, turn_rec);
+        rc = mb_s_str(s, STR_PTR("activeTurnId"), STR_LEN("activeTurnId"), mb_sp(&turn), turn.len);
+        rc = mb_s_bool(s, STR_PTR("aborted"), STR_LEN("aborted"), false);
+        rc = mb_s_bool(s, STR_PTR("activeAbort"), STR_LEN("activeAbort"), true);
+        let item: u64 = mb_new_obj();
+        rc = mb_s_str(item, STR_PTR("type"), STR_LEN("type"), STR_PTR("contextCompaction"), STR_LEN("contextCompaction"));
+        let iid = MbJson { bytes: [0u8; 262144], len: 0 };
+        mb_jassign(&iid, STR_PTR("mini-compact-"), STR_LEN("mini-compact-"));
+        mb_jappend(&iid, mb_sp(&turn), turn.len);
+        rc = mb_s_str(item, STR_PTR("id"), STR_LEN("id"), mb_jp(&iid), iid.len);
+        rc = mb_s_str(item, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&thread), thread.len);
+        rc = mb_s_str(item, STR_PTR("turnId"), STR_LEN("turnId"), mb_sp(&turn), turn.len);
+        rc = mb_s_str(item, STR_PTR("title"), STR_LEN("title"), STR_PTR("Context compaction"), STR_LEN("Context compaction"));
+        rc = mb_s_str(item, STR_PTR("status"), STR_LEN("status"), STR_PTR("inProgress"), STR_LEN("inProgress"));
+        rc = mb_s_str(item, STR_PTR("cliBackend"), STR_LEN("cliBackend"), STR_PTR("mini"), STR_LEN("mini"));
+        let messages: u64 = mb_g_node(s, STR_PTR("messages"), STR_LEN("messages"));
+        rc = mb_a_push_node(messages, item);
+        MiniBridge_persist(b, s);
+        let params: u64 = mb_new_obj();
+        rc = mb_s_str(params, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&thread), thread.len);
+        rc = mb_s_str(params, STR_PTR("turnId"), STR_LEN("turnId"), mb_sp(&turn), turn.len);
+        rc = mb_s_str(params, STR_PTR("engine"), STR_LEN("engine"), STR_PTR("mini"), STR_LEN("mini"));
+        let turn_obj: u64 = mb_new_obj();
+        rc = mb_s_str(turn_obj, STR_PTR("id"), STR_LEN("id"), mb_sp(&turn), turn.len);
+        rc = mb_s_str(turn_obj, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&thread), thread.len);
+        rc = mb_s_str(turn_obj, STR_PTR("status"), STR_LEN("status"), STR_PTR("inProgress"), STR_LEN("inProgress"));
+        rc = mb_s_node(params, STR_PTR("turn"), STR_LEN("turn"), turn_obj);
+        mb_emit_note(b, STR_PTR("turn/started"), STR_LEN("turn/started"), params);
+        let params2: u64 = mb_new_obj();
+        rc = mb_s_str(params2, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&thread), thread.len);
+        rc = mb_s_str(params2, STR_PTR("turnId"), STR_LEN("turnId"), mb_sp(&turn), turn.len);
+        rc = mb_s_node(params2, STR_PTR("item"), STR_LEN("item"), mb_clone_node(item));
+        mb_emit_note(b, STR_PTR("item/started"), STR_LEN("item/started"), params2);
+        mb_enqueue_run(b, STR_PTR("compact"), STR_LEN("compact"), mb_sp(&thread), thread.len, mb_sp(&turn), turn.len, STR_PTR(""), STR_LEN(""), 0);
+        let res: u64 = mb_new_obj();
+        let tout: u64 = mb_new_obj();
+        rc = mb_s_str(tout, STR_PTR("id"), STR_LEN("id"), mb_sp(&turn), turn.len);
+        rc = mb_s_str(tout, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&thread), thread.len);
+        rc = mb_s_str(tout, STR_PTR("status"), STR_LEN("status"), STR_PTR("inProgress"), STR_LEN("inProgress"));
+        rc = mb_s_node(res, STR_PTR("turn"), STR_LEN("turn"), tout);
+        rc = mb_s_str(res, STR_PTR("turnId"), STR_LEN("turnId"), mb_sp(&turn), turn.len);
+        *out = res;
+        return;
+    };
+    if mb_bytes_eq(method_p, method_n, STR_PTR("review/start"), STR_LEN("review/start")) {
+        let thread = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_req_id(rr, STR_PTR("threadId"), STR_LEN("threadId"), &thread);
+        let owner = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_owner: bool = mb_g_str(rr, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner);
+        let s: u64 = 0;
+        let has_s: bool = false;
+        MiniBridge_get_or_restore_session(b, mb_sp(&thread), thread.len, mb_sp(&owner), owner.len, has_owner, &s, &has_s);
+        if !has_s {
+            if thread.len == 0 {
+                let res: u64 = mb_new_obj();
+                let rc0: i32 = mb_s_bool(res, STR_PTR("ok"), STR_LEN("ok"), false);
+                *out = res;
+                return;
+            };
+            s = mb_new_obj();
+            let rc1: i32 = mb_s_str(s, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&thread), thread.len);
+            rc1 = mb_s_str(s, STR_PTR("cwd"), STR_LEN("cwd"), default_cwd_p, default_cwd_n);
+            rc1 = mb_s_str(s, STR_PTR("model"), STR_LEN("model"), STR_PTR("gpt-5-mini"), STR_LEN("gpt-5-mini"));
+            rc1 = mb_s_str(s, STR_PTR("effort"), STR_LEN("effort"), STR_PTR("medium"), STR_LEN("medium"));
+            rc1 = mb_s_i64(s, STR_PTR("createdAt"), STR_LEN("createdAt"), mb_now_ms());
+            rc1 = mb_s_node(s, STR_PTR("turns"), STR_LEN("turns"), mb_new_arr());
+            rc1 = mb_s_node(s, STR_PTR("messages"), STR_LEN("messages"), mb_new_arr());
+            MiniBridge_set_session(b, mb_sp(&thread), thread.len, s);
+        };
+        let released: bool = MiniBridge_release_stale_active_slot(s);
+        let active = MbStr { bytes: [0u8; 8192], len: 0 };
+        if mb_g_str(s, STR_PTR("activeTurnId"), STR_LEN("activeTurnId"), &active) {
+            let msg = MbJson { bytes: [0u8; 262144], len: 0 };
+            mb_jassign(&msg, STR_PTR("Turn is already active: "), STR_LEN("Turn is already active: "));
+            mb_jappend(&msg, mb_sp(&active), active.len);
+            mb_throw_j(out_err, out_throw, &msg);
+            return;
+        };
+        if has_owner { let rc2: i32 = mb_s_str(s, STR_PTR("ownerId"), STR_LEN("ownerId"), mb_sp(&owner), owner.len); };
+        let eff = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_eff: bool = false;
+        extractMiniEffort(rr, &eff, &has_eff);
+        if has_eff { let rc3: i32 = mb_s_str(s, STR_PTR("effort"), STR_LEN("effort"), mb_sp(&eff), eff.len); };
+        let target_val: u64 = mb_g_node(rr, STR_PTR("target"), STR_LEN("target"));
+        if target_val == 0 { target_val = mb_g_node(rr, STR_PTR("value"), STR_LEN("value")); };
+        if target_val == 0 { target_val = mb_parse(STR_PTR("\"\""), STR_LEN("\"\"")); };
+        let target: u64 = 0;
+        parseMiniReviewTarget(target_val, &target);
+        let hint = MbJson { bytes: [0u8; 262144], len: 0 };
+        miniReviewTargetLabel(target, &hint);
+        let prompt_text = MbJson { bytes: [0u8; 262144], len: 0 };
+        mb_jassign(&prompt_text, STR_PTR("Review "), STR_LEN("Review "));
+        mb_jappend(&prompt_text, mb_jp(&hint), hint.len);
+        let turn = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_new_uuid(&turn);
+        let user_item: u64 = mb_new_obj();
+        let rc: i32 = mb_s_str(user_item, STR_PTR("type"), STR_LEN("type"), STR_PTR("userMessage"), STR_LEN("userMessage"));
+        let iid = MbJson { bytes: [0u8; 262144], len: 0 };
+        mb_jassign(&iid, STR_PTR("mini-user-"), STR_LEN("mini-user-"));
+        mb_jappend(&iid, mb_sp(&turn), turn.len);
+        rc = mb_s_str(user_item, STR_PTR("id"), STR_LEN("id"), mb_jp(&iid), iid.len);
+        rc = mb_s_str(user_item, STR_PTR("turnId"), STR_LEN("turnId"), mb_sp(&turn), turn.len);
+        rc = mb_s_str(user_item, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&thread), thread.len);
+        rc = mb_s_str(user_item, STR_PTR("text"), STR_LEN("text"), mb_jp(&prompt_text), prompt_text.len);
+        let content: u64 = mb_new_arr();
+        let block: u64 = mb_new_obj();
+        rc = mb_s_str(block, STR_PTR("type"), STR_LEN("type"), STR_PTR("text"), STR_LEN("text"));
+        rc = mb_s_str(block, STR_PTR("text"), STR_LEN("text"), mb_jp(&prompt_text), prompt_text.len);
+        rc = mb_a_push_node(content, block);
+        rc = mb_s_node(user_item, STR_PTR("content"), STR_LEN("content"), content);
+        rc = mb_s_str(user_item, STR_PTR("role"), STR_LEN("role"), STR_PTR("user"), STR_LEN("user"));
+        rc = mb_s_str(user_item, STR_PTR("status"), STR_LEN("status"), STR_PTR("completed"), STR_LEN("completed"));
+        let messages: u64 = mb_g_node(s, STR_PTR("messages"), STR_LEN("messages"));
+        rc = mb_a_push_node(messages, user_item);
+        let turn_rec: u64 = mb_new_obj();
+        rc = mb_s_str(turn_rec, STR_PTR("id"), STR_LEN("id"), mb_sp(&turn), turn.len);
+        rc = mb_s_str(turn_rec, STR_PTR("status"), STR_LEN("status"), STR_PTR("inProgress"), STR_LEN("inProgress"));
+        rc = mb_s_i64(turn_rec, STR_PTR("createdAt"), STR_LEN("createdAt"), mb_now_ms());
+        let turns: u64 = mb_g_node(s, STR_PTR("turns"), STR_LEN("turns"));
+        rc = mb_a_push_node(turns, turn_rec);
+        rc = mb_s_str(s, STR_PTR("activeTurnId"), STR_LEN("activeTurnId"), mb_sp(&turn), turn.len);
+        rc = mb_s_bool(s, STR_PTR("aborted"), STR_LEN("aborted"), false);
+        rc = mb_s_bool(s, STR_PTR("activeAbort"), STR_LEN("activeAbort"), true);
+        let prev = MbStr { bytes: [0u8; 8192], len: 0 };
+        if !mb_g_str(s, STR_PTR("preview"), STR_LEN("preview"), &prev) || prev.len == 0 {
+            let p80 = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_slice_to_s(mb_jp(&prompt_text), prompt_text.len, 0, 80, &p80);
+            rc = mb_s_str(s, STR_PTR("preview"), STR_LEN("preview"), mb_sp(&p80), p80.len);
+        };
+        MiniBridge_persist(b, s);
+        let params: u64 = mb_new_obj();
+        rc = mb_s_str(params, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&thread), thread.len);
+        rc = mb_s_str(params, STR_PTR("turnId"), STR_LEN("turnId"), mb_sp(&turn), turn.len);
+        let turn_obj: u64 = mb_new_obj();
+        rc = mb_s_str(turn_obj, STR_PTR("id"), STR_LEN("id"), mb_sp(&turn), turn.len);
+        rc = mb_s_str(turn_obj, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&thread), thread.len);
+        rc = mb_s_str(turn_obj, STR_PTR("status"), STR_LEN("status"), STR_PTR("inProgress"), STR_LEN("inProgress"));
+        rc = mb_s_node(params, STR_PTR("turn"), STR_LEN("turn"), turn_obj);
+        mb_emit_note(b, STR_PTR("turn/started"), STR_LEN("turn/started"), params);
+        let params2: u64 = mb_new_obj();
+        rc = mb_s_str(params2, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&thread), thread.len);
+        rc = mb_s_str(params2, STR_PTR("turnId"), STR_LEN("turnId"), mb_sp(&turn), turn.len);
+        rc = mb_s_node(params2, STR_PTR("item"), STR_LEN("item"), mb_clone_node(user_item));
+        mb_emit_note(b, STR_PTR("item/completed"), STR_LEN("item/completed"), params2);
+        let review_prompt = MbJson { bytes: [0u8; 262144], len: 0 };
+        buildMiniReviewPrompt(target, &review_prompt);
+        let directed = MbJson { bytes: [0u8; 262144], len: 0 };
+        MiniBridge_apply_goal_directive(s, mb_jp(&review_prompt), review_prompt.len, &directed);
+        mb_enqueue_run(b, STR_PTR("turn"), STR_LEN("turn"), mb_sp(&thread), thread.len, mb_sp(&turn), turn.len, mb_jp(&directed), directed.len, mb_new_obj());
+        let res: u64 = mb_new_obj();
+        let tout: u64 = mb_new_obj();
+        rc = mb_s_str(tout, STR_PTR("id"), STR_LEN("id"), mb_sp(&turn), turn.len);
+        rc = mb_s_str(tout, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&thread), thread.len);
+        rc = mb_s_str(tout, STR_PTR("status"), STR_LEN("status"), STR_PTR("inProgress"), STR_LEN("inProgress"));
+        rc = mb_s_node(res, STR_PTR("turn"), STR_LEN("turn"), tout);
+        rc = mb_s_str(res, STR_PTR("turnId"), STR_LEN("turnId"), mb_sp(&turn), turn.len);
+        rc = mb_s_str(res, STR_PTR("reviewThreadId"), STR_LEN("reviewThreadId"), mb_sp(&thread), thread.len);
+        *out = res;
+        return;
+    };
+    if mb_bytes_eq(method_p, method_n, STR_PTR("thread/delete"), STR_LEN("thread/delete")) {
+        let thread = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_req_id(rr, STR_PTR("threadId"), STR_LEN("threadId"), &thread);
+        let owner = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_owner: bool = mb_g_str(rr, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner);
+        let session: u64 = MiniBridge_get_session(b, mb_sp(&thread), thread.len);
+        if session != 0 {
+            let so = MbStr { bytes: [0u8; 8192], len: 0 };
+            if mb_g_str(session, STR_PTR("ownerId"), STR_LEN("ownerId"), &so) && !mb_bytes_eq(mb_sp(&so), so.len, STR_PTR("local"), STR_LEN("local")) && !(has_owner && mb_bytes_eq(mb_sp(&so), so.len, mb_sp(&owner), owner.len)) {
+                let msg = MbJson { bytes: [0u8; 262144], len: 0 };
+                mb_jassign(&msg, STR_PTR("thread not found or not owned by this session: "), STR_LEN("thread not found or not owned by this session: "));
+                mb_jappend(&msg, mb_sp(&thread), thread.len);
+                mb_throw_j(out_err, out_throw, &msg);
+                return;
+            };
+            mb_interrupt_session_for_removal(b, handlers, session);
+        };
+        let rc: i32 = mb_o_remove(b.sessions, mb_sp(&thread), thread.len);
+        if session != 0 {
+            mb_fire_session_end_hook(handlers, session, STR_PTR("deleted"), STR_LEN("deleted"));
+            rc = mb_o_remove(b.snapshots, mb_sp(&thread), thread.len);
+        };
+        rc = mb_o_remove(b.history_summary_cache, mb_sp(&thread), thread.len);
+        MiniBridge_clear_goal_timer(b, mb_sp(&thread), thread.len);
+        rc = mb_o_remove(b.goal_counts, mb_sp(&thread), thread.len);
+        let child_ids: u64 = 0;
+        mb_collect_child_ids(b, mb_sp(&thread), thread.len, &child_ids);
+        let cc: u64 = mb_n_count(child_ids);
+        let ci: u64 = 0;
+        while ci < cc {
+            let cid = MbStr { bytes: [0u8; 8192], len: 0 };
+            if mb_n_str(mb_a_at(child_ids, ci), &cid) {
+                let cs: u64 = MiniBridge_get_session(b, mb_sp(&cid), cid.len);
+                if cs != 0 { mb_interrupt_session_for_removal(b, handlers, cs); };
+                rc = mb_o_remove(b.sessions, mb_sp(&cid), cid.len);
+                rc = mb_o_remove(b.snapshots, mb_sp(&cid), cid.len);
+                rc = mb_o_remove(b.history_summary_cache, mb_sp(&cid), cid.len);
+            };
+            ci = ci + 1;
+        }
+        let res: u64 = mb_new_obj();
+        rc = mb_s_bool(res, STR_PTR("ok"), STR_LEN("ok"), true);
+        *out = res;
+        return;
+    };
+    if mb_bytes_eq(method_p, method_n, STR_PTR("thread/archive"), STR_LEN("thread/archive")) {
+        let thread = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_req_id(rr, STR_PTR("threadId"), STR_LEN("threadId"), &thread);
+        if thread.len == 0 {
+            let res0: u64 = mb_new_obj();
+            let rc0: i32 = mb_s_bool(res0, STR_PTR("ok"), STR_LEN("ok"), false);
+            *out = res0;
+            return;
+        };
+        let live: u64 = MiniBridge_get_session(b, mb_sp(&thread), thread.len);
+        let rc: i32 = 0;
+        if live != 0 {
+            mb_interrupt_session_for_removal(b, handlers, live);
+            rc = mb_s_bool(live, STR_PTR("archived"), STR_LEN("archived"), true);
+            MiniBridge_persist(b, live);
+            rc = mb_o_remove(b.sessions, mb_sp(&thread), thread.len);
+            mb_fire_session_end_hook(handlers, live, STR_PTR("archived"), STR_LEN("archived"));
+        } else {
+            let snap: u64 = mb_g_node(b.snapshots, mb_sp(&thread), thread.len);
+            if snap != 0 { rc = mb_s_bool(snap, STR_PTR("archived"), STR_LEN("archived"), true); };
+        };
+        let child_ids: u64 = 0;
+        mb_collect_child_ids(b, mb_sp(&thread), thread.len, &child_ids);
+        let cc: u64 = mb_n_count(child_ids);
+        let ci: u64 = 0;
+        while ci < cc {
+            let cid = MbStr { bytes: [0u8; 8192], len: 0 };
+            if mb_n_str(mb_a_at(child_ids, ci), &cid) {
+                let cs: u64 = MiniBridge_get_session(b, mb_sp(&cid), cid.len);
+                if cs != 0 { mb_interrupt_session_for_removal(b, handlers, cs); };
+                rc = mb_o_remove(b.sessions, mb_sp(&cid), cid.len);
+                rc = mb_o_remove(b.history_summary_cache, mb_sp(&cid), cid.len);
+            };
+            ci = ci + 1;
+        }
+        rc = mb_o_remove(b.history_summary_cache, mb_sp(&thread), thread.len);
+        MiniBridge_clear_goal_timer(b, mb_sp(&thread), thread.len);
+        rc = mb_o_remove(b.goal_counts, mb_sp(&thread), thread.len);
+        let params: u64 = mb_new_obj();
+        rc = mb_s_str(params, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&thread), thread.len);
+        mb_emit_note(b, STR_PTR("thread/archived"), STR_LEN("thread/archived"), params);
+        let res: u64 = mb_new_obj();
+        rc = mb_s_bool(res, STR_PTR("ok"), STR_LEN("ok"), true);
+        *out = res;
+        return;
+    };
+    if mb_bytes_eq(method_p, method_n, STR_PTR("thread/fork"), STR_LEN("thread/fork")) {
+        let parent_id = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_req_id(rr, STR_PTR("threadId"), STR_LEN("threadId"), &parent_id);
+        if parent_id.len == 0 {
+            mb_throw(out_err, out_throw, STR_PTR("thread/fork requires threadId"), STR_LEN("thread/fork requires threadId"));
+            return;
+        };
+        let owner = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_owner: bool = mb_g_str(rr, STR_PTR("ownerId"), STR_LEN("ownerId"), &owner);
+        let parent: u64 = 0;
+        let has_parent: bool = false;
+        MiniBridge_get_or_restore_session(b, mb_sp(&parent_id), parent_id.len, mb_sp(&owner), owner.len, has_owner, &parent, &has_parent);
+        if !has_parent {
+            let msg = MbJson { bytes: [0u8; 262144], len: 0 };
+            mb_jassign(&msg, STR_PTR("thread not found: "), STR_LEN("thread not found: "));
+            let p64 = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_slice_to_s(mb_sp(&parent_id), parent_id.len, 0, 64, &p64);
+            mb_jappend(&msg, mb_sp(&p64), p64.len);
+            mb_throw_j(out_err, out_throw, &msg);
+            return;
+        };
+        let last_turn = MbStr { bytes: [0u8; 8192], len: 0 };
+        if !mb_req_trim_str(rr, STR_PTR("lastTurnId"), STR_LEN("lastTurnId"), &last_turn) {
+            let alt = MbStr { bytes: [0u8; 8192], len: 0 };
+            if mb_req_trim_str(rr, STR_PTR("last_turn_id"), STR_LEN("last_turn_id"), &alt) { mb_sassign_s2(&last_turn, &alt); };
+        };
+        let p_active = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_p_active: bool = mb_g_str(parent, STR_PTR("activeTurnId"), STR_LEN("activeTurnId"), &p_active);
+        if has_p_active && (last_turn.len == 0 || mb_bytes_eq(mb_sp(&last_turn), last_turn.len, mb_sp(&p_active), p_active.len)) {
+            mb_throw(out_err, out_throw, STR_PTR("Cannot fork through an in-progress turn"), STR_LEN("Cannot fork through an in-progress turn"));
+            return;
+        };
+        let p_turns: u64 = mb_g_node(parent, STR_PTR("turns"), STR_LEN("turns"));
+        let kept: u64 = mb_clone_node(p_turns);
+        if last_turn.len > 0 {
+            let tc: u64 = mb_n_count(p_turns);
+            let idx: i64 = 0 - 1;
+            let i: u64 = 0;
+            while i < tc {
+                let tid2 = MbStr { bytes: [0u8; 8192], len: 0 };
+                if mb_g_str(mb_a_at(p_turns, i), STR_PTR("id"), STR_LEN("id"), &tid2) && mb_bytes_eq(mb_sp(&tid2), tid2.len, mb_sp(&last_turn), last_turn.len) { idx = i as i64; };
+                i = i + 1;
+            }
+            if idx < 0 {
+                let msg = MbJson { bytes: [0u8; 262144], len: 0 };
+                mb_jassign(&msg, STR_PTR("thread/fork: turn not found: "), STR_LEN("thread/fork: turn not found: "));
+                let t64 = MbStr { bytes: [0u8; 8192], len: 0 };
+                mb_slice_to_s(mb_sp(&last_turn), last_turn.len, 0, 64, &t64);
+                mb_jappend(&msg, mb_sp(&t64), t64.len);
+                mb_throw_j(out_err, out_throw, &msg);
+                return;
+            };
+            let ref_turn: u64 = mb_a_at(p_turns, idx as u64);
+            let ref_status = MbStr { bytes: [0u8; 8192], len: 0 };
+            let ok_rs: bool = mb_g_str(ref_turn, STR_PTR("status"), STR_LEN("status"), &ref_status);
+            let ref_id = MbStr { bytes: [0u8; 8192], len: 0 };
+            let ok_ri: bool = mb_g_str(ref_turn, STR_PTR("id"), STR_LEN("id"), &ref_id);
+            if mb_bytes_eq(mb_sp(&ref_status), ref_status.len, STR_PTR("inProgress"), STR_LEN("inProgress")) || (has_p_active && mb_bytes_eq(mb_sp(&ref_id), ref_id.len, mb_sp(&p_active), p_active.len)) {
+                mb_throw(out_err, out_throw, STR_PTR("Cannot fork through an in-progress turn"), STR_LEN("Cannot fork through an in-progress turn"));
+                return;
+            };
+            kept = mb_new_arr();
+            let ki: u64 = 0;
+            while ki <= idx as u64 {
+                let rc9: i32 = mb_a_push_node(kept, mb_clone_node(mb_a_at(p_turns, ki)));
+                ki = ki + 1;
+            }
+        };
+        let kept_ids: u64 = mb_new_arr();
+        let kc: u64 = mb_n_count(kept);
+        let kj: u64 = 0;
+        while kj < kc {
+            let kid = MbStr { bytes: [0u8; 8192], len: 0 };
+            if mb_g_str(mb_a_at(kept, kj), STR_PTR("id"), STR_LEN("id"), &kid) { let rc8: i32 = mb_a_push_str(kept_ids, mb_sp(&kid), kid.len); };
+            kj = kj + 1;
+        }
+        let new_id = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_new_uuid(&new_id);
+        let fork: u64 = mb_new_obj();
+        let rc: i32 = mb_s_str(fork, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&new_id), new_id.len);
+        let v = MbStr { bytes: [0u8; 8192], len: 0 };
+        if mb_g_str(parent, STR_PTR("ownerId"), STR_LEN("ownerId"), &v) { rc = mb_s_str(fork, STR_PTR("ownerId"), STR_LEN("ownerId"), mb_sp(&v), v.len); } else if has_owner { rc = mb_s_str(fork, STR_PTR("ownerId"), STR_LEN("ownerId"), mb_sp(&owner), owner.len); };
+        if mb_g_str(parent, STR_PTR("cwd"), STR_LEN("cwd"), &v) { rc = mb_s_str(fork, STR_PTR("cwd"), STR_LEN("cwd"), mb_sp(&v), v.len); };
+        let model = MbStr { bytes: [0u8; 8192], len: 0 };
+        if !mb_req_trim_str(rr, STR_PTR("model"), STR_LEN("model"), &model) {
+            let pm = MbStr { bytes: [0u8; 8192], len: 0 };
+            let ok_pm: bool = mb_g_str(parent, STR_PTR("model"), STR_LEN("model"), &pm);
+            mb_sassign_s2(&model, &pm);
+        };
+        rc = mb_s_str(fork, STR_PTR("model"), STR_LEN("model"), mb_sp(&model), model.len);
+        let proots: u64 = mb_g_node(parent, STR_PTR("additionalRoots"), STR_LEN("additionalRoots"));
+        if proots != 0 { rc = mb_s_node(fork, STR_PTR("additionalRoots"), STR_LEN("additionalRoots"), mb_clone_node(proots)); };
+        if mb_g_str(parent, STR_PTR("providerId"), STR_LEN("providerId"), &v) { rc = mb_s_str(fork, STR_PTR("providerId"), STR_LEN("providerId"), mb_sp(&v), v.len); };
+        if mb_g_str(parent, STR_PTR("groupId"), STR_LEN("groupId"), &v) { rc = mb_s_str(fork, STR_PTR("groupId"), STR_LEN("groupId"), mb_sp(&v), v.len); };
+        if mb_g_str(parent, STR_PTR("preview"), STR_LEN("preview"), &v) { rc = mb_s_str(fork, STR_PTR("preview"), STR_LEN("preview"), mb_sp(&v), v.len); };
+        let eff = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_eff: bool = false;
+        extractMiniEffort(rr, &eff, &has_eff);
+        if !has_eff {
+            let pe = MbStr { bytes: [0u8; 8192], len: 0 };
+            if mb_g_str(parent, STR_PTR("effort"), STR_LEN("effort"), &pe) { mb_sassign_s2(&eff, &pe); has_eff = true; };
+        };
+        if has_eff { rc = mb_s_str(fork, STR_PTR("effort"), STR_LEN("effort"), mb_sp(&eff), eff.len); };
+        let sb = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_sb: bool = false;
+        normalizeMiniSandbox(mb_g_node(rr, STR_PTR("sandbox"), STR_LEN("sandbox")), &sb, &has_sb);
+        if !has_sb {
+            let ps = MbStr { bytes: [0u8; 8192], len: 0 };
+            if mb_g_str(parent, STR_PTR("sandbox"), STR_LEN("sandbox"), &ps) { mb_sassign_s2(&sb, &ps); has_sb = true; };
+        };
+        if has_sb { rc = mb_s_str(fork, STR_PTR("sandbox"), STR_LEN("sandbox"), mb_sp(&sb), sb.len); };
+        let ap = MbStr { bytes: [0u8; 8192], len: 0 };
+        let has_ap: bool = false;
+        normalizeMiniSandbox(mb_g_node(rr, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy")), &ap, &has_ap);
+        if !has_ap {
+            let pa = MbStr { bytes: [0u8; 8192], len: 0 };
+            if mb_g_str(parent, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"), &pa) { mb_sassign_s2(&ap, &pa); has_ap = true; };
+        };
+        if has_ap { rc = mb_s_str(fork, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"), mb_sp(&ap), ap.len); };
+        rc = mb_s_i64(fork, STR_PTR("createdAt"), STR_LEN("createdAt"), mb_now_ms());
+        let lut: u64 = mb_g_node(parent, STR_PTR("lastUsedTokens"), STR_LEN("lastUsedTokens"));
+        if lut != 0 { rc = mb_s_node(fork, STR_PTR("lastUsedTokens"), STR_LEN("lastUsedTokens"), mb_clone_node(lut)); };
+        let lcw: u64 = mb_g_node(parent, STR_PTR("lastContextWindow"), STR_LEN("lastContextWindow"));
+        if lcw != 0 { rc = mb_s_node(fork, STR_PTR("lastContextWindow"), STR_LEN("lastContextWindow"), mb_clone_node(lcw)); };
+        let amd: u64 = mb_g_node(parent, STR_PTR("agentsMdActive"), STR_LEN("agentsMdActive"));
+        if amd != 0 { rc = mb_s_node(fork, STR_PTR("agentsMdActive"), STR_LEN("agentsMdActive"), mb_clone_node(amd)); };
+        rc = mb_s_node(fork, STR_PTR("turns"), STR_LEN("turns"), kept);
+        let p_msgs: u64 = mb_g_node(parent, STR_PTR("messages"), STR_LEN("messages"));
+        let f_msgs: u64 = mb_new_arr();
+        let mc: u64 = mb_n_count(p_msgs);
+        let mi: u64 = 0;
+        while mi < mc {
+            let m: u64 = mb_a_at(p_msgs, mi);
+            if m != 0 {
+                let mt = MbStr { bytes: [0u8; 8192], len: 0 };
+                let has_mt: bool = mb_g_str(m, STR_PTR("turnId"), STR_LEN("turnId"), &mt);
+                if !has_mt || mb_str_in_arr(kept_ids, mb_sp(&mt), mt.len, false) {
+                    let rc7: i32 = mb_a_push_node(f_msgs, mb_clone_node(m));
+                };
+            };
+            mi = mi + 1;
+        }
+        rc = mb_s_node(fork, STR_PTR("messages"), STR_LEN("messages"), f_msgs);
+        MiniBridge_set_session(b, mb_sp(&new_id), new_id.len, fork);
+        MiniBridge_persist(b, fork);
+        let tobj: u64 = mb_new_obj();
+        rc = mb_s_str(tobj, STR_PTR("id"), STR_LEN("id"), mb_sp(&new_id), new_id.len);
+        rc = mb_s_str(tobj, STR_PTR("cliBackend"), STR_LEN("cliBackend"), STR_PTR("mini"), STR_LEN("mini"));
+        if mb_g_str(fork, STR_PTR("cwd"), STR_LEN("cwd"), &v) { rc = mb_s_str(tobj, STR_PTR("cwd"), STR_LEN("cwd"), mb_sp(&v), v.len); };
+        rc = mb_s_str(tobj, STR_PTR("model"), STR_LEN("model"), mb_sp(&model), model.len);
+        let fsb: u64 = mb_g_node(fork, STR_PTR("sandbox"), STR_LEN("sandbox"));
+        if fsb != 0 { rc = mb_s_node(tobj, STR_PTR("sandbox"), STR_LEN("sandbox"), mb_clone_node(fsb)); } else { rc = mb_s_null(tobj, STR_PTR("sandbox"), STR_LEN("sandbox")); };
+        let fap: u64 = mb_g_node(fork, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"));
+        if fap != 0 { rc = mb_s_node(tobj, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"), mb_clone_node(fap)); } else { rc = mb_s_null(tobj, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy")); };
+        rc = mb_s_str(tobj, STR_PTR("status"), STR_LEN("status"), STR_PTR("active"), STR_LEN("active"));
+        rc = mb_s_i64(tobj, STR_PTR("createdAt"), STR_LEN("createdAt"), mb_now_ms());
+        let res: u64 = mb_new_obj();
+        rc = mb_s_node(res, STR_PTR("thread"), STR_LEN("thread"), tobj);
+        rc = mb_s_str(res, STR_PTR("threadId"), STR_LEN("threadId"), mb_sp(&new_id), new_id.len);
+        *out = res;
+        return;
+    };
+    // default: throw new Error(`Mini backend does not support ${method}`)
+    let msg = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_jassign(&msg, STR_PTR("Mini backend does not support "), STR_LEN("Mini backend does not support "));
+    mb_jappend(&msg, method_p, method_n);
+    mb_throw_j(out_err, out_throw, &msg);
 }
