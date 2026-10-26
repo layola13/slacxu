@@ -140,3 +140,64 @@ slacxu main 手写区）。环境：sci 6bc56b29、sa_plugin_sla b228d0d2；
   开新 /content/bulk 工作树并按本节清单重跑批次 3（含 deref 修正版），
   然后全量复检 → 审计 diff → 提交推送；若 26 文件仅剩缺口 2/3/4 阻塞，
   转 sdk-frontend（6+2 文件）同法打通。
+
+## 批次 3 重跑（2026-10-26，盒子换运行时后）
+
+工作树：新运行时（986a7d79e415）上 `git worktree add /content/bulk
+origin/bulk-convert`，基点 644e0aa（fetch 已核）。旧运行时上的批次 3
+随盒消亡，本节为按清单重跑的结果。
+
+### 已落地（均双确认：脚本断言计数 + grep 复查）
+- 写穿：&标量出参裸赋值 41 处（8 文件）改 `*out = v`；审计器逐站点
+  列单核对，无 shadow 假阳性。
+- 读解引用：&标量参的裸值读 29 行改 `*name`（借用转发站点经逐条审
+  查排除：flush_key 转发、cliSpawn spawn 转发、pol_bool 转发、
+  vcClient_getStatus 转发共 9 处保持裸名）；自增形 `*p = *p + 1`
+  非法（解引用读在算术式中仍带 borrow 标签），8 处拆为
+  `let p_v = *p; *p = p_v + 1;`；for 范围上界 1 处改 `0..*p`。
+  探针定论：`*p` 可作索引与比较操作数，不可作算术操作数。
+- 超 i64 字面量：恰 7 处（imagePersistence 3 + openCode 4），
+  ((hi<<32)|lo) 等值转写，脚本内数值等价断言。
+- 回绑真实面：sha256 → sa_std_net_sha256_hex（3 调用点）；toml
+  table_len 改状态码+&out_len 形；sa_json_get_bool → sa_json_as_bool
+  （4 处）、sa_json_array_len → sa_json_value_count（3 处）；
+  sa_json_string_ptr/len 改直接返回形（5 站点）；rename →
+  sa_fs_rename（3 处）；remove_dir_recursive → sa_fs_remove_dir_all
+  （3 处）；read_dir_json 补 max_entries=65536（2 处）。
+- 删 @extern 块：codexVirtualConfig（10 声明）+ saVmWorkspaceSkill
+  （2 声明）。CVC 四个 lock helper（sa_now_ms / sa_sleep_ms /
+  sa_fs_close_quiet / sa_fs_stat_mtime_ms）由 time.sai / fs.sai 真实
+  面本地组合实现，非占位。
+- hex/数组指针惯用法：&本地数组/字段直传 ptr 形参是 capability
+  参数，共 5 处改 PTR_BYTE_ADD 物化（MFP hex、CVC hex、CVC single、
+  CVC setAtPath vj、THP options.cursor）。
+- arena 标注：THP turn_ids_len 改 &[u8; 65536]；CVC store_writeValue
+  的 edits 改 [ConfigEdit; 32] 就地填充；CSI SkillError.message 统一
+  4096；RC 新增 copy_str512 承接 component 字段。
+- imports 补齐：CVC +string.sa（STR_PTR/STR_LEN 宏定义在此，非
+  ptr.sa）/toml/net/time/env/fs/json；IP +json/fs/string；RC/CSI
+  +json。RC 的 str_eq_lower 改本地复制（import memoryFilePaths.sla
+  与 dataDir 的 PathBuf 重声明冲突）。
+
+### 结果：19/26 通过（基线批次 1-2 后 11 已验 → 批次 3 后 19）
+失败 7（名字集合）：bridgeEventLog、codexVirtualConfig、
+hostServices、imagePersistence、index、openCodeSessionProtocol、
+saVmWorkspaceSkill。分类：
+- 缺口 2（顶层可变全局，用户已裁决走 cell、产物回绑待 cell 批次）：
+  hostServices（let current:97）、openCodeSessionProtocol
+  （let cachedOpenCodeProjectId:227 等）、index（导入级联）、
+  saVmWorkspaceSkill（PluginHostServices 字面量经 hostServices 级联；
+  其自身另有缺口 3 的 mkdir_p_ws 调用在后）。
+- 缺口 3（mkdir -p）：bridgeEventLog（sa_fs_mkdir_p:206，其余调用
+  已全部回绑真实面，此为唯一阻塞）、imagePersistence
+  （sa_fs_mkdir_p:308）。
+- codexVirtualConfig 首错为「其他」：vcClient_* 转发调用的
+  codeCliBridgeClient_* 自由函数全树不存在，inner 字段类型
+  CodeCliBridgeClient 亦无定义；runtimeClient 的 CodexRuntimeClient
+  是 fn-ptr 表，而 SLA 不支持经 ptr 字段调用（探针：Undefined
+  call）——派发面属语言/结构缺口。其后还排队缺口 3
+  （sa_fs_mkdir_p2）与缺口 4（sa_fs_open_create_excl）。
+- imagePersistence 另有两个「其他」阻塞：sa_base64_decode（lib 有
+  sa_b64dec_simd 实现但无 .sai 声明，402）、sa_http_fetch_bytes
+  （无 one-shot fetch 面；http_client.sai 是有状态 client API，
+  组合实现非机械回绑，450）。
