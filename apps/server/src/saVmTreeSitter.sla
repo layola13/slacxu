@@ -11,6 +11,11 @@
 
 @import "sa_std/io/print.sai"
 @import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/tree_sitter.sai"
+@import "sa_std/globals.sai"
+@import "sa_std/env.sai"
+@import "sa_std/fs.sai"
 
 // DEFECT: node:fs existsSync, node:module createRequire, node:path
 // (dirname/extname/join/resolve/relative), node:url fileURLToPath,
@@ -348,7 +353,7 @@ struct OrganizeImportsResult {
 // ---- src/saVmTreeSitter.ts:1766-1778 — interface ScopeAnalysisResult ----
 struct CapturedVariable {
     name: [u8; 256], name_len: u64,
-    type: [u8; 1024], type_len: u64,        // TS type text kept verbatim
+    type_: [u8; 1024], type_len: u64,        // TS type text kept verbatim
     isFunction: bool, isStateSetter: bool,
 }
 
@@ -416,7 +421,7 @@ fn language_cache_get(st: &TreeSitterState, name_p: ptr, name_n: u64) -> u64 {
     let idx: u64 = 0;
     while idx < st.languageCache_len {
         let klen: u64 = 0;
-        while pos + klen < st.languageCache_names_len && st.languageCache_names[pos + klen] != 10 { klen = klen + 1; };
+        while pos + klen < st.languageCache_names_len && st.languageCache_names[pos + klen] != 10 { klen = klen + 1; }
         if klen == name_n {
             let j: u64 = 0;
             let ok = true;
@@ -628,14 +633,12 @@ fn loadLanguageForFile(st: &TreeSitterState, filePath: &StrBuf) -> u64 {
 }
 
 // ---- src/saVmTreeSitter.ts:280-300 — isInsideCommentOrString ----
-// TS: walks node.parent chain; String.prototype.includes on node.type.
+// TS: walks node.parent chain; String.prototype.includes on node.type_.
 fn isInsideCommentOrString(node: u64) -> bool {
     let curr = node;
     while curr != 0 {
-        let tp = ts_node_type_ptr(curr);
-        let tn = ts_node_type_len(curr);
         let tbuf = StrBuf { bytes: [0u8; 65536], len: 0 };
-        sb_append(&tbuf, tp, tn);
+        ts_node_type_sb(curr, &tbuf);
         if sb_contains(&tbuf, STR_PTR("comment"), STR_LEN("comment")) ||
            sb_contains(&tbuf, STR_PTR("string"), STR_LEN("string")) ||
            sb_eq_lit(&tbuf, STR_PTR("raw_string_literal"), STR_LEN("raw_string_literal")) ||
@@ -662,7 +665,7 @@ fn formatOutlineSymbols(pool: &OutlineSymbolList, first: u64, count: u64, prefix
         sb_append(out, STR_PTR(""), 0);
         // `${prefix}${branch}${kind} ${name} [L${start}-${end}]${sig}`
         let p: u64 = 0;
-        while p < prefix.len { sb_append_byte(out, prefix.bytes[p]); p = p + 1; };
+        while p < prefix.len { sb_append_byte(out, prefix.bytes[p]); p = p + 1; }
         if isLast { sb_append(out, STR_PTR("└── "), STR_LEN("└── ")); } else { sb_append(out, STR_PTR("├── "), STR_LEN("├── ")); };
         let kn = StrBuf { bytes: [0u8; 65536], len: 0 };
         kind_name(sym.kind, &kn);
@@ -671,7 +674,7 @@ fn formatOutlineSymbols(pool: &OutlineSymbolList, first: u64, count: u64, prefix
         sb_append(out, kp, kn.len);
         sb_append_byte(out, 32);
         let q: u64 = 0;
-        while q < sym.name_len { sb_append_byte(out, sym.name[q]); q = q + 1; };
+        while q < sym.name_len { sb_append_byte(out, sym.name[q]); q = q + 1; }
         sb_append(out, STR_PTR(" [L"), STR_LEN(" [L"));
         sb_append_u64(out, sym.startLine);
         sb_append_byte(out, 45);
@@ -680,14 +683,14 @@ fn formatOutlineSymbols(pool: &OutlineSymbolList, first: u64, count: u64, prefix
         if sym.has_signature {
             sb_append(out, STR_PTR(" ("), STR_LEN(" ("));
             let s2: u64 = 0;
-            while s2 < sym.signature_len { sb_append_byte(out, sym.signature[s2]); s2 = s2 + 1; };
+            while s2 < sym.signature_len { sb_append_byte(out, sym.signature[s2]); s2 = s2 + 1; }
             sb_append_byte(out, 41);
         };
         sb_append_byte(out, 10);
         if sym.children_len > 0 {
             let nextPrefix = StrBuf { bytes: [0u8; 65536], len: 0 };
             let r: u64 = 0;
-            while r < prefix.len { sb_append_byte(&nextPrefix, prefix.bytes[r]); r = r + 1; };
+            while r < prefix.len { sb_append_byte(&nextPrefix, prefix.bytes[r]); r = r + 1; }
             if isLast { sb_append(&nextPrefix, STR_PTR("    "), STR_LEN("    ")); } else { sb_append(&nextPrefix, STR_PTR("│   "), STR_LEN("│   ")); };
             formatOutlineSymbols(pool, sym.children_first, sym.children_len, &nextPrefix, out);
         };
@@ -741,17 +744,502 @@ fn truncateSignature(text: &StrBuf, maxLen: u64, out: &StrBuf) {
 }
 
 // ---- node-type helpers for the collector functions below ----
+// =====================================================================
+// Host layer (fix phase 1): the ts_*/proc_*/path_*/fs_* surface the
+// conversion assumed, implemented over sa_std — web-tree-sitter (WASM)
+// maps to sa_ts_* (tree_sitter.sai); languages are grammar NAMES in
+// sa_ts, so ts_language_load reduces a .wasm path to its grammar name
+// and registers it in a joined-name cell table (id = line number).
+// Node position/parent queries take only a node in the original API;
+// every walk in this module roots its tree via ts_tree_root right
+// before querying, so a single active parse context (source/tree/root
+// in sa_global cells, set by ts_parser_parse/ts_tree_root) is faithful
+// for this module's call flow.
+// TRUE GAP (four-source checked 2026-10-26: sala docs, sa_plugin_sla
+// demos + tests, sa_std tree_sitter.sai, sci sa_tree_sitter.zig):
+// sa_ts binds only 16 externs; the C API's ts_node_parent /
+// ts_node_start_position / ts_node_is_named / ts_node_is_missing /
+// ts_node_has_error are NOT bound. Positions below are computed
+// exactly from byte ranges + the registered source; parent via
+// deepest-match DFS (exact except same-type + same-range wrapper
+// chains); has_error via the tree's own sexp rendering (exact);
+// is_missing approximated as an empty-range leaf (noted at its def).
+// =====================================================================
+
+fn fs_exists(p: ptr, n: u64) -> bool {
+    // status-code surface: 0 = exists (see FIX notes on fs_exists).
+    return sa_std_fs_exists(p, n) == 0;
+}
+
+fn proc_cwd(out: &StrBuf) {
+    sb_clear(out);
+    let h = sa_env_current_dir();
+    if h == 0 { return; };
+    let vp: ptr = sa_env_buffer_data(h);
+    let n = sa_env_buffer_len(h);
+    if n > 0 { sb_append(out, vp, n); };
+    sa_env_buffer_free(h);
+}
+
+fn proc_resources_path(out: &StrBuf) -> bool {
+    // Electron-only (process.resourcesPath); the CXU server runtime
+    // is Bun/Node where the value is absent and callers skip the
+    // branch — returning false is the faithful non-Electron behavior.
+    sb_clear(out);
+    return false;
+}
+
+fn path_extname(p: &StrBuf, out: &StrBuf) {
+    sb_clear(out);
+    let dot: u64 = 0;
+    let has_dot = false;
+    let i: u64 = 0;
+    while i < p.len {
+        let c = p.bytes[i];
+        if c == 47 { has_dot = false; };
+        if c == 46 { dot = i; has_dot = true; };
+        i = i + 1;
+    }
+    if !has_dot { return; };
+    let k = dot;
+    while k < p.len { sb_append_byte(out, p.bytes[k]); k = k + 1; }
+}
+
+fn path_dirname(p: &StrBuf, out: &StrBuf) {
+    sb_clear(out);
+    if p.len == 0 { sb_append(out, STR_PTR("."), 1); return; };
+    let end = p.len;
+    while end > 1 && p.bytes[end - 1] == 47 { end = end - 1; }
+    let slash: u64 = 0;
+    let has_slash = false;
+    let i = end;
+    while i > 0 && !has_slash {
+        if p.bytes[i - 1] == 47 { slash = i - 1; has_slash = true; };
+        i = i - 1;
+    }
+    if !has_slash { sb_append(out, STR_PTR("."), 1); return; };
+    if slash == 0 { sb_append(out, STR_PTR("/"), 1); return; };
+    let k: u64 = 0;
+    while k < slash { sb_append_byte(out, p.bytes[k]); k = k + 1; }
+}
+
+fn path_normalize_sb(p: &StrBuf, out: &StrBuf) {
+    // Segment-stack normalization of "." / ".." (POSIX separators).
+    let absolute = p.len > 0 && p.bytes[0] == 47;
+    let nb = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let seg_end: [u64; 256] = [0u64; 256];
+    let depth: u64 = 0;
+    let start: u64 = 0;
+    let pos: u64 = 0;
+    while pos <= p.len {
+        let at_end = pos == p.len;
+        if at_end || p.bytes[pos] == 47 {
+            let seg_len = pos - start;
+            if seg_len == 1 && p.bytes[start] == 46 {
+                // "." — skip
+            } else if seg_len == 2 && p.bytes[start] == 46 && p.bytes[start + 1] == 46 {
+                if depth > 0 {
+                    depth = depth - 1;
+                    nb.len = seg_end[depth];
+                } else if !absolute {
+                    if nb.len > 0 { sb_append_byte(&nb, 47); };
+                    sb_append(&nb, STR_PTR(".."), 2);
+                };
+            } else if seg_len > 0 {
+                if nb.len > 0 { sb_append_byte(&nb, 47); };
+                let k = start;
+                while k < pos { sb_append_byte(&nb, p.bytes[k]); k = k + 1; }
+                if depth < 256 { seg_end[depth] = nb.len; depth = depth + 1; };
+            };
+            start = pos + 1;
+        };
+        pos = pos + 1;
+    }
+    sb_clear(out);
+    if absolute { sb_append_byte(out, 47); };
+    let nbp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(nbp, &nb.bytes, 0);
+    sb_append(out, nbp, nb.len);
+    if out.len == 0 { sb_append(out, STR_PTR("."), 1); };
+}
+
+fn path_resolve2(base: &StrBuf, spec: &StrBuf, out: &StrBuf) {
+    if spec.len > 0 && spec.bytes[0] == 47 {
+        path_normalize_sb(spec, out);
+        return;
+    };
+    let joined = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &base.bytes, 0);
+    sb_append(&joined, bp, base.len);
+    if joined.len > 0 && spec.len > 0 { sb_append_byte(&joined, 47); };
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, &spec.bytes, 0);
+    sb_append(&joined, sp, spec.len);
+    path_normalize_sb(&joined, out);
+}
+
+fn path_relative(from: &StrBuf, to: &StrBuf, out: &StrBuf) {
+    sb_clear(out);
+    // common segment-prefix length (bytes, segment aligned)
+    let common: u64 = 0;
+    let i: u64 = 0;
+    let lim = from.len;
+    if to.len < lim { lim = to.len; };
+    while i < lim && from.bytes[i] == to.bytes[i] { i = i + 1; }
+    common = i;
+    // back off to a segment boundary
+    while common > 0 && common < from.len && from.bytes[common] != 47 && from.bytes[common - 1] != 47 { common = common - 1; }
+    if common < from.len && from.bytes[common] == 47 { common = common + 1; };
+    // one ".." per remaining from-segment
+    let segs: u64 = 0;
+    if common < from.len {
+        segs = 1;
+        let k = common;
+        while k < from.len { if from.bytes[k] == 47 { segs = segs + 1; }; k = k + 1; }
+    };
+    let u: u64 = 0;
+    while u < segs {
+        if out.len > 0 { sb_append_byte(out, 47); };
+        sb_append(out, STR_PTR(".."), 2);
+        u = u + 1;
+    }
+    if common < to.len {
+        if out.len > 0 { sb_append_byte(out, 47); };
+        let k = common;
+        while k < to.len { sb_append_byte(out, to.bytes[k]); k = k + 1; }
+    };
+}
+
+fn ts_current_src(out: &StrBuf) -> bool {
+    sb_clear(out);
+    let n: u64 = 0;
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &out.bytes, 0);
+    let st = sa_global_bytes_get(STR_PTR("srv.ts.src"), STR_LEN("srv.ts.src"), bp, 65536, &n);
+    if st != 0 { return false; };
+    out.len = n;
+    return true;
+}
+
+fn ts_parser_init(wasm_ptr: ptr, wasm_len: u64) -> bool {
+    // web-tree-sitter Parser.init loads the runtime wasm; the native
+    // core is dlopen'ed by sa_std — init succeeds iff it is present.
+    return sa_ts_available() == 1;
+}
+
+fn ts_parser_new() -> u64 {
+    let h: u64 = 0;
+    let st = sa_ts_parser_new(&h);
+    if st != 0 { return 0; };
+    return h;
+}
+
+fn ts_language_load(path_ptr: ptr, path_len: u64) -> u64 {
+    // ".../tree-sitter-typescript.wasm" -> grammar name "typescript",
+    // appended to the joined-name registry; handle = 1-based line no.
+    let base_start: u64 = 0;
+    let i: u64 = 0;
+    while i < path_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, path_ptr, i);
+        if b == 47 { base_start = i + 1; };
+        i = i + 1;
+    }
+    let name = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let j = base_start;
+    while j < path_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, path_ptr, j);
+        sb_append_byte(&name, b);
+        j = j + 1;
+    }
+    if sb_starts_with(&name, STR_PTR("tree-sitter-"), STR_LEN("tree-sitter-")) {
+        let tmp = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let k: u64 = 12;
+        while k < name.len { sb_append_byte(&tmp, name.bytes[k]); k = k + 1; }
+        sb_clear(&name);
+        let tp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp2, &tmp.bytes, 0);
+        sb_append(&name, tp2, tmp.len);
+    };
+    if sb_ends_with(&name, STR_PTR(".wasm"), STR_LEN(".wasm")) { name.len = name.len - 5; };
+    if name.len == 0 { return 0; };
+    let reg = StrBuf { bytes: [0u8; 65536], len: 0 };
+    ts_langs_load(&reg);
+    // count existing entries and reject duplicates (idempotent load)
+    let id: u64 = 1;
+    let pos: u64 = 0;
+    let line_start: u64 = 0;
+    while pos < reg.len {
+        if reg.bytes[pos] == 10 {
+            if pos - line_start == name.len {
+                let same = true;
+                let k: u64 = 0;
+                while k < name.len { if reg.bytes[line_start + k] != name.bytes[k] { same = false; }; k = k + 1; }
+                if same { return id; };
+            };
+            id = id + 1;
+            line_start = pos + 1;
+        };
+        pos = pos + 1;
+    }
+    let np: ptr = PTR_NULL();
+    PTR_BYTE_ADD(np, &name.bytes, 0);
+    sb_append(&reg, np, name.len);
+    sb_append_byte(&reg, 10);
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &reg.bytes, 0);
+    sa_global_bytes_set(STR_PTR("srv.ts.langs"), STR_LEN("srv.ts.langs"), rp, reg.len);
+    return id;
+}
+
+fn ts_langs_load(out: &StrBuf) {
+    sb_clear(out);
+    let n: u64 = 0;
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &out.bytes, 0);
+    let st = sa_global_bytes_get(STR_PTR("srv.ts.langs"), STR_LEN("srv.ts.langs"), bp, 65536, &n);
+    if st == 0 { out.len = n; };
+}
+
+fn ts_parser_set_language(parser: u64, lang: u64) -> bool {
+    if parser == 0 || lang == 0 { return false; };
+    let reg = StrBuf { bytes: [0u8; 65536], len: 0 };
+    ts_langs_load(&reg);
+    let want = lang - 1;
+    let idx: u64 = 0;
+    let pos: u64 = 0;
+    let line_start: u64 = 0;
+    let namebuf: [u8; 128] = [0u8; 128];
+    let name_len: u64 = 0;
+    let found = false;
+    while pos <= reg.len && !found {
+        if pos == reg.len || reg.bytes[pos] == 10 {
+            if idx == want {
+                let k = line_start;
+                while k < pos && name_len < 128 { namebuf[name_len] = reg.bytes[k]; name_len = name_len + 1; k = k + 1; }
+                found = true;
+            };
+            idx = idx + 1;
+            line_start = pos + 1;
+        };
+        pos = pos + 1;
+    }
+    if !found || name_len == 0 { return false; };
+    return sa_ts_parser_set_language(parser, &namebuf, name_len) == 0;
+}
+
+fn ts_parser_parse(parser: u64, src_ptr: ptr, src_len: u64) -> u64 {
+    sa_global_bytes_set(STR_PTR("srv.ts.src"), STR_LEN("srv.ts.src"), src_ptr, src_len);
+    let tree: u64 = 0;
+    let st = sa_ts_parse(parser, src_ptr, src_len, &tree);
+    if st != 0 { return 0; };
+    return tree;
+}
+
+fn ts_tree_root(tree: u64) -> u64 {
+    let node: u64 = 0;
+    let st = sa_ts_tree_root(tree, &node);
+    if st != 0 { return 0; };
+    sa_global_u64_set(STR_PTR("srv.ts.tree"), STR_LEN("srv.ts.tree"), tree);
+    sa_global_u64_set(STR_PTR("srv.ts.root"), STR_LEN("srv.ts.root"), node);
+    return node;
+}
+
+fn ts_node_child(node: u64, idx: u64) -> u64 {
+    let out: u64 = 0;
+    let st = sa_ts_node_child(node, idx as u32, 0, &out);
+    if st != 0 { return 0; };
+    return out;
+}
+
+fn ts_node_named_child(node: u64, idx: u64) -> u64 {
+    let out: u64 = 0;
+    let st = sa_ts_node_child(node, idx as u32, 1, &out);
+    if st != 0 { return 0; };
+    return out;
+}
+
+fn ts_node_child_count(node: u64) -> u64 {
+    let c: u64 = 0;
+    let st = sa_ts_node_child_count(node, &c);
+    if st != 0 { return 0; };
+    return c;
+}
+
+fn ts_node_named_child_count(node: u64) -> u64 {
+    let c: u64 = 0;
+    let st = sa_ts_node_named_child_count(node, &c);
+    if st != 0 { return 0; };
+    return c;
+}
+
+fn ts_node_child_by_field(node: u64, fp: ptr, fl: u64) -> u64 {
+    let out: u64 = 0;
+    let st = sa_ts_node_child_by_field(node, fp, fl, &out);
+    if st != 0 { return 0; };
+    return out;
+}
+
+fn ts_node_text(node: u64, out: &StrBuf) {
+    sb_clear(out);
+    let n: u64 = 0;
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &out.bytes, 0);
+    let st = sa_ts_node_text(node, bp, 65536, &n);
+    if st == 0 { out.len = n; };
+}
+
+fn ts_node_type_sb(node: u64, out: &StrBuf) {
+    sb_clear(out);
+    let n: u64 = 0;
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &out.bytes, 0);
+    let st = sa_ts_node_type(node, bp, 65536, &n);
+    if st == 0 { out.len = n; };
+}
+
+fn ts_node_start_index(node: u64) -> u64 {
+    let s: u64 = 0;
+    let e: u64 = 0;
+    let st = sa_ts_node_byte_range(node, &s, &e);
+    if st != 0 { return 0; };
+    return s;
+}
+
+fn ts_node_end_index(node: u64) -> u64 {
+    let s: u64 = 0;
+    let e: u64 = 0;
+    let st = sa_ts_node_byte_range(node, &s, &e);
+    if st != 0 { return 0; };
+    return e;
+}
+
+fn ts_pos_row_col(byte: u64, want_col: bool) -> u64 {
+    let src = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if !ts_current_src(&src) { return 0; };
+    let lim = byte;
+    if lim > src.len { lim = src.len; };
+    let row: u64 = 0;
+    let line_start: u64 = 0;
+    let i: u64 = 0;
+    while i < lim {
+        if src.bytes[i] == 10 { row = row + 1; line_start = i + 1; };
+        i = i + 1;
+    }
+    if want_col { return byte - line_start; };
+    return row;
+}
+
+fn ts_node_start_row(node: u64) -> u64 { return ts_pos_row_col(ts_node_start_index(node), false); }
+fn ts_node_end_row(node: u64) -> u64 { return ts_pos_row_col(ts_node_end_index(node), false); }
+fn ts_node_start_col(node: u64) -> u64 { return ts_pos_row_col(ts_node_start_index(node), true); }
+
+fn ts_node_is_error(node: u64) -> bool {
+    return node_type_is(node, STR_PTR("ERROR"), STR_LEN("ERROR"));
+}
+
+fn ts_node_is_missing(node: u64) -> bool {
+    // APPROXIMATION (see header): sa_ts binds no is_missing; in the C
+    // API a MISSING node is an inserted zero-width token, i.e. an
+    // empty-range leaf here. Legitimate empty-range leaves are rare
+    // in the typescript/tsx grammars this module loads.
+    if node == 0 { return false; };
+    if ts_node_start_index(node) != ts_node_end_index(node) { return false; };
+    return ts_node_child_count(node) == 0;
+}
+
+fn ts_node_last_named_child(node: u64) -> u64 {
+    let c = ts_node_named_child_count(node);
+    if c == 0 { return 0; };
+    return ts_node_named_child(node, c - 1);
+}
+
+fn ts_subtree_has_error(node: u64) -> bool {
+    if node == 0 { return false; };
+    if ts_node_is_error(node) { return true; };
+    let cc = ts_node_child_count(node);
+    let i: u64 = 0;
+    while i < cc {
+        let ch = ts_node_child(node, i);
+        if ch != 0 && ts_subtree_has_error(ch) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ts_node_has_error(node: u64) -> bool {
+    // Exact via the tree's own sexp rendering ((ERROR / (MISSING
+    // markers are emitted by ts_node_to_string in the C core).
+    let tree: u64 = 0;
+    let st = sa_global_u64_get(STR_PTR("srv.ts.tree"), STR_LEN("srv.ts.tree"), &tree);
+    if st == 0 && tree != 0 {
+        let sx = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let n: u64 = 0;
+        let sxp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sxp, &sx.bytes, 0);
+        let s2 = sa_ts_tree_sexp(tree, sxp, 65536, &n);
+        if s2 == 0 {
+            sx.len = n;
+            if sb_contains(&sx, STR_PTR("(ERROR"), STR_LEN("(ERROR")) { return true; };
+            if sb_contains(&sx, STR_PTR("(MISSING"), STR_LEN("(MISSING")) { return true; };
+            return false;
+        };
+    };
+    return ts_subtree_has_error(node);
+}
+
+fn ts_parent_search(cur: u64, t_start: u64, t_end: u64, t_type: &StrBuf, depth: u64, best: &u64, best_depth: &u64) {
+    let cc = ts_node_child_count(cur);
+    let i: u64 = 0;
+    while i < cc {
+        let ch = ts_node_child(cur, i);
+        if ch != 0 {
+            let cs = ts_node_start_index(ch);
+            let ce = ts_node_end_index(ch);
+            if cs == t_start && ce == t_end {
+                let ct = StrBuf { bytes: [0u8; 65536], len: 0 };
+                ts_node_type_sb(ch, &ct);
+                if sb_eq_buf(&ct, t_type) {
+                    if depth > *best_depth { *best = cur; *best_depth = depth; };
+                };
+            };
+            if cs <= t_start && t_end <= ce {
+                ts_parent_search(ch, t_start, t_end, t_type, depth + 1, best, best_depth);
+            };
+        };
+        i = i + 1;
+    }
+}
+
+fn ts_node_parent(node: u64) -> u64 {
+    if node == 0 { return 0; };
+    let root: u64 = 0;
+    let st = sa_global_u64_get(STR_PTR("srv.ts.root"), STR_LEN("srv.ts.root"), &root);
+    if st != 0 || root == 0 || root == node { return 0; };
+    let t_start = ts_node_start_index(node);
+    let t_end = ts_node_end_index(node);
+    let t_type = StrBuf { bytes: [0u8; 65536], len: 0 };
+    ts_node_type_sb(node, &t_type);
+    let best: u64 = 0;
+    let best_depth: u64 = 0;
+    ts_parent_search(root, t_start, t_end, &t_type, 1, &best, &best_depth);
+    return best;
+}
+
+// ---- end host layer ----
+
 fn node_type_is(n: u64, p: ptr, len: u64) -> bool {
     if n == 0 { return false; };
-    if ts_node_type_len(n) != len { return false; };
-    let tp = ts_node_type_ptr(n);
+    let tb = StrBuf { bytes: [0u8; 65536], len: 0 };
+    ts_node_type_sb(n, &tb);
+    if tb.len != len { return false; };
     let i: u64 = 0;
     while i < len {
-        let a: u8 = 0;
-        let b: u8 = 0;
-        PTR_BYTE_AT(a, tp, i);
-        PTR_BYTE_AT(b, p, i);
-        if a != b { return false; };
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, i);
+        if tb.bytes[i] != c { return false; };
         i = i + 1;
     }
     return true;
@@ -980,7 +1468,7 @@ fn sym_prefix_export(pool: &OutlineSymbolList, idx: u64) {
     // name = `export ${name}` when the declaration is exported
     let old = StrBuf { bytes: [0u8; 65536], len: 0 };
     let i: u64 = 0;
-    while i < pool.items[idx].name_len { sb_append_byte(&old, pool.items[idx].name[i]); i = i + 1; };
+    while i < pool.items[idx].name_len { sb_append_byte(&old, pool.items[idx].name[i]); i = i + 1; }
     pool.items[idx].name_len = 0;
     let lit = "export ";
     let j: u64 = 0;
@@ -1074,7 +1562,7 @@ fn collectGoSymbols(pool: &OutlineSymbolList, node: u64) -> u64 {
                         // prepend "receiver."
                         let old = StrBuf { bytes: [0u8; 65536], len: 0 };
                         let q: u64 = 0;
-                        while q < pool.items[idx].name_len { sb_append_byte(&old, pool.items[idx].name[q]); q = q + 1; };
+                        while q < pool.items[idx].name_len { sb_append_byte(&old, pool.items[idx].name[q]); q = q + 1; }
                         pool.items[idx].name_len = 0;
                         let r: u64 = 0;
                         while r < rb.len && pool.items[idx].name_len < 255 {
@@ -1136,7 +1624,7 @@ fn collectZigSymbols(pool: &OutlineSymbolList, node: u64) -> u64 {
                     let tb = StrBuf { bytes: [0u8; 65536], len: 0 };
                     node_text_into(child, &tb);
                     let cut: u64 = 0;
-                    while cut < tb.len && tb.bytes[cut] != 40 { cut = cut + 1; };
+                    while cut < tb.len && tb.bytes[cut] != 40 { cut = cut + 1; }
                     tb.len = cut;
                     let trimmed = StrBuf { bytes: [0u8; 65536], len: 0 };
                     sb_trim(&tb, &trimmed);
@@ -1180,8 +1668,8 @@ fn collectZigSymbols(pool: &OutlineSymbolList, node: u64) -> u64 {
 }
 
 fn zig_decl_name(text: &StrBuf, out_at: &u64, out_len: &u64) {
-    out_at = 0;
-    out_len = 0;
+    *out_at = 0;
+    *out_len = 0;
     let i: u64 = 0;
     while i + 6 <= text.len {
         let isConst = text.bytes[i] == 99 && text.bytes[i + 1] == 111 && text.bytes[i + 2] == 110 && text.bytes[i + 3] == 115 && text.bytes[i + 4] == 116;
@@ -1191,7 +1679,7 @@ fn zig_decl_name(text: &StrBuf, out_at: &u64, out_len: &u64) {
         if isVar { kwLen = 3; };
         if kwLen > 0 {
             let j = i + kwLen;
-            while j < text.len && (text.bytes[j] == 32 || text.bytes[j] == 9) { j = j + 1; };
+            while j < text.len && (text.bytes[j] == 32 || text.bytes[j] == 9) { j = j + 1; }
             let s = j;
             while j < text.len {
                 let c = text.bytes[j];
@@ -1199,7 +1687,7 @@ fn zig_decl_name(text: &StrBuf, out_at: &u64, out_len: &u64) {
                 if !idc { break; };
                 j = j + 1;
             }
-            if j > s { out_at = s; out_len = j - s; return; };
+            if j > s { *out_at = s; *out_len = j - s; return; };
         };
         i = i + 1;
     }
@@ -1303,7 +1791,7 @@ fn extractRegexOutline(pool: &OutlineSymbolList, content: &StrBuf) -> u64 {
             let nb = StrBuf { bytes: [0u8; 65536], len: 0 };
             sb_append(&nb, STR_PTR("impl "), STR_LEN("impl "));
             let p: u64 = 4;
-            while p < trimmed.len && trimmed.bytes[p] != 123 { sb_append_byte(&nb, trimmed.bytes[p]); p = p + 1; };
+            while p < trimmed.len && trimmed.bytes[p] != 123 { sb_append_byte(&nb, trimmed.bytes[p]); p = p + 1; }
             let nt = StrBuf { bytes: [0u8; 65536], len: 0 };
             sb_trim(&nb, &nt);
             pool.items[sidx].name_len = 0;
@@ -1321,18 +1809,19 @@ fn extractRegexOutline(pool: &OutlineSymbolList, content: &StrBuf) -> u64 {
 
 fn skip_ws_and_kw(line: &StrBuf, pos: &u64, kw_p: ptr, kw_n: u64) -> bool {
     // consume optional keyword at pos (followed by whitespace)
-    if pos + kw_n > line.len { return false; };
+    let p = *pos;
+    if p + kw_n > line.len { return false; };
     let i: u64 = 0;
     while i < kw_n {
         let c: u8 = 0;
         PTR_BYTE_AT(c, kw_p, i);
-        if line.bytes[pos + i] != c { return false; };
+        if line.bytes[p + i] != c { return false; };
         i = i + 1;
     }
-    let after = pos + kw_n;
+    let after = p + kw_n;
     if after < line.len && line.bytes[after] != 32 && line.bytes[after] != 9 { return false; };
-    while after < line.len && (line.bytes[after] == 32 || line.bytes[after] == 9) { after = after + 1; };
-    pos = after;
+    while after < line.len && (line.bytes[after] == 32 || line.bytes[after] == 9) { after = after + 1; }
+    *pos = after;
     return true;
 }
 
@@ -1345,8 +1834,8 @@ fn read_ident(line: &StrBuf, pos: u64, out_at: &u64, out_len: &u64) -> bool {
         if !idc { break; };
         j = j + 1;
     }
-    out_at = s;
-    out_len = j - s;
+    *out_at = s;
+    *out_len = j - s;
     return j > s;
 }
 
@@ -1375,7 +1864,7 @@ fn regex_outline_type(line: &StrBuf, out_at: &u64, out_len: &u64, out_kind: &u64
     if skip_ws_and_kw(line, &p2, STR_PTR("export"), STR_LEN("export")) { pos = p2; };
     p2 = pos;
     if skip_ws_and_kw(line, &p2, STR_PTR("pub"), STR_LEN("pub")) { pos = p2; };
-    out_kind = KIND_TRAIT;
+    *out_kind = KIND_TRAIT;
     p2 = pos;
     if skip_ws_and_kw(line, &p2, STR_PTR("class"), STR_LEN("class")) { return read_ident(line, p2, out_at, out_len); };
     p2 = pos;
@@ -1399,7 +1888,7 @@ fn extractFileOutline(st: &TreeSitterState, pool: &OutlineSymbolList, filePath: 
     out.totalLines = totalLines;
     out.filePath_len = 0;
     let fp: u64 = 0;
-    while fp < filePath.len && fp < 1024 { out.filePath[fp] = filePath.bytes[fp]; out.filePath_len = out.filePath_len + 1; fp = fp + 1; };
+    while fp < filePath.len && fp < 1024 { out.filePath[fp] = filePath.bytes[fp]; out.filePath_len = out.filePath_len + 1; fp = fp + 1; }
     let langName = StrBuf { bytes: [0u8; 65536], len: 0 };
     let hasLang = getLanguageNameForFile(filePath, &langName);
     let first = pool.len;
@@ -1416,7 +1905,7 @@ fn extractFileOutline(st: &TreeSitterState, pool: &OutlineSymbolList, filePath: 
     out.has_language = true;
     out.language_len = 0;
     let lp: u64 = 0;
-    while lp < langName.len && lp < 64 { out.language[lp] = langName.bytes[lp]; out.language_len = out.language_len + 1; lp = lp + 1; };
+    while lp < langName.len && lp < 64 { out.language[lp] = langName.bytes[lp]; out.language_len = out.language_len + 1; lp = lp + 1; }
     let lang = loadLanguageForFile(st, filePath);
     if lang == 0 || st.parserInstance == 0 {
         count = extractRegexOutline(pool, content);
@@ -1463,7 +1952,7 @@ fn outline_result_format(out: &FileOutlineResult, pool: &OutlineSymbolList, file
     formatOutlineAsTree(filePath, totalLines, pool, out.symbols_first, out.symbols_len, &fb);
     out.formatted_len = 0;
     let i: u64 = 0;
-    while i < fb.len && i < 65536 { out.formatted[i] = fb.bytes[i]; out.formatted_len = out.formatted_len + 1; i = i + 1; };
+    while i < fb.len && i < 65536 { out.formatted[i] = fb.bytes[i]; out.formatted_len = out.formatted_len + 1; i = i + 1; }
 }
 
 // ---- src/saVmTreeSitter.ts:870-944 — renameSymbolInContent ----
@@ -1479,19 +1968,16 @@ struct RenameWalkState {
 }
 
 fn renameWalk(st: &RenameWalkState, content: &StrBuf, idx: &LineIndex, node: u64) {
-    let tp = ts_node_type_ptr(node);
-    let tn = ts_node_type_len(node);
+    let tb0 = StrBuf { bytes: [0u8; 65536], len: 0 };
+    ts_node_type_sb(node, &tb0);
     let isIdent = false;
-    // node.type in {identifier, type_identifier, field_identifier,
-    // property_identifier, shorthand_property_identifier,
-    // scoped_identifier, constant}
-    if (tn == STR_LEN("identifier") && bytes_eq(tp, tn, STR_PTR("identifier"), STR_LEN("identifier"))) ||
-       (tn == STR_LEN("type_identifier") && bytes_eq(tp, tn, STR_PTR("type_identifier"), STR_LEN("type_identifier"))) ||
-       (tn == STR_LEN("field_identifier") && bytes_eq(tp, tn, STR_PTR("field_identifier"), STR_LEN("field_identifier"))) ||
-       (tn == STR_LEN("property_identifier") && bytes_eq(tp, tn, STR_PTR("property_identifier"), STR_LEN("property_identifier"))) ||
-       (tn == STR_LEN("shorthand_property_identifier") && bytes_eq(tp, tn, STR_PTR("shorthand_property_identifier"), STR_LEN("shorthand_property_identifier"))) ||
-       (tn == STR_LEN("scoped_identifier") && bytes_eq(tp, tn, STR_PTR("scoped_identifier"), STR_LEN("scoped_identifier"))) ||
-       (tn == STR_LEN("constant") && bytes_eq(tp, tn, STR_PTR("constant"), STR_LEN("constant"))) {
+    if sb_eq_lit(&tb0, STR_PTR("identifier"), STR_LEN("identifier")) ||
+       sb_eq_lit(&tb0, STR_PTR("type_identifier"), STR_LEN("type_identifier")) ||
+       sb_eq_lit(&tb0, STR_PTR("field_identifier"), STR_LEN("field_identifier")) ||
+       sb_eq_lit(&tb0, STR_PTR("property_identifier"), STR_LEN("property_identifier")) ||
+       sb_eq_lit(&tb0, STR_PTR("shorthand_property_identifier"), STR_LEN("shorthand_property_identifier")) ||
+       sb_eq_lit(&tb0, STR_PTR("scoped_identifier"), STR_LEN("scoped_identifier")) ||
+       sb_eq_lit(&tb0, STR_PTR("constant"), STR_LEN("constant")) {
         isIdent = true;
     };
     if isIdent {
@@ -1520,13 +2006,13 @@ fn renameWalk(st: &RenameWalkState, content: &StrBuf, idx: &LineIndex, node: u64
                     st.edits.items[ei].column = col + 1;
                     st.edits.items[ei].oldText_len = 0;
                     let a: u64 = 0;
-                    while a < st.oldName_len && a < 256 { st.edits.items[ei].oldText[a] = st.oldName[a]; st.edits.items[ei].oldText_len = st.edits.items[ei].oldText_len + 1; a = a + 1; };
+                    while a < st.oldName_len && a < 256 { st.edits.items[ei].oldText[a] = st.oldName[a]; st.edits.items[ei].oldText_len = st.edits.items[ei].oldText_len + 1; a = a + 1; }
                     st.edits.items[ei].newText_len = 0;
                     let b: u64 = 0;
-                    while b < st.newName_len && b < 256 { st.edits.items[ei].newText[b] = st.newName[b]; st.edits.items[ei].newText_len = st.edits.items[ei].newText_len + 1; b = b + 1; };
+                    while b < st.newName_len && b < 256 { st.edits.items[ei].newText[b] = st.newName[b]; st.edits.items[ei].newText_len = st.edits.items[ei].newText_len + 1; b = b + 1; }
                     st.edits.items[ei].preview_len = 0;
                     let c2: u64 = 0;
-                    while c2 < trimmed.len && c2 < 1024 { st.edits.items[ei].preview[c2] = trimmed.bytes[c2]; st.edits.items[ei].preview_len = st.edits.items[ei].preview_len + 1; c2 = c2 + 1; };
+                    while c2 < trimmed.len && c2 < 1024 { st.edits.items[ei].preview[c2] = trimmed.bytes[c2]; st.edits.items[ei].preview_len = st.edits.items[ei].preview_len + 1; c2 = c2 + 1; }
                     st.edits.len = st.edits.len + 1;
                 };
             };
@@ -1575,18 +2061,18 @@ fn applyEditsDescending(content: &StrBuf, edits: &SymbolEditList, newName_p: ptr
     // Applied from the end backwards directly onto a copy.
     sb_clear(out);
     let q: u64 = 0;
-    while q < content.len { sb_append_byte(out, content.bytes[q]); q = q + 1; };
+    while q < content.len { sb_append_byte(out, content.bytes[q]); q = q + 1; }
     let k: u64 = 0;
     while k < edits.len {
         let e = edits.items[k];
         // splice: keep [0,start) + newName + [end,len)
         let tail = StrBuf { bytes: [0u8; 65536], len: 0 };
         let t: u64 = e.end;
-        while t < out.len { sb_append_byte(&tail, out.bytes[t]); t = t + 1; };
+        while t < out.len { sb_append_byte(&tail, out.bytes[t]); t = t + 1; }
         out.len = e.start;
         sb_append(out, newName_p, newName_n);
         let u: u64 = 0;
-        while u < tail.len { sb_append_byte(out, tail.bytes[u]); u = u + 1; };
+        while u < tail.len { sb_append_byte(out, tail.bytes[u]); u = u + 1; }
         k = k + 1;
     }
 }
@@ -1599,7 +2085,7 @@ fn renameSymbolInContent(st: &TreeSitterState, filePath: &StrBuf, content: &StrB
     sb_trim(oldName, &oldTrim);
     if oldTrim.len == 0 || (oldName.len == newName.len && sb_eq_buf(oldName, newName)) {
         let q: u64 = 0;
-        while q < content.len { sb_append_byte(outContent, content.bytes[q]); q = q + 1; };
+        while q < content.len { sb_append_byte(outContent, content.bytes[q]); q = q + 1; }
         return;
     };
     let lang = loadLanguageForFile(st, filePath);
@@ -1619,16 +2105,16 @@ fn renameSymbolInContent(st: &TreeSitterState, filePath: &StrBuf, content: &StrB
     build_line_index(content, &idx);
     let wst = RenameWalkState { edits: SymbolEditList { items: [SymbolEdit { start: 0, end: 0, line: 0, column: 0, oldText: [0u8; 256], oldText_len: 0, newText: [0u8; 256], newText_len: 0, preview: [0u8; 1024], preview_len: 0 }; 4096], len: 0 }, oldName: [0u8; 256], oldName_len: 0, newName: [0u8; 256], newName_len: 0 };
     let a: u64 = 0;
-    while a < oldName.len && a < 256 { wst.oldName[a] = oldName.bytes[a]; wst.oldName_len = wst.oldName_len + 1; a = a + 1; };
+    while a < oldName.len && a < 256 { wst.oldName[a] = oldName.bytes[a]; wst.oldName_len = wst.oldName_len + 1; a = a + 1; }
     let b: u64 = 0;
-    while b < newName.len && b < 256 { wst.newName[b] = newName.bytes[b]; wst.newName_len = wst.newName_len + 1; b = b + 1; };
+    while b < newName.len && b < 256 { wst.newName[b] = newName.bytes[b]; wst.newName_len = wst.newName_len + 1; b = b + 1; }
     renameWalk(&wst, content, &idx, ts_tree_root(tree));
     edits.len = wst.edits.len;
     let e: u64 = 0;
-    while e < wst.edits.len { edits.items[e] = wst.edits.items[e]; e = e + 1; };
+    while e < wst.edits.len { edits.items[e] = wst.edits.items[e]; e = e + 1; }
     if edits.len == 0 {
         let q: u64 = 0;
-        while q < content.len { sb_append_byte(outContent, content.bytes[q]); q = q + 1; };
+        while q < content.len { sb_append_byte(outContent, content.bytes[q]); q = q + 1; }
         return;
     };
     let np: ptr = PTR_NULL();
@@ -1657,7 +2143,7 @@ fn fallbackRegexRename(content: &StrBuf, oldName: &StrBuf, newName: &StrBuf, out
     build_line_index(content, &idx);
     if oldName.len == 0 {
         let q: u64 = 0;
-        while q < content.len { sb_append_byte(outContent, content.bytes[q]); q = q + 1; };
+        while q < content.len { sb_append_byte(outContent, content.bytes[q]); q = q + 1; }
         return;
     };
     let pos: u64 = 0;
@@ -1692,13 +2178,13 @@ fn fallbackRegexRename(content: &StrBuf, oldName: &StrBuf, newName: &StrBuf, out
                     edits.items[ei].column = colNum;
                     edits.items[ei].oldText_len = 0;
                     let a: u64 = 0;
-                    while a < oldName.len && a < 256 { edits.items[ei].oldText[a] = oldName.bytes[a]; edits.items[ei].oldText_len = edits.items[ei].oldText_len + 1; a = a + 1; };
+                    while a < oldName.len && a < 256 { edits.items[ei].oldText[a] = oldName.bytes[a]; edits.items[ei].oldText_len = edits.items[ei].oldText_len + 1; a = a + 1; }
                     edits.items[ei].newText_len = 0;
                     let b: u64 = 0;
-                    while b < newName.len && b < 256 { edits.items[ei].newText[b] = newName.bytes[b]; edits.items[ei].newText_len = edits.items[ei].newText_len + 1; b = b + 1; };
+                    while b < newName.len && b < 256 { edits.items[ei].newText[b] = newName.bytes[b]; edits.items[ei].newText_len = edits.items[ei].newText_len + 1; b = b + 1; }
                     edits.items[ei].preview_len = 0;
                     let c2: u64 = 0;
-                    while c2 < trimmed.len && c2 < 1024 { edits.items[ei].preview[c2] = trimmed.bytes[c2]; edits.items[ei].preview_len = edits.items[ei].preview_len + 1; c2 = c2 + 1; };
+                    while c2 < trimmed.len && c2 < 1024 { edits.items[ei].preview[c2] = trimmed.bytes[c2]; edits.items[ei].preview_len = edits.items[ei].preview_len + 1; c2 = c2 + 1; }
                     edits.len = edits.len + 1;
                 };
             };
@@ -1709,7 +2195,7 @@ fn fallbackRegexRename(content: &StrBuf, oldName: &StrBuf, newName: &StrBuf, out
     }
     if edits.len == 0 {
         let q: u64 = 0;
-        while q < content.len { sb_append_byte(outContent, content.bytes[q]); q = q + 1; };
+        while q < content.len { sb_append_byte(outContent, content.bytes[q]); q = q + 1; }
         return;
     };
     let np: ptr = PTR_NULL();
@@ -1743,38 +2229,38 @@ struct FindDefState {
 }
 
 fn findDefClassify(node: u64, out_name: &StrBuf, out_kind: &u64) -> bool {
-    // Mirrors the source if/else chain over node.type; returns true and
+    // Mirrors the source if/else chain over node.type_; returns true and
     // fills candidateName/kind when the node type is a candidate.
     sb_clear(out_name);
-    out_kind = KIND_FUNCTION;
+    *out_kind = KIND_FUNCTION;
     let nameNode: u64 = 0;
     if node_type_is(node, STR_PTR("function_declaration"), STR_LEN("function_declaration")) || node_type_is(node, STR_PTR("function_item"), STR_LEN("function_item")) || node_type_is(node, STR_PTR("function_definition"), STR_LEN("function_definition")) || node_type_is(node, STR_PTR("fn_proto"), STR_LEN("fn_proto")) {
-        out_kind = KIND_FUNCTION;
+        *out_kind = KIND_FUNCTION;
     } else if node_type_is(node, STR_PTR("class_declaration"), STR_LEN("class_declaration")) || node_type_is(node, STR_PTR("class_definition"), STR_LEN("class_definition")) || node_type_is(node, STR_PTR("class_specifier"), STR_LEN("class_specifier")) {
-        out_kind = KIND_CLASS;
+        *out_kind = KIND_CLASS;
     } else if node_type_is(node, STR_PTR("struct_item"), STR_LEN("struct_item")) || node_type_is(node, STR_PTR("struct_specifier"), STR_LEN("struct_specifier")) {
-        out_kind = KIND_STRUCT;
+        *out_kind = KIND_STRUCT;
     } else if node_type_is(node, STR_PTR("interface_declaration"), STR_LEN("interface_declaration")) {
-        out_kind = KIND_INTERFACE;
+        *out_kind = KIND_INTERFACE;
     } else if node_type_is(node, STR_PTR("type_alias_declaration"), STR_LEN("type_alias_declaration")) || node_type_is(node, STR_PTR("type_item"), STR_LEN("type_item")) {
-        out_kind = KIND_TYPE;
+        *out_kind = KIND_TYPE;
     } else if node_type_is(node, STR_PTR("type_spec"), STR_LEN("type_spec")) {
         let typeNode = node_field(node, STR_PTR("type"), STR_LEN("type"));
-        out_kind = KIND_TYPE;
-        if typeNode != 0 && node_type_is(typeNode, STR_PTR("struct_type"), STR_LEN("struct_type")) { out_kind = KIND_STRUCT; };
-        if typeNode != 0 && node_type_is(typeNode, STR_PTR("interface_type"), STR_LEN("interface_type")) { out_kind = KIND_INTERFACE; };
+        *out_kind = KIND_TYPE;
+        if typeNode != 0 && node_type_is(typeNode, STR_PTR("struct_type"), STR_LEN("struct_type")) { *out_kind = KIND_STRUCT; };
+        if typeNode != 0 && node_type_is(typeNode, STR_PTR("interface_type"), STR_LEN("interface_type")) { *out_kind = KIND_INTERFACE; };
     } else if node_type_is(node, STR_PTR("enum_declaration"), STR_LEN("enum_declaration")) || node_type_is(node, STR_PTR("enum_item"), STR_LEN("enum_item")) || node_type_is(node, STR_PTR("enum_specifier"), STR_LEN("enum_specifier")) {
-        out_kind = KIND_ENUM;
+        *out_kind = KIND_ENUM;
     } else if node_type_is(node, STR_PTR("trait_item"), STR_LEN("trait_item")) {
-        out_kind = KIND_TRAIT;
+        *out_kind = KIND_TRAIT;
     } else if node_type_is(node, STR_PTR("method_definition"), STR_LEN("method_definition")) || node_type_is(node, STR_PTR("method_declaration"), STR_LEN("method_declaration")) {
-        out_kind = KIND_METHOD;
+        *out_kind = KIND_METHOD;
     } else if node_type_is(node, STR_PTR("variable_declarator"), STR_LEN("variable_declarator")) {
         let val = node_field(node, STR_PTR("value"), STR_LEN("value"));
-        out_kind = KIND_CONSTANT;
-        if val != 0 && (node_type_is(val, STR_PTR("arrow_function"), STR_LEN("arrow_function")) || node_type_is(val, STR_PTR("function_expression"), STR_LEN("function_expression"))) { out_kind = KIND_FUNCTION; };
+        *out_kind = KIND_CONSTANT;
+        if val != 0 && (node_type_is(val, STR_PTR("arrow_function"), STR_LEN("arrow_function")) || node_type_is(val, STR_PTR("function_expression"), STR_LEN("function_expression"))) { *out_kind = KIND_FUNCTION; };
     } else if node_type_is(node, STR_PTR("const_item"), STR_LEN("const_item")) || node_type_is(node, STR_PTR("static_item"), STR_LEN("static_item")) {
-        out_kind = KIND_CONSTANT;
+        *out_kind = KIND_CONSTANT;
     } else {
         return false;
     };
@@ -1852,7 +2338,7 @@ fn findDefinitionInContent(st: &TreeSitterState, filePath: &StrBuf, content: &St
     };
     let fst = FindDefState { matchedNode: 0, matchedKind: KIND_FUNCTION, found: false, sym: [0u8; 256], sym_len: 0 };
     let a: u64 = 0;
-    while a < sym.len && a < 256 { fst.sym[a] = sym.bytes[a]; fst.sym_len = fst.sym_len + 1; a = a + 1; };
+    while a < sym.len && a < 256 { fst.sym[a] = sym.bytes[a]; fst.sym_len = fst.sym_len + 1; a = a + 1; }
     findDefWalk(&fst, ts_tree_root(tree));
     if !fst.found {
         fallbackFindDefinition(filePath, content, &sym, maxLines, out);
@@ -1876,7 +2362,7 @@ fn findDefinitionInContent(st: &TreeSitterState, filePath: &StrBuf, content: &St
         sb_trim(&lb, &lt);
         if sig.len > 0 { sb_append_byte(&sig, 32); };
         let q: u64 = 0;
-        while q < lt.len { sb_append_byte(&sig, lt.bytes[q]); q = q + 1; };
+        while q < lt.len { sb_append_byte(&sig, lt.bytes[q]); q = q + 1; }
         let endsColon = lt.len > 0 && lt.bytes[lt.len - 1] == 58;
         let endsSemi = lt.len > 0 && lt.bytes[lt.len - 1] == 59;
         if sb_contains(&lt, STR_PTR("{"), 1) || endsColon || endsSemi || sb_contains(&lt, STR_PTR("=>"), 2) { break; };
@@ -1894,7 +2380,7 @@ fn findDefinitionInContent(st: &TreeSitterState, filePath: &StrBuf, content: &St
         let lb = StrBuf { bytes: [0u8; 65536], len: 0 };
         line_at(content, &idx, r2, &lb);
         let q: u64 = 0;
-        while q < lb.len { sb_append_byte(&snippet, lb.bytes[q]); q = q + 1; };
+        while q < lb.len { sb_append_byte(&snippet, lb.bytes[q]); q = q + 1; }
         r2 = r2 + 1;
     }
     if endRow > actualEnd {
@@ -1913,18 +2399,18 @@ fn fillDefinitionMatch(out: &DefinitionMatch, filePath: &StrBuf, sym: &StrBuf, k
     out.endLine = endLine;
     out.filePath_len = 0;
     let i: u64 = 0;
-    while i < filePath.len && i < 1024 { out.filePath[i] = filePath.bytes[i]; out.filePath_len = out.filePath_len + 1; i = i + 1; };
+    while i < filePath.len && i < 1024 { out.filePath[i] = filePath.bytes[i]; out.filePath_len = out.filePath_len + 1; i = i + 1; }
     out.symbol_len = 0;
     let j: u64 = 0;
-    while j < sym.len && j < 256 { out.symbol[j] = sym.bytes[j]; out.symbol_len = out.symbol_len + 1; j = j + 1; };
+    while j < sym.len && j < 256 { out.symbol[j] = sym.bytes[j]; out.symbol_len = out.symbol_len + 1; j = j + 1; }
     let tsig = StrBuf { bytes: [0u8; 65536], len: 0 };
     truncateSignature(sig, 120, &tsig);
     out.signature_len = 0;
     let k: u64 = 0;
-    while k < tsig.len && k < 512 { out.signature[k] = tsig.bytes[k]; out.signature_len = out.signature_len + 1; k = k + 1; };
+    while k < tsig.len && k < 512 { out.signature[k] = tsig.bytes[k]; out.signature_len = out.signature_len + 1; k = k + 1; }
     out.bodySnippet_len = 0;
     let m: u64 = 0;
-    while m < snippet.len && m < 16384 { out.bodySnippet[m] = snippet.bytes[m]; out.bodySnippet_len = out.bodySnippet_len + 1; m = m + 1; };
+    while m < snippet.len && m < 16384 { out.bodySnippet[m] = snippet.bytes[m]; out.bodySnippet_len = out.bodySnippet_len + 1; m = m + 1; }
 }
 
 // ---- src/saVmTreeSitter.ts:1167-1217 — fallbackFindDefinition ----
@@ -1952,7 +2438,7 @@ fn fallbackFindDefinition(filePath: &StrBuf, content: &StrBuf, targetSymbol: &St
                 let lb = StrBuf { bytes: [0u8; 65536], len: 0 };
                 line_at(content, &idx, r, &lb);
                 let q: u64 = 0;
-                while q < lb.len { sb_append_byte(&snippet, lb.bytes[q]); q = q + 1; };
+                while q < lb.len { sb_append_byte(&snippet, lb.bytes[q]); q = q + 1; }
                 r = r + 1;
             }
             let kind = KIND_FUNCTION;
@@ -1988,7 +2474,7 @@ fn line_declares_symbol(line: &StrBuf, sym: &StrBuf) -> bool {
             // keyword search in line[0..pos)
             let head = StrBuf { bytes: [0u8; 65536], len: 0 };
             let h: u64 = 0;
-            while h < pos { sb_append_byte(&head, line.bytes[h]); h = h + 1; };
+            while h < pos { sb_append_byte(&head, line.bytes[h]); h = h + 1; }
             if sb_contains(&head, STR_PTR("fn "), 3) || sb_contains(&head, STR_PTR("def "), 4) || sb_contains(&head, STR_PTR("function "), 9) || sb_contains(&head, STR_PTR("class "), 6) || sb_contains(&head, STR_PTR("struct "), 7) || sb_contains(&head, STR_PTR("interface "), 10) || sb_contains(&head, STR_PTR("trait "), 6) || sb_contains(&head, STR_PTR("enum "), 5) || sb_contains(&head, STR_PTR("type "), 5) || sb_contains(&head, STR_PTR("const "), 6) || sb_contains(&head, STR_PTR("let "), 4) || sb_contains(&head, STR_PTR("var "), 4) || sb_contains(&head, STR_PTR("func "), 5) {
                 return true;
             };
@@ -2028,12 +2514,12 @@ fn formatDiagnostics(filePath: &StrBuf, errors: &SyntaxDiagnosticList, out: &Str
         sb_append_u64(out, e.column);
         sb_append(out, STR_PTR(" - "), STR_LEN(" - "));
         let q: u64 = 0;
-        while q < e.message_len { sb_append_byte(out, e.message[q]); q = q + 1; };
+        while q < e.message_len { sb_append_byte(out, e.message[q]); q = q + 1; }
         if e.preview_len > 0 {
             sb_append_byte(out, 10);
             sb_append(out, STR_PTR("    "), STR_LEN("    "));
             let r: u64 = 0;
-            while r < e.preview_len { sb_append_byte(out, e.preview[r]); r = r + 1; };
+            while r < e.preview_len { sb_append_byte(out, e.preview[r]); r = r + 1; }
         };
         i = i + 1;
     }
@@ -2063,7 +2549,7 @@ fn getSyntaxDiagnostics(st: &TreeSitterState, filePath: &StrBuf, content: &StrBu
     errors.len = 0;
     out.filePath_len = 0;
     let z: u64 = 0;
-    while z < filePath.len && z < 1024 { out.filePath[z] = filePath.bytes[z]; out.filePath_len = out.filePath_len + 1; z = z + 1; };
+    while z < filePath.len && z < 1024 { out.filePath[z] = filePath.bytes[z]; out.filePath_len = out.filePath_len + 1; z = z + 1; }
     let ext = StrBuf { bytes: [0u8; 65536], len: 0 };
     path_extname(filePath, &ext);
     let li: u64 = 0;
@@ -2126,7 +2612,7 @@ fn getSyntaxDiagnostics(st: &TreeSitterState, filePath: &StrBuf, content: &StrBu
 fn copy_into_diag_formatted(out: &SyntaxDiagnosticsResult, fb: &StrBuf) {
     out.formatted_len = 0;
     let i: u64 = 0;
-    while i < fb.len && i < 16384 { out.formatted[i] = fb.bytes[i]; out.formatted_len = out.formatted_len + 1; i = i + 1; };
+    while i < fb.len && i < 16384 { out.formatted[i] = fb.bytes[i]; out.formatted_len = out.formatted_len + 1; i = i + 1; }
 }
 
 // ---- src/saVmTreeSitter.ts:1392-1408 — nested collectTreeErrors ----
@@ -2151,28 +2637,28 @@ fn collectTreeErrors(errors: &SyntaxDiagnosticList, content: &StrBuf, idx: &Line
             errors.items[ei].column = col + 1;
             errors.items[ei].preview_len = 0;
             let q: u64 = 0;
-            while q < preview.len && q < 1024 { errors.items[ei].preview[q] = preview.bytes[q]; errors.items[ei].preview_len = errors.items[ei].preview_len + 1; q = q + 1; };
+            while q < preview.len && q < 1024 { errors.items[ei].preview[q] = preview.bytes[q]; errors.items[ei].preview_len = errors.items[ei].preview_len + 1; q = q + 1; }
             errors.items[ei].message_len = 0;
             let msg = StrBuf { bytes: [0u8; 65536], len: 0 };
             if ts_node_is_missing(node) {
                 sb_append(&msg, STR_PTR("Missing expected token near '"), STR_LEN("Missing expected token near '"));
                 let r: u64 = 0;
-                while r < preview.len { sb_append_byte(&msg, preview.bytes[r]); r = r + 1; };
+                while r < preview.len { sb_append_byte(&msg, preview.bytes[r]); r = r + 1; }
                 sb_append_byte(&msg, 39);
             } else {
                 sb_append(&msg, STR_PTR("Syntax error near '"), STR_LEN("Syntax error near '"));
                 let useText = &collapsed;
                 if useText.len == 0 { useText = &preview; };
                 let r: u64 = 0;
-                while r < useText.len { sb_append_byte(&msg, useText.bytes[r]); r = r + 1; };
+                while r < useText.len { sb_append_byte(&msg, useText.bytes[r]); r = r + 1; }
                 sb_append_byte(&msg, 39);
             };
             let m: u64 = 0;
-            while m < msg.len && m < 1024 { errors.items[ei].message[m] = msg.bytes[m]; errors.items[ei].message_len = errors.items[ei].message_len + 1; m = m + 1; };
+            while m < msg.len && m < 1024 { errors.items[ei].message[m] = msg.bytes[m]; errors.items[ei].message_len = errors.items[ei].message_len + 1; m = m + 1; }
             errors.items[ei].code_len = 0;
             let code = "SYNTAX_ERROR";
             let c2: u64 = 0;
-            while c2 < 12 { let ch: u8 = 0; PTR_BYTE_AT(ch, STR_PTR(code), c2); errors.items[ei].code[c2] = ch; errors.items[ei].code_len = errors.items[ei].code_len + 1; c2 = c2 + 1; };
+            while c2 < 12 { let ch: u8 = 0; PTR_BYTE_AT(ch, STR_PTR(code), c2); errors.items[ei].code[c2] = ch; errors.items[ei].code_len = errors.items[ei].code_len + 1; c2 = c2 + 1; }
             errors.items[ei].has_code = true;
             errors.len = errors.len + 1;
         };
@@ -2205,7 +2691,7 @@ fn split_lines(content: &StrBuf, out: &LineBufList) {
         let s = idx.starts[i];
         let n = idx.lens[i];
         let q: u64 = 0;
-        while q < n && q < 8192 { out.items[i].bytes[q] = content.bytes[s + q]; out.items[i].len = out.items[i].len + 1; q = q + 1; };
+        while q < n && q < 8192 { out.items[i].bytes[q] = content.bytes[s + q]; out.items[i].len = out.items[i].len + 1; q = q + 1; }
         out.len = out.len + 1;
         i = i + 1;
     }
@@ -2214,13 +2700,13 @@ fn split_lines(content: &StrBuf, out: &LineBufList) {
 fn lb_to_sb(lb: &LineBuf, out: &StrBuf) {
     sb_clear(out);
     let i: u64 = 0;
-    while i < lb.len { sb_append_byte(out, lb.bytes[i]); i = i + 1; };
+    while i < lb.len { sb_append_byte(out, lb.bytes[i]); i = i + 1; }
 }
 
 fn sb_to_lb(text: &StrBuf, lb: &LineBuf) {
     lb.len = 0;
     let i: u64 = 0;
-    while i < text.len && i < 8192 { lb.bytes[i] = text.bytes[i]; lb.len = lb.len + 1; i = i + 1; };
+    while i < text.len && i < 8192 { lb.bytes[i] = text.bytes[i]; lb.len = lb.len + 1; i = i + 1; }
 }
 
 fn join_lines(list: &LineBufList, eol_crlf: bool, out: &StrBuf) {
@@ -2232,7 +2718,7 @@ fn join_lines(list: &LineBufList, eol_crlf: bool, out: &StrBuf) {
             sb_append_byte(out, 10);
         };
         let q: u64 = 0;
-        while q < list.items[i].len { sb_append_byte(out, list.items[i].bytes[q]); q = q + 1; };
+        while q < list.items[i].len { sb_append_byte(out, list.items[i].bytes[q]); q = q + 1; }
         i = i + 1;
     }
 }
@@ -2285,10 +2771,10 @@ fn addImportToContent(content: &StrBuf, statementIn: &StrBuf, symbolIn: &StrBuf,
     };
     sb_clear(outContent);
     sb_clear(outMessage);
-    outApplied = false;
+    *outApplied = false;
     if statement.len == 0 {
         let q: u64 = 0;
-        while q < content.len { sb_append_byte(outContent, content.bytes[q]); q = q + 1; };
+        while q < content.len { sb_append_byte(outContent, content.bytes[q]); q = q + 1; }
         sb_append(outMessage, STR_PTR("Either 'statement' or 'symbol' + 'module' must be provided"), STR_LEN("Either 'statement' or 'symbol' + 'module' must be provided"));
         return;
     };
@@ -2315,7 +2801,7 @@ fn addImportToContent(content: &StrBuf, statementIn: &StrBuf, symbolIn: &StrBuf,
                         csv_missing(&symbol, &inner, &missing);
                         if missing.len == 0 {
                             let q: u64 = 0;
-                            while q < content.len { sb_append_byte(outContent, content.bytes[q]); q = q + 1; };
+                            while q < content.len { sb_append_byte(outContent, content.bytes[q]); q = q + 1; }
                             sb_append(outMessage, STR_PTR("Symbol(s) '"), STR_LEN("Symbol(s) '"));
                             let sp: ptr = PTR_NULL();
                             PTR_BYTE_ADD(sp, &symbol.bytes, 0);
@@ -2334,7 +2820,7 @@ fn addImportToContent(content: &StrBuf, statementIn: &StrBuf, symbolIn: &StrBuf,
                         replace_braces_inner(&line, &updated, &replaced);
                         sb_to_lb(&replaced, &lines.items[i]);
                         join_lines(&lines, eolCrlf, outContent);
-                        outApplied = true;
+                        *outApplied = true;
                         sb_append(outMessage, STR_PTR("Merged '"), STR_LEN("Merged '"));
                         let xp: ptr = PTR_NULL();
                         PTR_BYTE_ADD(xp, &missing.bytes, 0);
@@ -2369,7 +2855,7 @@ fn addImportToContent(content: &StrBuf, statementIn: &StrBuf, symbolIn: &StrBuf,
     if lastImportIdx != -1 {
         lines_insert(&lines, (lastImportIdx + 1) as u64, &statement);
         join_lines(&lines, eolCrlf, outContent);
-        outApplied = true;
+        *outApplied = true;
         sb_append(outMessage, STR_PTR("Inserted import after line "), STR_LEN("Inserted import after line "));
         sb_append_u64(outMessage, (lastImportIdx + 1) as u64);
         sb_append_byte(outMessage, 46);
@@ -2392,7 +2878,7 @@ fn addImportToContent(content: &StrBuf, statementIn: &StrBuf, symbolIn: &StrBuf,
     let emptyLine = StrBuf { bytes: [0u8; 65536], len: 0 };
     lines_insert(&lines, insertIdx + 1, &emptyLine); // splice(idx, 0, statement, "")
     join_lines(&lines, eolCrlf, outContent);
-    outApplied = true;
+    *outApplied = true;
     sb_append(outMessage, STR_PTR("Inserted import at line "), STR_LEN("Inserted import at line "));
     sb_append_u64(outMessage, insertIdx + 1);
     sb_append_byte(outMessage, 46);
@@ -2430,13 +2916,13 @@ fn parse_import_statement(statement: &StrBuf, symbol: &StrBuf, moduleName: &StrB
     if extract_from_module(statement, &fromMod) {
         // identifier between "import" and "from"
         let pos: u64 = 6;
-        while pos < statement.len && (statement.bytes[pos] == 32 || statement.bytes[pos] == 9) { pos = pos + 1; };
+        while pos < statement.len && (statement.bytes[pos] == 32 || statement.bytes[pos] == 9) { pos = pos + 1; }
         let at: u64 = 0;
         let ln: u64 = 0;
         if read_ident(statement, pos, &at, &ln) && symbol.len == 0 {
             sb_clear(symbol);
             let q: u64 = 0;
-            while q < ln { sb_append_byte(symbol, statement.bytes[at + q]); q = q + 1; };
+            while q < ln { sb_append_byte(symbol, statement.bytes[at + q]); q = q + 1; }
         };
         if moduleName.len == 0 { let p: ptr = PTR_NULL(); PTR_BYTE_ADD(p, &fromMod.bytes, 0); sb_clear(moduleName); sb_append(moduleName, p, fromMod.len); };
     };
@@ -2472,7 +2958,7 @@ fn extract_from_module(text: &StrBuf, out: &StrBuf) -> bool {
     }
     if !hasFrom { return false; };
     let i = fromAt + 4;
-    while i < text.len && text.bytes[i] != 39 && text.bytes[i] != 34 { i = i + 1; };
+    while i < text.len && text.bytes[i] != 39 && text.bytes[i] != 34 { i = i + 1; }
     if i >= text.len { return false; };
     let quote = text.bytes[i];
     i = i + 1;
@@ -2495,7 +2981,7 @@ fn replace_braces_inner(text: &StrBuf, inner: &StrBuf, out: &StrBuf) {
             sb_append_byte(out, 32);
             // skip to closing brace
             i = i + 1;
-            while i < text.len && text.bytes[i] != 125 { i = i + 1; };
+            while i < text.len && text.bytes[i] != 125 { i = i + 1; }
             if i < text.len { sb_append_byte(out, 125); i = i + 1; };
             done = true;
         } else {
@@ -2510,10 +2996,10 @@ fn csv_contains(csv: &StrBuf, item: &StrBuf) -> bool {
     let pos: u64 = 0;
     while pos <= csv.len {
         let end = pos;
-        while end < csv.len && csv.bytes[end] != 44 { end = end + 1; };
+        while end < csv.len && csv.bytes[end] != 44 { end = end + 1; }
         let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
         let q: u64 = 0;
-        while pos + q < end { sb_append_byte(&seg, csv.bytes[pos + q]); q = q + 1; };
+        while pos + q < end { sb_append_byte(&seg, csv.bytes[pos + q]); q = q + 1; }
         let t = StrBuf { bytes: [0u8; 65536], len: 0 };
         sb_trim(&seg, &t);
         if sb_eq_buf(&t, item) { return true; };
@@ -2530,10 +3016,10 @@ fn csv_missing(symbolCsv: &StrBuf, existingCsv: &StrBuf, outMissing: &StrBuf) {
     let pos: u64 = 0;
     while pos <= symbolCsv.len {
         let end = pos;
-        while end < symbolCsv.len && symbolCsv.bytes[end] != 44 { end = end + 1; };
+        while end < symbolCsv.len && symbolCsv.bytes[end] != 44 { end = end + 1; }
         let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
         let q: u64 = 0;
-        while pos + q < end { sb_append_byte(&seg, symbolCsv.bytes[pos + q]); q = q + 1; };
+        while pos + q < end { sb_append_byte(&seg, symbolCsv.bytes[pos + q]); q = q + 1; }
         let t = StrBuf { bytes: [0u8; 65536], len: 0 };
         sb_trim(&seg, &t);
         if t.len > 0 && !csv_contains(existingCsv, &t) {
@@ -2554,10 +3040,10 @@ fn csv_join(existingCsv: &StrBuf, missingJoined: &StrBuf, out: &StrBuf) {
     let first = true;
     while pos <= existingCsv.len {
         let end = pos;
-        while end < existingCsv.len && existingCsv.bytes[end] != 44 { end = end + 1; };
+        while end < existingCsv.len && existingCsv.bytes[end] != 44 { end = end + 1; }
         let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
         let q: u64 = 0;
-        while pos + q < end { sb_append_byte(&seg, existingCsv.bytes[pos + q]); q = q + 1; };
+        while pos + q < end { sb_append_byte(&seg, existingCsv.bytes[pos + q]); q = q + 1; }
         let t = StrBuf { bytes: [0u8; 65536], len: 0 };
         sb_trim(&seg, &t);
         if t.len > 0 {
@@ -2616,19 +3102,19 @@ struct ParsedImportList {
     items: [ParsedImport; 512], len: u64,
 }
 
-fn getModulePriority(mod: &StrBuf) -> u64 {
+fn getModulePriority(mod_sb: &StrBuf) -> u64 {
     // src: nested getModulePriority inside organizeImportsInContent
-    if sb_starts_with(mod, STR_PTR("node:"), STR_LEN("node:")) { return 1; };
+    if sb_starts_with(mod_sb, STR_PTR("node:"), STR_LEN("node:")) { return 1; };
     let bare = StrBuf { bytes: [0u8; 65536], len: 0 };
     sb_append(&bare, STR_PTR("fs path os crypto http https child_process events stream util url buffer"), STR_LEN("fs path os crypto http https child_process events stream util url buffer"));
     // ["fs",...].includes(mod)
-    if csv_contains(&bare, mod) { return 1; };
-    if !sb_starts_with(mod, STR_PTR("."), 1) {
-        if sb_starts_with(mod, STR_PTR("@/"), STR_LEN("@/")) || sb_starts_with(mod, STR_PTR("@codex-ui/"), STR_LEN("@codex-ui/")) { return 3; };
+    if csv_contains(&bare, mod_sb) { return 1; };
+    if !sb_starts_with(mod_sb, STR_PTR("."), 1) {
+        if sb_starts_with(mod_sb, STR_PTR("@/"), STR_LEN("@/")) || sb_starts_with(mod_sb, STR_PTR("@codex-ui/"), STR_LEN("@codex-ui/")) { return 3; };
         return 2;
     };
-    if sb_starts_with(mod, STR_PTR(".."), 2) { return 4; };
-    if sb_ends_with(mod, STR_PTR(".css"), STR_LEN(".css")) || sb_ends_with(mod, STR_PTR(".scss"), STR_LEN(".scss")) || sb_ends_with(mod, STR_PTR(".less"), STR_LEN(".less")) { return 6; };
+    if sb_starts_with(mod_sb, STR_PTR(".."), 2) { return 4; };
+    if sb_ends_with(mod_sb, STR_PTR(".css"), STR_LEN(".css")) || sb_ends_with(mod_sb, STR_PTR(".scss"), STR_LEN(".scss")) || sb_ends_with(mod_sb, STR_PTR(".less"), STR_LEN(".less")) { return 6; };
     return 5;
     // (source's trailing `return 7` is unreachable there too)
 }
@@ -2640,7 +3126,7 @@ fn organizeImportsInContent(st: &TreeSitterState, filePath: &StrBuf, content: &S
     let mergeDuplicates = !hasMerge || optMerge;
     out.filePath_len = 0;
     let z: u64 = 0;
-    while z < filePath.len && z < 1024 { out.filePath[z] = filePath.bytes[z]; out.filePath_len = out.filePath_len + 1; z = z + 1; };
+    while z < filePath.len && z < 1024 { out.filePath[z] = filePath.bytes[z]; out.filePath_len = out.filePath_len + 1; z = z + 1; }
     let ext = StrBuf { bytes: [0u8; 65536], len: 0 };
     path_extname(filePath, &ext);
     let el: u64 = 0;
@@ -2654,7 +3140,6 @@ fn organizeImportsInContent(st: &TreeSitterState, filePath: &StrBuf, content: &S
         return;
     };
     let sf = getCachedSourceFile(st, STR_PTR(""), 0, content);
-    void sf; // DEFECT: compiler SourceFile unavailable; text path below.
     // Locate import statements textually (source: sf.statements scan):
     // firstImportStart / lastImportEnd are byte offsets in content.
     let idx = LineIndex { starts: [0u64; 8192], lens: [0u64; 8192], count: 0 };
@@ -2715,7 +3200,7 @@ fn organizeImportsInContent(st: &TreeSitterState, filePath: &StrBuf, content: &S
         if removeUnused {
             if parsed.items[pi].has_default {
                 let dn = StrBuf { bytes: [0u8; 65536], len: 0 };
-                buf_field_to_sb(&parsed.items[pi].defaultName, parsed.items[pi].defaultName_len, &dn);
+                buf_field_to_sb256(&parsed.items[pi].defaultName, parsed.items[pi].defaultName_len, &dn);
                 if !csv_contains(&usedCsv, &dn) {
                     removedImportsCount = removedImportsCount + 1;
                     parsed.items[pi].has_default = false;
@@ -2723,7 +3208,7 @@ fn organizeImportsInContent(st: &TreeSitterState, filePath: &StrBuf, content: &S
             };
             if parsed.items[pi].has_namespace {
                 let nn = StrBuf { bytes: [0u8; 65536], len: 0 };
-                buf_field_to_sb(&parsed.items[pi].namespaceName, parsed.items[pi].namespaceName_len, &nn);
+                buf_field_to_sb256(&parsed.items[pi].namespaceName, parsed.items[pi].namespaceName_len, &nn);
                 if !csv_contains(&usedCsv, &nn) {
                     removedImportsCount = removedImportsCount + 1;
                     parsed.items[pi].has_namespace = false;
@@ -2738,7 +3223,7 @@ fn organizeImportsInContent(st: &TreeSitterState, filePath: &StrBuf, content: &S
             removedImportsCount = removedImportsCount + (before - csv_count(&kept));
             parsed.items[pi].named_len = 0;
             let q: u64 = 0;
-            while q < kept.len && q < 8192 { parsed.items[pi].named[q] = kept.bytes[q]; parsed.items[pi].named_len = parsed.items[pi].named_len + 1; q = q + 1; };
+            while q < kept.len && q < 8192 { parsed.items[pi].named[q] = kept.bytes[q]; parsed.items[pi].named_len = parsed.items[pi].named_len + 1; q = q + 1; }
             if !parsed.items[pi].has_default && !parsed.items[pi].has_namespace && csv_count(&kept) == 0 && !parsed.items[pi].sideEffectOnly {
                 parsed.items[pi].removed = true;
             };
@@ -2797,9 +3282,9 @@ fn organizeImportsInContent(st: &TreeSitterState, filePath: &StrBuf, content: &S
                 let prev = prev_live(&parsed, j);
                 if prev == j { break; };
                 let ma = StrBuf { bytes: [0u8; 65536], len: 0 };
-                buf_field_to_sb(&parsed.items[j].moduleSpecifier, parsed.items[j].moduleSpecifier_len, &ma);
+                buf_field_to_sb2(&parsed.items[j].moduleSpecifier, parsed.items[j].moduleSpecifier_len, &ma);
                 let mb = StrBuf { bytes: [0u8; 65536], len: 0 };
-                buf_field_to_sb(&parsed.items[prev].moduleSpecifier, parsed.items[prev].moduleSpecifier_len, &mb);
+                buf_field_to_sb2(&parsed.items[prev].moduleSpecifier, parsed.items[prev].moduleSpecifier_len, &mb);
                 let pa = getModulePriority(&ma);
                 let pb = getModulePriority(&mb);
                 let swap = false;
@@ -2833,7 +3318,7 @@ fn organizeImportsInContent(st: &TreeSitterState, filePath: &StrBuf, content: &S
     let newContent = StrBuf { bytes: [0u8; 65536], len: 0 };
     let bq: u64 = 0;
     let beforeEnd = firstImportStart as u64;
-    while bq < beforeEnd && bq < content.len { sb_append_byte(&newContent, content.bytes[bq]); bq = bq + 1; };
+    while bq < beforeEnd && bq < content.len { sb_append_byte(&newContent, content.bytes[bq]); bq = bq + 1; }
     let rp: ptr = PTR_NULL();
     PTR_BYTE_ADD(rp, &rendered.bytes, 0);
     sb_append(&newContent, rp, rendered.len);
@@ -2846,7 +3331,7 @@ fn organizeImportsInContent(st: &TreeSitterState, filePath: &StrBuf, content: &S
     let aq = lastImportEnd;
     if aq < content.len && content.bytes[aq] == 13 { aq = aq + 1; };
     if aq < content.len && content.bytes[aq] == 10 { aq = aq + 1; };
-    while aq < content.len { sb_append_byte(&after, content.bytes[aq]); aq = aq + 1; };
+    while aq < content.len { sb_append_byte(&after, content.bytes[aq]); aq = aq + 1; }
     let afterTrim = StrBuf { bytes: [0u8; 65536], len: 0 };
     sb_trim_start(&after, &afterTrim);
     let ap: ptr = PTR_NULL();
@@ -2865,7 +3350,7 @@ fn sb_trim_start(b: &StrBuf, out: &StrBuf) {
         if c == 32 || c == 9 || c == 10 || c == 13 { s = s + 1; } else { break; };
     }
     let i = s;
-    while i < b.len { sb_append_byte(out, b.bytes[i]); i = i + 1; };
+    while i < b.len { sb_append_byte(out, b.bytes[i]); i = i + 1; }
 }
 
 fn sb_compare(a: &StrBuf, b: &StrBuf) -> i32 {
@@ -2885,7 +3370,31 @@ fn sb_compare(a: &StrBuf, b: &StrBuf) -> i32 {
 fn buf_field_to_sb(field: &[u8; 8192], n: u64, out: &StrBuf) {
     sb_clear(out);
     let i: u64 = 0;
-    while i < n { sb_append_byte(out, field[i]); i = i + 1; };
+    while i < n { sb_append_byte(out, field[i]); i = i + 1; }
+}
+
+fn buf_field_to_sb1024(field: &[u8; 1024], n: u64, out: &StrBuf) {
+    sb_clear(out);
+    let i: u64 = 0;
+    while i < n { sb_append_byte(out, field[i]); i = i + 1; }
+}
+
+fn buf_field_to_sb4096(field: &[u8; 4096], n: u64, out: &StrBuf) {
+    sb_clear(out);
+    let i: u64 = 0;
+    while i < n { sb_append_byte(out, field[i]); i = i + 1; }
+}
+
+fn buf_field_to_sb64(field: &[u8; 64], n: u64, out: &StrBuf) {
+    sb_clear(out);
+    let i: u64 = 0;
+    while i < n { sb_append_byte(out, field[i]); i = i + 1; }
+}
+
+fn buf_field_to_sb256(field: &[u8; 256], n: u64, out: &StrBuf) {
+    sb_clear(out);
+    let i: u64 = 0;
+    while i < n { sb_append_byte(out, field[i]); i = i + 1; }
 }
 
 fn field_eq(a: &[u8; 512], an: u64, b: &[u8; 512], bn: u64) -> bool {
@@ -2925,10 +3434,10 @@ fn csv_filter_used(namedCsv: &StrBuf, usedCsv: &StrBuf, out: &StrBuf) {
     let pos: u64 = 0;
     while pos <= namedCsv.len {
         let end = pos;
-        while end < namedCsv.len && namedCsv.bytes[end] != 44 { end = end + 1; };
+        while end < namedCsv.len && namedCsv.bytes[end] != 44 { end = end + 1; }
         let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
         let q: u64 = 0;
-        while pos + q < end { sb_append_byte(&seg, namedCsv.bytes[pos + q]); q = q + 1; };
+        while pos + q < end { sb_append_byte(&seg, namedCsv.bytes[pos + q]); q = q + 1; }
         let t = StrBuf { bytes: [0u8; 65536], len: 0 };
         sb_trim(&seg, &t);
         // local name = last token after " as "
@@ -2960,7 +3469,7 @@ fn csv_local_name(entry: &StrBuf, out: &StrBuf) {
         i = i + 1;
     }
     if asAt != -1 { start = (asAt as u64) + 4; };
-    while start < t.len { sb_append_byte(out, t.bytes[start]); start = start + 1; };
+    while start < t.len { sb_append_byte(out, t.bytes[start]); start = start + 1; }
     let tr = StrBuf { bytes: [0u8; 65536], len: 0 };
     sb_trim(out, &tr);
     sb_clear(out);
@@ -2975,10 +3484,10 @@ fn csv_missing_entries(fromCsv: &StrBuf, existingCsv: &StrBuf, out: &StrBuf) {
     let pos: u64 = 0;
     while pos <= fromCsv.len {
         let end = pos;
-        while end < fromCsv.len && fromCsv.bytes[end] != 44 { end = end + 1; };
+        while end < fromCsv.len && fromCsv.bytes[end] != 44 { end = end + 1; }
         let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
         let q: u64 = 0;
-        while pos + q < end { sb_append_byte(&seg, fromCsv.bytes[pos + q]); q = q + 1; };
+        while pos + q < end { sb_append_byte(&seg, fromCsv.bytes[pos + q]); q = q + 1; }
         let t = StrBuf { bytes: [0u8; 65536], len: 0 };
         sb_trim(&seg, &t);
         if t.len > 0 && !csv_contains(existingCsv, &t) {
@@ -3001,13 +3510,13 @@ fn collect_used_identifiers(text: &StrBuf, outCsv: &StrBuf) {
         let startByte = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 36;
         if startByte {
             let s = i;
-            while i < text.len && is_word_byte(text.bytes[i]) { i = i + 1; };
+            while i < text.len && is_word_byte(text.bytes[i]) { i = i + 1; }
             // skip property-access names (preceded by ".")
             let precededByDot = s > 0 && text.bytes[s - 1] == 46;
             if !precededByDot {
                 let tok = StrBuf { bytes: [0u8; 65536], len: 0 };
                 let q = s;
-                while q < i { sb_append_byte(&tok, text.bytes[q]); q = q + 1; };
+                while q < i { sb_append_byte(&tok, text.bytes[q]); q = q + 1; }
                 if !csv_contains(outCsv, &tok) {
                     if outCsv.len > 0 { sb_append_byte(outCsv, 44); };
                     let p: ptr = PTR_NULL();
@@ -3032,12 +3541,12 @@ fn parse_import_line(lt: &StrBuf, list: &ParsedImportList) {
     if list.len >= 512 { return; };
     let idxSlot = list.len;
     list.items[idxSlot].removed = false;
-    let mod = StrBuf { bytes: [0u8; 65536], len: 0 };
-    if !extract_from_module(lt, &mod) {
+    let mod_sb = StrBuf { bytes: [0u8; 65536], len: 0 };
+    if !extract_from_module(lt, &mod_sb) {
         // side-effect import: import "mod";
         let q1 = first_quote(lt);
         if q1 >= 0 {
-            extract_quoted(lt, q1 as u64, &mod);
+            extract_quoted(lt, q1 as u64, &mod_sb);
             list.items[idxSlot].sideEffectOnly = true;
         } else {
             return;
@@ -3045,7 +3554,7 @@ fn parse_import_line(lt: &StrBuf, list: &ParsedImportList) {
     };
     list.items[idxSlot].moduleSpecifier_len = 0;
     let q: u64 = 0;
-    while q < mod.len && q < 512 { list.items[idxSlot].moduleSpecifier[q] = mod.bytes[q]; list.items[idxSlot].moduleSpecifier_len = list.items[idxSlot].moduleSpecifier_len + 1; q = q + 1; };
+    while q < mod_sb.len && q < 512 { list.items[idxSlot].moduleSpecifier[q] = mod_sb.bytes[q]; list.items[idxSlot].moduleSpecifier_len = list.items[idxSlot].moduleSpecifier_len + 1; q = q + 1; }
     if list.items[idxSlot].sideEffectOnly { list.len = list.len + 1; return; };
     // clause text between "import" and " from "
     let clause = StrBuf { bytes: [0u8; 65536], len: 0 };
@@ -3056,7 +3565,7 @@ fn parse_import_line(lt: &StrBuf, list: &ParsedImportList) {
         list.items[idxSlot].isTypeOnly = true;
         let rest = StrBuf { bytes: [0u8; 65536], len: 0 };
         let s: u64 = 5;
-        while s < ct.len { sb_append_byte(&rest, ct.bytes[s]); s = s + 1; };
+        while s < ct.len { sb_append_byte(&rest, ct.bytes[s]); s = s + 1; }
         let rt = StrBuf { bytes: [0u8; 65536], len: 0 };
         sb_trim(&rest, &rt);
         ct = rt;
@@ -3064,13 +3573,13 @@ fn parse_import_line(lt: &StrBuf, list: &ParsedImportList) {
     if sb_starts_with(&ct, STR_PTR("* as "), STR_LEN("* as ")) {
         let ns = StrBuf { bytes: [0u8; 65536], len: 0 };
         let s: u64 = 5;
-        while s < ct.len { sb_append_byte(&ns, ct.bytes[s]); s = s + 1; };
+        while s < ct.len { sb_append_byte(&ns, ct.bytes[s]); s = s + 1; }
         let nt = StrBuf { bytes: [0u8; 65536], len: 0 };
         sb_trim(&ns, &nt);
         list.items[idxSlot].has_namespace = true;
         list.items[idxSlot].namespaceName_len = 0;
         let w: u64 = 0;
-        while w < nt.len && w < 256 { list.items[idxSlot].namespaceName[w] = nt.bytes[w]; list.items[idxSlot].namespaceName_len = list.items[idxSlot].namespaceName_len + 1; w = w + 1; };
+        while w < nt.len && w < 256 { list.items[idxSlot].namespaceName[w] = nt.bytes[w]; list.items[idxSlot].namespaceName_len = list.items[idxSlot].namespaceName_len + 1; w = w + 1; }
         list.len = list.len + 1;
         return;
     };
@@ -3084,11 +3593,11 @@ fn parse_import_line(lt: &StrBuf, list: &ParsedImportList) {
         csv_normalize_join(&inner, &norm);
         list.items[idxSlot].named_len = 0;
         let w: u64 = 0;
-        while w < norm.len && w < 8192 { list.items[idxSlot].named[w] = norm.bytes[w]; list.items[idxSlot].named_len = list.items[idxSlot].named_len + 1; w = w + 1; };
+        while w < norm.len && w < 8192 { list.items[idxSlot].named[w] = norm.bytes[w]; list.items[idxSlot].named_len = list.items[idxSlot].named_len + 1; w = w + 1; }
         // default name: text before "{"
         let pre = StrBuf { bytes: [0u8; 65536], len: 0 };
         let s: u64 = 0;
-        while s < ct.len && ct.bytes[s] != 123 { sb_append_byte(&pre, ct.bytes[s]); s = s + 1; };
+        while s < ct.len && ct.bytes[s] != 123 { sb_append_byte(&pre, ct.bytes[s]); s = s + 1; }
         let pt = StrBuf { bytes: [0u8; 65536], len: 0 };
         sb_trim(&pre, &pt);
         if pt.len > 0 && pt.bytes[pt.len - 1] == 44 { pt.len = pt.len - 1; };
@@ -3098,14 +3607,14 @@ fn parse_import_line(lt: &StrBuf, list: &ParsedImportList) {
             list.items[idxSlot].has_default = true;
             list.items[idxSlot].defaultName_len = 0;
             let w2: u64 = 0;
-            while w2 < pt2.len && w2 < 256 { list.items[idxSlot].defaultName[w2] = pt2.bytes[w2]; list.items[idxSlot].defaultName_len = list.items[idxSlot].defaultName_len + 1; w2 = w2 + 1; };
+            while w2 < pt2.len && w2 < 256 { list.items[idxSlot].defaultName[w2] = pt2.bytes[w2]; list.items[idxSlot].defaultName_len = list.items[idxSlot].defaultName_len + 1; w2 = w2 + 1; }
         };
     } else if ct.len > 0 {
         // default-only import
         list.items[idxSlot].has_default = true;
         list.items[idxSlot].defaultName_len = 0;
         let w: u64 = 0;
-        while w < ct.len && w < 256 { list.items[idxSlot].defaultName[w] = ct.bytes[w]; list.items[idxSlot].defaultName_len = list.items[idxSlot].defaultName_len + 1; w = w + 1; };
+        while w < ct.len && w < 256 { list.items[idxSlot].defaultName[w] = ct.bytes[w]; list.items[idxSlot].defaultName_len = list.items[idxSlot].defaultName_len + 1; w = w + 1; }
     };
     list.len = list.len + 1;
 }
@@ -3123,7 +3632,7 @@ fn extract_quoted(text: &StrBuf, quoteAt: u64, out: &StrBuf) {
     sb_clear(out);
     let quote = text.bytes[quoteAt];
     let i = quoteAt + 1;
-    while i < text.len && text.bytes[i] != quote { sb_append_byte(out, text.bytes[i]); i = i + 1; };
+    while i < text.len && text.bytes[i] != quote { sb_append_byte(out, text.bytes[i]); i = i + 1; }
 }
 
 fn import_clause_text(lt: &StrBuf, out: &StrBuf) {
@@ -3138,7 +3647,7 @@ fn import_clause_text(lt: &StrBuf, out: &StrBuf) {
     let start: u64 = 6; // after "import"
     let end = lt.len;
     if fromAt != -1 { end = fromAt as u64; };
-    while start < end { sb_append_byte(out, lt.bytes[start]); start = start + 1; };
+    while start < end { sb_append_byte(out, lt.bytes[start]); start = start + 1; }
 }
 
 fn csv_normalize_join(csv: &StrBuf, out: &StrBuf) {
@@ -3146,10 +3655,10 @@ fn csv_normalize_join(csv: &StrBuf, out: &StrBuf) {
     let pos: u64 = 0;
     while pos <= csv.len {
         let end = pos;
-        while end < csv.len && csv.bytes[end] != 44 { end = end + 1; };
+        while end < csv.len && csv.bytes[end] != 44 { end = end + 1; }
         let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
         let q: u64 = 0;
-        while pos + q < end { sb_append_byte(&seg, csv.bytes[pos + q]); q = q + 1; };
+        while pos + q < end { sb_append_byte(&seg, csv.bytes[pos + q]); q = q + 1; }
         let t = StrBuf { bytes: [0u8; 65536], len: 0 };
         sb_trim(&seg, &t);
         if t.len > 0 {
@@ -3164,13 +3673,13 @@ fn csv_normalize_join(csv: &StrBuf, out: &StrBuf) {
 }
 
 fn render_import(item: &ParsedImport, out: &StrBuf) {
-    let mod = StrBuf { bytes: [0u8; 65536], len: 0 };
-    buf_field_to_sb2(&item.moduleSpecifier, item.moduleSpecifier_len, &mod);
+    let mod_sb = StrBuf { bytes: [0u8; 65536], len: 0 };
+    buf_field_to_sb2(&item.moduleSpecifier, item.moduleSpecifier_len, &mod_sb);
     if item.sideEffectOnly {
         sb_append(out, STR_PTR("import \""), STR_LEN("import \""));
         let p: ptr = PTR_NULL();
-        PTR_BYTE_ADD(p, &mod.bytes, 0);
-        sb_append(out, p, mod.len);
+        PTR_BYTE_ADD(p, &mod_sb.bytes, 0);
+        sb_append(out, p, mod_sb.len);
         sb_append(out, STR_PTR("\";"), STR_LEN("\";"));
         return;
     };
@@ -3184,7 +3693,7 @@ fn render_import(item: &ParsedImport, out: &StrBuf) {
     let wrotePart = false;
     if item.has_default {
         let dn = StrBuf { bytes: [0u8; 65536], len: 0 };
-        buf_field_to_sb2(&item.defaultName, item.defaultName_len, &dn);
+        buf_field_to_sb256(&item.defaultName, item.defaultName_len, &dn);
         let p: ptr = PTR_NULL();
         PTR_BYTE_ADD(p, &dn.bytes, 0);
         sb_append(out, p, dn.len);
@@ -3194,7 +3703,7 @@ fn render_import(item: &ParsedImport, out: &StrBuf) {
         if wrotePart { sb_append(out, STR_PTR(", "), STR_LEN(", ")); };
         sb_append(out, STR_PTR("* as "), STR_LEN("* as "));
         let nn = StrBuf { bytes: [0u8; 65536], len: 0 };
-        buf_field_to_sb2(&item.namespaceName, item.namespaceName_len, &nn);
+        buf_field_to_sb256(&item.namespaceName, item.namespaceName_len, &nn);
         let p: ptr = PTR_NULL();
         PTR_BYTE_ADD(p, &nn.bytes, 0);
         sb_append(out, p, nn.len);
@@ -3212,15 +3721,15 @@ fn render_import(item: &ParsedImport, out: &StrBuf) {
     };
     sb_append(out, STR_PTR(" from \""), STR_LEN(" from \""));
     let mp: ptr = PTR_NULL();
-    PTR_BYTE_ADD(mp, &mod.bytes, 0);
-    sb_append(out, mp, mod.len);
+    PTR_BYTE_ADD(mp, &mod_sb.bytes, 0);
+    sb_append(out, mp, mod_sb.len);
     sb_append(out, STR_PTR("\";"), STR_LEN("\";"));
 }
 
 fn buf_field_to_sb2(field: &[u8; 512], n: u64, out: &StrBuf) {
     sb_clear(out);
     let i: u64 = 0;
-    while i < n { sb_append_byte(out, field[i]); i = i + 1; };
+    while i < n { sb_append_byte(out, field[i]); i = i + 1; }
 }
 
 fn csv_sort_entries(csv: &StrBuf, out: &StrBuf) {
@@ -3252,10 +3761,10 @@ fn csv_min_entry(csv: &StrBuf, out: &StrBuf) {
     let first = true;
     while pos <= csv.len {
         let end = pos;
-        while end < csv.len && csv.bytes[end] != 44 { end = end + 1; };
+        while end < csv.len && csv.bytes[end] != 44 { end = end + 1; }
         let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
         let q: u64 = 0;
-        while pos + q < end { sb_append_byte(&seg, csv.bytes[pos + q]); q = q + 1; };
+        while pos + q < end { sb_append_byte(&seg, csv.bytes[pos + q]); q = q + 1; }
         let t = StrBuf { bytes: [0u8; 65536], len: 0 };
         sb_trim(&seg, &t);
         if t.len > 0 && (first || sb_compare(&t, out) < 0) {
@@ -3276,10 +3785,10 @@ fn csv_remove_entry(csv: &StrBuf, entry: &StrBuf, out: &StrBuf) {
     let removed = false;
     while pos <= csv.len {
         let end = pos;
-        while end < csv.len && csv.bytes[end] != 44 { end = end + 1; };
+        while end < csv.len && csv.bytes[end] != 44 { end = end + 1; }
         let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
         let q: u64 = 0;
-        while pos + q < end { sb_append_byte(&seg, csv.bytes[pos + q]); q = q + 1; };
+        while pos + q < end { sb_append_byte(&seg, csv.bytes[pos + q]); q = q + 1; }
         let t = StrBuf { bytes: [0u8; 65536], len: 0 };
         sb_trim(&seg, &t);
         if t.len > 0 {
@@ -3302,7 +3811,7 @@ fn org_result(out: &OrganizeImportsResult, content: &StrBuf, applied: bool, remo
     out.changed = applied;
     out.newContent_len = 0;
     let i: u64 = 0;
-    while i < content.len && i < 65536 { out.newContent[i] = content.bytes[i]; out.newContent_len = out.newContent_len + 1; i = i + 1; };
+    while i < content.len && i < 65536 { out.newContent[i] = content.bytes[i]; out.newContent_len = out.newContent_len + 1; i = i + 1; }
     out.removedImportsCount = removed;
     out.removedUnusedCount = removed;
     out.mergedImportsCount = merged;
@@ -3318,7 +3827,7 @@ fn org_result_fill(out: &OrganizeImportsResult, newContent: &StrBuf, applied: bo
     out.changed = applied;
     out.newContent_len = 0;
     let i: u64 = 0;
-    while i < newContent.len && i < 65536 { out.newContent[i] = newContent.bytes[i]; out.newContent_len = out.newContent_len + 1; i = i + 1; };
+    while i < newContent.len && i < 65536 { out.newContent[i] = newContent.bytes[i]; out.newContent_len = out.newContent_len + 1; i = i + 1; }
     out.removedImportsCount = removed;
     out.removedUnusedCount = removed;
     out.mergedImportsCount = merged;
@@ -3334,14 +3843,14 @@ fn set_org_text_skipped(out: &OrganizeImportsResult, filePath: &StrBuf) {
     sb_append(&fb, STR_PTR(" is not a JavaScript/TypeScript file."), STR_LEN(" is not a JavaScript/TypeScript file."));
     out.formatted_len = 0;
     let i: u64 = 0;
-    while i < fb.len && i < 2048 { out.formatted[i] = fb.bytes[i]; out.formatted_len = out.formatted_len + 1; i = i + 1; };
+    while i < fb.len && i < 2048 { out.formatted[i] = fb.bytes[i]; out.formatted_len = out.formatted_len + 1; i = i + 1; }
     let sb2 = StrBuf { bytes: [0u8; 65536], len: 0 };
     sb_append(&sb2, STR_PTR("Skipped: "), STR_LEN("Skipped: "));
     sb_append(&sb2, fp, filePath.len);
     sb_append(&sb2, STR_PTR(" is not a JavaScript/TypeScript file."), STR_LEN(" is not a JavaScript/TypeScript file."));
     out.summary_len = 0;
     let j: u64 = 0;
-    while j < sb2.len && j < 2048 { out.summary[j] = sb2.bytes[j]; out.summary_len = out.summary_len + 1; j = j + 1; };
+    while j < sb2.len && j < 2048 { out.summary[j] = sb2.bytes[j]; out.summary_len = out.summary_len + 1; j = j + 1; }
 }
 
 fn set_org_text(out: &OrganizeImportsResult, filePath: &StrBuf, applied: bool, removed: u64, merged: u64, noImports: bool) {
@@ -3376,10 +3885,10 @@ fn set_org_text(out: &OrganizeImportsResult, filePath: &StrBuf, applied: bool, r
     };
     out.formatted_len = 0;
     let i: u64 = 0;
-    while i < fb.len && i < 2048 { out.formatted[i] = fb.bytes[i]; out.formatted_len = out.formatted_len + 1; i = i + 1; };
+    while i < fb.len && i < 2048 { out.formatted[i] = fb.bytes[i]; out.formatted_len = out.formatted_len + 1; i = i + 1; }
     out.summary_len = 0;
     let j: u64 = 0;
-    while j < sm.len && j < 2048 { out.summary[j] = sm.bytes[j]; out.summary_len = out.summary_len + 1; j = j + 1; };
+    while j < sm.len && j < 2048 { out.summary[j] = sm.bytes[j]; out.summary_len = out.summary_len + 1; j = j + 1; }
 }
 
 // ---- src/saVmTreeSitter.ts:1779-1796 — JS_GLOBALS / TS_RESERVED ----
@@ -3407,7 +3916,7 @@ fn csv_has(csvText: &StrBuf, name: &StrBuf) -> bool {
 // isInterfaceDeclaration guards, ArrayBindingPattern (useState
 // destructuring) inference, JSX tag handling, ts.forEachChild walks
 // (walkBlock / walkOuter) with closures capturing Sets/Maps, fnSigText
-// reading fnNode.parameters[].type.getText(sf), and Set spread
+// reading fnNode.parameters[].type_.getText(sf), and Set spread
 // [...blockUsedIdentifiers].filter(...). No TS compiler exists in SLA.
 // Conversion below keeps the signature, the line-range math, the
 // capture filtering rules (declared / imported / JS_GLOBALS /
@@ -3426,7 +3935,6 @@ fn analyzeBlockScope(st: &TreeSitterState, filePath: &StrBuf, content: &StrBuf, 
     };
     if compName.len == 0 { sb_append(&compName, STR_PTR("ExtractedComponent"), STR_LEN("ExtractedComponent")); };
     let sf = getCachedSourceFile(st, STR_PTR(""), 0, content);
-    void sf; // DEFECT: compiler SourceFile unavailable
     let idx = LineIndex { starts: [0u64; 8192], lens: [0u64; 8192], count: 0 };
     build_line_index(content, &idx);
     let totalLines = idx.count;
@@ -3499,10 +4007,10 @@ fn analyzeBlockScope(st: &TreeSitterState, filePath: &StrBuf, content: &StrBuf, 
     let pos: u64 = 0;
     while pos <= usedCsv.len {
         let end = pos;
-        while end < usedCsv.len && usedCsv.bytes[end] != 44 { end = end + 1; };
+        while end < usedCsv.len && usedCsv.bytes[end] != 44 { end = end + 1; }
         let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
         let q: u64 = 0;
-        while pos + q < end { sb_append_byte(&seg, usedCsv.bytes[pos + q]); q = q + 1; };
+        while pos + q < end { sb_append_byte(&seg, usedCsv.bytes[pos + q]); q = q + 1; }
         let name = StrBuf { bytes: [0u8; 65536], len: 0 };
         sb_trim(&seg, &name);
         if name.len > 0 && !csv_has(&declaredCsv, &name) && !csv_has(&importedCsv, &name) && !csv_has(&globals, &name) && !csv_has(&reserved, &name) && !is_all_digits(&name) {
@@ -3530,10 +4038,10 @@ fn analyzeBlockScope(st: &TreeSitterState, filePath: &StrBuf, content: &StrBuf, 
             if ci < 512 {
                 captured.items[ci].name_len = 0;
                 let w: u64 = 0;
-                while w < name.len && w < 256 { captured.items[ci].name[w] = name.bytes[w]; captured.items[ci].name_len = captured.items[ci].name_len + 1; w = w + 1; };
+                while w < name.len && w < 256 { captured.items[ci].name[w] = name.bytes[w]; captured.items[ci].name_len = captured.items[ci].name_len + 1; w = w + 1; }
                 captured.items[ci].type_len = 0;
                 let w2: u64 = 0;
-                while w2 < typeText.len && w2 < 1024 { captured.items[ci].type[w2] = typeText.bytes[w2]; captured.items[ci].type_len = captured.items[ci].type_len + 1; w2 = w2 + 1; };
+                while w2 < typeText.len && w2 < 1024 { captured.items[ci].type_[w2] = typeText.bytes[w2]; captured.items[ci].type_len = captured.items[ci].type_len + 1; w2 = w2 + 1; }
                 captured.items[ci].isFunction = isFn;
                 captured.items[ci].isStateSetter = isSetter;
                 captured.len = captured.len + 1;
@@ -3566,13 +4074,13 @@ fn analyzeBlockScope(st: &TreeSitterState, filePath: &StrBuf, content: &StrBuf, 
         while vi < captured.len {
             sb_append(&propsIface, STR_PTR("  "), STR_LEN("  "));
             let vn = StrBuf { bytes: [0u8; 65536], len: 0 };
-            buf_field_to_sb2(&captured.items[vi].name, captured.items[vi].name_len, &vn);
+            buf_field_to_sb256(&captured.items[vi].name, captured.items[vi].name_len, &vn);
             let vp: ptr = PTR_NULL();
             PTR_BYTE_ADD(vp, &vn.bytes, 0);
             sb_append(&propsIface, vp, vn.len);
             sb_append(&propsIface, STR_PTR(": "), STR_LEN(": "));
             let vt = StrBuf { bytes: [0u8; 65536], len: 0 };
-            buf_field_to_sb(&captured.items[vi].type, captured.items[vi].type_len, &vt);
+            buf_field_to_sb1024(&captured.items[vi].type_, captured.items[vi].type_len, &vt);
             let tp2: ptr = PTR_NULL();
             PTR_BYTE_ADD(tp2, &vt.bytes, 0);
             sb_append(&propsIface, tp2, vt.len);
@@ -3599,7 +4107,7 @@ fn analyzeBlockScope(st: &TreeSitterState, filePath: &StrBuf, content: &StrBuf, 
         while vi < captured.len {
             if vi > 0 { sb_append_byte(&callSnippet, 32); };
             let vn = StrBuf { bytes: [0u8; 65536], len: 0 };
-            buf_field_to_sb2(&captured.items[vi].name, captured.items[vi].name_len, &vn);
+            buf_field_to_sb256(&captured.items[vi].name, captured.items[vi].name_len, &vn);
             let vp: ptr = PTR_NULL();
             PTR_BYTE_ADD(vp, &vn.bytes, 0);
             sb_append(&callSnippet, vp, vn.len);
@@ -3631,13 +4139,13 @@ fn analyzeBlockScope(st: &TreeSitterState, filePath: &StrBuf, content: &StrBuf, 
         while vi < captured.len {
             if vi > 0 { sb_append(&summary, STR_PTR(", "), STR_LEN(", ")); };
             let vn = StrBuf { bytes: [0u8; 65536], len: 0 };
-            buf_field_to_sb2(&captured.items[vi].name, captured.items[vi].name_len, &vn);
+            buf_field_to_sb256(&captured.items[vi].name, captured.items[vi].name_len, &vn);
             let vp: ptr = PTR_NULL();
             PTR_BYTE_ADD(vp, &vn.bytes, 0);
             sb_append(&summary, vp, vn.len);
             sb_append(&summary, STR_PTR(" ("), STR_LEN(" ("));
             let vt = StrBuf { bytes: [0u8; 65536], len: 0 };
-            buf_field_to_sb(&captured.items[vi].type, captured.items[vi].type_len, &vt);
+            buf_field_to_sb1024(&captured.items[vi].type_, captured.items[vi].type_len, &vt);
             let tp3: ptr = PTR_NULL();
             PTR_BYTE_ADD(tp3, &vt.bytes, 0);
             sb_append(&summary, tp3, vt.len);
@@ -3673,41 +4181,41 @@ fn analyzeBlockScope(st: &TreeSitterState, filePath: &StrBuf, content: &StrBuf, 
     // fill out
     out.filePath_len = 0;
     let w: u64 = 0;
-    while w < filePath.len && w < 1024 { out.filePath[w] = filePath.bytes[w]; out.filePath_len = out.filePath_len + 1; w = w + 1; };
+    while w < filePath.len && w < 1024 { out.filePath[w] = filePath.bytes[w]; out.filePath_len = out.filePath_len + 1; w = w + 1; }
     out.startLine = sLine;
     out.endLine = eLine;
     out.componentName_len = 0;
     let w3: u64 = 0;
-    while w3 < safe.len && w3 < 256 { out.componentName[w3] = safe.bytes[w3]; out.componentName_len = out.componentName_len + 1; w3 = w3 + 1; };
+    while w3 < safe.len && w3 < 256 { out.componentName[w3] = safe.bytes[w3]; out.componentName_len = out.componentName_len + 1; w3 = w3 + 1; }
     out.captured_first = 0;
     out.captured_len = captured.len;
     out.declaredSymbols_len = 0;
     let w4: u64 = 0;
-    while w4 < declaredCsv.len && w4 < 8192 { out.declaredSymbols[w4] = declaredCsv.bytes[w4]; out.declaredSymbols_len = out.declaredSymbols_len + 1; w4 = w4 + 1; };
+    while w4 < declaredCsv.len && w4 < 8192 { out.declaredSymbols[w4] = declaredCsv.bytes[w4]; out.declaredSymbols_len = out.declaredSymbols_len + 1; w4 = w4 + 1; }
     out.importedDependencies_len = 0;
     let w5: u64 = 0;
-    while w5 < importedDeps.len && w5 < 8192 { out.importedDependencies[w5] = importedDeps.bytes[w5]; out.importedDependencies_len = out.importedDependencies_len + 1; w5 = w5 + 1; };
+    while w5 < importedDeps.len && w5 < 8192 { out.importedDependencies[w5] = importedDeps.bytes[w5]; out.importedDependencies_len = out.importedDependencies_len + 1; w5 = w5 + 1; }
     out.suggestedPropsInterface_len = 0;
     let w6: u64 = 0;
-    while w6 < propsIface.len && w6 < 8192 { out.suggestedPropsInterface[w6] = propsIface.bytes[w6]; out.suggestedPropsInterface_len = out.suggestedPropsInterface_len + 1; w6 = w6 + 1; };
+    while w6 < propsIface.len && w6 < 8192 { out.suggestedPropsInterface[w6] = propsIface.bytes[w6]; out.suggestedPropsInterface_len = out.suggestedPropsInterface_len + 1; w6 = w6 + 1; }
     out.suggestedCallSnippet_len = 0;
     let w7: u64 = 0;
-    while w7 < callSnippet.len && w7 < 4096 { out.suggestedCallSnippet[w7] = callSnippet.bytes[w7]; out.suggestedCallSnippet_len = out.suggestedCallSnippet_len + 1; w7 = w7 + 1; };
+    while w7 < callSnippet.len && w7 < 4096 { out.suggestedCallSnippet[w7] = callSnippet.bytes[w7]; out.suggestedCallSnippet_len = out.suggestedCallSnippet_len + 1; w7 = w7 + 1; }
     out.summary_len = 0;
     let w8: u64 = 0;
-    while w8 < summary.len && w8 < 16384 { out.summary[w8] = summary.bytes[w8]; out.summary_len = out.summary_len + 1; w8 = w8 + 1; };
+    while w8 < summary.len && w8 < 16384 { out.summary[w8] = summary.bytes[w8]; out.summary_len = out.summary_len + 1; w8 = w8 + 1; }
 }
 
 fn collect_import_locals(item: &ParsedImport, outCsv: &StrBuf) {
     // default + namespace + named local names into the csv set
     if item.has_default {
         let dn = StrBuf { bytes: [0u8; 65536], len: 0 };
-        buf_field_to_sb2(&item.defaultName, item.defaultName_len, &dn);
+        buf_field_to_sb256(&item.defaultName, item.defaultName_len, &dn);
         csv_add(outCsv, &dn);
     };
     if item.has_namespace {
         let nn = StrBuf { bytes: [0u8; 65536], len: 0 };
-        buf_field_to_sb2(&item.namespaceName, item.namespaceName_len, &nn);
+        buf_field_to_sb256(&item.namespaceName, item.namespaceName_len, &nn);
         csv_add(outCsv, &nn);
     };
     let named = StrBuf { bytes: [0u8; 65536], len: 0 };
@@ -3715,10 +4223,10 @@ fn collect_import_locals(item: &ParsedImport, outCsv: &StrBuf) {
     let pos: u64 = 0;
     while pos <= named.len {
         let end = pos;
-        while end < named.len && named.bytes[end] != 44 { end = end + 1; };
+        while end < named.len && named.bytes[end] != 44 { end = end + 1; }
         let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
         let q: u64 = 0;
-        while pos + q < end { sb_append_byte(&seg, named.bytes[pos + q]); q = q + 1; };
+        while pos + q < end { sb_append_byte(&seg, named.bytes[pos + q]); q = q + 1; }
         let t = StrBuf { bytes: [0u8; 65536], len: 0 };
         sb_trim(&seg, &t);
         let local = StrBuf { bytes: [0u8; 65536], len: 0 };
@@ -3743,10 +4251,10 @@ fn csv_intersect(a: &StrBuf, b: &StrBuf, out: &StrBuf) {
     let pos: u64 = 0;
     while pos <= a.len {
         let end = pos;
-        while end < a.len && a.bytes[end] != 44 { end = end + 1; };
+        while end < a.len && a.bytes[end] != 44 { end = end + 1; }
         let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
         let q: u64 = 0;
-        while pos + q < end { sb_append_byte(&seg, a.bytes[pos + q]); q = q + 1; };
+        while pos + q < end { sb_append_byte(&seg, a.bytes[pos + q]); q = q + 1; }
         let t = StrBuf { bytes: [0u8; 65536], len: 0 };
         sb_trim(&seg, &t);
         if t.len > 0 && csv_contains(b, &t) && !csv_contains(out, &t) {
@@ -3795,16 +4303,16 @@ fn decl_scan_line(line: &StrBuf, outCsv: &StrBuf) {
         };
         if matched > 0 {
             let p2 = pos + matched;
-            while p2 < line.len && (line.bytes[p2] == 32 || line.bytes[p2] == 9) { p2 = p2 + 1; };
+            while p2 < line.len && (line.bytes[p2] == 32 || line.bytes[p2] == 9) { p2 = p2 + 1; }
             // destructuring: skip [ / { then read identifier
             if p2 < line.len && (line.bytes[p2] == 91 || line.bytes[p2] == 123) { p2 = p2 + 1; };
-            while p2 < line.len && (line.bytes[p2] == 32 || line.bytes[p2] == 9) { p2 = p2 + 1; };
+            while p2 < line.len && (line.bytes[p2] == 32 || line.bytes[p2] == 9) { p2 = p2 + 1; }
             let at: u64 = 0;
             let ln: u64 = 0;
             if read_ident(line, p2, &at, &ln) {
                 let tok = StrBuf { bytes: [0u8; 65536], len: 0 };
                 let q: u64 = 0;
-                while q < ln { sb_append_byte(&tok, line.bytes[at + q]); q = q + 1; };
+                while q < ln { sb_append_byte(&tok, line.bytes[at + q]); q = q + 1; }
                 csv_add(outCsv, &tok);
             };
             pos = pos + matched;
@@ -3853,8 +4361,8 @@ fn infer_outer_type(outerText: &StrBuf, name: &StrBuf, outType: &StrBuf, outIsFn
     // initializers yield "…" placeholder signatures documented in the
     // defect log; declared type annotations are carried verbatim.
     sb_clear(outType);
-    outIsFn = false;
-    outIsSetter = false;
+    *outIsFn = false;
+    *outIsSetter = false;
     // useState pair pattern: const [NAME, SETTER] = useState<T>(...)
     // DEFECT: approximated — setter detection by name pairing is left
     // to the caller's setX heuristic when this returns false.
@@ -3867,7 +4375,7 @@ fn infer_outer_type(outerText: &StrBuf, name: &StrBuf, outType: &StrBuf, outIsFn
         // `function NAME(` ?
         if sb_contains(&line, STR_PTR("function"), STR_LEN("function")) && csv_contains(&line, name) {
             // DEFECT: fnSigText rebuild — returns "() => void"-shaped placeholder
-            outIsFn = true;
+            *outIsFn = true;
             sb_append(outType, STR_PTR("() => void"), STR_LEN("() => void"));
             return true;
         };
@@ -3876,25 +4384,25 @@ fn infer_outer_type(outerText: &StrBuf, name: &StrBuf, outType: &StrBuf, outIsFn
         if namePos != -1 {
             let rest = StrBuf { bytes: [0u8; 65536], len: 0 };
             let s = (namePos as u64) + name.len;
-            while s < line.len { sb_append_byte(&rest, line.bytes[s]); s = s + 1; };
+            while s < line.len { sb_append_byte(&rest, line.bytes[s]); s = s + 1; }
             let rt = StrBuf { bytes: [0u8; 65536], len: 0 };
             sb_trim(&rest, &rt);
             if sb_starts_with(&rt, STR_PTR(":"), 1) {
                 // declared type text up to "=" or end of line
                 let ty = StrBuf { bytes: [0u8; 65536], len: 0 };
                 let q: u64 = 1;
-                while q < rt.len && rt.bytes[q] != 61 { sb_append_byte(&ty, rt.bytes[q]); q = q + 1; };
+                while q < rt.len && rt.bytes[q] != 61 { sb_append_byte(&ty, rt.bytes[q]); q = q + 1; }
                 let tt = StrBuf { bytes: [0u8; 65536], len: 0 };
                 sb_trim(&ty, &tt);
                 let p: ptr = PTR_NULL();
                 PTR_BYTE_ADD(p, &tt.bytes, 0);
                 sb_append(outType, p, tt.len);
-                if sb_contains(&rt, STR_PTR("=>"), 2) { outIsFn = true; };
+                if sb_contains(&rt, STR_PTR("=>"), 2) { *outIsFn = true; };
                 return true;
             };
             if sb_starts_with(&rt, STR_PTR("="), 1) {
                 if sb_contains(&rt, STR_PTR("=>"), 2) || sb_contains(&rt, STR_PTR("function"), STR_LEN("function")) {
-                    outIsFn = true;
+                    *outIsFn = true;
                     sb_append(outType, STR_PTR("() => void"), STR_LEN("() => void"));
                     return true;
                 };
@@ -3936,7 +4444,6 @@ fn find_word(text: &StrBuf, word: &StrBuf) -> i64 {
 fn generateTargetImportsForBlock(st: &TreeSitterState, sourcePath: &StrBuf, targetPath: &StrBuf, sourceContent: &StrBuf, startLine: u64, endLine: u64, out: &StrBuf) {
     sb_clear(out);
     let sf = getCachedSourceFile(st, STR_PTR(""), 0, sourceContent);
-    void sf;
     let idx = LineIndex { starts: [0u64; 8192], lens: [0u64; 8192], count: 0 };
     build_line_index(sourceContent, &idx);
     let totalLines = idx.count;
@@ -3981,7 +4488,7 @@ fn generateTargetImportsForBlock(st: &TreeSitterState, sourcePath: &StrBuf, targ
     while pi < parsed.len {
         let item = parsed.items[pi];
         if item.sideEffectOnly { pi = pi + 1; continue; }; // !clause -> skip
-        let keep = item;
+        let keep = parsed.items[pi]; // second copy: SLA struct assignment moves (TS aliases)
         keep.has_default = item.has_default && named_used(&item.defaultName, item.defaultName_len, &usedCsv);
         keep.has_namespace = item.has_namespace && named_used(&item.namespaceName, item.namespaceName_len, &usedCsv);
         // neededNamed: elements whose local name is used, with
@@ -3992,17 +4499,17 @@ fn generateTargetImportsForBlock(st: &TreeSitterState, sourcePath: &StrBuf, targ
         csv_filter_used(&named, &usedCsv, &keptNamed);
         keep.named_len = 0;
         let q: u64 = 0;
-        while q < keptNamed.len && q < 8192 { keep.named[q] = keptNamed.bytes[q]; keep.named_len = keep.named_len + 1; q = q + 1; };
+        while q < keptNamed.len && q < 8192 { keep.named[q] = keptNamed.bytes[q]; keep.named_len = keep.named_len + 1; q = q + 1; }
         if !keep.has_default && !keep.has_namespace && keptNamed.len == 0 { pi = pi + 1; continue; };
         // rewrite relative module path against target dir
-        let mod = StrBuf { bytes: [0u8; 65536], len: 0 };
-        buf_field_to_sb2(&item.moduleSpecifier, item.moduleSpecifier_len, &mod);
-        if sb_starts_with(&mod, STR_PTR("."), 1) {
+        let mod_sb = StrBuf { bytes: [0u8; 65536], len: 0 };
+        buf_field_to_sb2(&item.moduleSpecifier, item.moduleSpecifier_len, &mod_sb);
+        if sb_starts_with(&mod_sb, STR_PTR("."), 1) {
             let rewritten = StrBuf { bytes: [0u8; 65536], len: 0 };
-            rewrite_relative_module(sourcePath, targetPath, &mod, &rewritten);
+            rewrite_relative_module(sourcePath, targetPath, &mod_sb, &rewritten);
             keep.moduleSpecifier_len = 0;
             let w: u64 = 0;
-            while w < rewritten.len && w < 512 { keep.moduleSpecifier[w] = rewritten.bytes[w]; keep.moduleSpecifier_len = keep.moduleSpecifier_len + 1; w = w + 1; };
+            while w < rewritten.len && w < 512 { keep.moduleSpecifier[w] = rewritten.bytes[w]; keep.moduleSpecifier_len = keep.moduleSpecifier_len + 1; w = w + 1; }
         };
         if linesOut.len > 0 {
             if detect_eol_crlf(sourceContent) { sb_append_byte(&linesOut, 13); };
@@ -4019,7 +4526,7 @@ fn generateTargetImportsForBlock(st: &TreeSitterState, sourcePath: &StrBuf, targ
 fn named_used(field: &[u8; 256], n: u64, usedCsv: &StrBuf) -> bool {
     if n == 0 { return false; };
     let name = StrBuf { bytes: [0u8; 65536], len: 0 };
-    buf_field_to_sb2(field, n, &name);
+    buf_field_to_sb256(field, n, &name);
     return csv_contains(usedCsv, &name);
 }
 
@@ -4075,10 +4582,10 @@ fn collect_type_ids(typeText: &StrBuf, intoCsv: &StrBuf) {
         let startByte = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 36;
         if startByte {
             let s = i;
-            while i < typeText.len && is_word_byte(typeText.bytes[i]) { i = i + 1; };
+            while i < typeText.len && is_word_byte(typeText.bytes[i]) { i = i + 1; }
             let tok = StrBuf { bytes: [0u8; 65536], len: 0 };
             let q = s;
-            while q < i { sb_append_byte(&tok, typeText.bytes[q]); q = q + 1; };
+            while q < i { sb_append_byte(&tok, typeText.bytes[q]); q = q + 1; }
             if !csv_contains(&globals, &tok) { csv_add(intoCsv, &tok); };
         } else {
             i = i + 1;
@@ -4092,13 +4599,12 @@ fn generatePropsTypeImports(st: &TreeSitterState, sourcePath: &StrBuf, targetPat
     let vi: u64 = 0;
     while vi < captured.len {
         let t = StrBuf { bytes: [0u8; 65536], len: 0 };
-        buf_field_to_sb(&captured.items[vi].type, captured.items[vi].type_len, &t);
+        buf_field_to_sb1024(&captured.items[vi].type_, captured.items[vi].type_len, &t);
         collect_type_ids(&t, &needed);
         vi = vi + 1;
     }
     if needed.len == 0 { return; };
     let sf = getCachedSourceFile(st, STR_PTR(""), 0, sourceContent);
-    void sf;
     let covered = StrBuf { bytes: [0u8; 65536], len: 0 };
     let idx = LineIndex { starts: [0u64; 8192], lens: [0u64; 8192], count: 0 };
     build_line_index(sourceContent, &idx);
@@ -4115,29 +4621,29 @@ fn generatePropsTypeImports(st: &TreeSitterState, sourcePath: &StrBuf, targetPat
             parse_import_line(&lt, &parsed);
             if parsed.len > 0 {
                 let item = parsed.items[0];
-                let mod = StrBuf { bytes: [0u8; 65536], len: 0 };
-                buf_field_to_sb2(&item.moduleSpecifier, item.moduleSpecifier_len, &mod);
+                let mod_sb = StrBuf { bytes: [0u8; 65536], len: 0 };
+                buf_field_to_sb2(&item.moduleSpecifier, item.moduleSpecifier_len, &mod_sb);
                 let rewritten = StrBuf { bytes: [0u8; 65536], len: 0 };
-                if sb_starts_with(&mod, STR_PTR("."), 1) {
-                    rewrite_relative_module(sourcePath, targetPath, &mod, &rewritten);
+                if sb_starts_with(&mod_sb, STR_PTR("."), 1) {
+                    rewrite_relative_module(sourcePath, targetPath, &mod_sb, &rewritten);
                 } else {
                     let p: ptr = PTR_NULL();
-                    PTR_BYTE_ADD(p, &mod.bytes, 0);
-                    sb_append(&rewritten, p, mod.len);
+                    PTR_BYTE_ADD(p, &mod_sb.bytes, 0);
+                    sb_append(&rewritten, p, mod_sb.len);
                 };
                 // default import provides a type name
                 if item.has_default {
                     let dn = StrBuf { bytes: [0u8; 65536], len: 0 };
-                    buf_field_to_sb2(&item.defaultName, item.defaultName_len, &dn);
-                    if csv_contains(&needed, &dn) && !csv_contains(&covered, &dn) && !csv_contains(&locallyDeclaredCsv, &dn) && find_word(existingImportsText, &dn) == -1 {
+                    buf_field_to_sb256(&item.defaultName, item.defaultName_len, &dn);
+                    if csv_contains(&needed, &dn) && !csv_contains(&covered, &dn) && !csv_contains(locallyDeclaredCsv,  &dn) && find_word(existingImportsText, &dn) == -1 {
                         append_out_line(out, eolCrlf, &dn, &rewritten, 0);
                         csv_add(&covered, &dn);
                     };
                 };
                 if item.has_namespace {
                     let nn = StrBuf { bytes: [0u8; 65536], len: 0 };
-                    buf_field_to_sb2(&item.namespaceName, item.namespaceName_len, &nn);
-                    if csv_contains(&needed, &nn) && !csv_contains(&covered, &nn) && !csv_contains(&locallyDeclaredCsv, &nn) && find_word(existingImportsText, &nn) == -1 {
+                    buf_field_to_sb256(&item.namespaceName, item.namespaceName_len, &nn);
+                    if csv_contains(&needed, &nn) && !csv_contains(&covered, &nn) && !csv_contains(locallyDeclaredCsv,  &nn) && find_word(existingImportsText, &nn) == -1 {
                         append_out_line(out, eolCrlf, &nn, &rewritten, 1);
                         csv_add(&covered, &nn);
                     };
@@ -4150,15 +4656,15 @@ fn generatePropsTypeImports(st: &TreeSitterState, sourcePath: &StrBuf, targetPat
                 let pos: u64 = 0;
                 while pos <= named.len {
                     let end = pos;
-                    while end < named.len && named.bytes[end] != 44 { end = end + 1; };
+                    while end < named.len && named.bytes[end] != 44 { end = end + 1; }
                     let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
                     let q: u64 = 0;
-                    while pos + q < end { sb_append_byte(&seg, named.bytes[pos + q]); q = q + 1; };
+                    while pos + q < end { sb_append_byte(&seg, named.bytes[pos + q]); q = q + 1; }
                     let t = StrBuf { bytes: [0u8; 65536], len: 0 };
                     sb_trim(&seg, &t);
                     let local = StrBuf { bytes: [0u8; 65536], len: 0 };
                     csv_local_name(&t, &local);
-                    if local.len > 0 && csv_contains(&needed, &local) && !csv_contains(&covered, &local) && !csv_contains(&locallyDeclaredCsv, &local) && find_word(existingImportsText, &local) == -1 {
+                    if local.len > 0 && csv_contains(&needed, &local) && !csv_contains(&covered, &local) && !csv_contains(locallyDeclaredCsv,  &local) && find_word(existingImportsText, &local) == -1 {
                         if hits.len > 0 { sb_append(&hits, STR_PTR(", "), STR_LEN(", ")); };
                         let p: ptr = PTR_NULL();
                         PTR_BYTE_ADD(p, &t.bytes, 0);
@@ -4191,7 +4697,7 @@ fn generatePropsTypeImports(st: &TreeSitterState, sourcePath: &StrBuf, targetPat
     }
 }
 
-fn append_out_line(out: &StrBuf, eolCrlf: bool, name: &StrBuf, mod: &StrBuf, form: u64) {
+fn append_out_line(out: &StrBuf, eolCrlf: bool, name: &StrBuf, mod_sb: &StrBuf, form: u64) {
     // form 0: import Name from "mod";  form 1: import * as Name from "mod";
     if out.len > 0 {
         if eolCrlf { sb_append_byte(out, 13); };
@@ -4204,8 +4710,8 @@ fn append_out_line(out: &StrBuf, eolCrlf: bool, name: &StrBuf, mod: &StrBuf, for
     sb_append(out, np, name.len);
     sb_append(out, STR_PTR(" from \""), STR_LEN(" from \""));
     let mp: ptr = PTR_NULL();
-    PTR_BYTE_ADD(mp, &mod.bytes, 0);
-    sb_append(out, mp, mod.len);
+    PTR_BYTE_ADD(mp, &mod_sb.bytes, 0);
+    sb_append(out, mp, mod_sb.len);
     sb_append(out, STR_PTR("\";"), STR_LEN("\";"));
 }
 
@@ -4220,18 +4726,16 @@ fn append_out_line(out: &StrBuf, eolCrlf: bool, name: &StrBuf, mod: &StrBuf, for
 // text approximation of getText.
 fn generatePropsLocalTypes(st: &TreeSitterState, sourcePath: &StrBuf, sourceContent: &StrBuf, captured: &CapturedVariableList, existingText: &StrBuf, out: &StrBuf) {
     sb_clear(out);
-    void sourcePath;
     let needed = StrBuf { bytes: [0u8; 65536], len: 0 };
     let vi: u64 = 0;
     while vi < captured.len {
         let t = StrBuf { bytes: [0u8; 65536], len: 0 };
-        buf_field_to_sb(&captured.items[vi].type, captured.items[vi].type_len, &t);
+        buf_field_to_sb1024(&captured.items[vi].type_, captured.items[vi].type_len, &t);
         collect_type_ids(&t, &needed);
         vi = vi + 1;
     }
     if needed.len == 0 { return; };
     let sf = getCachedSourceFile(st, STR_PTR(""), 0, sourceContent);
-    void sf;
     // decls: name -> declaration text (csv names + parallel text via
     // repeated lookup; texts re-extracted on demand by find_local_decl)
     let pickedNames = StrBuf { bytes: [0u8; 65536], len: 0 };
@@ -4247,10 +4751,10 @@ fn generatePropsLocalTypes(st: &TreeSitterState, sourcePath: &StrBuf, sourceCont
         let pos: u64 = 0;
         while pos <= snapshot.len {
             let end = pos;
-            while end < snapshot.len && snapshot.bytes[end] != 44 { end = end + 1; };
+            while end < snapshot.len && snapshot.bytes[end] != 44 { end = end + 1; }
             let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
             let q: u64 = 0;
-            while pos + q < end { sb_append_byte(&seg, snapshot.bytes[pos + q]); q = q + 1; };
+            while pos + q < end { sb_append_byte(&seg, snapshot.bytes[pos + q]); q = q + 1; }
             let name = StrBuf { bytes: [0u8; 65536], len: 0 };
             sb_trim(&seg, &name);
             if name.len > 0 && !csv_contains(&pickedNames, &name) && find_word(existingText, &name) == -1 {
@@ -4298,14 +4802,14 @@ fn find_local_decl(content: &StrBuf, name: &StrBuf, outText: &StrBuf) -> bool {
         if sb_starts_with(&rest, STR_PTR("export "), STR_LEN("export ")) {
             let r2 = StrBuf { bytes: [0u8; 65536], len: 0 };
             let s: u64 = 7;
-            while s < rest.len { sb_append_byte(&r2, rest.bytes[s]); s = s + 1; };
+            while s < rest.len { sb_append_byte(&r2, rest.bytes[s]); s = s + 1; }
             rest = r2;
         };
         let kwLen: u64 = 0;
         if kw_at(&rest, 0, STR_PTR("interface"), STR_LEN("interface")) { kwLen = 9; } else if kw_at(&rest, 0, STR_PTR("type"), STR_LEN("type")) { kwLen = 4; } else if kw_at(&rest, 0, STR_PTR("enum"), STR_LEN("enum")) { kwLen = 4; } else if kw_at(&rest, 0, STR_PTR("class"), STR_LEN("class")) { kwLen = 5; };
         if kwLen > 0 {
             let after = kwLen;
-            while after < rest.len && (rest.bytes[after] == 32 || rest.bytes[after] == 9) { after = after + 1; };
+            while after < rest.len && (rest.bytes[after] == 32 || rest.bytes[after] == 9) { after = after + 1; }
             if find_word(&rest, name) == after as i64 {
                 // copy from this line until braces balance (or ";" for
                 // brace-less aliases on the same accumulation)
@@ -4351,18 +4855,16 @@ fn splitEnvironmentalErrors(st: &TreeSitterState, sourcePath: &StrBuf, sourceCon
     hard.len = 0;
     warnings.len = 0;
     if errors.len == 0 { return; };
-    void st;
-    void sourcePath;
     let declared = StrBuf { bytes: [0u8; 65536], len: 0 };
     collect_declared_names_textual(sourceContent, &declared);
     let i: u64 = 0;
     while i < errors.len {
         let e = errors.items[i];
         let code = StrBuf { bytes: [0u8; 65536], len: 0 };
-        if e.has_code { buf_field_to_sb2(&e.code, e.code_len, &code); };
+        if e.has_code { buf_field_to_sb64(&e.code, e.code_len, &code); };
         if sb_eq_lit(&code, STR_PTR("TS2304"), STR_LEN("TS2304")) {
             let msg = StrBuf { bytes: [0u8; 65536], len: 0 };
-            buf_field_to_sb(&e.message, e.message_len, &msg);
+            buf_field_to_sb1024(&e.message, e.message_len, &msg);
             let nm = StrBuf { bytes: [0u8; 65536], len: 0 };
             extract_quoted_after(&msg, STR_PTR("Cannot find name '"), STR_LEN("Cannot find name '"), &nm);
             if nm.len == 0 {
@@ -4374,7 +4876,7 @@ fn splitEnvironmentalErrors(st: &TreeSitterState, sourcePath: &StrBuf, sourceCon
             };
         } else if sb_eq_lit(&code, STR_PTR("TS2339"), STR_LEN("TS2339")) {
             let msg = StrBuf { bytes: [0u8; 65536], len: 0 };
-            buf_field_to_sb(&e.message, e.message_len, &msg);
+            buf_field_to_sb1024(&e.message, e.message_len, &msg);
             let prop = StrBuf { bytes: [0u8; 65536], len: 0 };
             extract_quoted_after(&msg, STR_PTR("Property '"), STR_LEN("Property '"), &prop);
             if prop.len == 0 {
@@ -4403,7 +4905,7 @@ fn splitEnvironmentalErrors(st: &TreeSitterState, sourcePath: &StrBuf, sourceCon
 
 fn push_issue(list: &SemanticIssueList, e: &SemanticIssue) {
     if list.len < 256 {
-        list.items[list.len] = e;
+        list.items[list.len] = *e;
         list.len = list.len + 1;
     };
 }
@@ -4428,7 +4930,7 @@ fn extract_quoted_after(text: &StrBuf, prefix_p: ptr, prefix_n: u64, out: &StrBu
     }
     if foundAt == -1 { return; };
     let i = (foundAt as u64) + prefix_n;
-    while i < text.len && text.bytes[i] != 39 { sb_append_byte(out, text.bytes[i]); i = i + 1; };
+    while i < text.len && text.bytes[i] != 39 { sb_append_byte(out, text.bytes[i]); i = i + 1; }
     if i >= text.len { sb_clear(out); };
 }
 
@@ -4461,13 +4963,13 @@ fn enum_scan_line(line: &StrBuf, outCsv: &StrBuf) {
     while pos < line.len {
         if (pos == 0 || !is_word_byte(line.bytes[pos - 1])) && kw_at(line, pos, STR_PTR("enum"), STR_LEN("enum")) {
             let p2 = pos + 4;
-            while p2 < line.len && (line.bytes[p2] == 32 || line.bytes[p2] == 9) { p2 = p2 + 1; };
+            while p2 < line.len && (line.bytes[p2] == 32 || line.bytes[p2] == 9) { p2 = p2 + 1; }
             let at: u64 = 0;
             let ln: u64 = 0;
             if read_ident(line, p2, &at, &ln) {
                 let tok = StrBuf { bytes: [0u8; 65536], len: 0 };
                 let q: u64 = 0;
-                while q < ln { sb_append_byte(&tok, line.bytes[at + q]); q = q + 1; };
+                while q < ln { sb_append_byte(&tok, line.bytes[at + q]); q = q + 1; }
                 csv_add(outCsv, &tok);
             };
             pos = pos + 4;
@@ -4519,9 +5021,6 @@ fn findTopImportInsertLine(content: &StrBuf) -> u64 {
 // Callers (getSemanticDiagnosticsForContent / autoFixMissingImports)
 // degrade to empty/no-op results, as they do when LS creation fails.
 fn createInMemoryLanguageService(fileName: &StrBuf, content: &StrBuf, cwd: &StrBuf) -> u64 {
-    void fileName;
-    void content;
-    void cwd;
     return 0;
 }
 
@@ -4560,9 +5059,9 @@ fn getSemanticDiagnosticsForContent(filePath: &StrBuf, content: &StrBuf, cwd: &S
 fn autoFixMissingImportsInContent(filePath: &StrBuf, content: &StrBuf, cwd: &StrBuf, hasCwd: bool, outContent: &StrBuf, outApplied: &bool, outFixedCount: &u64, outSummary: &StrBuf) {
     sb_clear(outContent);
     let q: u64 = 0;
-    while q < content.len { sb_append_byte(outContent, content.bytes[q]); q = q + 1; };
-    outApplied = false;
-    outFixedCount = 0;
+    while q < content.len { sb_append_byte(outContent, content.bytes[q]); q = q + 1; }
+    *outApplied = false;
+    *outFixedCount = 0;
     sb_clear(outSummary);
     let effCwd = StrBuf { bytes: [0u8; 65536], len: 0 };
     if hasCwd {
@@ -4608,10 +5107,10 @@ fn analyzeFileCoupling(st: &TreeSitterState, filePath: &StrBuf, content: &StrBuf
     let ti: u64 = 0;
     while ti < tops.len && ti < 40 {
         let t = tops.items[ti];
-        let captured = CapturedVariableList { items: [CapturedVariable { name: [0u8; 256], name_len: 0, type: [0u8; 1024], type_len: 0, isFunction: false, isStateSetter: false }; 512], len: 0 };
+        let captured = CapturedVariableList { items: [CapturedVariable { name: [0u8; 256], name_len: 0, type_: [0u8; 1024], type_len: 0, isFunction: false, isStateSetter: false }; 512], len: 0 };
         let scopeOut = ScopeAnalysisResult { filePath: [0u8; 1024], filePath_len: 0, startLine: 0, endLine: 0, componentName: [0u8; 256], componentName_len: 0, captured_first: 0, captured_len: 0, declaredSymbols: [0u8; 8192], declaredSymbols_len: 0, importedDependencies: [0u8; 8192], importedDependencies_len: 0, suggestedPropsInterface: [0u8; 8192], suggestedPropsInterface_len: 0, suggestedCallSnippet: [0u8; 4096], suggestedCallSnippet_len: 0, summary: [0u8; 16384], summary_len: 0 };
         let tName = StrBuf { bytes: [0u8; 65536], len: 0 };
-        buf_field_to_sb2(&t.name, t.name_len, &tName);
+        buf_field_to_sb256(&t.name, t.name_len, &tName);
         analyzeBlockScope(st, filePath, content, t.startLine, t.endLine, &tName, true, &captured, &scopeOut);
         let n = captured.len;
         let rec = StrBuf { bytes: [0u8; 65536], len: 0 };
@@ -4624,13 +5123,13 @@ fn analyzeFileCoupling(st: &TreeSitterState, filePath: &StrBuf, content: &StrBuf
         };
         let ci = candidates.len;
         if ci < 64 {
-            candidates.items[ci] = t;
+            candidates.items[ci] = tops.items[ti]; // fresh copy: t stays live for field reads below
             candidates.items[ci].capturedOuterState = n;
             candidates.items[ci].importedDeps = csv_count_from_field(&scopeOut.importedDependencies, scopeOut.importedDependencies_len);
             candidates.items[ci].internalLines = t.endLine - t.startLine + 1;
             candidates.items[ci].recommendation_len = 0;
             let w: u64 = 0;
-            while w < rec.len && w < 256 { candidates.items[ci].recommendation[w] = rec.bytes[w]; candidates.items[ci].recommendation_len = candidates.items[ci].recommendation_len + 1; w = w + 1; };
+            while w < rec.len && w < 256 { candidates.items[ci].recommendation[w] = rec.bytes[w]; candidates.items[ci].recommendation_len = candidates.items[ci].recommendation_len + 1; w = w + 1; }
             candidates.len = candidates.len + 1;
         };
         ti = ti + 1;
@@ -4652,7 +5151,7 @@ fn analyzeFileCoupling(st: &TreeSitterState, filePath: &StrBuf, content: &StrBuf
         sb_append_u64(outSummary, ci2 + 1);
         sb_append(outSummary, STR_PTR(". "), STR_LEN(". "));
         let cn = StrBuf { bytes: [0u8; 65536], len: 0 };
-        buf_field_to_sb2(&c.name, c.name_len, &cn);
+        buf_field_to_sb256(&c.name, c.name_len, &cn);
         let cp3: ptr = PTR_NULL();
         PTR_BYTE_ADD(cp3, &cn.bytes, 0);
         sb_append(outSummary, cp3, cn.len);
@@ -4668,7 +5167,7 @@ fn analyzeFileCoupling(st: &TreeSitterState, filePath: &StrBuf, content: &StrBuf
         sb_append_u64(outSummary, c.internalLines);
         sb_append(outSummary, STR_PTR(" -> "), STR_LEN(" -> "));
         let cr = StrBuf { bytes: [0u8; 65536], len: 0 };
-        buf_field_to_sb2(&c.recommendation, c.recommendation_len, &cr);
+        buf_field_to_sb256(&c.recommendation, c.recommendation_len, &cr);
         let rp: ptr = PTR_NULL();
         PTR_BYTE_ADD(rp, &cr.bytes, 0);
         sb_append(outSummary, rp, cr.len);
@@ -4741,10 +5240,10 @@ fn collect_top_level(content: &StrBuf, idx: &LineIndex, tops: &CouplingCandidate
                 let ci = tops.len;
                 tops.items[ci].name_len = 0;
                 let w: u64 = 0;
-                while w < name.len && w < 256 { tops.items[ci].name[w] = name.bytes[w]; tops.items[ci].name_len = tops.items[ci].name_len + 1; w = w + 1; };
+                while w < name.len && w < 256 { tops.items[ci].name[w] = name.bytes[w]; tops.items[ci].name_len = tops.items[ci].name_len + 1; w = w + 1; }
                 tops.items[ci].kind_len = 0;
                 let w2: u64 = 0;
-                while w2 < kind.len && w2 < 64 { tops.items[ci].kind[w2] = kind.bytes[w2]; tops.items[ci].kind_len = tops.items[ci].kind_len + 1; w2 = w2 + 1; };
+                while w2 < kind.len && w2 < 64 { tops.items[ci].kind[w2] = kind.bytes[w2]; tops.items[ci].kind_len = tops.items[ci].kind_len + 1; w2 = w2 + 1; }
                 tops.items[ci].startLine = li + 1;
                 tops.items[ci].endLine = endLine + 1;
                 tops.len = tops.len + 1;
@@ -4772,12 +5271,12 @@ fn top_decl_match(lt: &StrBuf, outName: &StrBuf, outKind: &StrBuf) -> bool {
     if sb_starts_with(&rest, STR_PTR("export default "), STR_LEN("export default ")) {
         let r2 = StrBuf { bytes: [0u8; 65536], len: 0 };
         let s: u64 = 15;
-        while s < rest.len { sb_append_byte(&r2, rest.bytes[s]); s = s + 1; };
+        while s < rest.len { sb_append_byte(&r2, rest.bytes[s]); s = s + 1; }
         rest = r2;
     } else if sb_starts_with(&rest, STR_PTR("export "), STR_LEN("export ")) {
         let r2 = StrBuf { bytes: [0u8; 65536], len: 0 };
         let s: u64 = 7;
-        while s < rest.len { sb_append_byte(&r2, rest.bytes[s]); s = s + 1; };
+        while s < rest.len { sb_append_byte(&r2, rest.bytes[s]); s = s + 1; }
         rest = r2;
     };
     if sb_starts_with(&rest, STR_PTR("async function "), STR_LEN("async function ")) || sb_starts_with(&rest, STR_PTR("function "), STR_LEN("function ")) {
@@ -4787,7 +5286,7 @@ fn top_decl_match(lt: &StrBuf, outName: &StrBuf, outKind: &StrBuf) -> bool {
         let ln: u64 = 0;
         if read_ident(&rest, off, &at, &ln) {
             let q: u64 = 0;
-            while q < ln { sb_append_byte(outName, rest.bytes[at + q]); q = q + 1; };
+            while q < ln { sb_append_byte(outName, rest.bytes[at + q]); q = q + 1; }
             sb_append(outKind, STR_PTR("function"), STR_LEN("function"));
             return true;
         };
@@ -4798,7 +5297,7 @@ fn top_decl_match(lt: &StrBuf, outName: &StrBuf, outKind: &StrBuf) -> bool {
         let ln: u64 = 0;
         if read_ident(&rest, 6, &at, &ln) {
             let q: u64 = 0;
-            while q < ln { sb_append_byte(outName, rest.bytes[at + q]); q = q + 1; };
+            while q < ln { sb_append_byte(outName, rest.bytes[at + q]); q = q + 1; }
             sb_append(outKind, STR_PTR("class"), STR_LEN("class"));
             return true;
         };
@@ -4814,7 +5313,7 @@ fn top_decl_match(lt: &StrBuf, outName: &StrBuf, outKind: &StrBuf) -> bool {
         if read_ident(&rest, kwLen, &at, &ln) {
             if sb_contains(&rest, STR_PTR("=>"), 2) || sb_contains(&rest, STR_PTR("= function"), STR_LEN("= function")) || sb_contains(&rest, STR_PTR("= async"), STR_LEN("= async")) {
                 let q: u64 = 0;
-                while q < ln { sb_append_byte(outName, rest.bytes[at + q]); q = q + 1; };
+                while q < ln { sb_append_byte(outName, rest.bytes[at + q]); q = q + 1; }
                 if outName.len > 0 && outName.bytes[0] >= 65 && outName.bytes[0] <= 90 {
                     sb_append(outKind, STR_PTR("component"), STR_LEN("component"));
                 } else {
@@ -4842,11 +5341,11 @@ fn buildExtractComponent(st: &TreeSitterState, sourcePath: &StrBuf, sourceConten
     sb_clear(outImportStatement);
     sb_clear(outPropsInterface);
     sb_clear(outError);
-    let captured = CapturedVariableList { items: [CapturedVariable { name: [0u8; 256], name_len: 0, type: [0u8; 1024], type_len: 0, isFunction: false, isStateSetter: false }; 512], len: 0 };
+    let captured = CapturedVariableList { items: [CapturedVariable { name: [0u8; 256], name_len: 0, type_: [0u8; 1024], type_len: 0, isFunction: false, isStateSetter: false }; 512], len: 0 };
     let analysis = ScopeAnalysisResult { filePath: [0u8; 1024], filePath_len: 0, startLine: 0, endLine: 0, componentName: [0u8; 256], componentName_len: 0, captured_first: 0, captured_len: 0, declaredSymbols: [0u8; 8192], declaredSymbols_len: 0, importedDependencies: [0u8; 8192], importedDependencies_len: 0, suggestedPropsInterface: [0u8; 8192], suggestedPropsInterface_len: 0, suggestedCallSnippet: [0u8; 4096], suggestedCallSnippet_len: 0, summary: [0u8; 16384], summary_len: 0 };
     analyzeBlockScope(st, sourcePath, sourceContent, startLine, endLine, componentName, true, &captured, &analysis);
     let safe = StrBuf { bytes: [0u8; 65536], len: 0 };
-    buf_field_to_sb2(&analysis.componentName, analysis.componentName_len, &safe);
+    buf_field_to_sb256(&analysis.componentName, analysis.componentName_len, &safe);
     if safe.len == 0 {
         // (analysis.componentName || componentName) sanitized again
         let ci: u64 = 0;
@@ -4881,19 +5380,19 @@ fn buildExtractComponent(st: &TreeSitterState, sourcePath: &StrBuf, sourceConten
     let localDeclCsv = StrBuf { bytes: [0u8; 65536], len: 0 };
     collect_decl_names_multiline(&localTypes, &localDeclCsv);
     // augmented captured: [...captured, { name: "__localTypes", type: localTypes }]
-    let augmented = CapturedVariableList { items: [CapturedVariable { name: [0u8; 256], name_len: 0, type: [0u8; 1024], type_len: 0, isFunction: false, isStateSetter: false }; 512], len: 0 };
+    let augmented = CapturedVariableList { items: [CapturedVariable { name: [0u8; 256], name_len: 0, type_: [0u8; 1024], type_len: 0, isFunction: false, isStateSetter: false }; 512], len: 0 };
     augmented.len = captured.len;
     let ai: u64 = 0;
-    while ai < captured.len { augmented.items[ai] = captured.items[ai]; ai = ai + 1; };
+    while ai < captured.len { augmented.items[ai] = captured.items[ai]; ai = ai + 1; }
     if localTypes.len > 0 && augmented.len < 512 {
         let slot = augmented.len;
         augmented.items[slot].name_len = 0;
         let lit = "__localTypes";
         let w: u64 = 0;
-        while w < 12 { let c: u8 = 0; PTR_BYTE_AT(c, STR_PTR(lit), w); augmented.items[slot].name[w] = c; augmented.items[slot].name_len = augmented.items[slot].name_len + 1; w = w + 1; };
+        while w < 12 { let c: u8 = 0; PTR_BYTE_AT(c, STR_PTR(lit), w); augmented.items[slot].name[w] = c; augmented.items[slot].name_len = augmented.items[slot].name_len + 1; w = w + 1; }
         augmented.items[slot].type_len = 0;
         let w2: u64 = 0;
-        while w2 < localTypes.len && w2 < 1024 { augmented.items[slot].type[w2] = localTypes.bytes[w2]; augmented.items[slot].type_len = augmented.items[slot].type_len + 1; w2 = w2 + 1; };
+        while w2 < localTypes.len && w2 < 1024 { augmented.items[slot].type_[w2] = localTypes.bytes[w2]; augmented.items[slot].type_len = augmented.items[slot].type_len + 1; w2 = w2 + 1; }
         augmented.len = augmented.len + 1;
     };
     let extra = StrBuf { bytes: [0u8; 65536], len: 0 };
@@ -4921,7 +5420,7 @@ fn buildExtractComponent(st: &TreeSitterState, sourcePath: &StrBuf, sourceConten
     // firstStmt = trimmedBlock.split("\n")[0].trim()
     let firstStmt = StrBuf { bytes: [0u8; 65536], len: 0 };
     let fsq: u64 = 0;
-    while fsq < trimmedBlock.len && trimmedBlock.bytes[fsq] != 10 { sb_append_byte(&firstStmt, trimmedBlock.bytes[fsq]); fsq = fsq + 1; };
+    while fsq < trimmedBlock.len && trimmedBlock.bytes[fsq] != 10 { sb_append_byte(&firstStmt, trimmedBlock.bytes[fsq]); fsq = fsq + 1; }
     let firstStmtT = StrBuf { bytes: [0u8; 65536], len: 0 };
     sb_trim(&firstStmt, &firstStmtT);
     let isStatementBlock = starts_with_keyword(&firstStmtT) && !isReturnBlock;
@@ -4931,7 +5430,7 @@ fn buildExtractComponent(st: &TreeSitterState, sourcePath: &StrBuf, sourceConten
         let show = firstStmtT.len;
         if show > 60 { show = 60; };
         let q: u64 = 0;
-        while q < show { sb_append_byte(outError, firstStmtT.bytes[q]); q = q + 1; };
+        while q < show { sb_append_byte(outError, firstStmtT.bytes[q]); q = q + 1; }
         sb_append(outError, STR_PTR("\"), which cannot be wrapped in \"return (...)\". Use raw mode (extract_to_file with raw:true) and wire the call site manually, or select an expression/JSX range instead."), STR_LEN("\"), which cannot be wrapped in \"return (...)\". Use raw mode (extract_to_file with raw:true) and wire the call site manually, or select an expression/JSX range instead."));
         return;
     };
@@ -4939,8 +5438,8 @@ fn buildExtractComponent(st: &TreeSitterState, sourcePath: &StrBuf, sourceConten
     if isReturnBlock {
         // trimmedBlock.replace(/^return\s+/, "").replace(/;\s*$/, "")
         let s: u64 = 6;
-        while s < trimmedBlock.len && (trimmedBlock.bytes[s] == 32 || trimmedBlock.bytes[s] == 9 || trimmedBlock.bytes[s] == 10 || trimmedBlock.bytes[s] == 13) { s = s + 1; };
-        while s < trimmedBlock.len { sb_append_byte(&blockExpr, trimmedBlock.bytes[s]); s = s + 1; };
+        while s < trimmedBlock.len && (trimmedBlock.bytes[s] == 32 || trimmedBlock.bytes[s] == 9 || trimmedBlock.bytes[s] == 10 || trimmedBlock.bytes[s] == 13) { s = s + 1; }
+        while s < trimmedBlock.len { sb_append_byte(&blockExpr, trimmedBlock.bytes[s]); s = s + 1; }
         // strip trailing ";" plus surrounding whitespace
         while blockExpr.len > 0 {
             let c = blockExpr.bytes[blockExpr.len - 1];
@@ -4962,7 +5461,7 @@ fn buildExtractComponent(st: &TreeSitterState, sourcePath: &StrBuf, sourceConten
     if bt.len >= 2 && bt.bytes[0] == 123 && bt.bytes[bt.len - 1] == 125 {
         let inner = StrBuf { bytes: [0u8; 65536], len: 0 };
         let s: u64 = 1;
-        while s + 1 < bt.len { sb_append_byte(&inner, bt.bytes[s]); s = s + 1; };
+        while s + 1 < bt.len { sb_append_byte(&inner, bt.bytes[s]); s = s + 1; }
         let looks = (sb_contains(&inner, STR_PTR("&&"), 2) && (contains_jsx_open(&inner))) || sb_contains(&inner, STR_PTR(".map("), STR_LEN(".map(")) || (sb_contains(&inner, STR_PTR("?"), 1) && contains_jsx_open(&inner));
         // DEFECT: source tests /&&\s*<[A-Za-z]/, /&&\s*\(/, /\?\s*<[A-Za-z]/,
         // /\.map\s*\(/ — approximated by the contains checks above.
@@ -4983,7 +5482,7 @@ fn buildExtractComponent(st: &TreeSitterState, sourcePath: &StrBuf, sourceConten
         if bi > 0 { append_eol(&body, eolCrlf); };
         sb_append(&body, STR_PTR("  "), STR_LEN("  "));
         let q: u64 = 0;
-        while q < blines.items[bi].len { sb_append_byte(&body, blines.items[bi].bytes[q]); q = q + 1; };
+        while q < blines.items[bi].len { sb_append_byte(&body, blines.items[bi].bytes[q]); q = q + 1; }
         bi = bi + 1;
     }
     append_eol(&body, eolCrlf);
@@ -5025,13 +5524,13 @@ fn buildExtractComponent(st: &TreeSitterState, sourcePath: &StrBuf, sourceConten
             if vi > 0 { append_eol(outTargetContent, eolCrlf); };
             sb_append(outTargetContent, STR_PTR("  "), STR_LEN("  "));
             let vn = StrBuf { bytes: [0u8; 65536], len: 0 };
-            buf_field_to_sb2(&captured.items[vi].name, captured.items[vi].name_len, &vn);
+            buf_field_to_sb256(&captured.items[vi].name, captured.items[vi].name_len, &vn);
             let vp: ptr = PTR_NULL();
             PTR_BYTE_ADD(vp, &vn.bytes, 0);
             sb_append(outTargetContent, vp, vn.len);
             sb_append(outTargetContent, STR_PTR(": "), STR_LEN(": "));
             let vt = StrBuf { bytes: [0u8; 65536], len: 0 };
-            buf_field_to_sb(&captured.items[vi].type, captured.items[vi].type_len, &vt);
+            buf_field_to_sb1024(&captured.items[vi].type_, captured.items[vi].type_len, &vt);
             let tp4: ptr = PTR_NULL();
             PTR_BYTE_ADD(tp4, &vt.bytes, 0);
             sb_append(outTargetContent, tp4, vt.len);
@@ -5052,7 +5551,7 @@ fn buildExtractComponent(st: &TreeSitterState, sourcePath: &StrBuf, sourceConten
         while vi < captured.len {
             if vi > 0 { sb_append(outTargetContent, STR_PTR(", "), STR_LEN(", ")); };
             let vn = StrBuf { bytes: [0u8; 65536], len: 0 };
-            buf_field_to_sb2(&captured.items[vi].name, captured.items[vi].name_len, &vn);
+            buf_field_to_sb256(&captured.items[vi].name, captured.items[vi].name_len, &vn);
             let vp: ptr = PTR_NULL();
             PTR_BYTE_ADD(vp, &vn.bytes, 0);
             sb_append(outTargetContent, vp, vn.len);
@@ -5082,10 +5581,10 @@ fn buildExtractComponent(st: &TreeSitterState, sourcePath: &StrBuf, sourceConten
     // callSnippet = suggestedCallSnippet with componentName replaced by
     // safe name; prefixed "return " + ";" when isReturnBlock
     let baseCall = StrBuf { bytes: [0u8; 65536], len: 0 };
-    buf_field_to_sb(&analysis.suggestedCallSnippet, analysis.suggestedCallSnippet_len, &baseCall);
+    buf_field_to_sb4096(&analysis.suggestedCallSnippet, analysis.suggestedCallSnippet_len, &baseCall);
     // String.replace(analysis.componentName, safe) — first occurrence
     let compNameBuf = StrBuf { bytes: [0u8; 65536], len: 0 };
-    buf_field_to_sb2(&analysis.componentName, analysis.componentName_len, &compNameBuf);
+    buf_field_to_sb256(&analysis.componentName, analysis.componentName_len, &compNameBuf);
     let replacedCall = StrBuf { bytes: [0u8; 65536], len: 0 };
     replace_first(&baseCall, &compNameBuf, &safe, &replacedCall);
     if isReturnBlock {
@@ -5171,7 +5670,7 @@ fn collect_decl_names_multiline(text: &StrBuf, outCsv: &StrBuf) {
         if sb_starts_with(&rest, STR_PTR("export "), STR_LEN("export ")) {
             let r2 = StrBuf { bytes: [0u8; 65536], len: 0 };
             let s: u64 = 7;
-            while s < rest.len { sb_append_byte(&r2, rest.bytes[s]); s = s + 1; };
+            while s < rest.len { sb_append_byte(&r2, rest.bytes[s]); s = s + 1; }
             rest = r2;
         };
         let kwLen: u64 = 0;
@@ -5180,11 +5679,11 @@ fn collect_decl_names_multiline(text: &StrBuf, outCsv: &StrBuf) {
             let at: u64 = 0;
             let ln: u64 = 0;
             let start = kwLen;
-            while start < rest.len && rest.bytes[start] == 32 { start = start + 1; };
+            while start < rest.len && rest.bytes[start] == 32 { start = start + 1; }
             if read_ident(&rest, start, &at, &ln) {
                 let tok = StrBuf { bytes: [0u8; 65536], len: 0 };
                 let q: u64 = 0;
-                while q < ln { sb_append_byte(&tok, rest.bytes[at + q]); q = q + 1; };
+                while q < ln { sb_append_byte(&tok, rest.bytes[at + q]); q = q + 1; }
                 csv_add(outCsv, &tok);
             };
         };
@@ -5213,10 +5712,10 @@ fn compute_import_rel(sourcePath: &StrBuf, targetPath: &StrBuf, out: &StrBuf) {
     let pos: u64 = 0;
     while pos <= exts.len {
         let end = pos;
-        while end < exts.len && exts.bytes[end] != 44 { end = end + 1; };
+        while end < exts.len && exts.bytes[end] != 44 { end = end + 1; }
         let seg = StrBuf { bytes: [0u8; 65536], len: 0 };
         let q: u64 = 0;
-        while pos + q < end { sb_append_byte(&seg, exts.bytes[pos + q]); q = q + 1; };
+        while pos + q < end { sb_append_byte(&seg, exts.bytes[pos + q]); q = q + 1; }
         let sp: ptr = PTR_NULL();
         PTR_BYTE_ADD(sp, &seg.bytes, 0);
         if sb_ends_with(out, sp, seg.len) { out.len = out.len - seg.len; break; };
@@ -5254,10 +5753,10 @@ fn replace_first(text: &StrBuf, needle: &StrBuf, replacement: &StrBuf, out: &Str
         return;
     };
     let i: u64 = 0;
-    while i < (at as u64) { sb_append_byte(out, text.bytes[i]); i = i + 1; };
+    while i < (at as u64) { sb_append_byte(out, text.bytes[i]); i = i + 1; }
     let rp: ptr = PTR_NULL();
     PTR_BYTE_ADD(rp, &replacement.bytes, 0);
     sb_append(out, rp, replacement.len);
     let j = (at as u64) + needle.len;
-    while j < text.len { sb_append_byte(out, text.bytes[j]); j = j + 1; };
+    while j < text.len { sb_append_byte(out, text.bytes[j]); j = j + 1; }
 }
