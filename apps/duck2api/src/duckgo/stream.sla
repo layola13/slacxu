@@ -3,6 +3,11 @@
 @import "sa_std/time.sai"
 @import "sa_std/string.sa"
 @import "sa_std/ts_math.sa"
+@import "sa_std/globals.sai"
+@import "sa_std/fmt.sai"
+@import "sa_std/http_server.sai"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/crypto.sai"
 @import "response.sla"
 @import "tool-simulation.sla"
 @import "tokens.sla"
@@ -22,6 +27,261 @@
 // incremental UTF-8 handling lives inside the extern.
 // DEFECT: Record<string, unknown> response objects are assembled as JSON
 // text in ByteBufs (field order mirrors the TS object literals).
+
+// --- body/sink handle layer (was: intent externs sa_body_* /
+// sa_sink_* / sa_test_sink_*; none exist in sa_std). Handles are u64
+// ids (0 = null) over the sa_global_* cell registry (globals.sai):
+//   "body.<id>"      bytes cell: full body text
+//   "body.pos.<id>"  u64 cell: read offset
+//   "sink.lines.<id>" u64 cell: test-sink segment count
+//   "sink.segs.<id>"  bytes cell: length-prefixed segment records
+//   "sink.raw.<id>"   u64 cell: production sink = v2 stream resp ptr
+//   "sink.scratch.<id>" u64 cell: last fmt-buffer handle handed out
+// Chunk reads serve 8192-byte slices (the consumers accumulate and
+// split on newlines, so slice boundaries are unobservable). All
+// storage inherits the domain's 40960-byte ByteBuf convention.
+fn handle_alloc_id() -> u64 {
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&nm, STR_PTR("duck.handle.next"), STR_LEN("duck.handle.next"));
+    let np: ptr = PTR_NULL();
+    PTR_BYTE_ADD(np, nm.bytes, 0);
+    let cur: u64 = 0;
+    if sa_global_u64_get(np, nm.len, &cur) != 0 { cur = 0; };
+    let id = cur + 1;
+    sa_global_u64_set(np, nm.len, id);
+    return id;
+}
+
+fn handle_cell_name(out: &ByteBuf, prefix_ptr: ptr, prefix_len: u64, id: u64) -> ptr {
+    buf_reset(out);
+    buf_append_lit(out, prefix_ptr, prefix_len);
+    buf_append_u64(out, id);
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, out.bytes, 0);
+    return p;
+}
+
+fn sa_sink_null() -> u64 {
+    return 0;
+}
+
+// Register a production SSE stream response (its ptr value) as a
+// sink; server.sla's begin_sse is the caller.
+fn sa_sink_register_raw(resp_value: u64) -> u64 {
+    let id = handle_alloc_id();
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let np = handle_cell_name(&nm, STR_PTR("sink.raw."), STR_LEN("sink.raw."), id);
+    sa_global_u64_set(np, nm.len, resp_value);
+    return id;
+}
+
+fn sa_body_from_text(text_ptr: ptr, text_len: u64) -> u64 {
+    let id = handle_alloc_id();
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let np = handle_cell_name(&nm, STR_PTR("body."), STR_LEN("body."), id);
+    sa_global_bytes_set(np, nm.len, text_ptr, text_len);
+    let pp = handle_cell_name(&nm, STR_PTR("body.pos."), STR_LEN("body.pos."), id);
+    sa_global_u64_set(pp, nm.len, 0);
+    return id;
+}
+
+fn sa_body_read_chunk(body: u64, out_chunk: &ByteBuf, out_done: &bool) -> void {
+    buf_reset(out_chunk);
+    *out_done = false;
+    if body == 0 { *out_done = true; return; };
+    let data = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let np = handle_cell_name(&nm, STR_PTR("body."), STR_LEN("body."), body);
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, data.bytes, 0);
+    let total: u64 = 0;
+    if sa_global_bytes_get(np, nm.len, dp, 40960, &total) != 0 { *out_done = true; return; };
+    if total > 40960 { total = 40960; };
+    data.len = total;
+    let pp = handle_cell_name(&nm, STR_PTR("body.pos."), STR_LEN("body.pos."), body);
+    let pos: u64 = 0;
+    if sa_global_u64_get(pp, nm.len, &pos) != 0 { pos = 0; };
+    if pos >= total { *out_done = true; return; };
+    let n = total - pos;
+    if n > 8192 { n = 8192; };
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, data.bytes, pos);
+    buf_append_lit(out_chunk, sp, n);
+    pos = pos + n;
+    sa_global_u64_set(pp, nm.len, pos);
+    if pos >= total { *out_done = true; };
+}
+
+fn sa_body_close(body: u64, failed: bool) -> void {
+    // TS: reader cancel/release — no observable state in the
+    // registry model; the stored text is process-lifetime.
+}
+
+fn sink_append_segment(sink: u64, data_ptr: ptr, data_len: u64) -> void {
+    let segs = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let np = handle_cell_name(&nm, STR_PTR("sink.segs."), STR_LEN("sink.segs."), sink);
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, segs.bytes, 0);
+    let cur: u64 = 0;
+    if sa_global_bytes_get(np, nm.len, sp, 40960, &cur) == 0 { segs.len = cur; };
+    for k in 0..8 {
+        buf_append_byte(&segs, ((data_len >> (k * 8)) & 255) as u8);
+    }
+    buf_append_lit(&segs, data_ptr, data_len);
+    let wp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(wp, segs.bytes, 0);
+    sa_global_bytes_set(np, nm.len, wp, segs.len);
+    let lp = handle_cell_name(&nm, STR_PTR("sink.lines."), STR_LEN("sink.lines."), sink);
+    let lines: u64 = 0;
+    if sa_global_u64_get(lp, nm.len, &lines) != 0 { lines = 0; };
+    sa_global_u64_set(lp, nm.len, lines + 1);
+}
+
+// TS write callback: 0 = written; nonzero models the TS write()
+// throw that aborts the consume with null.
+fn sa_sink_write_line(sink: u64, data_ptr: ptr, data_len: u64) -> i32 {
+    if sink == 0 { return 1; };
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let rp = handle_cell_name(&nm, STR_PTR("sink.raw."), STR_LEN("sink.raw."), sink);
+    let raw: u64 = 0;
+    if sa_global_u64_get(rp, nm.len, &raw) == 0 && raw != 0 {
+        let resp: ptr = PTR_NULL();
+        PTR_CAST(resp, raw);
+        if sa_http_server_resp_stream_write_v2(resp, data_ptr, data_len, 30000) != 0 { return 1; };
+        return 0;
+    };
+    let lp = handle_cell_name(&nm, STR_PTR("sink.lines."), STR_LEN("sink.lines."), sink);
+    let lines: u64 = 0;
+    if sa_global_u64_get(lp, nm.len, &lines) == 0 {
+        sink_append_segment(sink, data_ptr, data_len);
+        return 0;
+    };
+    return 1;
+}
+
+fn sa_test_sink_new() -> u64 {
+    let id = handle_alloc_id();
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let lp = handle_cell_name(&nm, STR_PTR("sink.lines."), STR_LEN("sink.lines."), id);
+    sa_global_u64_set(lp, nm.len, 0);
+    return id;
+}
+
+fn sa_test_sink_line_count(sink: u64) -> u64 {
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let lp = handle_cell_name(&nm, STR_PTR("sink.lines."), STR_LEN("sink.lines."), sink);
+    let lines: u64 = 0;
+    if sa_global_u64_get(lp, nm.len, &lines) != 0 { return 0; };
+    return lines;
+}
+
+fn sa_test_sink_line(sink: u64, idx: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    *out_ptr = PTR_NULL();
+    *out_len = 0;
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    // Release the previous hand-out buffer for this sink.
+    let cp = handle_cell_name(&nm, STR_PTR("sink.scratch."), STR_LEN("sink.scratch."), sink);
+    let prev: u64 = 0;
+    if sa_global_u64_get(cp, nm.len, &prev) == 0 && prev != 0 {
+        sa_fmt_buffer_free(prev);
+        sa_global_u64_set(cp, nm.len, 0);
+    };
+    let segs = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let np = handle_cell_name(&nm, STR_PTR("sink.segs."), STR_LEN("sink.segs."), sink);
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, segs.bytes, 0);
+    let total: u64 = 0;
+    if sa_global_bytes_get(np, nm.len, sp, 40960, &total) != 0 { return; };
+    segs.len = total;
+    let off: u64 = 0;
+    let cur: u64 = 0;
+    while off + 8 <= segs.len {
+        let seg_len: u64 = 0;
+        for k in 0..8 {
+            seg_len = seg_len | ((segs.bytes[off + k] as u64) << (k * 8));
+        }
+        if cur == idx {
+            if off + 8 + seg_len > segs.len { return; };
+            let seg_ptr: ptr = PTR_NULL();
+            PTR_BYTE_ADD(seg_ptr, segs.bytes, off + 8);
+            let h = sa_fmt_bytes(seg_ptr, seg_len);
+            if h == 0 { return; };
+            let cp2 = handle_cell_name(&nm, STR_PTR("sink.scratch."), STR_LEN("sink.scratch."), sink);
+            sa_global_u64_set(cp2, nm.len, h);
+            let dp: ptr = sa_fmt_buffer_data(h);
+            *out_ptr = dp;
+            *out_len = sa_fmt_buffer_len(h);
+            return;
+        };
+        off = off + 8 + seg_len;
+        cur = cur + 1;
+    }
+}
+
+// TS: randomUUID().replaceAll("-", "") appended after the resp_/msg_
+// prefix (the converter's intent extern sa_crypto_random_uuid_hex).
+// Rebound to sa_deno_random_uuid (crypto.sai; its .sai declaration
+// was the closed GAP) with dashes stripped during the append.
+fn uuid_hex_append(field: &StrField) -> void {
+    let h = sa_deno_random_uuid();
+    if h == 0 { return; };
+    let p: ptr = sa_fmt_buffer_data(h);
+    let l = sa_fmt_buffer_len(h);
+    let i: u64 = 0;
+    while i < l {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, p, i);
+        if b != 45 && field.len < 512 {
+            field.bytes[field.len] = b;
+            field.len = field.len + 1;
+        };
+        i = i + 1;
+    }
+    sa_fmt_buffer_free(h);
+}
+
+// --- event field accessors (were intent externs sa_event_*). The
+// duck.ai SSE event is a flat JSON object; every accessor is the
+// top-level string field of the same name in stream.ts (toolName /
+// toolCallId / toolArguments feed nativeToolCall). Return is the
+// sa_json_object_get_string status (0 = present); absent fields
+// leave the caller's (PTR_NULL, 0) outs untouched.
+fn sa_event_action(event: u64, out_ptr: &ptr, out_len: &u64) -> i32 {
+    return sa_json_object_get_string(event, STR_PTR("action"), STR_LEN("action"), out_ptr, out_len);
+}
+
+fn sa_event_role(event: u64, out_ptr: &ptr, out_len: &u64) -> i32 {
+    return sa_json_object_get_string(event, STR_PTR("role"), STR_LEN("role"), out_ptr, out_len);
+}
+
+fn sa_event_state(event: u64, out_ptr: &ptr, out_len: &u64) -> i32 {
+    return sa_json_object_get_string(event, STR_PTR("state"), STR_LEN("state"), out_ptr, out_len);
+}
+
+fn sa_event_text(event: u64, out_ptr: &ptr, out_len: &u64) -> i32 {
+    return sa_json_object_get_string(event, STR_PTR("text"), STR_LEN("text"), out_ptr, out_len);
+}
+
+fn sa_event_message(event: u64, out_ptr: &ptr, out_len: &u64) -> i32 {
+    return sa_json_object_get_string(event, STR_PTR("message"), STR_LEN("message"), out_ptr, out_len);
+}
+
+fn sa_event_model(event: u64, out_ptr: &ptr, out_len: &u64) -> i32 {
+    return sa_json_object_get_string(event, STR_PTR("model"), STR_LEN("model"), out_ptr, out_len);
+}
+
+fn sa_event_tool_name(event: u64, out_ptr: &ptr, out_len: &u64) -> i32 {
+    return sa_json_object_get_string(event, STR_PTR("toolName"), STR_LEN("toolName"), out_ptr, out_len);
+}
+
+fn sa_event_tool_call_id(event: u64, out_ptr: &ptr, out_len: &u64) -> i32 {
+    return sa_json_object_get_string(event, STR_PTR("toolCallId"), STR_LEN("toolCallId"), out_ptr, out_len);
+}
+
+fn sa_event_tool_arguments(event: u64, out_ptr: &ptr, out_len: &u64) -> i32 {
+    return sa_json_object_get_string(event, STR_PTR("toolArguments"), STR_LEN("toolArguments"), out_ptr, out_len);
+}
 
 // TS: export interface StreamStats { start; promptTokens; cachedTokens; effort }
 struct StreamStats {
@@ -78,7 +338,9 @@ fn chat_write_chunk(sink: u64, chunk_json: &ByteBuf) -> bool {
     buf_append_lit(&line, STR_PTR("data: "), STR_LEN("data: "));
     buf_append_buf(&line, chunk_json);
     buf_append_lit(&line, STR_PTR("\n\n"), STR_LEN("\n\n"));
-    return sa_sink_write_line(sink, &line.bytes, line.len) == 0;
+    let __ap_line: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_line, line.bytes, 0);
+    return sa_sink_write_line(sink, __ap_line, line.len) == 0;
 }
 
 // TS: const emitPart = async (part) => Promise<boolean>
@@ -152,8 +414,10 @@ fn consume_upstream(opts: &ConsumeOptions, result: &StreamResult) -> i32 {
                 let __ap43: ptr = PTR_NULL();
                 PTR_BYTE_ADD(__ap43, payload.bytes, 0);
                 if starts_with(__ap43, payload.len, STR_PTR("[DONE]"), STR_LEN("[DONE]")) { continue; };
-                let event: u64 = 0;
-                if sa_json_parse(&payload.bytes, payload.len, &event) != 0 || event == 0 { continue; };
+                let __ap_ev: ptr = PTR_NULL();
+                PTR_BYTE_ADD(__ap_ev, payload.bytes, 0);
+                let event: u64 = sa_json_parse(__ap_ev, payload.len);
+                if event == 0 { continue; };
                 // Strict Go parity: missing/non-success action aborts.
                 let ap: ptr = PTR_NULL();
                 let al: u64 = 0;
@@ -183,16 +447,21 @@ fn consume_upstream(opts: &ConsumeOptions, result: &StreamResult) -> i32 {
                         let call = ToolCall { has_index: false, index: 0, id: [0u8; 128], id_len: 0, typ: [0u8; 32], typ_len: 0, fn_name: [0u8; 128], fn_name_len: 0, fn_arguments: [0u8; 4096], fn_arguments_len: 0 };
                         if native_tool_call(&call, has_name, np, nl2, has_id, ip, il, has_args, gp, gl) {
                             chat_mark_first(&st, opts);
-                            if st.tool_calls.len < 64 {
-                                st.tool_calls.calls[st.tool_calls.len] = call;
-                                st.tool_calls.len = st.tool_calls.len + 1;
-                            };
+                            // TS pushes the call, then emits its chunk
+                            // with index = length-1 (== the pre-push
+                            // length). SLA moves the value into the
+                            // array, so the chunk is emitted first with
+                            // that same index; the store follows.
                             if opts.stream {
                                 let json = ByteBuf { bytes: [0u8; 40960], len: 0 };
                                 let __ap44: ptr = PTR_NULL();
                                 PTR_BYTE_ADD(__ap44, opts.request_model.bytes, 0);
-                                tool_call_chunk_with_model(&json, &call, __ap44, opts.request_model.len, st.tool_calls.len - 1);
+                                tool_call_chunk_with_model(&json, &call, __ap44, opts.request_model.len, st.tool_calls.len);
                                 if !chat_write_chunk(opts.sink, &json) { fatal = true; break; };
+                            };
+                            if st.tool_calls.len < 64 {
+                                st.tool_calls.calls[st.tool_calls.len] = call;
+                                st.tool_calls.len = st.tool_calls.len + 1;
                             };
                         };
                     };
@@ -379,7 +648,9 @@ fn responses_write_event(sink: u64, type_ptr: ptr, type_len: u64, fields_json: &
         buf_append_buf(&line, fields_json);
     };
     buf_append_lit(&line, STR_PTR("}\n\n"), STR_LEN("}\n\n"));
-    return sa_sink_write_line(sink, &line.bytes, line.len) == 0;
+    let __ap_line: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_line, line.bytes, 0);
+    return sa_sink_write_line(sink, __ap_line, line.len) == 0;
 }
 
 // the in-progress response object (also embedded in response.created)
@@ -390,7 +661,7 @@ fn responses_in_progress_json(out: &ByteBuf, st: &ResponsesConsumeState, opts: &
     PTR_BYTE_ADD(__ap56, st.response_id.bytes, 0);
     buf_append_escaped(out, __ap56, st.response_id.len);
     buf_append_lit(out, STR_PTR("\",\"object\":\"response\",\"created_at\":"), STR_LEN("\",\"object\":\"response\",\"created_at\":"));
-    buf_append_u64(out, ts_math_rounding((sa_time_unix_ms() as u64) / 1000.0, 0));
+    buf_append_u64(out, ts_math_rounding(((sa_time_unix_ms() as u64) as f64) / 1000.0, 0));
     buf_append_lit(out, STR_PTR(",\"status\":\"in_progress\",\"model\":\""), STR_LEN(",\"status\":\"in_progress\",\"model\":\""));
     let __ap57: ptr = PTR_NULL();
     PTR_BYTE_ADD(__ap57, opts.request_model.bytes, 0);
@@ -632,7 +903,7 @@ fn responses_completed_json(out: &ByteBuf, st: &ResponsesConsumeState, opts: &Co
     PTR_BYTE_ADD(__ap79, st.response_id.bytes, 0);
     buf_append_escaped(out, __ap79, st.response_id.len);
     buf_append_lit(out, STR_PTR("\",\"object\":\"response\",\"created_at\":"), STR_LEN("\",\"object\":\"response\",\"created_at\":"));
-    buf_append_u64(out, ts_math_rounding((sa_time_unix_ms() as u64) / 1000.0, 0));
+    buf_append_u64(out, ts_math_rounding(((sa_time_unix_ms() as u64) as f64) / 1000.0, 0));
     buf_append_lit(out, STR_PTR(",\"status\":\"completed\",\"model\":\""), STR_LEN(",\"status\":\"completed\",\"model\":\""));
     let __ap80: ptr = PTR_NULL();
     PTR_BYTE_ADD(__ap80, opts.request_model.bytes, 0);
@@ -711,9 +982,9 @@ fn consume_upstream_responses(opts: &ConsumeOptions, result: &StreamResponsesRes
     let st = ResponsesConsumeState { seq: 1, response_id: StrField { bytes: [0u8; 512], len: 0 }, message_id: StrField { bytes: [0u8; 512], len: 0 }, text: ByteBuf { bytes: [0u8; 40960], len: 0 }, tool_calls: ToolCallList { calls: [ToolCall { has_index: false, index: 0, id: [0u8; 128], id_len: 0, typ: [0u8; 32], typ_len: 0, fn_name: [0u8; 128], fn_name_len: 0, fn_arguments: [0u8; 4096], fn_arguments_len: 0 }; 64], len: 0 }, tool_parser: ToolSimulationStream { pending: ToolSimPending { bytes: [0u8; 262144], len: 0 }, next_call: 0 }, pending_native: ToolCallList { calls: [ToolCall { has_index: false, index: 0, id: [0u8; 128], id_len: 0, typ: [0u8; 32], typ_len: 0, fn_name: [0u8; 128], fn_name_len: 0, fn_arguments: [0u8; 4096], fn_arguments_len: 0 }; 64], len: 0 }, native_awaiting: false, ttft_ms: 0, first_token: false, text_item_opened: false, output_index: 0 };
     // responseId = `resp_${randomUUID().replaceAll("-", "")}`; messageId likewise
     str_field_set(&st.response_id, STR_PTR("resp_"), STR_LEN("resp_"));
-    sa_crypto_random_uuid_hex(&st.response_id.bytes, &st.response_id.len, 5);
+    uuid_hex_append(&st.response_id);
     str_field_set(&st.message_id, STR_PTR("msg_"), STR_LEN("msg_"));
-    sa_crypto_random_uuid_hex(&st.message_id.bytes, &st.message_id.len, 4);
+    uuid_hex_append(&st.message_id);
     if opts.stream {
         let inprog = ByteBuf { bytes: [0u8; 40960], len: 0 };
         responses_in_progress_json(&inprog, &st, opts);
@@ -758,8 +1029,10 @@ fn consume_upstream_responses(opts: &ConsumeOptions, result: &StreamResponsesRes
                 let __ap91: ptr = PTR_NULL();
                 PTR_BYTE_ADD(__ap91, payload.bytes, 0);
                 if starts_with(__ap91, payload.len, STR_PTR("[DONE]"), STR_LEN("[DONE]")) { continue; };
-                let event: u64 = 0;
-                if sa_json_parse(&payload.bytes, payload.len, &event) != 0 || event == 0 { continue; };
+                let __ap_ev: ptr = PTR_NULL();
+                PTR_BYTE_ADD(__ap_ev, payload.bytes, 0);
+                let event: u64 = sa_json_parse(__ap_ev, payload.len);
+                if event == 0 { continue; };
                 let ap: ptr = PTR_NULL();
                 let al: u64 = 0;
                 sa_event_action(event, &ap, &al);
