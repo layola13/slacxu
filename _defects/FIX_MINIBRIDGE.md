@@ -63,7 +63,18 @@ TS 真值中 fs 存在性判断点（译时逐点核极性，落点一律 `== 0`
 
 ## 6. 批次台账（实时填充）
 
-（待填）
+| 批 | TS 行段 | 内容 | check | 提交 |
+|---|---|---|---|---|
+| B0 | — | 助手层全量（Mb*/JSON/字符串/路径/正则/SHA-1 移植） | PASS | 902c26e |
+| B1 | 40-655 | 常量、env 块、exec 收尾、取消/steer、goal 标记/迁移/状态/预算/指纹 | PASS | 91114f3 |
+| B2 | 655-1344 | effort、上下文窗、usage、历史预算、摘要计划、turn 预算、响应链、协议探测 | PASS | 1e67cb7 |
+| B3 | 1345-2404 | Anthropic 族、chat→anthropic、输出收缩、auto-compact、tilde、工具表 | PASS | 5cadf66 |
+| B4 | 2405-2920 | 工具+MCP、子代理名、参数校验、normalizeSaVmArgs、steer 族 | PASS | 1acc1f9 |
+| B5 | 3183-4638 | history 文本、图片剥离、计划族、echo 门、收件箱、紧凑/锚点、上游错误、评审族、patch 校验、去重/sanitize | PASS | de895c9 |
+| B6 | 4560-4638 余 + 类前自由函数 | readSseStream、extractUserInputAnswer、runMiniWebSearch、AGENTS.md active 追踪 | 待 | — |
+| B7 | 4639-5430 | 类状态/构造/emit 模型、respond/pending、会话恢复、resolveTarget、摘要请求、usage/retry 通知、fetch 上游、exec 会话族 | 待 | — |
+| B8 | 5431-7630 | request 分发、子代理调用族、排队/等待/收尾 | 待 | — |
+| B9 | 7631-10282 | runMiniTurn/Once 主循环 | 待 | — |
 
 ## 7. 普查三账（终态填充）
 
