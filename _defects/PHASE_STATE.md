@@ -1,7 +1,7 @@
 # 批量转换 → 分阶段修复：状态与恢复点（机器重启/会话丢失后从这里续）
 
-更新：2026-10-26 11:05 CST。用户指令：禁止提问、主动完成、重启后自恢复续作。
-**当前战场：tsgosa 全量编译 CXU 探坑（见「已定决策」战场转移条）；SLA 修复阶段已在检查点暂停，恢复点见待办 4。**
+更新：2026-10-26 11:52 CST。用户指令：禁止提问、主动完成、重启后自恢复续作。
+**当前战场：SLA 主战场（2026-10-26 用户选 B 回归）；tsgosa 探坑战役已完成（双普查存档），tsgosa 方言升级另行排期、不作门。SLA 修复从检查点恢复：server 残余 2 文件 + index.sla 进行中，恢复点见待办 4。**
 
 ## 已定决策
 - 源：codex-react-ui plugins @ f2cb649d（本机 + Colab 两克隆已对齐）。
@@ -63,15 +63,19 @@ web-tsx（104/50577/7748）、mini-codex（21/5178/347）。合计 1287 文件�
      扫描未做）；other-apps 5/33（8e6b1a1，余 28 个逐文件定分类：17 机械
      续修 + 9 真缺口（scrypt/HMAC-SHA1/AES-GCM/ed25519/QR/PNG 等），见
      FIX_OTHER_APPS.md；altB 三字段不匹配不在该域、待主线路由；
-     convert.test 的 role 期望矛盾已再标记、语义未动）。**修复阶段在此
-     暂停（战场转移）；回主战场从本条与两份 FIX 文档续行；F3
-     （apps/server/src/index.sla）未开工。**
+     convert.test 的 role 期望矛盾已再标记、语义未动）。**修复阶段已于
+     2026-10-26 恢复（用户选 B）：server 残余 2 文件（saVmCodeGraph、
+     saVmTool）与 F3（apps/server/src/index.sla）进行中；其后 packages →
+     backends → mini-codex → frontends。**
    - ⚠ F2 实测修正：@ts_* 是 SA 层函数、SLA 不可直调；转换日志的「已回绑
      ts 面」从未编译验证。回主战场时须以 SLA 本地复刻或 SA 层组合处理
      （other-apps 已以本地复刻落地）。
-4.5. tsgosa 探坑战役（当前战场）：扫测驱动逐文件编译 CXU 后端面 → 坑普查
-   三分类（sci / sa_std / tsgosa）→ 修地基（sci、sa_std 优先）→ 通过率达
-   门槛后回待办 4 续修。
+4.5. ✅ tsgosa 探坑战役（2026-10-26 完成）：双普查存档（TSGOSA_SWEEP.md /
+   TSGOSA_SWEEP2.md，763f855 / 88fed46）。结论：sci 编译器 0 确诊；sa_std
+   仅投影小清单（node:crypto 等接入、9 具名映射、node.sai 表面）；tsgosa
+   无 checker 喂 lowering 的路径（标注子集为其 lowering 自身方言，整程序
+   回收量为 0）。用户 2026-10-26 选 B：回 SLA 主战场，tsgosa 方言升级
+   另行排期、不作门。
 5. 修复阶段 2（wasm 前端）：SAX 渲染 + DOM 桥面。
 6. tests/ 第二波转换（未纳入第一波）。
 
