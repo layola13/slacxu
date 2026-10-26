@@ -1,17 +1,19 @@
 // Converted 1:1 from mini-codex/src/memory.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
 @import "sa_std/io/print.sai"
 @import "sa_std/ptr.sa"
-// DEFECT: Node API | node:fs existsSync/readFileSync/appendFileSync/mkdirSync, node:os homedir, node:path join/dirname have no direct .sai used here; approximated via sa_std fs externs (sa_std_fs_read / sa_std_fs_write / sa_std_fs_append / sa_std_fs_mkdir / sa_std_fs_exists) declared in the fs .sai.
-// @import "sa_std/fs.sai"
+@import "sa_std/string.sa"
+// DEFECT: Node API | node:fs existsSync/readFileSync/appendFileSync/mkdirSync, node:os homedir, node:path join/dirname bound to sa_std surfaces: readFileSync -> sa_std_fs_open_read + sa_std_fs_file_read + sa_fs_file_close; appendFileSync -> sa_std_fs_open_options (flags 22 = write|create|append, mode 438) + sa_std_fs_file_write; mkdirSync(recursive) -> sa_fs_mkdir_p; homedir() -> sa_env_home_dir (buffer handle, copied out then freed); existsSync -> sa_std_fs_exists(...) == 0 (STATUS CODE, never a boolean).
+@import "sa_std/fs.sai"
+@import "sa_std/env.sai"
 
 // Growable text buffer used for string returns (TS string -> buffer + len).
 struct MemStr {
     bytes: [u8; 16384], len: u64,
 }
 
-/** Cap for injected long-term memory (keeps system prompt bounded). */
+// Cap for injected long-term memory (keeps system prompt bounded).
 const MINI_MEMORY_MAX_CHARS: u64 = 8000;
-/** Cap for a single remember write (append-only note, not a novel). */
+// Cap for a single remember write (append-only note, not a novel).
 const MINI_REMEMBER_MAX_CHARS: u64 = 2000;
 const MINI_MEMORY_FILENAME = "MEMORY.md";
 
@@ -66,8 +68,14 @@ fn readCapped(path_ptr: ptr, path_len: u64, cap: u64, out: &MemStr) {
     // DEFECT: Node API | existsSync approximated via sa_std_fs_exists status.
     let raw = MemStr { bytes: [0u8; 16384], len: 0 };
     // const raw = readFileSync(path, "utf8");
-    // DEFECT: Node API | readFileSync approximated via sa_std_fs_read into a fixed buffer (files larger than the buffer are truncated before the cap is applied).
-    sa_std_fs_read(path_ptr, path_len, &raw.bytes, 16384, &raw.len);
+    // DEFECT: Node API | readFileSync via open_read/file_read into a fixed buffer (files larger than the buffer are truncated before the cap is applied).
+    let fh: u64 = 0;
+    if sa_std_fs_open_read(path_ptr, path_len, &fh) == 0 {
+        let rd: u64 = 0;
+        let rst = sa_std_fs_file_read(fh, &raw.bytes, 16384, &rd);
+        sa_fs_file_close(fh);
+        if rst == 0 { raw.len = rd; };
+    };
     if raw.len == 0 { return; };
     let rp: ptr = PTR_NULL();
     PTR_BYTE_ADD(rp, &raw.bytes, 0);
@@ -76,11 +84,10 @@ fn readCapped(path_ptr: ptr, path_len: u64, cap: u64, out: &MemStr) {
     sliceTail(rp, raw.len, cap, out);
 }
 
-/**
- * Two-level long-term memory (upstream parity: codex-rs MEMORY.md):
- * repo-level `<cwd>/MEMORY.md` plus user-level `~/.codex/MEMORY.md`.
- * Returns the formatted block for system-prompt injection, or "" when empty.
- */
+//
+// Two-level long-term memory (upstream parity: codex-rs MEMORY.md):
+// repo-level `<cwd>/MEMORY.md` plus user-level `~/.codex/MEMORY.md`.
+// Returns the formatted block for system-prompt injection, or "" when empty.
 // TS lines 27-44: loadMiniMemory(cwd: string): string
 // DEFECT: Node API | join()/homedir() approximated by byte concatenation with '/' separators (no Windows separator handling).
 // DEFECT: template literal | block assembled by manual concatenation into out.
@@ -97,9 +104,14 @@ fn loadMiniMemory(cwd_ptr: ptr, cwd_len: u64, out: &MemStr) {
     readCapped(rpp, repo_path.len, MINI_MEMORY_MAX_CHARS, &repo);
     // let home = ""; try { homePath = join(homedir(), ".codex", MINI_MEMORY_FILENAME); if (homePath !== repoPath) home = readCapped(...) } catch { home = "" }
     let home = MemStr { bytes: [0u8; 16384], len: 0 };
-    // DEFECT: Node API | homedir() has no sa_std equivalent used here; approximated from the HOME environment via sa_std_env_get (empty when unset).
+    // DEFECT: Node API | homedir() bound to sa_env_home_dir() (owned buffer handle; bytes copied out, handle freed; empty when unset).
     let home_dir = MemStr { bytes: [0u8; 16384], len: 0 };
-    sa_std_env_get(STR_PTR("HOME"), STR_LEN("HOME"), &home_dir.bytes, 16384, &home_dir.len);
+    let hh = sa_env_home_dir();
+    if hh != 0 {
+        let hbp: ptr = sa_env_buffer_data(hh);
+        memStrPush(&home_dir, hbp, sa_env_buffer_len(hh));
+        sa_env_buffer_free(hh);
+    };
     if home_dir.len > 0 {
         let home_path = MemStr { bytes: [0u8; 16384], len: 0 };
         let hdp: ptr = PTR_NULL();
@@ -165,14 +177,13 @@ fn loadMiniMemory(cwd_ptr: ptr, cwd_len: u64, out: &MemStr) {
     memStrPush(out, bp, block.len);
 }
 
-/**
- * Append one note to the repo-level `<cwd>/MEMORY.md` (created on demand).
- * Returns the confirmation text shown to the model.
- */
+//
+// Append one note to the repo-level `<cwd>/MEMORY.md` (created on demand).
+// Returns the confirmation text shown to the model.
 // TS lines 50-61: appendMiniMemory(cwd: string, text: string): string
 // DEFECT: regex replace | note.replace(/\r?\n/g, " ") approximated with a byte loop flattening CR/LF to spaces.
 // DEFECT: exception handling | try/catch + `e instanceof Error ? e.message : String(e)` has no counterpart; any fs failure yields the fixed "remember failed: fs error" text.
-// DEFECT: Node API | mkdirSync(dirname(file), {recursive:true}) / appendFileSync approximated via sa_std_fs_mkdir / sa_std_fs_append status codes.
+// DEFECT: Node API | mkdirSync(dirname(file), {recursive:true}) -> sa_fs_mkdir_p; appendFileSync -> sa_std_fs_open_options(append) + file_write status codes.
 fn appendMiniMemory(cwd_ptr: ptr, cwd_len: u64, text_ptr: ptr, text_len: u64, out: &MemStr) {
     out.len = 0;
     // const note = String(text ?? "").trim().slice(0, MINI_REMEMBER_MAX_CHARS);
@@ -206,9 +217,9 @@ fn appendMiniMemory(cwd_ptr: ptr, cwd_len: u64, text_ptr: ptr, text_len: u64, ou
     PTR_BYTE_ADD(fp, &file.bytes, 0);
     // mkdirSync(dirname(file), { recursive: true });
     // DEFECT: Node API | dirname() approximated as the cwd itself (file is cwd + '/' + filename by construction).
-    sa_std_fs_mkdir(cwd_ptr, cwd_len);
+    sa_fs_mkdir_p(cwd_ptr, cwd_len);
     // const prefix = existsSync(file) ? "\n" : "";
-    let exists = sa_std_fs_exists(fp, file.len);
+    let exists = sa_std_fs_exists(fp, file.len) == 0;
     let line = MemStr { bytes: [0u8; 16384], len: 0 };
     if exists { memStrPush(&line, STR_PTR("\n"), STR_LEN("\n")); };
     memStrPush(&line, STR_PTR("- "), STR_LEN("- "));
@@ -236,7 +247,14 @@ fn appendMiniMemory(cwd_ptr: ptr, cwd_len: u64, text_ptr: ptr, text_len: u64, ou
     // appendFileSync(file, `${prefix}- ${...}\n`, "utf8");
     let lp: ptr = PTR_NULL();
     PTR_BYTE_ADD(lp, &line.bytes, 0);
-    let ok = sa_std_fs_append(fp, file.len, lp, line.len);
+    let ok = false;
+    let ah: u64 = 0;
+    if sa_std_fs_open_options(fp, file.len, 22, 438, 0, &ah) == 0 {
+        let wr: u64 = 0;
+        let wst = sa_std_fs_file_write(ah, lp, line.len, &wr);
+        sa_fs_file_close(ah);
+        if wst == 0 { ok = true; };
+    };
     if !ok {
         memStrPush(out, STR_PTR("remember failed: fs error"), STR_LEN("remember failed: fs error"));
         return;

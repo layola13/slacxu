@@ -1,8 +1,18 @@
-// Converted 1:1 from mini-codex/src/cli.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Converted 1:1 from mini-codex/src/cli.ts (CXU plugins @ f2cb649d).
+// Fix phase (Agent M): main() retranslated in full — argv scan over
+// sa_env_args_json, env fallback chains over sa_env_get, runPrompt wired
+// through a field-wise CliCfg -> MiniConfig copy. Top-level awaits are
+// sequential synchronous calls (createUltraExecutor / runPrompt are
+// synchronous status-returning fns in this port). console.error goes to
+// stderr via sa_io_write_all(sa_io_stderr(), ...); process.exit(1) is
+// `return 1` from main; console.log(out) is sa_print_bytes of the out
+// buffer.
 @import "sa_std/io/print.sai"
+@import "sa_std/io.sai"
 @import "sa_std/ptr.sa"
 @import "sa_std/string.sa"
 @import "sa_std/env.sai"
+@import "sa_std/encoding/json.sai"
 @import "loop.sla"
 @import "ultraAdapter.sla"
 @import "types.sla"
@@ -10,10 +20,6 @@
 // TS lines 1-2: import { defaultThreadFile, loadThreadFile, runPrompt } from "./loop.ts";
 //               import { createUltraExecutor } from "./ultraAdapter.ts";
 // (loop.sla / ultraAdapter.sla imported above.)
-
-// TS source is a top-level module script (no exported functions): the whole
-// body becomes main() below, statements in the original order.
-// DEFECT: top-level await (lines 29 and 35: await createUltraExecutor(), await runPrompt(...)) | SLA has no top-level code or await; approximated by sequential synchronous calls inside main.
 
 // Local byte-string (stand-in for TS string values in this module).
 struct CliStr {
@@ -30,74 +36,260 @@ struct CliCfg {
     cwd: [u8; 4096], cwd_len: u64,
 }
 
+fn cli_copy(dst: ptr, cap: u64, src: ptr, n: u64) -> u64 {
+    let take = n;
+    if take > cap { take = cap; };
+    let i: u64 = 0;
+    while i < take {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src, i);
+        let dp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp, dst, i);
+        PTR_WRITE_U8(dp, b);
+        i = i + 1;
+    }
+    return take;
+}
+
+fn cli_set_lit(dst: ptr, cap: u64, lit: ptr, lit_len: u64, out_len: &u64) -> void {
+    *out_len = cli_copy(dst, cap, lit, lit_len);
+}
+
+// env value or literal fallback (the TS `process.env.X || "lit"` chain).
+fn cli_env_or(dst: ptr, cap: u64, out_len: &u64, key: ptr, key_len: u64, lit: ptr, lit_len: u64) -> void {
+    let v = TextBuf { bytes: [0u8; 32768], len: 0 };
+    let has = env_get_buf(key, key_len, &v);
+    if has && v.len > 0 {
+        let vp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(vp, &v.bytes, 0);
+        *out_len = cli_copy(dst, cap, vp, v.len);
+    } else {
+        *out_len = cli_copy(dst, cap, lit, lit_len);
+    };
+}
+
+fn cli_stderr(msg_ptr: ptr, msg_len: u64, extra_ptr: ptr, extra_len: u64) -> void {
+    let h = sa_io_stderr();
+    let st = sa_io_write_all(h, msg_ptr, msg_len);
+    if extra_len > 0 {
+        let st2 = sa_io_write_all(h, extra_ptr, extra_len);
+    };
+    let st3 = sa_io_write_all(h, STR_PTR("\n"), STR_LEN("\n"));
+}
+
 fn main() -> i32 {
-    // Flags (consumed before the prompt is joined): --resume [file] continues a
-    // persisted transcript in place (default .mini-codex-thread.jsonl).
+    // TS line 5: const cwd0 = process.cwd(); (hoisted: --resume's default
+    // and cfg.cwd both need it)
+    let cwd0 = CliStr { bytes: [0u8; 8192], len: 0 };
+    let ch = sa_env_current_dir();
+    if ch != 0 {
+        let cp: ptr = sa_env_buffer_data(ch);
+        let cl: u64 = sa_env_buffer_len(ch);
+        let dp0: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp0, &cwd0.bytes, 0);
+        cwd0.len = cli_copy(dp0, 8192, cp, cl);
+        sa_env_buffer_free(ch);
+    };
     // TS line 6: const argv = process.argv.slice(2);
-    // DEFECT: process.argv / Array.slice | no process.argv in SLA; approximated by host-provided argv buffers (argc/argv extern) with the first two entries skipped, in the fix phase.
+    // sa_env_args_json yields the process argv as a JSON string array;
+    // entries 0 and 1 (runtime + script) are skipped exactly like
+    // slice(2).
     // TS line 7: let resumeFile: string | undefined;
     let resumeFile = CliStr { bytes: [0u8; 8192], len: 0 };
     let has_resumeFile = false;
     // TS line 8: const rest: string[] = [];
-    // DEFECT: dynamic string array (rest.push(...)) | approximated with a fixed-capacity array of CliStr (cap 64).
+    // DEFECT: dynamic string array (rest.push(...)) | fixed-capacity array of CliStr (cap 64).
     let rest: [CliStr; 64] = [CliStr { bytes: [0u8; 8192], len: 0 }; 64];
     let rest_len: u64 = 0;
-    // TS lines 9-17: for (let i = 0; i < argv.length; i++) {
-    //   if (argv[i] === "--resume") {
-    //     const next = argv[i + 1];
-    //     resumeFile = next && !next.startsWith("--") ? argv[++i] as string : defaultThreadFile(process.cwd());
-    //     // DEFECT: string truthiness + startsWith + `as string` cast + process.cwd() | approximated with length/prefix byte checks and an sa_std cwd extern; defaultThreadFile is loop.sla's (ptr,len,out) form.
-    //   } else {
-    //     rest.push(argv[i] as string);
-    //   }
-    // }
-    // (Loop body preserved above as comments; the argv scan itself needs the
-    // host argv extern from the DEFECT above.)
-    // TS line 18: const prompt = rest.join(" ") || "list files here";
-    // DEFECT: Array.join(" ") + string || fallback | approximated by concatenating rest entries with single spaces into prompt; empty result selects the "list files here" literal.
-    let prompt = CliStr { bytes: [0u8; 8192], len: 0 };
-    if rest_len == 0 {
-        prompt.len = 13; // "list files here" bytes copied in the fix phase
+    let ah = sa_env_args_json();
+    if ah != 0 {
+        let ap: ptr = sa_env_buffer_data(ah);
+        let al: u64 = sa_env_buffer_len(ah);
+        let doc = sa_json_parse(ap, al);
+        if doc != 0 {
+            let argc: u64 = 0;
+            if sa_json_value_count(doc, &argc) == 0 {
+                let i: u64 = 2;
+                while i < argc {
+                    let node: u64 = 0;
+                    if sa_json_array_get(doc, i, &node) == 0 && sa_json_kind(node) == 5 {
+                        let sp: ptr = sa_json_string_ptr(node);
+                        let sl: u64 = sa_json_string_len(node);
+                        if bytes_eq(sp, sl, STR_PTR("--resume"), STR_LEN("--resume")) {
+                            // const next = argv[i + 1];
+                            // resumeFile = next && !next.startsWith("--") ? argv[++i] : defaultThreadFile(cwd)
+                            let took = false;
+                            if i + 1 < argc {
+                                let nn: u64 = 0;
+                                if sa_json_array_get(doc, i + 1, &nn) == 0 && sa_json_kind(nn) == 5 {
+                                    let np: ptr = sa_json_string_ptr(nn);
+                                    let nl: u64 = sa_json_string_len(nn);
+                                    let is_flag = false;
+                                    if nl >= 2 {
+                                        let b0: u8 = 0;
+                                        PTR_BYTE_AT(b0, np, 0);
+                                        let b1: u8 = 0;
+                                        PTR_BYTE_AT(b1, np, 1);
+                                        if b0 == 45 && b1 == 45 { is_flag = true; };
+                                    };
+                                    if !is_flag {
+                                        let rp: ptr = PTR_NULL();
+                                        PTR_BYTE_ADD(rp, &resumeFile.bytes, 0);
+                                        resumeFile.len = cli_copy(rp, 8192, np, nl);
+                                        has_resumeFile = true;
+                                        took = true;
+                                        i = i + 1;
+                                    };
+                                };
+                            };
+                            if !took {
+                                let tf = TextOut { bytes: [0u8; 8192], len: 0 };
+                                let cwdp: ptr = PTR_NULL();
+                                PTR_BYTE_ADD(cwdp, &cwd0.bytes, 0);
+                                let dst = defaultThreadFile(cwdp, cwd0.len, &tf);
+                                if dst == 0 {
+                                    let tp: ptr = PTR_NULL();
+                                    PTR_BYTE_ADD(tp, &tf.bytes, 0);
+                                    let rp2: ptr = PTR_NULL();
+                                    PTR_BYTE_ADD(rp2, &resumeFile.bytes, 0);
+                                    resumeFile.len = cli_copy(rp2, 8192, tp, tf.len);
+                                    has_resumeFile = true;
+                                };
+                            };
+                        } else {
+                            if rest_len < 64 {
+                                let rp3: ptr = PTR_NULL();
+                                PTR_BYTE_ADD(rp3, &rest[rest_len].bytes, 0);
+                                rest[rest_len].len = cli_copy(rp3, 8192, sp, sl);
+                                rest_len = rest_len + 1;
+                            };
+                        };
+                    };
+                    i = i + 1;
+                }
+            };
+            sa_json_free(doc);
+        };
+        sa_env_buffer_free(ah);
     };
-    // TS lines 19-27: const cfg = {
-    //   baseUrl: process.env.MINI_BASE_URL || "https://api.openai.com/v1",
-    //   apiKey: process.env.MINI_API_KEY || process.env.OPENAI_API_KEY || "",
-    //   model: process.env.MINI_MODEL || "gpt-5-mini",
-    //   effort: process.env.MINI_EFFORT || "medium",
-    //   cwd: process.cwd(),
-    // };
-    // DEFECT: process.env.* with || fallback chains + process.cwd() | no process.env object in SLA; approximated via sa_env_get buffer reads (empty = fall through to the next source/default, exactly the || semantics) and an sa_std cwd extern.
+    // TS line 18: const prompt = rest.join(" ") || "list files here";
+    let prompt = CliStr { bytes: [0u8; 8192], len: 0 };
+    let ji: u64 = 0;
+    while ji < rest_len {
+        if ji > 0 {
+            let pp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(pp, &prompt.bytes, prompt.len);
+            prompt.len = prompt.len + cli_copy(pp, 8192 - prompt.len, STR_PTR(" "), STR_LEN(" "));
+        };
+        let ep: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ep, &rest[ji].bytes, 0);
+        let dp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp2, &prompt.bytes, prompt.len);
+        prompt.len = prompt.len + cli_copy(dp2, 8192 - prompt.len, ep, rest[ji].len);
+        ji = ji + 1;
+    }
+    if prompt.len == 0 {
+        let pp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(pp2, &prompt.bytes, 0);
+        prompt.len = cli_copy(pp2, 8192, STR_PTR("list files here"), STR_LEN("list files here"));
+    };
+    // TS lines 19-27: const cfg = { baseUrl: env || lit, apiKey: env || env || "",
+    //   model: env || lit, effort: env || lit, cwd };
     let cfg = CliCfg { baseUrl: [0u8; 2048], baseUrl_len: 0, apiKey: [0u8; 1024], apiKey_len: 0, model: [0u8; 256], model_len: 0, effort: [0u8; 64], effort_len: 0, cwd: [0u8; 4096], cwd_len: 0 };
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &cfg.baseUrl, 0);
+    cli_env_or(bp, 2048, &cfg.baseUrl_len, STR_PTR("MINI_BASE_URL"), STR_LEN("MINI_BASE_URL"), STR_PTR("https://api.openai.com/v1"), STR_LEN("https://api.openai.com/v1"));
+    let kp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(kp, &cfg.apiKey, 0);
+    let kv = TextBuf { bytes: [0u8; 32768], len: 0 };
+    let has_k = env_get_buf(STR_PTR("MINI_API_KEY"), STR_LEN("MINI_API_KEY"), &kv);
+    if has_k && kv.len > 0 {
+        let kvp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(kvp, &kv.bytes, 0);
+        cfg.apiKey_len = cli_copy(kp, 1024, kvp, kv.len);
+    } else {
+        let has_k2 = env_get_buf(STR_PTR("OPENAI_API_KEY"), STR_LEN("OPENAI_API_KEY"), &kv);
+        if has_k2 && kv.len > 0 {
+            let kvp2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(kvp2, &kv.bytes, 0);
+            cfg.apiKey_len = cli_copy(kp, 1024, kvp2, kv.len);
+        };
+    };
+    let mp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(mp, &cfg.model, 0);
+    cli_env_or(mp, 256, &cfg.model_len, STR_PTR("MINI_MODEL"), STR_LEN("MINI_MODEL"), STR_PTR("gpt-5-mini"), STR_LEN("gpt-5-mini"));
+    let ep2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ep2, &cfg.effort, 0);
+    cli_env_or(ep2, 64, &cfg.effort_len, STR_PTR("MINI_EFFORT"), STR_LEN("MINI_EFFORT"), STR_PTR("medium"), STR_LEN("medium"));
+    let cp3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cp3, &cfg.cwd, 0);
+    let cwp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cwp, &cwd0.bytes, 0);
+    cfg.cwd_len = cli_copy(cp3, 4096, cwp, cwd0.len);
     // TS lines 28-31: if (!cfg.apiKey) { console.error("missing MINI_API_KEY (or OPENAI_API_KEY)"); process.exit(1); }
-    // DEFECT: console.error / process.exit | no console/process objects in SLA; approximated with println (stdout) and returning 1 from main.
     if cfg.apiKey_len == 0 {
-        println("missing MINI_API_KEY (or OPENAI_API_KEY)");
+        cli_stderr(STR_PTR("missing MINI_API_KEY (or OPENAI_API_KEY)"), STR_LEN("missing MINI_API_KEY (or OPENAI_API_KEY)"), STR_PTR(""), 0);
         return 1;
     };
-    // TS line 29 (renumbered in source as line 29): const exec = await createUltraExecutor();
+    // TS line 29: const exec = await createUltraExecutor();
     let exec = UltraToolExecutor { id: 0 };
     let exec_st = createUltraExecutor(&exec);
     if exec_st != 0 { return exec_st; };
     // TS line 30: const initialThread = resumeFile ? (loadThreadFile(resumeFile) ?? undefined) : undefined;
-    // DEFECT: ternary + nullish coalescing (loadThreadFile(...) ?? undefined) with ThreadItem[] | undefined | approximated with has_initialThread flag + ThreadItems buffer (loop.sla form); loadThreadFile status 1 (TS null) maps to has_initialThread = false.
+    // loadThreadFile status 1 (TS null) maps to has_initialThread = false.
     let initialThread = ThreadItems { bytes: [0u8; 262144], len: 0, count: 0 };
     let has_initialThread = false;
     if has_resumeFile {
-        let lt_st = loadThreadFile(&resumeFile.bytes, resumeFile.len, &initialThread);
+        let rfp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rfp, &resumeFile.bytes, 0);
+        let lt_st = loadThreadFile(rfp, resumeFile.len, &initialThread);
         if lt_st == 0 { has_initialThread = true; };
     };
     // TS lines 31-34: if (resumeFile && !initialThread) { console.error(`--resume: no transcript at ${resumeFile}`); process.exit(1); }
-    // DEFECT: template literal in console.error + process.exit (see above) | message approximated as println of the prefix + resumeFile bytes; exit approximated by return 1.
     if has_resumeFile && !has_initialThread {
-        println("--resume: no transcript at ");
+        let rfp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rfp2, &resumeFile.bytes, 0);
+        cli_stderr(STR_PTR("--resume: no transcript at "), STR_LEN("--resume: no transcript at "), rfp2, resumeFile.len);
         return 1;
     };
+    // Field-wise CliCfg -> MiniConfig copy for loop.sla's runPrompt.
+    let mcfg = MiniConfig { baseUrl_bytes: [0u8; 1024], baseUrl_len: 0, apiKey_bytes: [0u8; 1024], apiKey_len: 0, model_bytes: [0u8; 256], model_len: 0, effort_bytes: [0u8; 64], effort_len: 0, has_effort: true, cwd_bytes: [0u8; 1024], cwd_len: 0, maxTurns: 0, has_maxTurns: false, protocol: 0, has_protocol: false };
+    let mb: ptr = PTR_NULL();
+    PTR_BYTE_ADD(mb, &mcfg.baseUrl_bytes, 0);
+    let sb: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sb, &cfg.baseUrl, 0);
+    mcfg.baseUrl_len = cli_copy(mb, 1024, sb, cfg.baseUrl_len);
+    let mk: ptr = PTR_NULL();
+    PTR_BYTE_ADD(mk, &mcfg.apiKey_bytes, 0);
+    let sk: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sk, &cfg.apiKey, 0);
+    mcfg.apiKey_len = cli_copy(mk, 1024, sk, cfg.apiKey_len);
+    let mm: ptr = PTR_NULL();
+    PTR_BYTE_ADD(mm, &mcfg.model_bytes, 0);
+    let sm: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sm, &cfg.model, 0);
+    mcfg.model_len = cli_copy(mm, 256, sm, cfg.model_len);
+    let me: ptr = PTR_NULL();
+    PTR_BYTE_ADD(me, &mcfg.effort_bytes, 0);
+    let se: ptr = PTR_NULL();
+    PTR_BYTE_ADD(se, &cfg.effort, 0);
+    mcfg.effort_len = cli_copy(me, 64, se, cfg.effort_len);
+    let mc: ptr = PTR_NULL();
+    PTR_BYTE_ADD(mc, &mcfg.cwd_bytes, 0);
+    let sc: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sc, &cfg.cwd, 0);
+    mcfg.cwd_len = cli_copy(mc, 1024, sc, cfg.cwd_len);
     // TS line 35: const out = await runPrompt(cfg, prompt, exec, resumeFile ? { initialThread, threadFile: resumeFile } : undefined);
-    // DEFECT: optional options object argument { initialThread, threadFile } | undefined | approximated with has_options flag + the two values passed separately (runPrompt in loop.sla carries its own signature approximation).
     let out = TextOut { bytes: [0u8; 8192], len: 0 };
-    // (call shape: runPrompt(&cfg-as-MiniConfig, prompt, &exec, has_options, &initialThread, resumeFile) — cfg field layout differs from loop.sla MiniConfig; the field-wise copy is left to the fix phase.)
+    let pp3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pp3, &prompt.bytes, 0);
+    let rfp3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rfp3, &resumeFile.bytes, 0);
+    let rp_st = runPrompt(&mcfg, pp3, prompt.len, &exec, has_resumeFile, 0, has_initialThread, &initialThread, has_resumeFile, rfp3, resumeFile.len, &out);
+    if rp_st != 0 { return rp_st; };
     // TS line 36: console.log(out);
-    // DEFECT: console.log | approximated with println of the out buffer.
-    println(""); // placeholder for out bytes
+    let op: ptr = PTR_NULL();
+    PTR_BYTE_ADD(op, &out.bytes, 0);
+    sa_print_bytes(op, out.len);
     return 0;
 }

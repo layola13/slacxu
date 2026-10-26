@@ -7,7 +7,10 @@
 @import "sa_std/ptr.sa"
 @import "sa_std/env.sai"
 @import "sa_std/string.sa"
-@import "sa_std/json.sai"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/crypto.sai"
+@import "sa_std/fmt.sai"
+@import "sa_std/time.sai"
 @import "./mcp.sla"
 @import "./memory.sla"
 @import "./hooks.sla"
@@ -58,11 +61,13 @@ struct HookCtx {
     use_call_mcp_raw: bool,
 }
 
-// Result of executeHooks (hooks.ts) as consumed here.
+// Result of executeHooks (hooks.ts) as consumed here; renamed
+// McpHookExecResult in the fix phase — hooks.sla owns HookExecResult
+// (a different, struct-of-handles shape) and both are imported here.
 // DEFECT: dynamic result object -> struct; updatedInput (Record | undefined)
 // becomes has_updated_input + JSON text; additionalContexts is a JSON array
 // text; hookEvents are HookCompletedEvent JSON text.
-struct HookExecResult {
+struct McpHookExecResult {
     hook_events_json: [u8; 16384], hook_events_json_len: u64,
     blocked: bool,
     has_block_reason: bool, block_reason: [u8; 2048], block_reason_len: u64,
@@ -80,14 +85,14 @@ struct HookGlobals {
 fn resolveSink(g: &HookGlobals, opts: &HookPipelineOpts, sink: &u64, has_sink: &bool) -> void {
     // if (opts.sink === null) return undefined;
     if opts.sink_kind == 1 {
-        has_sink = false;
-        sink = 0;
+        *has_sink = false;
+        *sink = 0;
         return;
     };
     // if (opts.sink) return opts.sink;
     if opts.sink_kind == 2 {
-        has_sink = true;
-        sink = opts.sink;
+        *has_sink = true;
+        *sink = opts.sink;
         return;
     };
     // if (process.env.MINI_HOOKS_LOG === "off") return undefined;
@@ -96,17 +101,17 @@ fn resolveSink(g: &HookGlobals, opts: &HookPipelineOpts, sink: &u64, has_sink: &
     if has_v {
         let vp: ptr = PTR_NULL();
         PTR_BYTE_ADD(vp, &v.bytes, 0);
-        if str_eq(vp, v.len, STR_PTR("off"), STR_LEN("off")) {
-            has_sink = false;
-            sink = 0;
+        if mcpStrEq(vp, v.len, STR_PTR("off"), STR_LEN("off")) {
+            *has_sink = false;
+            *sink = 0;
             return;
         };
     };
     // if (!warnedNoSink) { warnedNoSink = true; }
     if !g.warned_no_sink { g.warned_no_sink = true; };
     // return defaultHookSink();
-    sink = defaultHookSink();
-    has_sink = true;
+    *sink = defaultHookSink();
+    *has_sink = true;
 }
 
 // Run one tool call with hooks. Never throws: hook failures degrade to
@@ -127,11 +132,13 @@ fn runToolWithHooks(g: &HookGlobals, mcp: &McpGlobals, tool_name_ptr: ptr, tool_
     // const events = await loadHookEvents(opts.cwd).catch(() => ({}));
     // DEFECT: Promise .catch(() => ({})) approximated by the extern status:
     // on any failure the events JSON stays "{}".
-    let events = TextBuf { bytes: [0u8; 32768], len: 0 };
-    text_buf_append(&events, STR_PTR("{}"), STR_LEN("{}"));
+    let state = hook_module_state_new();
+    let events = hook_events_new();
     let cwd_ptr: ptr = PTR_NULL();
     PTR_BYTE_ADD(cwd_ptr, &opts.cwd, 0);
-    loadHookEvents(cwd_ptr, opts.cwd_len, &events);
+    let load_st = loadHookEvents(&state, cwd_ptr, opts.cwd_len, false, &events);
+    let files_arr: [HookFileRef; 8] = [HookFileRef { path_ptr: PTR_NULL(), path_len: 0, source: 0 }; 8];
+    let files_len = mh_files(&state, &files_arr);
     let sink: u64 = 0;
     let has_sink = false;
     resolveSink(g, opts, &sink, &has_sink);
@@ -146,7 +153,7 @@ fn runToolWithHooks(g: &HookGlobals, mcp: &McpGlobals, tool_name_ptr: ptr, tool_
         let has_env = env_get_buf(STR_PTR("MINI_SESSION_ID"), STR_LEN("MINI_SESSION_ID"), &session_id);
         if !has_env || session_id.len == 0 {
             session_id.len = 0;
-            sa_random_uuid(&session_id.bytes, &session_id.len);
+            let hp_uuid: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_uuid, &session_id.bytes, 0); mh_random_uuid(hp_uuid, &session_id.len);
         };
     };
     // const turnId = opts.turnId ?? `${Date.now()}`;
@@ -157,17 +164,19 @@ fn runToolWithHooks(g: &HookGlobals, mcp: &McpGlobals, tool_name_ptr: ptr, tool_
         PTR_BYTE_ADD(tp, &opts.turn_id, 0);
         text_buf_append(&turn_id, tp, opts.turn_id_len);
     } else {
-        sa_u64_to_dec(sa_time_now_ms(), &turn_id.bytes, &turn_id.len);
+        let hp_td: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_td, &turn_id.bytes, 0); mj_u64_dec((sa_time_unix_ms() as u64), hp_td, &turn_id.len);
     };
-    // const toolInput = mcpHookToolInput(args);
+    // const toolInput = mh_tool_input(args);
     let tool_input = TextBuf { bytes: [0u8; 32768], len: 0 };
-    mcpHookToolInput(args_ptr, args_len, &tool_input);
+    mh_tool_input(args_ptr, args_len, &tool_input);
     // const hookCtxBase = { sessionId, turnId, cwd, model, toolName,
     //   toolUseId: callId, toolInput,
     //   callMcpRaw: (server, tool, input, timeoutMs) => callMcpByServerRaw(server, tool, input, timeoutMs), sink };
     let ctx = HookCtx { session_id: [0u8; 128], session_id_len: 0, turn_id: [0u8; 64], turn_id_len: 0, cwd: [0u8; 512], cwd_len: 0, model: [0u8; 128], model_len: 0, tool_name: [0u8; 128], tool_name_len: 0, tool_use_id: [0u8; 128], tool_use_id_len: 0, tool_input_json: [0u8; 8192], tool_input_json_len: 0, has_tool_response: false, tool_response_json: [0u8; 16384], tool_response_json_len: 0, sink: 0, use_call_mcp_raw: true };
-    copy_text_to(&session_id, &ctx.session_id, &ctx.session_id_len, 128);
-    copy_text_to(&turn_id, &ctx.turn_id, &ctx.turn_id_len, 64);
+    let cp_1: ptr = PTR_NULL(); PTR_BYTE_ADD(cp_1, &ctx.session_id, 0);
+    copy_text_to(&session_id, cp_1, &ctx.session_id_len, 128);
+    let cp_2: ptr = PTR_NULL(); PTR_BYTE_ADD(cp_2, &ctx.turn_id, 0);
+    copy_text_to(&turn_id, cp_2, &ctx.turn_id_len, 64);
     ctx.cwd_len = 0;
     let ci: u64 = 0;
     while ci < opts.cwd_len && ci < 512 {
@@ -187,11 +196,14 @@ fn runToolWithHooks(g: &HookGlobals, mcp: &McpGlobals, tool_name_ptr: ptr, tool_
     // (tool_name arrives as (ptr, len); copy via a scratch TextBuf)
     let tn = TextBuf { bytes: [0u8; 32768], len: 0 };
     text_buf_append(&tn, tool_name_ptr, tool_name_len);
-    copy_text_to(&tn, &ctx.tool_name, &ctx.tool_name_len, 128);
+    let cp_3: ptr = PTR_NULL(); PTR_BYTE_ADD(cp_3, &ctx.tool_name, 0);
+    copy_text_to(&tn, cp_3, &ctx.tool_name_len, 128);
     let cn = TextBuf { bytes: [0u8; 32768], len: 0 };
     text_buf_append(&cn, call_id_ptr, call_id_len);
-    copy_text_to(&cn, &ctx.tool_use_id, &ctx.tool_use_id_len, 128);
-    copy_text_to(&tool_input, &ctx.tool_input_json, &ctx.tool_input_json_len, 8192);
+    let cp_4: ptr = PTR_NULL(); PTR_BYTE_ADD(cp_4, &ctx.tool_use_id, 0);
+    copy_text_to(&cn, cp_4, &ctx.tool_use_id_len, 128);
+    let cp_5: ptr = PTR_NULL(); PTR_BYTE_ADD(cp_5, &ctx.tool_input_json, 0);
+    copy_text_to(&tool_input, cp_5, &ctx.tool_input_json_len, 8192);
     ctx.sink = sink;
     // const hookEvents: HookCompletedEvent[] = [];
     let hook_events = TextBuf { bytes: [0u8; 32768], len: 0 };
@@ -209,16 +221,16 @@ fn runToolWithHooks(g: &HookGlobals, mcp: &McpGlobals, tool_name_ptr: ptr, tool_
     // DEFECT: process.stderr.write has no SLA counterpart; approximated by
     // println of a static prefix (message body dropped). try/catch becomes
     // the executeHooks status code.
-    let pre = HookExecResult { hook_events_json: [0u8; 16384], hook_events_json_len: 0, blocked: false, has_block_reason: false, block_reason: [0u8; 2048], block_reason_len: 0, has_feedback: false, feedback: [0u8; 2048], feedback_len: 0, has_updated_input: false, updated_input_json: [0u8; 8192], updated_input_json_len: 0, additional_contexts_json: [0u8; 8192], additional_contexts_json_len: 0 };
-    let files = hookFilesLoaded();
-    let ev_ptr: ptr = PTR_NULL();
-    PTR_BYTE_ADD(ev_ptr, &events.bytes, 0);
-    let pre_st = executeHooks(ev_ptr, events.len, files, STR_PTR("PreToolUse"), STR_LEN("PreToolUse"), &ctx, mcp, &pre);
+    let pre = McpHookExecResult { hook_events_json: [0u8; 16384], hook_events_json_len: 0, blocked: false, has_block_reason: false, block_reason: [0u8; 2048], block_reason_len: 0, has_feedback: false, feedback: [0u8; 2048], feedback_len: 0, has_updated_input: false, updated_input_json: [0u8; 8192], updated_input_json_len: 0, additional_contexts_json: [0u8; 8192], additional_contexts_json_len: 0 };
+    let pre_node_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pre_node_p, &ctx.tool_input_json, 0);
+    let pre_node = sa_json_parse(pre_node_p, ctx.tool_input_json_len);
+    let pre_st = mh_execute(&state, &events, &files_arr, files_len, 0, &ctx, pre_node, &pre);
     if pre_st != 0 {
-        println("[hook:PreToolUse] infra error");
+        sa_print_bytes(STR_PTR("[hook:PreToolUse] infra error"), STR_LEN("[hook:PreToolUse] infra error"));
     } else {
         // hookEvents.push(...pre.hookEvents);
-        sa_json_array_extend(&hook_events.bytes, &hook_events.len, &pre.hook_events_json, pre.hook_events_json_len);
+        let hp_x1: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_x1, &hook_events.bytes, 0); let hp_x2: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_x2, &pre.hook_events_json, 0); mh_arr_extend(hp_x1, &hook_events.len, hp_x2, pre.hook_events_json_len);
         if pre.blocked {
             // return { output: `Blocked by PreToolUse hook (${toolName}): ${(pre.blockReason ?? "no reason").slice(0, 2000)}`, hookEvents, blocked: true };
             let t = TextBuf { bytes: [0u8; 32768], len: 0 };
@@ -234,7 +246,8 @@ fn runToolWithHooks(g: &HookGlobals, mcp: &McpGlobals, tool_name_ptr: ptr, tool_
             } else {
                 text_buf_append(&t, STR_PTR("no reason"), STR_LEN("no reason"));
             };
-            copy_text_to(&t, &out.output, &out.output_len, 16384);
+            let cp_6: ptr = PTR_NULL(); PTR_BYTE_ADD(cp_6, &out.output, 0);
+            copy_text_to(&t, cp_6, &out.output_len, 16384);
             out.hook_events_json_len = 0;
             let hi2: u64 = 0;
             while hi2 < hook_events.len && hi2 < 16384 {
@@ -288,7 +301,7 @@ fn runToolWithHooks(g: &HookGlobals, mcp: &McpGlobals, tool_name_ptr: ptr, tool_
         // text = await opts.execNonMcp(toolName, effectiveArgs ?? {}, opts.cwd);
         // DEFECT: callback invocation through the opaque handle (see
         // HookedToolRunner DEFECT); failure lands in the same catch path.
-        let st = sa_hook_exec_non_mcp(opts.exec_non_mcp, tool_name_ptr, tool_name_len, ea_ptr, effective_args.len, cwd_ptr, opts.cwd_len, &text.bytes, &text.len, &exec_err.bytes, &exec_err.len);
+        let hp_nm1: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_nm1, &text.bytes, 0); let hp_nm2: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_nm2, &exec_err.bytes, 0); let st = mh_exec_non_mcp(opts.exec_non_mcp, tool_name_ptr, tool_name_len, ea_ptr, effective_args.len, cwd_ptr, opts.cwd_len, hp_nm1, &text.len, hp_nm2, &exec_err.len);
         if st != 0 {
             exec_failed = true;
         } else {
@@ -319,15 +332,16 @@ fn runToolWithHooks(g: &HookGlobals, mcp: &McpGlobals, tool_name_ptr: ptr, tool_
     };
 
     // ---- PostToolUse ----
-    // try { const post = await executeHooks(events, hookFilesLoaded(), "PostToolUse", { ...hookCtxBase, toolInput: mcpHookToolInput(effectiveArgs), toolResponse: response }); ... }
+    // try { const post = await executeHooks(events, hookFilesLoaded(), "PostToolUse", { ...hookCtxBase, toolInput: mh_tool_input(effectiveArgs), toolResponse: response }); ... }
     // catch (e) { process.stderr.write(`[hook:PostToolUse] infra error: ...`); }
     // DEFECT: object spread ({ ...hookCtxBase, ... }) approximated by copying
     // ctx and overwriting the two fields.
     let post_ctx = ctx;
     post_ctx.tool_input_json_len = 0;
     let post_input = TextBuf { bytes: [0u8; 32768], len: 0 };
-    mcpHookToolInput(ea_ptr, effective_args.len, &post_input);
-    copy_text_to(&post_input, &post_ctx.tool_input_json, &post_ctx.tool_input_json_len, 8192);
+    mh_tool_input(ea_ptr, effective_args.len, &post_input);
+    let cp_7: ptr = PTR_NULL(); PTR_BYTE_ADD(cp_7, &post_ctx.tool_input_json, 0);
+    copy_text_to(&post_input, cp_7, &post_ctx.tool_input_json_len, 8192);
     post_ctx.has_tool_response = true;
     post_ctx.tool_response_json_len = 0;
     let rpi: u64 = 0;
@@ -336,22 +350,25 @@ fn runToolWithHooks(g: &HookGlobals, mcp: &McpGlobals, tool_name_ptr: ptr, tool_
         rpi = rpi + 1;
     }
     post_ctx.tool_response_json_len = rpi;
-    let post = HookExecResult { hook_events_json: [0u8; 16384], hook_events_json_len: 0, blocked: false, has_block_reason: false, block_reason: [0u8; 2048], block_reason_len: 0, has_feedback: false, feedback: [0u8; 2048], feedback_len: 0, has_updated_input: false, updated_input_json: [0u8; 8192], updated_input_json_len: 0, additional_contexts_json: [0u8; 8192], additional_contexts_json_len: 0 };
-    let post_st = executeHooks(ev_ptr, events.len, files, STR_PTR("PostToolUse"), STR_LEN("PostToolUse"), &post_ctx, mcp, &post);
+    let post = McpHookExecResult { hook_events_json: [0u8; 16384], hook_events_json_len: 0, blocked: false, has_block_reason: false, block_reason: [0u8; 2048], block_reason_len: 0, has_feedback: false, feedback: [0u8; 2048], feedback_len: 0, has_updated_input: false, updated_input_json: [0u8; 8192], updated_input_json_len: 0, additional_contexts_json: [0u8; 8192], additional_contexts_json_len: 0 };
+    let post_node_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(post_node_p, &post_ctx.tool_input_json, 0);
+    let post_node = sa_json_parse(post_node_p, post_ctx.tool_input_json_len);
+    let post_st = mh_execute(&state, &events, &files_arr, files_len, 2, &post_ctx, post_node, &post);
     if post_st != 0 {
-        println("[hook:PostToolUse] infra error");
+        sa_print_bytes(STR_PTR("[hook:PostToolUse] infra error"), STR_LEN("[hook:PostToolUse] infra error"));
     } else {
         // hookEvents.push(...post.hookEvents);
-        sa_json_array_extend(&hook_events.bytes, &hook_events.len, &post.hook_events_json, post.hook_events_json_len);
+        let hp_x3: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_x3, &hook_events.bytes, 0); let hp_x4: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_x4, &post.hook_events_json, 0); mh_arr_extend(hp_x3, &hook_events.len, hp_x4, post.hook_events_json_len);
         // const extras = [...preContexts, ...post.additionalContexts];
         let extras = TextBuf { bytes: [0u8; 32768], len: 0 };
         text_buf_append(&extras, STR_PTR("[]"), STR_LEN("[]"));
-        sa_json_array_extend(&extras.bytes, &extras.len, &pre_contexts.bytes, pre_contexts.len);
-        sa_json_array_extend(&extras.bytes, &extras.len, &post.additional_contexts_json, post.additional_contexts_json_len);
+        let hp_x5: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_x5, &extras.bytes, 0); let hp_x6: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_x6, &pre_contexts.bytes, 0); mh_arr_extend(hp_x5, &extras.len, hp_x6, pre_contexts.len);
+        let hp_x7: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_x7, &extras.bytes, 0); let hp_x8: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_x8, &post.additional_contexts_json, 0); mh_arr_extend(hp_x7, &extras.len, hp_x8, post.additional_contexts_json_len);
         // if (extras.length) { text += `\n\n[hook additionalContext]\n${extras.map((c) => String(c).slice(0, 2000)).join("\n---\n").slice(0, 6000)}`; }
         // DEFECT: map/join over the contexts approximated by a scan emitting
         // each context sliced to 2000, joined by "\n---\n", total capped 6000.
-        let n_extras = sa_json_array_len(&extras.bytes, extras.len);
+        let hp_el: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_el, &extras.bytes, 0); let n_extras = mj_arr_len(hp_el, extras.len);
         if n_extras > 0 {
             text_buf_append(&text, STR_PTR("\n\n[hook additionalContext]\n"), STR_LEN("\n\n[hook additionalContext]\n"));
             let joined = TextBuf { bytes: [0u8; 32768], len: 0 };
@@ -359,7 +376,7 @@ fn runToolWithHooks(g: &HookGlobals, mcp: &McpGlobals, tool_name_ptr: ptr, tool_
             let xfirst = true;
             while xi < n_extras {
                 let c = TextBuf { bytes: [0u8; 32768], len: 0 };
-                sa_json_array_get_string(&extras.bytes, extras.len, xi, &c.bytes, &c.len);
+                let hp_eg1: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_eg1, &extras.bytes, 0); let hp_eg2: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_eg2, &c.bytes, 0); mj_arr_get_string(hp_eg1, extras.len, xi, hp_eg2, &c.len);
                 xi = xi + 1;
                 if !xfirst { text_buf_append(&joined, STR_PTR("\n---\n"), STR_LEN("\n---\n")); };
                 xfirst = false;
@@ -397,7 +414,8 @@ fn runToolWithHooks(g: &HookGlobals, mcp: &McpGlobals, tool_name_ptr: ptr, tool_
         };
     };
     // return { output: text, hookEvents, blocked: false };
-    copy_text_to(&text, &out.output, &out.output_len, 16384);
+    let cp_8: ptr = PTR_NULL(); PTR_BYTE_ADD(cp_8, &out.output, 0);
+    copy_text_to(&text, cp_8, &out.output_len, 16384);
     out.hook_events_json_len = 0;
     let hi3: u64 = 0;
     while hi3 < hook_events.len && hi3 < 16384 {
@@ -409,27 +427,34 @@ fn runToolWithHooks(g: &HookGlobals, mcp: &McpGlobals, tool_name_ptr: ptr, tool_
 }
 
 // helper: copy a TextBuf into a fixed (bytes, len) field with a cap
-fn copy_text_to(src: &TextBuf, arr: &[u8; 16384], len: &u64, cap: u64) -> void {
-    len = 0;
-    let i: u64 = 0;
-    while i < src.len && i < cap {
-        arr[i] = src.bytes[i];
-        i = i + 1;
+fn copy_text_to(src: &TextBuf, dst: ptr, len: &u64, cap: u64) -> void {
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, &src.bytes, 0);
+    let n: u64 = 0;
+    while n < src.len && n < cap {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, sp, n);
+        let dp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp, dst, n);
+        PTR_WRITE_U8(dp, b);
+        n = n + 1;
     }
-    len = i;
+    *len = n;
 }
 
 // helper: append to a 16384-cap (bytes, len) pair (used for result fields)
 fn text_buf_append_len16(arr: &[u8; 16384], len: &u64, src_ptr: ptr, src_len: u64) -> void {
+    let n = *len;
     let i: u64 = 0;
     while i < src_len {
-        if len >= 16384 { return; };
+        if n >= 16384 { break; };
         let b: u8 = 0;
         PTR_BYTE_AT(b, src_ptr, i);
-        arr[len] = b;
-        len = len + 1;
+        arr[n] = b;
+        n = n + 1;
         i = i + 1;
     }
+    *len = n;
 }
 
 // Decide whether a tool result is worth remembering (cheap local triage, no LLM).
@@ -559,21 +584,17 @@ fn fireLifecycleHook(g: &HookGlobals, mcp: &McpGlobals, event_name_ptr: ptr, eve
     // DEFECT: the whole body is one try/catch in TS; here any nonzero status
     // falls through to the final return with out == "[]", and the stderr
     // write is a static println (see runToolWithHooks note).
-    let events = TextBuf { bytes: [0u8; 32768], len: 0 };
-    text_buf_append(&events, STR_PTR("{}"), STR_LEN("{}"));
+    let state = hook_module_state_new();
+    let events = hook_events_new();
     let cwd_ptr: ptr = PTR_NULL();
     PTR_BYTE_ADD(cwd_ptr, &opts.cwd, 0);
-    loadHookEvents(cwd_ptr, opts.cwd_len, &events);
+    let load_st = loadHookEvents(&state, cwd_ptr, opts.cwd_len, false, &events);
+    let files_arr: [HookFileRef; 8] = [HookFileRef { path_ptr: PTR_NULL(), path_len: 0, source: 0 }; 8];
+    let files_len = mh_files(&state, &files_arr);
     // const groups = events[eventName]; if (!groups?.length) return [];
-    // DEFECT: dynamic key access events[eventName] + optional chaining
-    // approximated by a JSON probe for a non-empty array under that key.
-    let groups = TextBuf { bytes: [0u8; 32768], len: 0 };
-    let evp: ptr = PTR_NULL();
-    PTR_BYTE_ADD(evp, &events.bytes, 0);
-    let has_groups = sa_json_object_get_json_strkey(evp, events.len, event_name_ptr, event_name_len, &groups.bytes, &groups.len);
-    if !has_groups { return; };
-    if !sa_json_is_array(&groups.bytes, groups.len) { return; };
-    if sa_json_array_len(&groups.bytes, groups.len) == 0 { return; };
+    let event_idx = mh_event_index(event_name_ptr, event_name_len);
+    if event_idx >= 12 { return; };
+    if hook_events_len(&events, event_idx) == 0 { return; };
     // const sink = opts.sink === null ? undefined : (opts.sink ?? (process.env.MINI_HOOKS_LOG === "off" ? undefined : defaultHookSink()));
     let sink: u64 = 0;
     let has_sink = true;
@@ -588,7 +609,7 @@ fn fireLifecycleHook(g: &HookGlobals, mcp: &McpGlobals, event_name_ptr: ptr, eve
         if has_v {
             let vp: ptr = PTR_NULL();
             PTR_BYTE_ADD(vp, &v.bytes, 0);
-            is_off = str_eq(vp, v.len, STR_PTR("off"), STR_LEN("off"));
+            is_off = mcpStrEq(vp, v.len, STR_PTR("off"), STR_LEN("off"));
         };
         if is_off { has_sink = false; } else { sink = defaultHookSink(); };
     };
@@ -603,7 +624,7 @@ fn fireLifecycleHook(g: &HookGlobals, mcp: &McpGlobals, event_name_ptr: ptr, eve
         let has_env = env_get_buf(STR_PTR("MINI_SESSION_ID"), STR_LEN("MINI_SESSION_ID"), &session_id);
         if !has_env || session_id.len == 0 {
             session_id.len = 0;
-            sa_random_uuid(&session_id.bytes, &session_id.len);
+            let hp_uuid: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_uuid, &session_id.bytes, 0); mh_random_uuid(hp_uuid, &session_id.len);
         };
     };
     // const turnId = opts.turnId ?? `${Date.now()}`;
@@ -613,7 +634,7 @@ fn fireLifecycleHook(g: &HookGlobals, mcp: &McpGlobals, event_name_ptr: ptr, eve
         PTR_BYTE_ADD(tp, &opts.turn_id, 0);
         text_buf_append(&turn_id, tp, opts.turn_id_len);
     } else {
-        sa_u64_to_dec(sa_time_now_ms(), &turn_id.bytes, &turn_id.len);
+        let hp_td: ptr = PTR_NULL(); PTR_BYTE_ADD(hp_td, &turn_id.bytes, 0); mj_u64_dec((sa_time_unix_ms() as u64), hp_td, &turn_id.len);
     };
     // const res = await executeHooks(events, hookFilesLoaded(), eventName, {
     //   sessionId, turnId, cwd: opts.cwd, model: opts.model,
@@ -624,8 +645,10 @@ fn fireLifecycleHook(g: &HookGlobals, mcp: &McpGlobals, event_name_ptr: ptr, eve
     //   sink });
     // return res.additionalContexts;
     let ctx = HookCtx { session_id: [0u8; 128], session_id_len: 0, turn_id: [0u8; 64], turn_id_len: 0, cwd: [0u8; 512], cwd_len: 0, model: [0u8; 128], model_len: 0, tool_name: [0u8; 128], tool_name_len: 0, tool_use_id: [0u8; 128], tool_use_id_len: 0, tool_input_json: [0u8; 8192], tool_input_json_len: 0, has_tool_response: false, tool_response_json: [0u8; 16384], tool_response_json_len: 0, sink: 0, use_call_mcp_raw: true };
-    copy_text_to(&session_id, &ctx.session_id, &ctx.session_id_len, 128);
-    copy_text_to(&turn_id, &ctx.turn_id, &ctx.turn_id_len, 64);
+    let cp_9: ptr = PTR_NULL(); PTR_BYTE_ADD(cp_9, &ctx.session_id, 0);
+    copy_text_to(&session_id, cp_9, &ctx.session_id_len, 128);
+    let cp_10: ptr = PTR_NULL(); PTR_BYTE_ADD(cp_10, &ctx.turn_id, 0);
+    copy_text_to(&turn_id, cp_10, &ctx.turn_id_len, 64);
     ctx.cwd_len = 0;
     let ci: u64 = 0;
     while ci < opts.cwd_len && ci < 512 {
@@ -643,11 +666,13 @@ fn fireLifecycleHook(g: &HookGlobals, mcp: &McpGlobals, event_name_ptr: ptr, eve
     if has_tool_name {
         let tn = TextBuf { bytes: [0u8; 32768], len: 0 };
         text_buf_append(&tn, tool_name_ptr, tool_name_len);
-        copy_text_to(&tn, &ctx.tool_name, &ctx.tool_name_len, 128);
+        let cp_11: ptr = PTR_NULL(); PTR_BYTE_ADD(cp_11, &ctx.tool_name, 0);
+        copy_text_to(&tn, cp_11, &ctx.tool_name_len, 128);
     } else {
         let tn = TextBuf { bytes: [0u8; 32768], len: 0 };
         text_buf_append(&tn, STR_PTR("lifecycle"), STR_LEN("lifecycle"));
-        copy_text_to(&tn, &ctx.tool_name, &ctx.tool_name_len, 128);
+        let cp_12: ptr = PTR_NULL(); PTR_BYTE_ADD(cp_12, &ctx.tool_name, 0);
+        copy_text_to(&tn, cp_12, &ctx.tool_name_len, 128);
     };
     // toolUseId: `${eventName}-${turnId}`
     let tuid = TextBuf { bytes: [0u8; 32768], len: 0 };
@@ -656,7 +681,8 @@ fn fireLifecycleHook(g: &HookGlobals, mcp: &McpGlobals, event_name_ptr: ptr, eve
     let tup: ptr = PTR_NULL();
     PTR_BYTE_ADD(tup, &turn_id.bytes, 0);
     text_buf_append(&tuid, tup, turn_id.len);
-    copy_text_to(&tuid, &ctx.tool_use_id, &ctx.tool_use_id_len, 128);
+    let cp_13: ptr = PTR_NULL(); PTR_BYTE_ADD(cp_13, &ctx.tool_use_id, 0);
+    copy_text_to(&tuid, cp_13, &ctx.tool_use_id_len, 128);
     // toolInput: opts.prompt ? { prompt: opts.prompt.slice(0, 4000) } : {}
     // DEFECT: JSON escaping of the prompt delegated to sa_json_* (bulk pass
     // copies bytes verbatim, as in runToolWithHooks).
@@ -670,18 +696,21 @@ fn fireLifecycleHook(g: &HookGlobals, mcp: &McpGlobals, event_name_ptr: ptr, eve
     } else {
         text_buf_append(&tinput, STR_PTR("{}"), STR_LEN("{}"));
     };
-    copy_text_to(&tinput, &ctx.tool_input_json, &ctx.tool_input_json_len, 8192);
+    let cp_14: ptr = PTR_NULL(); PTR_BYTE_ADD(cp_14, &ctx.tool_input_json, 0);
+    copy_text_to(&tinput, cp_14, &ctx.tool_input_json_len, 8192);
     ctx.sink = sink;
     // DEFECT: opts.callMcpRaw override (a caller-supplied closure) cannot be
     // stored; use_call_mcp_raw stays true and hooks.sla always routes to
     // mcp.sla's callMcpByServerRaw unless the handle is set, which this
     // conversion does not model.
     if opts.call_mcp_raw != 0 { };
-    let res = HookExecResult { hook_events_json: [0u8; 16384], hook_events_json_len: 0, blocked: false, has_block_reason: false, block_reason: [0u8; 2048], block_reason_len: 0, has_feedback: false, feedback: [0u8; 2048], feedback_len: 0, has_updated_input: false, updated_input_json: [0u8; 8192], updated_input_json_len: 0, additional_contexts_json: [0u8; 8192], additional_contexts_json_len: 0 };
-    let files = hookFilesLoaded();
-    let st = executeHooks(evp, events.len, files, event_name_ptr, event_name_len, &ctx, mcp, &res);
+    let res = McpHookExecResult { hook_events_json: [0u8; 16384], hook_events_json_len: 0, blocked: false, has_block_reason: false, block_reason: [0u8; 2048], block_reason_len: 0, has_feedback: false, feedback: [0u8; 2048], feedback_len: 0, has_updated_input: false, updated_input_json: [0u8; 8192], updated_input_json_len: 0, additional_contexts_json: [0u8; 8192], additional_contexts_json_len: 0 };
+    let lc_node_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(lc_node_p, &ctx.tool_input_json, 0);
+    let lc_node = sa_json_parse(lc_node_p, ctx.tool_input_json_len);
+    let st = mh_execute(&state, &events, &files_arr, files_len, event_idx, &ctx, lc_node, &res);
     if st != 0 {
-        println("[hook] infra error");
+        sa_print_bytes(STR_PTR("[hook] infra error"), STR_LEN("[hook] infra error"));
         return;
     };
     out.len = 0;
@@ -700,7 +729,292 @@ fn autoRemember(cwd_ptr: ptr, cwd_len: u64, tool_name_ptr: ptr, tool_name_len: u
     if has_note {
         let np: ptr = PTR_NULL();
         PTR_BYTE_ADD(np, &note.bytes, 0);
-        let st = appendMiniMemory(cwd_ptr, cwd_len, np, note.len);
-        if st != 0 { };
+        let mout = MemStr { bytes: [0u8; 16384], len: 0 };
+        appendMiniMemory(cwd_ptr, cwd_len, np, note.len, &mout);
     };
+}
+
+// =======================================================================
+// Fix-phase adapters (Agent M): the bulk pass modelled hooks.sla as a
+// JSON-text bridge (events/files/ctx/result all JSON text, executeHooks
+// taking (ptr, len, files, name text, ctx, mcp, res)). The real
+// hooks.sla API is struct-based: HookModuleState + HookEvents +
+// HookFileRef[] + event-name INDEX + HookExecCtx (JSON node handles) +
+// HookExecResult. The mh_* fns bridge mcpHooks' text model to it.
+// A fresh HookModuleState is built per pipeline call, so hooks'
+// 30 s cache does not persist across calls (perf-only divergence).
+// =======================================================================
+
+fn mh_ptr_from_u64(v: u64) -> ptr {
+    let np: ptr = PTR_NULL();
+    let out: ptr = PTR_NULL();
+    PTR_BYTE_ADD(out, np, v);
+    return out;
+}
+
+fn mh_event_index(name_ptr: ptr, name_len: u64) -> u64 {
+    let i: u64 = 0;
+    while i < 12 {
+        let nl: u64 = 0;
+        let np = HOOK_EVENT_NAMES_at(i, &nl);
+        if bytes_eq(np, nl, name_ptr, name_len) { return i; };
+        i = i + 1;
+    }
+    return 12;
+}
+
+fn mh_files(state: &HookModuleState, files_out: &[HookFileRef; 8]) -> u64 {
+    let paths: [u64; 8] = [0; 8];
+    let lens: [u64; 8] = [0; 8];
+    let srcs: [u64; 8] = [0; 8];
+    let n = hookFilesLoaded(state, &paths[0], &lens[0], &srcs[0]);
+    let i: u64 = 0;
+    while i < n && i < 8 {
+        files_out[i].path_ptr = mh_ptr_from_u64(paths[i]);
+        files_out[i].path_len = lens[i];
+        files_out[i].source = srcs[i];
+        i = i + 1;
+    }
+    return n;
+}
+
+fn mh_exec_ctx(ctx: &HookCtx, tool_input_node: u64, out: &HookExecCtx) -> void {
+    let p1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p1, &ctx.session_id, 0);
+    out.sessionId_ptr = p1;
+    out.sessionId_len = ctx.session_id_len;
+    let p2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p2, &ctx.turn_id, 0);
+    out.turnId_ptr = p2;
+    out.turnId_len = ctx.turn_id_len;
+    let p3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p3, &ctx.cwd, 0);
+    out.cwd_ptr = p3;
+    out.cwd_len = ctx.cwd_len;
+    let p4: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p4, &ctx.model, 0);
+    out.model_ptr = p4;
+    out.model_len = ctx.model_len;
+    let p5: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p5, &ctx.tool_name, 0);
+    out.toolName_ptr = p5;
+    out.toolName_len = ctx.tool_name_len;
+    let p6: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p6, &ctx.tool_use_id, 0);
+    out.toolUseId_ptr = p6;
+    out.toolUseId_len = ctx.tool_use_id_len;
+    out.toolInput_node = tool_input_node;
+    out.toolResponse_node = 0;
+    out.has_toolResponse = false;
+    if ctx.has_tool_response {
+        let rp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp, &ctx.tool_response_json, 0);
+        let doc = sa_json_parse(rp, ctx.tool_response_json_len);
+        if doc != 0 {
+            out.toolResponse_node = doc;
+            out.has_toolResponse = true;
+        };
+    };
+    out.callMcpRaw_id = 0;
+    if ctx.use_call_mcp_raw { out.callMcpRaw_id = 1; };
+    out.sink_id = ctx.sink;
+    out.has_sink = ctx.sink != 0;
+}
+
+fn mh_copy_field(sp: ptr, sl: u64, cap: u64, dst: ptr, dst_len: &u64) -> void {
+    let n = sl;
+    if n > cap { n = cap; };
+    let i: u64 = 0;
+    while i < n {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, sp, i);
+        let dp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp, dst, i);
+        PTR_WRITE_U8(dp, b);
+        i = i + 1;
+    }
+    *dst_len = n;
+}
+
+fn mh_num(out: &TextBuf, v: u64) -> void {
+    let nb = TextBuf { bytes: [0u8; 32768], len: 0 };
+    let nbp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(nbp, &nb.bytes, 0);
+    mj_u64_dec(v, nbp, &nb.len);
+    text_buf_append(out, nbp, nb.len);
+}
+
+fn mh_run_json(run: &HookRunSummary, out: &TextBuf) -> void {
+    // Serialise one HookRunSummary as JSON text (the McpHookExecResult
+    // transport form). Status/handler_type stay numeric codes — the
+    // TS string unions are hooks.sla's u64 codes in this port.
+    text_buf_append(out, STR_PTR("{\"event_name\":\""), STR_LEN("{\"event_name\":\""));
+    let nl: u64 = 0;
+    let np = HOOK_EVENT_NAMES_at(run.event_name, &nl);
+    mj_json_escape_into(out, np, nl);
+    text_buf_append(out, STR_PTR("\",\"handler_type\":"), STR_LEN("\",\"handler_type\":"));
+    mh_num(out, run.handler_type);
+    text_buf_append(out, STR_PTR(",\"status\":"), STR_LEN(",\"status\":"));
+    mh_num(out, run.status);
+    text_buf_append(out, STR_PTR(",\"source_path\":\""), STR_LEN(",\"source_path\":\""));
+    mj_json_escape_into(out, run.source_path_ptr, run.source_path_len);
+    text_buf_append(out, STR_PTR("\",\"display_order\":"), STR_LEN("\",\"display_order\":"));
+    mh_num(out, run.display_order);
+    text_buf_append(out, STR_PTR(",\"entries\":["), STR_LEN(",\"entries\":["));
+    let i: u64 = 0;
+    while i < run.entries_len {
+        if i > 0 { text_buf_append(out, STR_PTR(","), STR_LEN(",")); };
+        text_buf_append(out, STR_PTR("{\"kind\":"), STR_LEN("{\"kind\":"));
+        mh_num(out, run.entries[i].kind);
+        text_buf_append(out, STR_PTR(",\"text\":\""), STR_LEN(",\"text\":\""));
+        mj_json_escape_into(out, run.entries[i].text_ptr, run.entries[i].text_len);
+        text_buf_append(out, STR_PTR("\"}"), STR_LEN("\"}"));
+        i = i + 1;
+    }
+    text_buf_append(out, STR_PTR("]}"), STR_LEN("]}"));
+}
+
+fn mh_map_result(res: &HookExecResult, out: &McpHookExecResult) -> void {
+    out.blocked = res.blocked;
+    out.has_block_reason = res.has_blockReason;
+    if res.has_blockReason {
+        let dp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp, &out.block_reason, 0);
+        mh_copy_field(res.blockReason_ptr, res.blockReason_len, 2048, dp, &out.block_reason_len);
+    } else {
+        out.block_reason_len = 0;
+    };
+    out.has_feedback = res.has_feedback;
+    if res.has_feedback {
+        let dp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp2, &out.feedback, 0);
+        mh_copy_field(res.feedback_ptr, res.feedback_len, 2048, dp2, &out.feedback_len);
+    } else {
+        out.feedback_len = 0;
+    };
+    out.has_updated_input = res.has_updatedInput;
+    out.updated_input_json_len = 0;
+    if res.has_updatedInput && res.updatedInput_node != 0 {
+        let dp3: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp3, &out.updated_input_json, 0);
+        let ok = mj_node_text(res.updatedInput_node, 8192, dp3, &out.updated_input_json_len);
+        if !ok { out.has_updated_input = false; out.updated_input_json_len = 0; };
+    };
+    // additionalContexts -> JSON array text
+    let ac = TextBuf { bytes: [0u8; 32768], len: 0 };
+    text_buf_append(&ac, STR_PTR("["), STR_LEN("["));
+    let i: u64 = 0;
+    while i < res.additionalContexts_len {
+        if i > 0 { text_buf_append(&ac, STR_PTR(","), STR_LEN(",")); };
+        text_buf_append(&ac, STR_PTR("\""), STR_LEN("\""));
+        mj_json_escape_into(&ac, res.additionalContexts_ptr[i], res.additionalContexts_len_field[i]);
+        text_buf_append(&ac, STR_PTR("\""), STR_LEN("\""));
+        i = i + 1;
+    }
+    text_buf_append(&ac, STR_PTR("]"), STR_LEN("]"));
+    let acp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(acp, &out.additional_contexts_json, 0);
+    let acs: ptr = PTR_NULL();
+    PTR_BYTE_ADD(acs, &ac.bytes, 0);
+    mh_copy_field(acs, ac.len, 8192, acp, &out.additional_contexts_json_len);
+    // hookEvents -> JSON array text of completed events
+    let he = TextBuf { bytes: [0u8; 32768], len: 0 };
+    text_buf_append(&he, STR_PTR("["), STR_LEN("["));
+    let j: u64 = 0;
+    while j < res.hookEvents_len {
+        if j > 0 { text_buf_append(&he, STR_PTR(","), STR_LEN(",")); };
+        let ev = &res.hookEvents[j];
+        text_buf_append(&he, STR_PTR("{\"turn_id\":"), STR_LEN("{\"turn_id\":"));
+        if ev.has_turn_id {
+            text_buf_append(&he, STR_PTR("\""), STR_LEN("\""));
+            mj_json_escape_into(&he, ev.turn_id_ptr, ev.turn_id_len);
+            text_buf_append(&he, STR_PTR("\""), STR_LEN("\""));
+        } else {
+            text_buf_append(&he, STR_PTR("null"), STR_LEN("null"));
+        };
+        text_buf_append(&he, STR_PTR(",\"run\":"), STR_LEN(",\"run\":"));
+        mh_run_json(&ev.run, &he);
+        text_buf_append(&he, STR_PTR("}"), STR_LEN("}"));
+        j = j + 1;
+    }
+    text_buf_append(&he, STR_PTR("]"), STR_LEN("]"));
+    let hep: ptr = PTR_NULL();
+    PTR_BYTE_ADD(hep, &out.hook_events_json, 0);
+    let hes: ptr = PTR_NULL();
+    PTR_BYTE_ADD(hes, &he.bytes, 0);
+    mh_copy_field(hes, he.len, 16384, hep, &out.hook_events_json_len);
+}
+
+fn mh_execute(state: &HookModuleState, events: &HookEvents, files: &[HookFileRef; 8], files_len: u64, event_idx: u64, ctx: &HookCtx, tool_input_node: u64, out: &McpHookExecResult) -> i32 {
+    let hctx = HookExecCtx { sessionId_ptr: PTR_NULL(), sessionId_len: 0, turnId_ptr: PTR_NULL(), turnId_len: 0, cwd_ptr: PTR_NULL(), cwd_len: 0, model_ptr: PTR_NULL(), model_len: 0, toolName_ptr: PTR_NULL(), toolName_len: 0, toolUseId_ptr: PTR_NULL(), toolUseId_len: 0, toolInput_node: 0, toolResponse_node: 0, has_toolResponse: false, callMcpRaw_id: 0, sink_id: 0, has_sink: false };
+    mh_exec_ctx(ctx, tool_input_node, &hctx);
+    let res = HookExecResult { blocked: false, blockReason_ptr: PTR_NULL(), blockReason_len: 0, has_blockReason: false, updatedInput_node: 0, has_updatedInput: false, additionalContexts_ptr: [PTR_NULL(); 32], additionalContexts_len_field: [0; 32], additionalContexts_len: 0, feedback_ptr: PTR_NULL(), feedback_len: 0, has_feedback: false, hookEvents: [HookCompletedEvent { turn_id_ptr: PTR_NULL(), turn_id_len: 0, has_turn_id: false, run: HookRunSummary { id_ptr: PTR_NULL(), id_len: 0, event_name: 0, handler_type: 0, execution_mode: 0, scope: 0, source_path_ptr: PTR_NULL(), source_path_len: 0, source: 0, display_order: 0, status: 0, status_message_ptr: PTR_NULL(), status_message_len: 0, has_status_message: false, started_at: 0, completed_at: 0, has_completed_at: false, duration_ms: 0, has_duration_ms: false, entries: [HookOutputEntry { kind: 0, text_ptr: PTR_NULL(), text_len: 0 }; 32], entries_len: 0 } }; 64], hookEvents_len: 0 };
+    let st = executeHooks(state, events, &files[0], files_len, event_idx, &hctx, &res);
+    if st == 0 { mh_map_result(&res, out); };
+    return st;
+}
+
+fn mh_tool_input(args_ptr: ptr, args_len: u64, out: &TextBuf) -> void {
+    // Real mcpHookToolInput is node -> node (hooks.sla); the text form
+    // parses, converts, and stringifies back.
+    out.len = 0;
+    let doc = sa_json_parse(args_ptr, args_len);
+    let node = doc;
+    if node == 0 { node = sa_json_parse(STR_PTR("{}"), STR_LEN("{}")); };
+    let conv = mcpHookToolInput(node);
+    let op: ptr = PTR_NULL();
+    PTR_BYTE_ADD(op, &out.bytes, 0);
+    let ok = mj_node_text(conv, 32768, op, &out.len);
+    if !ok { text_buf_append(out, STR_PTR("{}"), STR_LEN("{}")); };
+}
+
+fn mh_arr_extend(dst_p: ptr, dst_len: &u64, src_p: ptr, src_len: u64) -> void {
+    // Append all elements of the src JSON array text to the dst one.
+    let ddoc = sa_json_parse(dst_p, *dst_len);
+    if ddoc == 0 { return; };
+    let sdoc = sa_json_parse(src_p, src_len);
+    if sdoc == 0 { sa_json_free(ddoc); return; };
+    if sa_json_kind(ddoc) == 6 && sa_json_kind(sdoc) == 6 {
+        let n: u64 = 0;
+        if sa_json_value_count(sdoc, &n) == 0 {
+            let i: u64 = 0;
+            while i < n {
+                let node: u64 = 0;
+                if sa_json_array_get(sdoc, i, &node) == 0 {
+                    let st = sa_json_array_push_node(ddoc, node);
+                };
+                i = i + 1;
+            }
+        };
+    };
+    sa_json_free(sdoc);
+    let h: u64 = 0;
+    if sa_json_stringify(ddoc, &h) == 0 && h != 0 {
+        let bp: ptr = sa_json_buffer_data(h);
+        let bl: u64 = sa_json_buffer_len(h);
+        mj_copy_cap(bp, bl, 32768, dst_p, dst_len);
+        sa_json_buffer_free(h);
+    };
+    sa_json_free(ddoc);
+}
+
+fn mh_random_uuid(out_p: ptr, out_len: &u64) -> void {
+    let h = sa_deno_random_uuid();
+    if h == 0 { *out_len = 0; return; };
+    let p: ptr = sa_fmt_buffer_data(h);
+    let n: u64 = sa_fmt_buffer_len(h);
+    mj_copy_cap(p, n, 32768, out_p, out_len);
+    sa_fmt_buffer_free(h);
+}
+
+fn mh_exec_non_mcp(handle: u64, name_ptr: ptr, name_len: u64, args_ptr: ptr, args_len: u64, cwd_ptr: ptr, cwd_len: u64, out_p: ptr, out_len: &u64, err_p: ptr, err_len: &u64) -> i32 {
+    // Host boundary: opts.execNonMcp is a host-supplied tool runner
+    // callback (HookedToolRunner). No SLA registry exists for it yet,
+    // so the dispatch fails explicitly (the caller surfaces it as a
+    // tool error) instead of silently succeeding.
+    *out_len = 0;
+    let msg = STR_PTR("execNonMcp dispatch is not wired in the SLA port yet");
+    let ml = STR_LEN("execNonMcp dispatch is not wired in the SLA port yet");
+    mj_copy(msg, ml, err_p, err_len);
+    return 1;
 }

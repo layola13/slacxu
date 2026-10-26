@@ -1,8 +1,10 @@
 // Converted 1:1 from mini-codex/src/skills.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
 @import "sa_std/io/print.sai"
 @import "sa_std/ptr.sa"
-// DEFECT: Node API | node:fs/promises readdir/readFile and node:path join/resolve approximated via sa_std fs externs (sa_std_fs_list_names / sa_std_fs_is_dir / sa_std_fs_read) plus byte-wise path helpers.
-// @import "sa_std/fs.sai"
+@import "sa_std/string.sa"
+// DEFECT: Node API | node:fs/promises readdir/readFile and node:path join/resolve bound to sa_std fs externs: readdir -> sa_std_fs_read_dir_json (JSON array of name strings, flattened by skillListNames), Dirent.isDirectory -> sa_std_fs_metadata + sa_fs_metadata_is_directory (skillIsDir), readFile -> sa_std_fs_open_read + sa_std_fs_file_read + sa_fs_file_close (skillReadFile); plus byte-wise path helpers.
+@import "sa_std/fs.sai"
+@import "sa_std/encoding/json.sai"
 
 // SkillEntry = { name: string; description: string; path: string } (TS line 4).
 struct SkillEntry {
@@ -84,6 +86,61 @@ fn joinPath(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64, out: &SkillStr) {
 // TS lines 8-21: parseFrontmatter(md: string): { name?: string; description?: string }
 // DEFECT: regex | frontmatter regex /^---\s*\r?\n([\s\S]*?)\r?\n---/ and per-line /^\s*(name|description)\s*:\s*(.*?)\s*$/ and quote-strip regex have no regex engine; approximated with line scanning and manual quote stripping.
 // DEFECT: string methods | toLowerCase() and replace(/_/g, "-") approximated byte-wise (ASCII).
+// readdir(path) names: read_dir_json yields a JSON array of entry-name
+// strings; flattened here into the newline-separated buffer scanSkills
+// consumes. False on any failure (TS: try/catch -> skip the root).
+fn skillListNames(rdp: ptr, rd_len: u64, names: &SkillStr) -> bool {
+    names.len = 0;
+    let dh: u64 = 0;
+    if sa_std_fs_read_dir_json(rdp, rd_len, 1024, &dh) != 0 { return false; };
+    let lp: ptr = sa_fs_dir_buffer_data(dh);
+    let ll = sa_fs_dir_buffer_len(dh);
+    let doc = sa_json_parse(lp, ll);
+    if doc == 0 {
+        sa_fs_dir_buffer_free(dh);
+        return false;
+    };
+    let n: u64 = 0;
+    if sa_json_value_count(doc, &n) != 0 { n = 0; };
+    let i: u64 = 0;
+    while i < n {
+        let en: u64 = 0;
+        if sa_json_array_get(doc, i, &en) != 0 { break; };
+        let e_np: ptr = sa_json_string_ptr(en);
+        let e_nl = sa_json_string_len(en);
+        if e_nl > 0 {
+            skillStrPush(names, e_np, e_nl);
+            skillStrPushByte(names, 10);
+        };
+        i = i + 1;
+    }
+    sa_json_free(doc);
+    sa_fs_dir_buffer_free(dh);
+    return true;
+}
+
+// Dirent.isDirectory() via the sa_std metadata handle.
+fn skillIsDir(p: ptr, n: u64) -> bool {
+    let md: u64 = 0;
+    if sa_std_fs_metadata(p, n, &md) != 0 { return false; };
+    let r = sa_fs_metadata_is_directory(md) != 0;
+    sa_std_fs_metadata_free(md);
+    return r;
+}
+
+// readFile(path, "utf8") into a fixed buffer; false on any failure.
+fn skillReadFile(p: ptr, n: u64, out: &SkillStr) -> bool {
+    out.len = 0;
+    let fh: u64 = 0;
+    if sa_std_fs_open_read(p, n, &fh) != 0 { return false; };
+    let rd: u64 = 0;
+    let rst = sa_std_fs_file_read(fh, &out.bytes, 16384, &rd);
+    sa_fs_file_close(fh);
+    if rst != 0 { return false; };
+    out.len = rd;
+    return true;
+}
+
 fn parseFrontmatter(md_ptr: ptr, md_len: u64, out: &Frontmatter) {
     out.has_name = false;
     out.has_description = false;
@@ -241,7 +298,7 @@ fn validSkillName(n_ptr: ptr, n_len: u64) -> bool {
 
 // TS lines 23-42: export async function scanSkills(cwd: string): Promise<SkillEntry[]>
 // DEFECT: async | async/await + Promise removed; the function is synchronous and fills `found` in place.
-// DEFECT: Node API | readdir(..., { withFileTypes: true }) Dirent objects approximated by a newline-separated name listing (sa_std_fs_list_names) plus per-entry is_dir checks; per-entry try/catch approximated by status checks.
+// DEFECT: Node API | readdir(..., { withFileTypes: true }) Dirent objects: names via skillListNames (read_dir_json flattened to a newline-separated listing) plus per-entry skillIsDir metadata checks; per-entry try/catch approximated by status checks.
 // DEFECT: dynamic array | found.push/slice(0, 50) approximated over the fixed-capacity SkillList.
 fn scanSkills(cwd_ptr: ptr, cwd_len: u64, found: &SkillList) {
     found.len = 0;
@@ -257,7 +314,7 @@ fn scanSkills(cwd_ptr: ptr, cwd_len: u64, found: &SkillList) {
         PTR_BYTE_ADD(rdp, &root_dir.bytes, 0);
         // let entries; try { entries = await readdir(...) } catch { continue }
         let names = SkillStr { bytes: [0u8; 16384], len: 0 };
-        let ok = sa_std_fs_list_names(rdp, root_dir.len, &names.bytes, 16384, &names.len);
+        let ok = skillListNames(rdp, root_dir.len, &names);
         if ok {
             // Entries are newline-separated in `names`.
             let pos: u64 = 0;
@@ -281,7 +338,7 @@ fn scanSkills(cwd_ptr: ptr, cwd_len: u64, found: &SkillList) {
                 joinPath(rdp, root_dir.len, ep, e_len, &entry_dir);
                 let edp: ptr = PTR_NULL();
                 PTR_BYTE_ADD(edp, &entry_dir.bytes, 0);
-                if !sa_std_fs_is_dir(edp, entry_dir.len) { continue; };
+                if !skillIsDir(edp, entry_dir.len) { continue; };
                 // const p = join(cwd, root, e.name, "SKILL.md");
                 let pbuf = SkillStr { bytes: [0u8; 16384], len: 0 };
                 joinPath(edp, entry_dir.len, STR_PTR("SKILL.md"), STR_LEN("SKILL.md"), &pbuf);
@@ -289,7 +346,7 @@ fn scanSkills(cwd_ptr: ptr, cwd_len: u64, found: &SkillList) {
                 PTR_BYTE_ADD(pp, &pbuf.bytes, 0);
                 // try { const md = await readFile(p, "utf8"); ... } catch {}
                 let md = SkillStr { bytes: [0u8; 16384], len: 0 };
-                let rok = sa_std_fs_read(pp, pbuf.len, &md.bytes, 16384, &md.len);
+                let rok = skillReadFile(pp, pbuf.len, &md);
                 if rok {
                     let mp: ptr = PTR_NULL();
                     PTR_BYTE_ADD(mp, &md.bytes, 0);
@@ -439,7 +496,9 @@ fn expandSlash(text_ptr: ptr, text_len: u64, skills: &SkillList, out: &SkillStr)
     skillStrPush(out, hpp, h.path_len);
     skillStrPush(out, STR_PTR("]\n"), STR_LEN("]\n"));
     // ${m[2] ?? ""}
-    skillStrPush(out, text_ptr + i, text_len - i);
+    let rest_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rest_p, text_ptr, i);
+    skillStrPush(out, rest_p, text_len - i);
     // .trim() — approximated: drop trailing whitespace bytes.
     while out.len > 0 {
         let c = out.bytes[out.len - 1];
@@ -457,7 +516,7 @@ fn readSkillBody(entry: &SkillEntry, out: &SkillStr) {
     let ep: ptr = PTR_NULL();
     PTR_BYTE_ADD(ep, &entry.path, 0);
     let md = SkillStr { bytes: [0u8; 16384], len: 0 };
-    sa_std_fs_read(ep, entry.path_len, &md.bytes, 16384, &md.len);
+    skillReadFile(ep, entry.path_len, &md);
     let mp: ptr = PTR_NULL();
     PTR_BYTE_ADD(mp, &md.bytes, 0);
     if md.len > 12000 {
@@ -494,7 +553,9 @@ fn readSkillBody(entry: &SkillEntry, out: &SkillStr) {
                 PTR_BYTE_AT(c, mp, ls);
                 if c == 35 { // '#'
                     if heads > 0 { skillStrPushByte(out, 10); };
-                    skillStrPush(out, mp + ls, pos - ls);
+                    let line_p: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(line_p, mp, ls);
+                    skillStrPush(out, line_p, pos - ls);
                     heads = heads + 1;
                 };
             };
