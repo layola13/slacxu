@@ -3,6 +3,9 @@
 @import "sa_std/time.sai"
 @import "sa_std/string.sa"
 @import "sa_std/ts_math.sa"
+@import "sa_std/crypto.sai"
+@import "sa_std/env.sai"
+@import "sa_std/fmt.sai"
 @import "convert.sla"
 @import "vqd.sla"
 
@@ -63,10 +66,23 @@ fn backoff_ms(retry_number: u64) -> u64 {
 // reproduced here.
 fn random_hex(out: &ByteBuf, byte_length: u64) -> void {
     buf_reset(out);
-    if sa_crypto_random_hex(&out.bytes, byte_length, &out.len) != 0 {
-        // DEFECT: Date.now().toString(16) — lowercase hex of epoch ms.
+    // TS source adjudication (upstream.ts:73-75): randomHex is
+    // randomBytes(byteLength).toString("hex") from node:crypto — a
+    // cryptographic use. The intent extern sa_crypto_random_hex does
+    // not exist, but the OS CSPRNG does: sa_crypto_random_bytes
+    // (crypto.sai, std wave 2). Failure (or an oversized request)
+    // keeps the TS fallback: Date.now().toString(16).
+    let tmp: [u8; 512] = [0u8; 512];
+    if byte_length > 512 || sa_crypto_random_bytes(&tmp, byte_length) != 0 {
         buf_append_hex_u64(out, (sa_time_unix_ms() as u64));
+        return;
     };
+    let digits = STR_PTR("0123456789abcdef");
+    for i in 0..byte_length {
+        let b = tmp[i] as u64;
+        buf_append_byte(out, PTR_BYTE_AT(digits, b >> 4));
+        buf_append_byte(out, PTR_BYTE_AT(digits, b & 15));
+    }
 }
 
 // TS: class Jar — minimal cookie jar: name=value pairs per proxy session.
@@ -168,6 +184,19 @@ fn is_duck_fetch_degraded(state: &UpstreamState) -> bool {
     return state.fetch_degraded;
 }
 
+// Real env surface (env.sai): sa_env_get(key, klen) -> u64 handle
+// (0 = unset) + sa_env_buffer_data/len/free. The converter's
+// sa_env_get(&buf, key, klen) out-param form does not exist.
+fn env_read_buf(out: &ByteBuf, kp: ptr, kl: u64) -> void {
+    buf_reset(out);
+    let h = sa_env_get(kp, kl);
+    if h != 0 {
+        let p: ptr = sa_env_buffer_data(h);
+        buf_append_lit(out, p, sa_env_buffer_len(h));
+        sa_env_buffer_free(h);
+    };
+}
+
 // TS: async function getFetch(): Promise<FetchFn>
 // Resolves the transport once: DUCK_FETCH != "native" tries the
 // impersonating fetch (preset DUCK_IMPERSONATE_TARGET ?? "chrome146") and
@@ -176,7 +205,7 @@ fn is_duck_fetch_degraded(state: &UpstreamState) -> bool {
 fn get_fetch(state: &UpstreamState) -> void {
     if state.fetch_ready { return; };
     let mode = ByteBuf { bytes: [0u8; 40960], len: 0 };
-    sa_env_get(&mode, STR_PTR("DUCK_FETCH"), STR_LEN("DUCK_FETCH"));
+    env_read_buf(&mode, STR_PTR("DUCK_FETCH"), STR_LEN("DUCK_FETCH"));
     if mode.len == 0 { buf_append_lit(&mode, STR_PTR("impersonate"), STR_LEN("impersonate")); };
     buf_to_lower(&mode);
     state.fetch_degraded = false;
@@ -184,7 +213,7 @@ fn get_fetch(state: &UpstreamState) -> void {
     PTR_BYTE_ADD(__ap140, mode.bytes, 0);
     if !bytes_eq_str(__ap140, mode.len, STR_PTR("native"), STR_LEN("native")) {
         let preset = ByteBuf { bytes: [0u8; 40960], len: 0 };
-        sa_env_get(&preset, STR_PTR("DUCK_IMPERSONATE_TARGET"), STR_LEN("DUCK_IMPERSONATE_TARGET"));
+        env_read_buf(&preset, STR_PTR("DUCK_IMPERSONATE_TARGET"), STR_LEN("DUCK_IMPERSONATE_TARGET"));
         if preset.len == 0 { buf_append_lit(&preset, STR_PTR("chrome146"), STR_LEN("chrome146")); };
         if sa_http_impersonate_available(&preset.bytes, preset.len) != 0 {
             state.fetch_degraded = true;
@@ -316,7 +345,9 @@ fn create_fe_signals(out: &ByteBuf, now_ms: u64) -> void {
     buf_append_lit(&payload, STR_PTR("}"), STR_LEN("}"));
     buf_reset(out);
     // DEFECT: Buffer.from(json, "utf8").toString("base64") — intent extern.
-    sa_base64_encode(&payload.bytes, payload.len, out);
+    let __ap_b64u: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_b64u, payload.bytes, 0);
+    sa_base64_encode(__ap_b64u, payload.len, out);
 }
 
 // TS: async function fetchFEVersion(session): Promise<string>
@@ -638,8 +669,14 @@ fn post_conversation(state: &UpstreamState, out: &ConversationResult, request: &
         res = 0;
         reset_session(state, proxy_ptr, proxy_len);
         let retry_idx = session_for(state, proxy_ptr, proxy_len);
-        sa_crypto_random_uuid(&request.durable_message_id.bytes, &request.durable_message_id.len);
-        sa_crypto_random_uuid(&request.durable_conversation_id.bytes, &request.durable_conversation_id.len);
+        let uuid_ha = sa_deno_random_uuid();
+        let uuid_pa: ptr = sa_fmt_buffer_data(uuid_ha);
+        str_field_set(&request.durable_message_id, uuid_pa, sa_fmt_buffer_len(uuid_ha));
+        sa_fmt_buffer_free(uuid_ha);
+        let uuid_hb = sa_deno_random_uuid();
+        let uuid_pb: ptr = sa_fmt_buffer_data(uuid_hb);
+        str_field_set(&request.durable_conversation_id, uuid_pb, sa_fmt_buffer_len(uuid_hb));
+        sa_fmt_buffer_free(uuid_hb);
         let retry_token = ByteBuf { bytes: [0u8; 40960], len: 0 };
         let rst: u64 = 0;
         let rrc = fetch_xvqd(state, retry_idx, &retry_token, &rst);
@@ -691,8 +728,14 @@ fn post_conversation(state: &UpstreamState, out: &ConversationResult, request: &
         sa_sleep_ms(backoff_ms(1));
         reset_session(state, proxy_ptr, proxy_len);
         let retry_idx = session_for(state, proxy_ptr, proxy_len);
-        sa_crypto_random_uuid(&request.durable_message_id.bytes, &request.durable_message_id.len);
-        sa_crypto_random_uuid(&request.durable_conversation_id.bytes, &request.durable_conversation_id.len);
+        let uuid_ha = sa_deno_random_uuid();
+        let uuid_pa: ptr = sa_fmt_buffer_data(uuid_ha);
+        str_field_set(&request.durable_message_id, uuid_pa, sa_fmt_buffer_len(uuid_ha));
+        sa_fmt_buffer_free(uuid_ha);
+        let uuid_hb = sa_deno_random_uuid();
+        let uuid_pb: ptr = sa_fmt_buffer_data(uuid_hb);
+        str_field_set(&request.durable_conversation_id, uuid_pb, sa_fmt_buffer_len(uuid_hb));
+        sa_fmt_buffer_free(uuid_hb);
         let fresh = ByteBuf { bytes: [0u8; 40960], len: 0 };
         let fst: u64 = 0;
         let frc = fetch_xvqd(state, retry_idx, &fresh, &fst);
