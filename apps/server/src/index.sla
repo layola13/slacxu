@@ -6,6 +6,17 @@
 
 @import "sa_std/io/print.sai"
 @import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/env.sai"
+@import "sa_std/time.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/math.sai"
+// F3 (fix phase): std surfaces wired for the retranslated functions in this
+// unit — JSON registry maps (encoding/json.sai), env/exe/cwd (env.sai),
+// Date.now (time.sai), existsSync probing (fs.sai), randomInt seed (math.sai),
+// byte access (ptr.sa). fs.sai is imported directly: .sai externs do not
+// propagate transitively through .sla imports (FIX_PHASE1 playbook).
 
 // @import "./pluginHost.sla"            // cliDiscoveryForKind, cliPluginIdForSettingsSlug, cliSettingsEntries, cliSettingsLinks, pluginCatalog, serverPluginRegistry, setPluginInstalled
 // @import "./sshCodeCliBridge.sla"      // prepareSshCodeCliLauncher, terminateSshCodeCliChild, SshCodeCliLauncher
@@ -123,16 +134,463 @@ struct HttpApiError {
 }
 
 fn HttpApiError_new(out: &HttpApiError, status: i32, message_ptr: ptr, message_len: u64, code_ptr: ptr, code_len: u64, has_code: bool) -> void {
+    // src/index.ts:298-307: super(message) sets Error.message; this.name is
+    // "HttpApiError"; status/code are readonly fields. Fixed-buffer model:
+    // message/code are byte-copied, truncated at buffer capacity.
     out.status = status;
     out.has_code = has_code;
-    // DEFECT: string copy into fixed buffers (TS string is heap/UTF-16); byte-wise copy approximation.
+    let mlen = message_len;
+    if mlen > 1024 { mlen = 1024; };
+    let i: u64 = 0;
+    while i < mlen {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, message_ptr, i);
+        out.message[i] = c;
+        i = i + 1;
+    }
+    out.message_len = mlen;
+    let clen: u64 = 0;
+    if has_code {
+        clen = code_len;
+        if clen > 128 { clen = 128; };
+        let j: u64 = 0;
+        while j < clen {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, code_ptr, j);
+            out.code[j] = c;
+            j = j + 1;
+        }
+    };
+    out.code_len = clen;
+    let nlen = STR_LEN("HttpApiError");
+    let k: u64 = 0;
+    while k < nlen {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, STR_PTR("HttpApiError"), k);
+        out.name[k] = c;
+        k = k + 1;
+    }
+    out.name_len = nlen;
 }
 
+// ---- F3 helpers (unit-local; support the retranslated functions below) ----
+// Text buffer used for string building (turn keys, client ids, path work).
+struct IdxTextBuf {
+    bytes: [u8; 8192],
+    len: u64,
+}
+
+fn idx_tb_reset(b: &IdxTextBuf) -> void {
+    b.len = 0;
+}
+
+fn idx_tb_push_byte(b: &IdxTextBuf, c: u8) -> void {
+    // Saturating append: buffer capacity is the unit's fixed-size model limit.
+    if b.len < 8192 {
+        b.bytes[b.len] = c;
+        b.len = b.len + 1;
+    };
+}
+
+fn idx_tb_push(b: &IdxTextBuf, s_ptr: ptr, s_len: u64) -> void {
+    let i: u64 = 0;
+    while i < s_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, s_ptr, i);
+        idx_tb_push_byte(b, c);
+        i = i + 1;
+    }
+}
+
+fn idx_tb_push_range(b: &IdxTextBuf, s_ptr: ptr, from: u64, to: u64) -> void {
+    let i = from;
+    while i < to {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, s_ptr, i);
+        idx_tb_push_byte(b, c);
+        i = i + 1;
+    }
+}
+
+fn idx_tb_copy(dst: &IdxTextBuf, src: &IdxTextBuf) -> void {
+    idx_tb_reset(dst);
+    let i: u64 = 0;
+    while i < src.len {
+        idx_tb_push_byte(dst, src.bytes[i]);
+        i = i + 1;
+    }
+}
+
+fn idx_hex_digit(n: u8) -> u8 {
+    if n < 10 { return 48 + n; };
+    return 87 + n;
+}
+
+// JSON.stringify escaping for a string body: quotes, backslash and control
+// characters are escaped; all other bytes pass through (UTF-8 content is
+// emitted raw by JSON.stringify as well).
+fn idx_tb_push_escaped(b: &IdxTextBuf, s_ptr: ptr, s_len: u64) -> void {
+    let i: u64 = 0;
+    while i < s_len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, s_ptr, i);
+        if c == 34 {
+            idx_tb_push(b, STR_PTR("\\\""), STR_LEN("\\\""));
+        } else if c == 92 {
+            idx_tb_push(b, STR_PTR("\\\\"), STR_LEN("\\\\"));
+        } else if c == 10 {
+            idx_tb_push(b, STR_PTR("\\n"), STR_LEN("\\n"));
+        } else if c == 13 {
+            idx_tb_push(b, STR_PTR("\\r"), STR_LEN("\\r"));
+        } else if c == 9 {
+            idx_tb_push(b, STR_PTR("\\t"), STR_LEN("\\t"));
+        } else if c < 32 {
+            idx_tb_push(b, STR_PTR("\\u00"), STR_LEN("\\u00"));
+            idx_tb_push_byte(b, idx_hex_digit(c / 16));
+            idx_tb_push_byte(b, idx_hex_digit(c % 16));
+        } else {
+            idx_tb_push_byte(b, c);
+        };
+        i = i + 1;
+    }
+}
+
+fn idx_tb_push_i64(b: &IdxTextBuf, v: i64) -> void {
+    let x: u64 = 0;
+    if v < 0 {
+        idx_tb_push_byte(b, 45);
+        x = (0 - v) as u64;
+    } else {
+        x = v as u64;
+    };
+    if x == 0 {
+        idx_tb_push_byte(b, 48);
+        return;
+    };
+    let digits: [u8; 24] = [0u8; 24];
+    let n: u64 = 0;
+    while x > 0 {
+        let d = (x % 10) as u8;
+        digits[n] = d + 48;
+        n = n + 1;
+        x = x / 10;
+    }
+    while n > 0 {
+        n = n - 1;
+        idx_tb_push_byte(b, digits[n]);
+    }
+}
+
+// Parses the buffer (which must hold one complete JSON string literal, quotes
+// included) and delivers its document handle through out.
+fn idx_tb_json_string(b: &IdxTextBuf, out: &u64) -> void {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &b.bytes, 0);
+    let h = sa_json_parse(p, b.len);
+    *out = h;
+}
+
+// Builds the JSON string node handle for a raw byte string (the SLA model for
+// a returned TS string in this unit's JSON-registry functions).
+fn idx_json_string_handle(s_ptr: ptr, s_len: u64, out: &u64) -> void {
+    let tb: IdxTextBuf = IdxTextBuf { bytes: [0u8; 8192], len: 0 };
+    idx_tb_push_byte(&tb, 34);
+    idx_tb_push_escaped(&tb, s_ptr, s_len);
+    idx_tb_push_byte(&tb, 34);
+    idx_tb_json_string(&tb, out);
+}
+
+// Builds the JSON string node handle for a text buffer's raw bytes.
+fn idx_tb_string_handle(b: &IdxTextBuf, out: &u64) -> void {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &b.bytes, 0);
+    idx_json_string_handle(p, b.len, out);
+}
+
+fn idx_bytes_eq(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    let i: u64 = 0;
+    while i < a_len {
+        let x: u8 = 0;
+        PTR_BYTE_AT(x, a_ptr, i);
+        let y: u8 = 0;
+        PTR_BYTE_AT(y, b_ptr, i);
+        if x != y { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn idx_byte_lower(c: u8) -> u8 {
+    if c >= 65 && c <= 90 { return c + 32; };
+    return c;
+}
+
+// Case-insensitive compare of a[from..to] against b (ASCII case folding, the
+// /i flag semantics for the ASCII env values this unit compares).
+fn idx_bytes_eq_ci_range(a_ptr: ptr, from: u64, to: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if to - from != b_len { return false; };
+    let i: u64 = 0;
+    while i < b_len {
+        let x: u8 = 0;
+        PTR_BYTE_AT(x, a_ptr, from + i);
+        let y: u8 = 0;
+        PTR_BYTE_AT(y, b_ptr, i);
+        if idx_byte_lower(x) != idx_byte_lower(y) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn idx_is_ascii_ws(c: u8) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 11 || c == 12 || c == 13;
+}
+
+fn idx_json_doc() -> u64 {
+    return sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+}
+
+fn idx_json_arr() -> u64 {
+    return sa_json_parse(STR_PTR("[]"), STR_LEN("[]"));
+}
+
+// stringValue(record[key]) with asRecord semantics: succeeds only when node is
+// an object and the field is a JSON string; the (ptr,len) stay valid while the
+// owning document is not mutated (arena rule, FIX_PHASE1).
+fn idx_json_get_string(node: u64, key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    *out_len = 0;
+    if node == 0 { return false; };
+    if sa_json_kind(node) != 7 { return false; };
+    let child: u64 = 0;
+    let st = sa_json_object_get(node, key_ptr, key_len, &child);
+    if st != 0 || child == 0 { return false; };
+    if sa_json_kind(child) != 5 { return false; };
+    let p: ptr = sa_json_string_ptr(child);
+    *out_ptr = p;
+    *out_len = sa_json_string_len(child);
+    return true;
+}
+
+// Map<string, Set<string>>.add over a JSON object document (values are JSON
+// string arrays), with Set dedup.
+fn idx_strset_add(doc: u64, key_ptr: ptr, key_len: u64, val_ptr: ptr, val_len: u64) -> void {
+    let arr: u64 = 0;
+    let st = sa_json_object_get(doc, key_ptr, key_len, &arr);
+    let created = false;
+    if st != 0 || arr == 0 || sa_json_kind(arr) != 6 {
+        arr = idx_json_arr();
+        created = true;
+    };
+    let cnt: u64 = 0;
+    sa_json_value_count(arr, &cnt);
+    let found = false;
+    let i: u64 = 0;
+    while i < cnt {
+        let n: u64 = 0;
+        let stg = sa_json_array_get(arr, i, &n);
+        if stg == 0 && n != 0 && sa_json_kind(n) == 5 {
+            let p: ptr = sa_json_string_ptr(n);
+            let l = sa_json_string_len(n);
+            if idx_bytes_eq(p, l, val_ptr, val_len) { found = true; };
+        };
+        i = i + 1;
+    }
+    if !found {
+        sa_json_array_push_string(arr, val_ptr, val_len);
+        if created {
+            sa_json_object_set_node(doc, key_ptr, key_len, arr);
+        };
+    };
+}
+
+fn idx_strset_size(doc: u64, key_ptr: ptr, key_len: u64) -> u64 {
+    if doc == 0 { return 0; };
+    let arr: u64 = 0;
+    let st = sa_json_object_get(doc, key_ptr, key_len, &arr);
+    if st != 0 || arr == 0 || sa_json_kind(arr) != 6 { return 0; };
+    let cnt: u64 = 0;
+    sa_json_value_count(arr, &cnt);
+    return cnt;
+}
+
+// Map<string, Set<string>> delete-one with the unit's prune rule: an emptied
+// set removes its key from the map. JSON has no array-remove extern, so the
+// set is rebuilt without the value (order preserved).
+fn idx_strset_remove(doc: u64, key_ptr: ptr, key_len: u64, val_ptr: ptr, val_len: u64) -> void {
+    if doc == 0 { return; };
+    let arr: u64 = 0;
+    let st = sa_json_object_get(doc, key_ptr, key_len, &arr);
+    if st != 0 || arr == 0 || sa_json_kind(arr) != 6 { return; };
+    let kept = idx_json_arr();
+    let cnt: u64 = 0;
+    sa_json_value_count(arr, &cnt);
+    let kept_count: u64 = 0;
+    let i: u64 = 0;
+    while i < cnt {
+        let n: u64 = 0;
+        let stg = sa_json_array_get(arr, i, &n);
+        let drop = false;
+        if stg == 0 && n != 0 && sa_json_kind(n) == 5 {
+            let p: ptr = sa_json_string_ptr(n);
+            let l = sa_json_string_len(n);
+            if idx_bytes_eq(p, l, val_ptr, val_len) {
+                drop = true;
+            } else {
+                sa_json_array_push_string(kept, p, l);
+                kept_count = kept_count + 1;
+            };
+        };
+        i = i + 1;
+    }
+    if kept_count == 0 {
+        sa_json_object_remove(doc, key_ptr, key_len);
+    } else {
+        sa_json_object_set_node(doc, key_ptr, key_len, kept);
+    };
+}
+
+// Lexical path normalization (node:path posix normalize): collapses duplicate
+// slashes and "." segments, resolves ".." against prior segments (kept when a
+// relative path has nothing to pop; dropped at the root of absolute paths).
+fn idx_path_normalize(out: &IdxTextBuf, src: &IdxTextBuf) -> void {
+    idx_tb_reset(out);
+    let starts: [u64; 256] = [0u64; 256];
+    let is_dd: [bool; 256] = [false; 256];
+    let sc: u64 = 0;
+    let absolute = src.len > 0 && src.bytes[0] == 47;
+    if absolute { idx_tb_push_byte(out, 47); };
+    let r: u64 = 0;
+    while r < src.len {
+        if src.bytes[r] == 47 {
+            r = r + 1;
+        } else {
+            let seg_start = r;
+            let scanning = true;
+            while scanning {
+                if r < src.len && src.bytes[r] != 47 {
+                    r = r + 1;
+                } else {
+                    scanning = false;
+                };
+            }
+            let seg_len = r - seg_start;
+            let is_dot = seg_len == 1 && src.bytes[seg_start] == 46;
+            let is_dotdot = seg_len == 2 && src.bytes[seg_start] == 46 && src.bytes[seg_start + 1] == 46;
+            if is_dot {
+                // "." segments vanish
+            } else if is_dotdot {
+                if sc > 0 && !is_dd[sc - 1] {
+                    sc = sc - 1;
+                    out.len = starts[sc];
+                } else if !absolute {
+                    if sc < 256 {
+                        starts[sc] = out.len;
+                        if out.len > 0 && out.bytes[out.len - 1] != 47 { idx_tb_push_byte(out, 47); };
+                        idx_tb_push_byte(out, 46);
+                        idx_tb_push_byte(out, 46);
+                        is_dd[sc] = true;
+                        sc = sc + 1;
+                    };
+                };
+            } else {
+                if sc < 256 {
+                    starts[sc] = out.len;
+                    if out.len > 0 && out.bytes[out.len - 1] != 47 { idx_tb_push_byte(out, 47); };
+                    let i = seg_start;
+                    while i < seg_start + seg_len {
+                        idx_tb_push_byte(out, src.bytes[i]);
+                        i = i + 1;
+                    }
+                    is_dd[sc] = false;
+                    sc = sc + 1;
+                };
+            };
+        };
+    }
+}
+
+// node:path resolve for a (ptr, from..to) source: absolute sources normalize
+// directly; relative sources are joined under cwd first.
+fn idx_path_resolve(out: &IdxTextBuf, cwd: &IdxTextBuf, s_ptr: ptr, from: u64, to: u64) -> void {
+    let joined: IdxTextBuf = IdxTextBuf { bytes: [0u8; 8192], len: 0 };
+    let absolute = false;
+    if to > from {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, s_ptr, from);
+        if c == 47 { absolute = true; };
+    };
+    if absolute {
+        idx_tb_push_range(&joined, s_ptr, from, to);
+    } else {
+        idx_tb_copy(&joined, cwd);
+        if joined.len > 0 { idx_tb_push_byte(&joined, 47); };
+        idx_tb_push_range(&joined, s_ptr, from, to);
+    };
+    idx_path_normalize(out, &joined);
+}
+
+// node:path dirname over text buffers (trailing slashes stripped first, root
+// preserved; a slash-less name yields ".").
+fn idx_path_dirname(out: &IdxTextBuf, src: &IdxTextBuf) -> void {
+    idx_tb_copy(out, src);
+    let stripping = true;
+    while stripping {
+        if out.len > 1 && out.bytes[out.len - 1] == 47 {
+            out.len = out.len - 1;
+        } else {
+            stripping = false;
+        };
+    }
+    let cut: u64 = 0;
+    let has = false;
+    let j = out.len;
+    let scanning = true;
+    while scanning && j > 0 {
+        j = j - 1;
+        if out.bytes[j] == 47 {
+            cut = j;
+            has = true;
+            scanning = false;
+        };
+    }
+    if !has {
+        out.len = 0;
+        idx_tb_push_byte(out, 46);
+    } else if cut == 0 {
+        out.len = 1;
+    } else {
+        out.len = cut;
+    };
+}
+
+
+// resolveWebDist candidate step: records the first candidate (the TS
+// fallback), probes <cand>/index.html with fs exists (status 0 = exists),
+// and on a hit delivers the candidate as a JSON string handle.
+fn idx_webdist_consider(cand: &IdxTextBuf, first: &IdxTextBuf, have_first: &bool, out_path: &u64) -> bool {
+    let hf = *have_first;
+    if !hf {
+        idx_tb_copy(first, cand);
+        *have_first = true;
+    };
+    let probe: IdxTextBuf = IdxTextBuf { bytes: [0u8; 8192], len: 0 };
+    idx_tb_copy(&probe, cand);
+    idx_tb_push(&probe, STR_PTR("/index.html"), STR_LEN("/index.html"));
+    let pp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pp, &probe.bytes, 0);
+    if sa_std_fs_exists(pp, probe.len) == 0 {
+        idx_tb_string_handle(cand, out_path);
+        return true;
+    };
+    return false;
+}
 // ---- src/index.ts:341-385 — createLazyBridge<T> (generic + Proxy) ----
-// DEFECT: generics + JS Proxy trap + EventEmitter listener deferral have no SLA
-// counterpart. Approximated as a lazy-holder struct with an explicit ensure fn;
-// callers must call LazyBridge_ensure before use; deferred on/once/addListener
-// registrations are stored as JSON text records and replayed on ensure, in order.
+// DEFECT: generics + JS Proxy trap have no SLA counterpart. Approximated as a
+// lazy-holder struct with an explicit ensure fn; callers must call
+// LazyBridge_ensure before use. F3: the deferred on/once/addListener storage
+// half is implemented (LazyBridge_on appends {method,args} records to the JSON
+// text list in order); construction + replay + instance dispatch remain
+// blocked — DEFECT(F3-B2), see _defects/FIX_INDEX.md.
 struct LazyBridge {
     instance: u64,          // opaque handle to the constructed bridge (0 = not built)
     factory_id: u64,        // selects the factory in a unit-local switch (DEFECT: closure factory)
@@ -147,92 +605,249 @@ fn createLazyBridge(factory_id: u64, out: &LazyBridge) -> void {
 
 fn LazyBridge_ensure(b: &LazyBridge) -> u64 {
     if b.instance != 0 { return b.instance; };
-    // DEFECT: factory() closure invocation -> dispatch by factory_id to the
-    // concrete bridge constructor in this unit (switch elided in bulk pass).
-    // Then replay deferred listeners via the instance's on/once/addListener.
+    // DEFECT(F3-B2): factory() construction + deferred-listener replay are
+    // blocked. The six factories are untranslated closures in index.ts
+    // (:786/:896/:986/:1204/:1209/:1381) constructing backends-domain bridge
+    // classes (GrokBridge/MuseBridge/PiBridge/OpencodeBridge x2/AgyBridge)
+    // whose SLA domains are not yet retranslated, and no instance dispatch
+    // table exists to replay {method,args} records against. See FIX_INDEX B2.
     return b.instance;
 }
 
 fn LazyBridge_on(b: &LazyBridge, args_ptr: ptr, args_len: u64) -> u64 {
-    // if instance: forward call; else append {method:"on",args} to deferred list, return self
-    return 0; // DEFECT: dynamic dispatch / variadic args
+    // TS (index.ts:314-360): with an instance, on(...) forwards and returns its
+    // result; without one, {method:"on",args} is appended to deferredListeners
+    // and the proxy itself is returned (the proxy has no handle in this model,
+    // so 0 is returned either way).
+    if b.instance != 0 {
+        // DEFECT(F3-B2): instance forwarding blocked (no dispatch table).
+        return 0;
+    };
+    let rec: IdxTextBuf = IdxTextBuf { bytes: [0u8; 8192], len: 0 };
+    idx_tb_push(&rec, STR_PTR("{\"method\":\"on\",\"args\":"), STR_LEN("{\"method\":\"on\",\"args\":"));
+    idx_tb_push(&rec, args_ptr, args_len);
+    idx_tb_push_byte(&rec, 125);
+    if b.deferred_listeners_len == 0 {
+        if rec.len + 2 > 8192 { return 0; };
+        b.deferred_listeners[0] = 91;
+        let i: u64 = 0;
+        while i < rec.len {
+            b.deferred_listeners[1 + i] = rec.bytes[i];
+            i = i + 1;
+        }
+        b.deferred_listeners[1 + rec.len] = 93;
+        b.deferred_listeners_len = rec.len + 2;
+        return 0;
+    };
+    // Invariant: the buffer holds "[rec,rec,...]"; insert before the final ']'.
+    if b.deferred_listeners_len + 1 + rec.len > 8192 { return 0; };
+    let pos = b.deferred_listeners_len - 1;
+    b.deferred_listeners[pos] = 44;
+    let i: u64 = 0;
+    while i < rec.len {
+        b.deferred_listeners[pos + 1 + i] = rec.bytes[i];
+        i = i + 1;
+    }
+    b.deferred_listeners[pos + 1 + rec.len] = 93;
+    b.deferred_listeners_len = pos + 1 + rec.len + 1;
+    return 0;
 }
 
 fn LazyBridge_stop(b: &LazyBridge) -> u64 {
-    // no instance -> undefined (0); else forward stop()
-    return 0; // DEFECT: dynamic dispatch
+    // TS: no instance -> undefined; else forwards stop() and returns its result.
+    if b.instance == 0 { return 0; };
+    // DEFECT(F3-B2): instance forwarding blocked (no dispatch table).
+    return 0;
 }
 
 fn LazyBridge_hasSession(b: &LazyBridge) -> bool {
+    // TS: no instance -> false; else forwards hasSession(...).
     if b.instance == 0 { return false; };
-    return false; // DEFECT: dynamic dispatch on instance
+    // DEFECT(F3-B2): instance forwarding blocked (no dispatch table).
+    return false;
 }
 
 fn LazyBridge_deleteSession(b: &LazyBridge) -> void {
-    // forward only when instance exists
+    // TS: forwards deleteSession(...) only when an instance exists.
+    if b.instance == 0 { return; };
+    // DEFECT(F3-B2): instance forwarding blocked (no dispatch table).
 }
 
 // ---- src/index.ts:386-392 — global turn/child tracking maps ----
-// DEFECT: Map<string, Set<string>> / Map<string, JsonRpcMessage> — approximated
-// as JSON-text registries (unit-local handles); key/value semantics preserved,
-// iteration order not guaranteed.
+// Map<string, Set<string>> / Map<string, string> / Map<string, JsonRpcMessage>
+// are modeled as JSON document handles (CAPABILITY_MAP §16: dynamic JSON is a
+// supported std surface). F3: the tracking functions below are fully
+// retranslated over sa_json mutation/query externs; key/value semantics are
+// preserved and set iteration order matches insertion order.
 struct ServerGlobals {
     activeTurnsByUser: u64,        // Map<string, Set<string>> as JSON handle
     codexChildParentByThread: u64, // Map<string, string>
     codexActiveChildrenByParent: u64, // Map<string, Set<string>>
     codexDeferredTerminalByTurn: u64, // Map<string, JsonRpcMessage & {method, params?}>
+    cliPluginEnabledState: u64,    // Map<string, boolean> (src/index.ts:967)
+    agySettingsSnapshotted: bool,  // src/index.ts:1588 module flag
+    nextSshForwardPort: i32,       // src/index.ts:1611 counter (0 = unseeded; TS seeds at module init)
 }
 
 fn trackCodexChildStarted(g: &ServerGlobals, childThreadId_ptr: ptr, childThreadId_len: u64, parentThreadId_ptr: ptr, parentThreadId_len: u64) -> void {
-    // if (!childThreadId || !parentThreadId || childThreadId === parentThreadId) return;
-    // codexChildParentByThread.set(child, parent); children = get(parent) ?? new Set; children.add(child); set(parent, children)
-    // DEFECT: Map/Set semantics over string keys (JSON registry approximation)
+    // src/index.ts:370: guard, then child->parent record + parent child-set add.
+    if childThreadId_len == 0 || parentThreadId_len == 0 { return; };
+    if idx_bytes_eq(childThreadId_ptr, childThreadId_len, parentThreadId_ptr, parentThreadId_len) { return; };
+    if g.codexChildParentByThread == 0 { g.codexChildParentByThread = idx_json_doc(); };
+    if g.codexActiveChildrenByParent == 0 { g.codexActiveChildrenByParent = idx_json_doc(); };
+    sa_json_object_set_string(g.codexChildParentByThread, childThreadId_ptr, childThreadId_len, parentThreadId_ptr, parentThreadId_len);
+    idx_strset_add(g.codexActiveChildrenByParent, parentThreadId_ptr, parentThreadId_len, childThreadId_ptr, childThreadId_len);
 }
 
 fn trackCodexChildTerminal(g: &ServerGlobals, childThreadId_ptr: ptr, childThreadId_len: u64, out_parent: &u64) -> bool {
-    // returns parentThreadId | undefined; deletes child entry; prunes empty child set
-    return false; // DEFECT: Map/Set semantics
+    // src/index.ts:378: returns the parent id (JSON string handle here) or
+    // undefined (false + out 0); removes the child record and prunes the
+    // parent's child set (idx_strset_remove drops the key when it empties).
+    *out_parent = 0;
+    if childThreadId_len == 0 { return false; };
+    if g.codexChildParentByThread == 0 { return false; };
+    let pp: ptr = STR_PTR("");
+    let pl: u64 = 0;
+    if !idx_json_get_string(g.codexChildParentByThread, childThreadId_ptr, childThreadId_len, &pp, &pl) { return false; };
+    // Materialize the result before mutating the document (removal invalidates
+    // arena pointers into it, FIX_PHASE1 representation rule).
+    let parent_tb: IdxTextBuf = IdxTextBuf { bytes: [0u8; 8192], len: 0 };
+    idx_tb_push(&parent_tb, pp, pl);
+    let p0: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p0, &parent_tb.bytes, 0);
+    let result: u64 = 0;
+    idx_json_string_handle(p0, parent_tb.len, &result);
+    sa_json_object_remove(g.codexChildParentByThread, childThreadId_ptr, childThreadId_len);
+    if g.codexActiveChildrenByParent != 0 {
+        idx_strset_remove(g.codexActiveChildrenByParent, p0, parent_tb.len, childThreadId_ptr, childThreadId_len);
+    };
+    *out_parent = result;
+    return true;
 }
 
 fn codexParentHasActiveChildren(g: &ServerGlobals, threadId_ptr: ptr, threadId_len: u64) -> bool {
-    // (codexActiveChildrenByParent.get(threadId)?.size ?? 0) > 0
-    return false; // DEFECT: Map/Set semantics
+    // src/index.ts:389: (codexActiveChildrenByParent.get(threadId)?.size ?? 0) > 0
+    return idx_strset_size(g.codexActiveChildrenByParent, threadId_ptr, threadId_len) > 0;
 }
 
 fn trackCodexChildrenFromItem(g: &ServerGlobals, parentThreadId_ptr: ptr, parentThreadId_len: u64, item: u64) -> void {
-    // if (!parentThreadId || stringValue(item.type) !== "collabAgentToolCall") return;
-    // for receiverThreadId of item.receiverThreadIds (strings): trackCodexChildStarted(...)
-    // DEFECT: dynamic JSON record access
+    // src/index.ts:393: only collabAgentToolCall items contribute their
+    // string receiverThreadIds as children of the parent thread.
+    if parentThreadId_len == 0 { return; };
+    let tp: ptr = STR_PTR("");
+    let tl: u64 = 0;
+    if !idx_json_get_string(item, STR_PTR("type"), STR_LEN("type"), &tp, &tl) { return; };
+    if !idx_bytes_eq(tp, tl, STR_PTR("collabAgentToolCall"), STR_LEN("collabAgentToolCall")) { return; };
+    let arr: u64 = 0;
+    let st = sa_json_object_get(item, STR_PTR("receiverThreadIds"), STR_LEN("receiverThreadIds"), &arr);
+    if st != 0 || arr == 0 || sa_json_kind(arr) != 6 { return; };
+    let cnt: u64 = 0;
+    sa_json_value_count(arr, &cnt);
+    let i: u64 = 0;
+    while i < cnt {
+        let n: u64 = 0;
+        let stg = sa_json_array_get(arr, i, &n);
+        if stg == 0 && n != 0 && sa_json_kind(n) == 5 {
+            let p: ptr = sa_json_string_ptr(n);
+            let l = sa_json_string_len(n);
+            trackCodexChildStarted(g, p, l, parentThreadId_ptr, parentThreadId_len);
+        };
+        i = i + 1;
+    }
 }
 
 fn flushDeferredCodexParent(g: &ServerGlobals, parentThreadId_ptr: ptr, parentThreadId_len: u64) -> void {
-    // if (codexParentHasActiveChildren(parent)) return;
-    // deferred = codexDeferredTerminalByTurn.get(parent); if (!deferred) return;
-    // delete(parent); routeCodexNotification(deferred);
+    // src/index.ts:401: hold while children are active; then take + delete
+    // the deferred terminal notification and route it.
+    if codexParentHasActiveChildren(g, parentThreadId_ptr, parentThreadId_len) { return; };
+    if g.codexDeferredTerminalByTurn == 0 { return; };
+    let node: u64 = 0;
+    let st = sa_json_object_get(g.codexDeferredTerminalByTurn, parentThreadId_ptr, parentThreadId_len, &node);
+    if st != 0 || node == 0 { return; };
+    sa_json_object_remove(g.codexDeferredTerminalByTurn, parentThreadId_ptr, parentThreadId_len);
+    // DEFECT(F3-B6): routeCodexNotification(deferred) — the router exists only
+    // in index.ts's untranslated bulk (no SLA counterpart in this unit yet).
+    // The registry state transition above is faithful; only the dispatch is
+    // blocked. See _defects/FIX_INDEX.md B6.
 }
 
 fn activeTurnCount(g: &ServerGlobals, userId_ptr: ptr, userId_len: u64) -> u64 {
-    return 0; // activeTurnsByUser.get(userId)?.size ?? 0 — DEFECT: Map/Set
+    // src/index.ts:409: activeTurnsByUser.get(userId)?.size ?? 0
+    return idx_strset_size(g.activeTurnsByUser, userId_ptr, userId_len);
 }
 
 fn trackTurnStart(g: &ServerGlobals, userId_ptr: ptr, userId_len: u64, turnKey_ptr: ptr, turnKey_len: u64) -> void {
-    // get-or-create Set for user, add turnKey
+    // src/index.ts:413: get-or-create the user's set, add the turn key.
+    if g.activeTurnsByUser == 0 { g.activeTurnsByUser = idx_json_doc(); };
+    idx_strset_add(g.activeTurnsByUser, userId_ptr, userId_len, turnKey_ptr, turnKey_len);
 }
 
 fn trackTurnEnd(g: &ServerGlobals, userId_ptr: ptr, userId_len: u64, turnKey_ptr: ptr, turnKey_len: u64) -> void {
-    // set.delete(turnKey); if empty -> delete user entry
+    // src/index.ts:422: delete the key; an emptied set removes the user
+    // entry (idx_strset_remove prune rule). Missing set -> no-op, as in TS.
+    if g.activeTurnsByUser == 0 { return; };
+    idx_strset_remove(g.activeTurnsByUser, userId_ptr, userId_len, turnKey_ptr, turnKey_len);
 }
 
 fn releaseAllTurnsForUser(g: &ServerGlobals, userId_ptr: ptr, userId_len: u64) -> void {
-    // activeTurnsByUser.delete(userId)
+    // src/index.ts:431: activeTurnsByUser.delete(userId)
+    if g.activeTurnsByUser == 0 { return; };
+    sa_json_object_remove(g.activeTurnsByUser, userId_ptr, userId_len);
 }
 
 fn extractTurnKey(result: u64, params: u64, out_key: &u64) -> bool {
-    // record = asRecord(result); turn = asRecord(record.turn);
-    // turnId = stringValue(turn.id) ?? stringValue(record.turnId) ?? stringValue(record.id);
-    // threadId = stringValue(params.threadId) ?? stringValue(asRecord(params.thread).id) ?? stringValue(turn.threadId);
-    // if (turnId) return "turn:" + turnId; if (threadId) return "thread:" + threadId + ":" + Date.now(); return null
-    return false; // DEFECT: dynamic JSON (JsonValue) traversal + template strings
+    // src/index.ts:435. asRecord(x) = object-or-{} and stringValue(x) =
+    // string-or-undefined are modeled by idx_json_get_string; note the TS ??
+    // chain stops at the first PRESENT string (even an empty one), while the
+    // branch decisions below test truthiness (non-empty), exactly as in TS.
+    *out_key = 0;
+    let turn_node: u64 = 0;
+    let has_turn = false;
+    if result != 0 && sa_json_kind(result) == 7 {
+        let st = sa_json_object_get(result, STR_PTR("turn"), STR_LEN("turn"), &turn_node);
+        if st == 0 && turn_node != 0 { has_turn = true; };
+    };
+    let idp: ptr = STR_PTR("");
+    let idl: u64 = 0;
+    let have_turn_id = false;
+    if has_turn { have_turn_id = idx_json_get_string(turn_node, STR_PTR("id"), STR_LEN("id"), &idp, &idl); };
+    if !have_turn_id { have_turn_id = idx_json_get_string(result, STR_PTR("turnId"), STR_LEN("turnId"), &idp, &idl); };
+    if !have_turn_id { have_turn_id = idx_json_get_string(result, STR_PTR("id"), STR_LEN("id"), &idp, &idl); };
+    let thp: ptr = STR_PTR("");
+    let thl: u64 = 0;
+    let have_thread_id = idx_json_get_string(params, STR_PTR("threadId"), STR_LEN("threadId"), &thp, &thl);
+    if !have_thread_id {
+        let th_node: u64 = 0;
+        if params != 0 && sa_json_kind(params) == 7 {
+            let st2 = sa_json_object_get(params, STR_PTR("thread"), STR_LEN("thread"), &th_node);
+            if st2 == 0 && th_node != 0 {
+                have_thread_id = idx_json_get_string(th_node, STR_PTR("id"), STR_LEN("id"), &thp, &thl);
+            };
+        };
+    };
+    if !have_thread_id && has_turn {
+        have_thread_id = idx_json_get_string(turn_node, STR_PTR("threadId"), STR_LEN("threadId"), &thp, &thl);
+    };
+    let tb: IdxTextBuf = IdxTextBuf { bytes: [0u8; 8192], len: 0 };
+    if have_turn_id && idl > 0 {
+        idx_tb_push_byte(&tb, 34);
+        idx_tb_push_escaped(&tb, STR_PTR("turn:"), STR_LEN("turn:"));
+        idx_tb_push_escaped(&tb, idp, idl);
+        idx_tb_push_byte(&tb, 34);
+        idx_tb_json_string(&tb, out_key);
+        return true;
+    };
+    if have_thread_id && thl > 0 {
+        idx_tb_push_byte(&tb, 34);
+        idx_tb_push_escaped(&tb, STR_PTR("thread:"), STR_LEN("thread:"));
+        idx_tb_push_escaped(&tb, thp, thl);
+        idx_tb_push_byte(&tb, 58);
+        idx_tb_push_i64(&tb, sa_time_unix_ms());
+        idx_tb_push_byte(&tb, 34);
+        idx_tb_json_string(&tb, out_key);
+        return true;
+    };
+    return false;
 }
 
 // ---- src/index.ts:473-650 — module-level constants & store wiring ----
@@ -375,19 +990,61 @@ fn extractTurnKey(result: u64, params: u64, out_key: &u64) -> bool {
 // ---- src/index.ts:1079-1099 — CLI plugin default enablement ----
 // cliPluginEnabledByDefault(envValue) -> /^(1|true|yes)$/i.test((envValue ?? "").trim())  // DEFECT: RegExp
 fn cliPluginEnabledByDefault(envValue_ptr: ptr, envValue_len: u64, has_value: bool) -> bool {
-    // trim, then case-insensitive compare against "1" | "true" | "yes"
-    return false; // (transliteration placeholder in bulk pass)
+    // src/index.ts:957: /^(1|true|yes)$/i.test((envValue ?? "").trim()).
+    // The anchored alternation is decided by exact byte compares after an
+    // ASCII-whitespace trim and ASCII case folding (CAPABILITY_MAP §6: the
+    // std RegExp surface is a POSIX ERE subset; no std surface is needed for
+    // this fixed pattern). JS trim also strips Unicode whitespace; env values
+    // here are ASCII flags, noted in FIX_INDEX.
+    if !has_value { return false; };
+    let lo: u64 = 0;
+    let hi = envValue_len;
+    let adv = true;
+    while adv && lo < hi {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, envValue_ptr, lo);
+        if idx_is_ascii_ws(c) { lo = lo + 1; } else { adv = false; };
+    }
+    let adv2 = true;
+    while adv2 && hi > lo {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, envValue_ptr, hi - 1);
+        if idx_is_ascii_ws(c) { hi = hi - 1; } else { adv2 = false; };
+    }
+    let n = hi - lo;
+    if n == 1 {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, envValue_ptr, lo);
+        return c == 49;
+    };
+    if n == 4 { return idx_bytes_eq_ci_range(envValue_ptr, lo, hi, STR_PTR("true"), STR_LEN("true")); };
+    if n == 3 { return idx_bytes_eq_ci_range(envValue_ptr, lo, hi, STR_PTR("yes"), STR_LEN("yes")); };
+    return false;
 }
 
-// cliPluginEnabledState = Map<string, boolean>
 fn isCliPluginEnabled(g: &ServerGlobals, pluginId_ptr: ptr, pluginId_len: u64) -> bool {
-    // cached = state.get(pluginId); if undefined: entry = cliSettingsEntries().find(pluginId);
-    // enabled = entry ? cliPluginEnabledByDefault(process.env[entry.enabledEnvVar]) : false; cache; return
-    return false; // DEFECT: Map + plugin registry lookup
+    // src/index.ts:969-977: the state cache is consulted first and is fully
+    // implemented here (setCliPluginEnabled below writes it).
+    if g.cliPluginEnabledState != 0 {
+        let bv: bool = false;
+        let st = sa_json_object_get_bool(g.cliPluginEnabledState, pluginId_ptr, pluginId_len, &bv);
+        if st == 0 { return bv; };
+    };
+    // DEFECT(F3-B3): the cache-miss path is blocked — it needs
+    // cliSettingsEntries().find(pluginId) plus process.env[entry.enabledEnvVar];
+    // pluginHost.sla's cliSettingsEntries is still a comment-only stub whose
+    // own sdk ServerPluginRegistry wiring belongs to that unit's fix step.
+    // Returning false here matches TS only when no entry exists or its env
+    // flag is unset; the entry-present case is the blocked residue.
+    return false;
 }
 
 fn setCliPluginEnabled(g: &ServerGlobals, pluginId_ptr: ptr, pluginId_len: u64, value: bool) -> void {
-    // cliPluginEnabledState.set(pluginId, value)
+    // src/index.ts:979-982: cliPluginEnabledState.set(pluginId, value)
+    if g.cliPluginEnabledState == 0 { g.cliPluginEnabledState = idx_json_doc(); };
+    let bv: u8 = 0;
+    if value { bv = 1; };
+    sa_json_object_set_bool(g.cliPluginEnabledState, pluginId_ptr, pluginId_len, bv);
 }
 
 // ---- src/index.ts:1105-1205 — piBridge = createLazyBridge(() => new PiBridge({...})) ----
@@ -486,7 +1143,15 @@ fn setCliPluginEnabled(g: &ServerGlobals, pluginId_ptr: ptr, pluginId_len: u64, 
 // agyThreadBridges = Map<string, AgyBridge>
 // agySettingsSnapshotted = false (module flag)
 fn ensureAgySettingsSnapshot(g: &ServerGlobals) -> void {
-    // if (agySettingsSnapshotted) return; snapshotAgySettings(); agySettingsSnapshotted = true;
+    // src/index.ts:1590: if (agySettingsSnapshotted) return;
+    // snapshotAgySettings(); agySettingsSnapshotted = true;
+    if g.agySettingsSnapshotted { return; };
+    // DEFECT(F3-B4): the snapshotAgySettings() call is blocked —
+    // backends/agy/src/runtime/agySettingsGuard.sla exposes it only as a
+    // state method on AgySettingsGuardState (fn snapshotAgySettings(self:
+    // &AgySettingsGuardState)) and exports no shared instance or accessor;
+    // the backends domain is not yet retranslated. The flag is deliberately
+    // NOT set: marking it would falsely claim the snapshot happened.
 }
 
 // ---- src/index.ts:1582-1651 — per-thread bridge event wiring helpers ----
@@ -495,19 +1160,27 @@ fn ensureAgySettingsSnapshot(g: &ServerGlobals) -> void {
 //   routeServerRequest({...}).catch(warn "Failed to route Auggie server request"); notification -> route.
 //   // DEFECT: EventEmitter .on with closures
 fn auggieBridgeFor(g: &ServerGlobals, threadId_ptr: ptr, threadId_len: u64, has_thread: bool) -> u64 {
-    // ensureAuggieBridgeForThread(threadId, { runtimeEnv: () => ({...process.env,
-    //   AUGMENT_CACHE_DIR: defaultAuggieCacheDir(codexUiDataDir())}), onCreate: wireAuggieBridgeEvents })
-    return 0; // DEFECT: closure options + process.env spread
+    // DEFECT(F3-B5): blocked — delegates to backends/auggie auggieRuntime's
+    // ensureAuggieBridgeForThread(threadId, { runtimeEnv closure, onCreate:
+    // wireAuggieBridgeEvents }); the backends domain is not yet retranslated
+    // and wireAuggieBridgeEvents lives in this unit's untranslated bulk.
+    return 0;
 }
 // wireClineBridgeEvents(bridge): on message (method) -> routeCodexNotification;
 //   on stderr -> console.warn("[cline]", String(chunk).trimEnd())
 fn clineBridgeFor(g: &ServerGlobals, threadId_ptr: ptr, threadId_len: u64, has_thread: bool) -> u64 {
-    // ensureClineBridgeForThread(threadId, codexUiDataDir(), wireClineBridgeEvents)
+    // DEFECT(F3-B5): blocked — delegates to backends/cline clineRuntime's
+    // ensureClineBridgeForThread(threadId, codexUiDataDir(), wireClineBridgeEvents);
+    // the backends domain is not yet retranslated and wireClineBridgeEvents
+    // lives in this unit's untranslated bulk.
     return 0;
 }
 // wireCommandCodeBridgeEvents(bridge): same shape as cline; stderr prefix "[command-code]"
 fn commandCodeBridgeFor(g: &ServerGlobals, threadId_ptr: ptr, threadId_len: u64, has_thread: bool) -> u64 {
-    // ensureCommandCodeBridgeForThread(threadId, codexUiDataDir(), wireCommandCodeBridgeEvents)
+    // DEFECT(F3-B5): blocked — delegates to backends/command-code
+    // commandCodeRuntime's ensureCommandCodeBridgeForThread(threadId, ...);
+    // the backends domain is not yet retranslated and
+    // wireCommandCodeBridgeEvents lives in this unit's untranslated bulk.
     return 0;
 }
 
@@ -517,8 +1190,23 @@ fn commandCodeBridgeFor(g: &ServerGlobals, threadId_ptr: ptr, threadId_len: u64,
 // nextSshForwardPort = randomInt(46120, 48960)  (comment: reverse forwards live on the
 //   SSH host; randomize this process's allocation window instead of colliding at 46120)
 fn allocateSshForwardPort(g: &ServerGlobals) -> i32 {
-    // port = nextSshForwardPort++; if (nextSshForwardPort > 49000) nextSshForwardPort = 46120; return port
-    return 0;
+    // src/index.ts:1611-1615: module counter seeded once with
+    // randomInt(46120, 48960); each call returns the counter, increments it,
+    // and wraps it back to 46120 once it exceeds 49000. The seed is drawn
+    // lazily on first allocate (indistinguishable: only this fn reads the
+    // counter). TS draws from crypto randomInt; sa_math_random is the std
+    // uniform source (CAPABILITY_MAP §7) — the value is an allocation-window
+    // seed, not security material.
+    if g.nextSshForwardPort == 0 {
+        let r = sa_math_random();
+        let off = (r * 2840.0) as i32;
+        g.nextSshForwardPort = 46120 + off;
+    };
+    let port = g.nextSshForwardPort;
+    let next = port + 1;
+    if next > 49000 { next = 46120; };
+    g.nextSshForwardPort = next;
+    return port;
 }
 // writerLeases = new ThreadWriterLeaseStore(localDatabase.connection)
 // subscriptionRegistry = new ThreadSubscriptionRegistry(threadId ->
@@ -588,11 +1276,101 @@ fn allocateSshForwardPort(g: &ServerGlobals) -> i32 {
 
 // ---- src/index.ts:1963-1990 — resolveWebDist() ----
 fn resolveWebDist(out_path: &u64) -> void {
-    // candidates: env CODEX_UI_WEB_DIST (resolve) first; then exeDir/web-dist,
-    // exeDir/web/dist, exeDir/apps/web/dist (dirname(process.execPath));
-    // then <module dir>/../../web/dist. First candidate containing index.html
-    // (existsSync) wins; fallback resolve(candidates[0] ?? module-relative).
-    // DEFECT: import.meta.url / process.execPath / fs probing — path buffer approximation.
+    // src/index.ts:1827-1853: candidates in order — env CODEX_UI_WEB_DIST
+    // (resolve()d), exeDir/web-dist, exeDir/web/dist, exeDir/apps/web/dist
+    // (exeDir = dirname(process.execPath)), then the module-relative
+    // ../../web/dist. The first candidate containing index.html wins; the
+    // fallback is resolve(candidates[0] ?? module-relative). Candidates are
+    // stored resolved+normalized in TS (resolve/join), and resolve() of an
+    // absolute normalized path is lexically the identity, so winners are
+    // delivered as stored.
+    // Native mapping: this toolchain's build-exe places the binary next to
+    // its source file, so exeDir is the module directory (apps/server/src)
+    // and the module-relative candidate keeps its literal form
+    // exeDir/../../web/dist, normalized.
+    *out_path = 0;
+    // Env/exe/cwd buffer handles are read but never freed: they are
+    // process-lifetime values, and conditionally consuming a ^-handle in a
+    // branch breaks SAB phi-state agreement (PhiStateConflict). Every fixed
+    // sdk unit follows the same read-only convention for env buffers.
+    let cand: IdxTextBuf = IdxTextBuf { bytes: [0u8; 8192], len: 0 };
+    let first: IdxTextBuf = IdxTextBuf { bytes: [0u8; 8192], len: 0 };
+    let raw: IdxTextBuf = IdxTextBuf { bytes: [0u8; 8192], len: 0 };
+    let have_first = false;
+    let cwd: IdxTextBuf = IdxTextBuf { bytes: [0u8; 8192], len: 0 };
+    let cwdh = sa_env_current_dir();
+    if cwdh != 0 {
+        let cp: ptr = sa_env_buffer_data(cwdh);
+        let cl = sa_env_buffer_len(cwdh);
+        idx_tb_push(&cwd, cp, cl);
+    };
+    let exe_dir: IdxTextBuf = IdxTextBuf { bytes: [0u8; 8192], len: 0 };
+    let have_exe = false;
+    let exeh = sa_env_current_exe();
+    if exeh != 0 {
+        let ep: ptr = sa_env_buffer_data(exeh);
+        let el = sa_env_buffer_len(exeh);
+        idx_tb_push(&raw, ep, el);
+        idx_path_dirname(&exe_dir, &raw);
+        idx_tb_reset(&raw);
+        have_exe = true;
+    };
+    // Candidate 1: CODEX_UI_WEB_DIST (trimmed; skipped when empty, as in TS).
+    let envh = sa_env_get(STR_PTR("CODEX_UI_WEB_DIST"), STR_LEN("CODEX_UI_WEB_DIST"));
+    if envh != 0 {
+        let ep: ptr = sa_env_buffer_data(envh);
+        let el = sa_env_buffer_len(envh);
+        let lo: u64 = 0;
+        let hi = el;
+        let adv = true;
+        while adv && lo < hi {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, ep, lo);
+            if idx_is_ascii_ws(c) { lo = lo + 1; } else { adv = false; };
+        }
+        let adv2 = true;
+        while adv2 && hi > lo {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, ep, hi - 1);
+            if idx_is_ascii_ws(c) { hi = hi - 1; } else { adv2 = false; };
+        }
+        let won = false;
+        if hi > lo {
+            idx_path_resolve(&cand, &cwd, ep, lo, hi);
+            won = idx_webdist_consider(&cand, &first, &have_first, out_path);
+        };
+        if won { return; };
+    };
+    // Candidates 2-4: under exeDir (TS wraps execPath access in try/catch and
+    // skips these when it fails; have_exe is that gate).
+    if have_exe {
+        idx_tb_copy(&raw, &exe_dir);
+        idx_tb_push(&raw, STR_PTR("/web-dist"), STR_LEN("/web-dist"));
+        idx_path_normalize(&cand, &raw);
+        if idx_webdist_consider(&cand, &first, &have_first, out_path) { return; };
+        idx_tb_copy(&raw, &exe_dir);
+        idx_tb_push(&raw, STR_PTR("/web/dist"), STR_LEN("/web/dist"));
+        idx_path_normalize(&cand, &raw);
+        if idx_webdist_consider(&cand, &first, &have_first, out_path) { return; };
+        idx_tb_copy(&raw, &exe_dir);
+        idx_tb_push(&raw, STR_PTR("/apps/web/dist"), STR_LEN("/apps/web/dist"));
+        idx_path_normalize(&cand, &raw);
+        if idx_webdist_consider(&cand, &first, &have_first, out_path) { return; };
+    };
+    // Candidate 5: module-relative ../../web/dist (anchor per header note).
+    if have_exe {
+        idx_tb_copy(&raw, &exe_dir);
+    } else {
+        idx_tb_copy(&raw, &cwd);
+    };
+    idx_tb_push(&raw, STR_PTR("/../../web/dist"), STR_LEN("/../../web/dist"));
+    idx_path_normalize(&cand, &raw);
+    if idx_webdist_consider(&cand, &first, &have_first, out_path) { return; };
+    // Fallback: resolve(candidates[0]) — first considered candidate, stored
+    // resolved (have_first is always set: candidate 5 is unconditional).
+    if have_first {
+        idx_tb_string_handle(&first, out_path);
+    };
 }
 // webDist = resolveWebDist(); hasWebBuild = existsSync(join(webDist, "index.html")); webDistRoot = resolve(webDist)
 
@@ -959,7 +1737,18 @@ fn resolveWebDist(out_path: &u64) -> void {
 
 // ---- src/index.ts:6346-6405 — project discussion types & state ----
 fn projectClientId(ownerId_ptr: ptr, ownerId_len: u64, projectId_ptr: ptr, projectId_len: u64, out: &u64) -> void {
-    // return ownerId + ":" + projectId (client-id composition)
+    // src/index.ts:6346: return `project:${ownerId}:${projectId}` — delivered
+    // as a JSON string node handle (this unit's string-return model). The
+    // bulk-pass comment here omitted the "project:" prefix; the TS source
+    // governs.
+    let tb: IdxTextBuf = IdxTextBuf { bytes: [0u8; 8192], len: 0 };
+    idx_tb_push_byte(&tb, 34);
+    idx_tb_push_escaped(&tb, STR_PTR("project:"), STR_LEN("project:"));
+    idx_tb_push_escaped(&tb, ownerId_ptr, ownerId_len);
+    idx_tb_push_byte(&tb, 58);
+    idx_tb_push_escaped(&tb, projectId_ptr, projectId_len);
+    idx_tb_push_byte(&tb, 34);
+    idx_tb_json_string(&tb, out);
 }
 // type ProjectDispatchResult = { threadId, turnId?, clientId, member: AgentProjectMember, phase }
 //   -> struct with JSON member payload (DEFECT: dynamic object member)
