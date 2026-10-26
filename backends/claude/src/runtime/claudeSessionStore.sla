@@ -1,15 +1,24 @@
-// Converted 1:1 from backends/claude/src/runtime/claudeSessionStore.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Converted 1:1 from backends/claude/src/runtime/claudeSessionStore.ts (CXU plugins @ f2cb649d).
+// FIX(be2): the bulk skeleton was truncated mid-upsert and its
+// runtime_db_* externs were placeholders. The unit is completed
+// here over sa_std's synchronous SQLite facade
+// (sa_std/plugin_sqlite.sa macros over the node plugin's
+// @sa_node_plugin_sqlite_* externs), following the licenseStore
+// binding model: statement handles are the facade's u64 handles;
+// reads go through SA_SQLITE_STEP_JSON, whose row JSON document is
+// parsed once per step and cached in a global u64 cell keyed by
+// statement handle ("sqlite.doc.<stmt>"); column accessors read
+// that document by column index (SELECT * column order = table
+// definition order). The db handle is the facade handle opened by
+// the host (RuntimeDatabase in TS); ClaudeSessionStore_new only
+// runs the schema DDL, as the TS constructor does.
 @import "sa_std/string.sa"
 @import "sa_std/ptr.sa"
 @import "sa_std/time.sai"
-
-// DEFECT: @cxu/sdk-backend RuntimeDatabase (SQLite) has no sa_std .sai counterpart;
-// the db handle is an opaque u64 and runtime_db_* externs below are placeholders
-// for the prepared-statement API (prepare/get/all/run/exec).
-// extern runtime_db_exec(db: u64, sql_ptr: ptr, sql_len: u64) -> i32
-// extern runtime_db_prepare(db: u64, sql_ptr: ptr, sql_len: u64) -> u64
-// extern runtime_db_stmt_run(stmt: u64, ...) -> i64   // returns changes
-// extern runtime_db_stmt_get_text / _int / _bind_*     // row access placeholders
+@import "sa_std/encoding/json.sai"
+@import "sa_std/plugin_sqlite.sa"
+@import "sa_std/globals.sai"
+@import "claudeCompatibleProbe.sla"
 
 // Persists Claude-compatible CLI external session metadata separately
 // from Codex thread IDs. This allows history to remain readable after
@@ -49,6 +58,12 @@ struct ClaudeSessionRecord {
     updatedAt: u64,
 }
 
+// TS ClaudeSessionRow (snake_case wire shape). In the STEP_JSON
+// model the row is the parsed JSON document, so this struct is
+// retained only as the documented column layout:
+// 0 thread_id, 1 owner_id, 2 external_session_id, 3 cli_version,
+// 4 model, 5 cwd, 6 permission_mode, 7 config_dir, 8 state_json,
+// 9 created_at, 10 updated_at.
 struct ClaudeSessionRow {
     thread_id: [u8; 128],
     thread_id_len: u64,
@@ -79,14 +94,212 @@ struct ClaudeSessionRow {
     updated_at: u64,
 }
 
-// TS class ClaudeSessionStore -> struct + function family with &ClaudeSessionStore first param.
-struct ClaudeSessionStore {
-    db: u64, // RuntimeDatabase opaque handle
+// DEFECT: TS listByOwner returns an unbounded array; the SLA form
+// caps the materialized page at 32 records.
+struct ClaudeSessionRecordList {
+    items: [ClaudeSessionRecord; 32],
+    count: u64,
 }
 
-// DEFECT: Date.now() — wall-clock ms extern assumed (sa_std time surface unverified).
+// TS class ClaudeSessionStore -> struct + function family with &ClaudeSessionStore first param.
+struct ClaudeSessionStore {
+    db: u64, // facade SQLite handle (TS RuntimeDatabase)
+}
+
 fn claudeSessionStore_now_ms() -> u64 {
-    return sa_time_now_ms();
+    return (sa_time_unix_ms() as u64);
+}
+
+// ---------------------------------------------------------------------------
+// SQLite binding layer (licenseStore model, css_ prefix).
+// ---------------------------------------------------------------------------
+
+fn css_buf_append_u64(b: &ByteBuf, v: u64) -> void {
+    if v >= 10 { css_buf_append_u64(b, v / 10); };
+    buf_append_byte(b, 48 + ((v % 10) as u8));
+    return;
+}
+
+fn css_row_key(out: &ByteBuf, stmt: u64) -> void {
+    out.len = 0;
+    buf_append_lit(out, STR_PTR("sqlite.doc."), STR_LEN("sqlite.doc."));
+    css_buf_append_u64(out, stmt);
+    return;
+}
+
+fn css_row_doc(stmt: u64) -> u64 {
+    let key = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    css_row_key(&key, stmt);
+    let kp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(kp, &key.bytes, 0);
+    let doc: u64 = 0;
+    let ig = sa_global_u64_get(kp, key.len, &doc);
+    return doc;
+}
+
+fn css_set_row_doc(stmt: u64, doc: u64) -> void {
+    let key = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    css_row_key(&key, stmt);
+    let kp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(kp, &key.bytes, 0);
+    let ig = sa_global_u64_set(kp, key.len, doc);
+    return;
+}
+
+fn css_column_node(stmt: u64, idx: u64) -> u64 {
+    let doc = css_row_doc(stmt);
+    if doc == 0 { return 0; };
+    let kp: ptr = PTR_NULL();
+    let kl: u64 = 0;
+    if sa_json_object_key_at(doc, idx, &kp, &kl) != 0 { return 0; };
+    let node: u64 = 0;
+    if sa_json_object_get(doc, kp, kl, &node) != 0 { return 0; };
+    return node;
+}
+
+fn runtime_db_exec(db: u64, sql_ptr: ptr, sql_len: u64) -> i32 {
+    let st: u64 = 0;
+    SA_SQLITE_EXEC(st, db, sql_ptr, sql_len);
+    return st as i32;
+}
+
+fn runtime_db_prepare(db: u64, sql_ptr: ptr, sql_len: u64) -> u64 {
+    let st: u64 = 0;
+    let stmt: u64 = 0;
+    SA_SQLITE_PREPARE(st, stmt, db, sql_ptr, sql_len);
+    return stmt;
+}
+
+fn css_bind_text(stmt: u64, idx: u64, val_ptr: ptr, val_len: u64) -> void {
+    let st: u64 = 0;
+    SA_SQLITE_BIND_TEXT(st, stmt, idx, val_ptr, val_len);
+    return;
+}
+
+fn css_bind_null(stmt: u64, idx: u64) -> void {
+    let st: u64 = 0;
+    SA_SQLITE_BIND_NULL(st, stmt, idx);
+    return;
+}
+
+fn css_bind_int(stmt: u64, idx: u64, value: u64) -> void {
+    let st: u64 = 0;
+    SA_SQLITE_BIND_INT(st, stmt, idx, value);
+    return;
+}
+
+// Step once; on a row, parse + cache its JSON document.
+fn css_step(stmt: u64) -> bool {
+    let old = css_row_doc(stmt);
+    if old != 0 {
+        let ig = sa_json_free(old);
+        css_set_row_doc(stmt, 0);
+    };
+    let st: u64 = 0;
+    let ready: u64 = 0;
+    let rp: ptr = PTR_NULL();
+    let rl: u64 = 0;
+    SA_SQLITE_STEP_JSON(st, ready, rp, rl, stmt);
+    if ready == 0 { return false; };
+    let doc = sa_json_parse(rp, rl);
+    css_set_row_doc(stmt, doc);
+    return doc != 0;
+}
+
+fn css_finalize(stmt: u64) -> void {
+    let old = css_row_doc(stmt);
+    if old != 0 {
+        let ig = sa_json_free(old);
+        css_set_row_doc(stmt, 0);
+    };
+    let st: u64 = 0;
+    SA_SQLITE_FINALIZE(st, stmt);
+    return;
+}
+
+fn css_column_text(stmt: u64, idx: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    *out_ptr = PTR_NULL();
+    *out_len = 0;
+    let node = css_column_node(stmt, idx);
+    if node == 0 { return; };
+    if sa_json_kind(node) != 5 { return; };
+    let sp: ptr = PTR_NULL();
+    sp = sa_json_string_ptr(node);
+    *out_ptr = sp;
+    *out_len = sa_json_string_len(node);
+    return;
+}
+
+fn css_column_int(stmt: u64, idx: u64) -> u64 {
+    let node = css_column_node(stmt, idx);
+    if node == 0 { return 0; };
+    let v: i64 = 0;
+    if sa_json_as_i64(node, &v) != 0 { return 0; };
+    return v as u64;
+}
+
+fn css_column_is_null(stmt: u64, idx: u64) -> bool {
+    let node = css_column_node(stmt, idx);
+    if node == 0 { return true; };
+    return sa_json_kind(node) == 0;
+}
+
+fn css_changes(db: u64) -> u64 {
+    // sqlite3_changes() via the SQL changes() function on a scratch
+    // statement (the facade exposes no direct changes macro).
+    let stmt = runtime_db_prepare(db, STR_PTR("SELECT changes()"), STR_LEN("SELECT changes()"));
+    if stmt == 0 { return 0; };
+    let n: u64 = 0;
+    if css_step(stmt) { n = css_column_int(stmt, 0); };
+    css_finalize(stmt);
+    return n;
+}
+
+fn css_copy_field(dst: &[u8], dst_cap: u64, src_ptr: ptr, src_len: u64) -> u64 {
+    let n = src_len;
+    if n > dst_cap { n = dst_cap; };
+    let i: u64 = 0;
+    while i < n {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, src_ptr, i);
+        dst[i] = v;
+        i = i + 1;
+    }
+    return n;
+}
+
+fn css_fill_text_field(stmt: u64, idx: u64, dst: &[u8], dst_cap: u64, out_len: &u64, out_has: &bool) -> void {
+    if css_column_is_null(stmt, idx) {
+        *out_len = 0;
+        *out_has = false;
+        return;
+    };
+    let p: ptr = PTR_NULL();
+    let l: u64 = 0;
+    css_column_text(stmt, idx, &p, &l);
+    *out_len = css_copy_field(dst, dst_cap, p, l);
+    *out_has = true;
+    return;
+}
+
+// mapRow: the current stepped row -> ClaudeSessionRecord.
+fn css_fill_record(stmt: u64, out: &ClaudeSessionRecord) -> void {
+    let p: ptr = PTR_NULL();
+    let l: u64 = 0;
+    css_column_text(stmt, 0, &p, &l);
+    out.threadId_len = css_copy_field(&out.threadId, 128, p, l);
+    css_column_text(stmt, 1, &p, &l);
+    out.ownerId_len = css_copy_field(&out.ownerId, 128, p, l);
+    css_fill_text_field(stmt, 2, &out.externalSessionId, 128, &out.externalSessionId_len, &out.has_externalSessionId);
+    css_fill_text_field(stmt, 3, &out.cliVersion, 64, &out.cliVersion_len, &out.has_cliVersion);
+    css_fill_text_field(stmt, 4, &out.model, 256, &out.model_len, &out.has_model);
+    css_fill_text_field(stmt, 5, &out.cwd, 1024, &out.cwd_len, &out.has_cwd);
+    css_fill_text_field(stmt, 6, &out.permissionMode, 64, &out.permissionMode_len, &out.has_permissionMode);
+    css_fill_text_field(stmt, 7, &out.configDir, 1024, &out.configDir_len, &out.has_configDir);
+    css_fill_text_field(stmt, 8, &out.stateJson, 262144, &out.stateJson_len, &out.has_stateJson);
+    out.createdAt = css_column_int(stmt, 9);
+    out.updatedAt = css_column_int(stmt, 10);
+    return;
 }
 
 // constructor(private readonly db: RuntimeDatabase)
@@ -100,6 +313,20 @@ fn ClaudeSessionStore_new(store: &ClaudeSessionStore, db: u64) -> i32 {
     // try { ALTER TABLE ... ADD COLUMN config_dir } catch {}
     let ignored2 = runtime_db_exec(db, STR_PTR("ALTER TABLE claude_sessions ADD COLUMN config_dir TEXT"), STR_LEN("ALTER TABLE claude_sessions ADD COLUMN config_dir TEXT"));
     return 0;
+}
+
+// get(ownerId, threadId): record or null.
+// Returns 0 = found (out filled), 1 = not found, 2 = db error.
+fn ClaudeSessionStore_get(store: &ClaudeSessionStore, ownerId_ptr: ptr, ownerId_len: u64, threadId_ptr: ptr, threadId_len: u64, out: &ClaudeSessionRecord) -> i32 {
+    let stmt = runtime_db_prepare(store.db, STR_PTR("SELECT * FROM claude_sessions WHERE thread_id = ? AND owner_id = ? LIMIT 1"), STR_LEN("SELECT * FROM claude_sessions WHERE thread_id = ? AND owner_id = ? LIMIT 1"));
+    if stmt == 0 { return 2; };
+    css_bind_text(stmt, 1, threadId_ptr, threadId_len);
+    css_bind_text(stmt, 2, ownerId_ptr, ownerId_len);
+    let found = css_step(stmt);
+    if found { css_fill_record(stmt, out); };
+    css_finalize(stmt);
+    if found { return 0; };
+    return 1;
 }
 
 // upsert(input: {...}): ClaudeSessionRecord
@@ -120,7 +347,109 @@ fn ClaudeSessionStore_upsert(store: &ClaudeSessionStore,
     let now: u64 = claudeSessionStore_now_ms();
     // const existing = this.get(input.ownerId, input.threadId);
     let existing = ClaudeSessionRecord { threadId: [0u8; 128], threadId_len: 0, ownerId: [0u8; 128], ownerId_len: 0, has_externalSessionId: false, externalSessionId: [0u8; 128], externalSessionId_len: 0, has_cliVersion: false, cliVersion: [0u8; 64], cliVersion_len: 0, has_model: false, model: [0u8; 256], model_len: 0, has_cwd: false, cwd: [0u8; 1024], cwd_len: 0, has_permissionMode: false, permissionMode: [0u8; 64], permissionMode_len: 0, has_configDir: false, configDir: [0u8; 1024], configDir_len: 0, has_stateJson: false, stateJson: [0u8; 262144], stateJson_len: 0, createdAt: 0, updatedAt: 0 };
-    let has_existing: bool = ClaudeSessionStore_get(store, ownerId_ptr, ownerId_len, threadId_ptr, threadId_len, &existing) == 0;
+    let get_rc = ClaudeSessionStore_get(store, ownerId_ptr, ownerId_len, threadId_ptr, threadId_len, &existing);
+    if get_rc == 2 { return 2; };
+    let has_existing: bool = get_rc == 0;
     // INSERT ... ON CONFLICT(thread_id, owner_id) DO UPDATE SET col = COALESCE(excluded.col, col), updated_at = excluded.updated_at
-    let stmt = runtime_db_prepare(store.db, STR_PTR("INSERT INTO claude_sessions (thread_id, owner_id, external_session_id, cli_version, model, cwd, permission_mode, config_dir, state_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id, owner_id) DO UPDATE SET external_session_id = COALESCE(excluded.external_session_id, claude_sessions.external_session_id), cli_version = COALESCE(excluded.cli_version, claude_sessions.cli_version), model = COALESCE(excluded.model, claude_sessions.model), cwd = COALESCE(excluded.cwd, claude_sessions.cwd), permission_mode = COALESCE(excluded.permission_mode, claude_sessions.permission_mode), config_dir = COALESCE(excluded.config_dir, claude_sessions.config_dir), state_json = COALESCE(excluded.state_json, claude_sessions.state_json), updated_at = excluded.updated_at"), STR_LEN("INSERT INTO claude_sessions (thread_id, owner_id, external_session_id, cli_version, model, cwd, permission_mode, config_dir, state_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id, owner_id) DO UPDATE SET external_session_id = COALESCE(excluded.external_session_id, claude_sessions.external_session_id), cli_version = COALESCE(excluded.cli_version, claude_sessions.cli_version), model = COALESCE(excluded.model, claude_sessions.model), cwd = COALESCE(excluded.cwd, claude_sessions.cwd), permission_mode = COALESCE(excluded.permission_mode, claude_sessions.permission_mode), config_dir = COALESCE(excluded.config_dir, claude_sessions.config_dir), state
-...[truncated 9869 chars]
+    let stmt = runtime_db_prepare(store.db, STR_PTR("INSERT INTO claude_sessions (thread_id, owner_id, external_session_id, cli_version, model, cwd, permission_mode, config_dir, state_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id, owner_id) DO UPDATE SET external_session_id = COALESCE(excluded.external_session_id, claude_sessions.external_session_id), cli_version = COALESCE(excluded.cli_version, claude_sessions.cli_version), model = COALESCE(excluded.model, claude_sessions.model), cwd = COALESCE(excluded.cwd, claude_sessions.cwd), permission_mode = COALESCE(excluded.permission_mode, claude_sessions.permission_mode), config_dir = COALESCE(excluded.config_dir, claude_sessions.config_dir), state_json = COALESCE(excluded.state_json, claude_sessions.state_json), updated_at = excluded.updated_at"), STR_LEN("INSERT INTO claude_sessions (thread_id, owner_id, external_session_id, cli_version, model, cwd, permission_mode, config_dir, state_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id, owner_id) DO UPDATE SET external_session_id = COALESCE(excluded.external_session_id, claude_sessions.external_session_id), cli_version = COALESCE(excluded.cli_version, claude_sessions.cli_version), model = COALESCE(excluded.model, claude_sessions.model), cwd = COALESCE(excluded.cwd, claude_sessions.cwd), permission_mode = COALESCE(excluded.permission_mode, claude_sessions.permission_mode), config_dir = COALESCE(excluded.config_dir, claude_sessions.config_dir), state_json = COALESCE(excluded.state_json, claude_sessions.state_json), updated_at = excluded.updated_at"));
+    if stmt == 0 { return 2; };
+    css_bind_text(stmt, 1, threadId_ptr, threadId_len);
+    css_bind_text(stmt, 2, ownerId_ptr, ownerId_len);
+    // input.x ?? existing?.x ?? null, per nullable column.
+    let cap_x1: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_x1, &existing.externalSessionId, 0);
+    if has_externalSessionId { css_bind_text(stmt, 3, externalSessionId_ptr, externalSessionId_len); } else if has_existing && existing.has_externalSessionId { css_bind_text(stmt, 3, cap_x1, existing.externalSessionId_len); } else { css_bind_null(stmt, 3); };
+    let cap_x2: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_x2, &existing.cliVersion, 0);
+    if has_cliVersion { css_bind_text(stmt, 4, cliVersion_ptr, cliVersion_len); } else if has_existing && existing.has_cliVersion { css_bind_text(stmt, 4, cap_x2, existing.cliVersion_len); } else { css_bind_null(stmt, 4); };
+    let cap_x3: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_x3, &existing.model, 0);
+    if has_model { css_bind_text(stmt, 5, model_ptr, model_len); } else if has_existing && existing.has_model { css_bind_text(stmt, 5, cap_x3, existing.model_len); } else { css_bind_null(stmt, 5); };
+    let cap_x4: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_x4, &existing.cwd, 0);
+    if has_cwd { css_bind_text(stmt, 6, cwd_ptr, cwd_len); } else if has_existing && existing.has_cwd { css_bind_text(stmt, 6, cap_x4, existing.cwd_len); } else { css_bind_null(stmt, 6); };
+    let cap_x5: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_x5, &existing.permissionMode, 0);
+    if has_permissionMode { css_bind_text(stmt, 7, permissionMode_ptr, permissionMode_len); } else if has_existing && existing.has_permissionMode { css_bind_text(stmt, 7, cap_x5, existing.permissionMode_len); } else { css_bind_null(stmt, 7); };
+    let cap_x6: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_x6, &existing.configDir, 0);
+    if has_configDir { css_bind_text(stmt, 8, configDir_ptr, configDir_len); } else if has_existing && existing.has_configDir { css_bind_text(stmt, 8, cap_x6, existing.configDir_len); } else { css_bind_null(stmt, 8); };
+    let cap_x7: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_x7, &existing.stateJson, 0);
+    if has_stateJson { css_bind_text(stmt, 9, stateJson_ptr, stateJson_len); } else if has_existing && existing.has_stateJson { css_bind_text(stmt, 9, cap_x7, existing.stateJson_len); } else { css_bind_null(stmt, 9); };
+    // created_at = existing?.createdAt ?? now; updated_at = now.
+    if has_existing { css_bind_int(stmt, 10, existing.createdAt); } else { css_bind_int(stmt, 10, now); };
+    css_bind_int(stmt, 11, now);
+    // .run()
+    let drained = css_step(stmt);
+    css_finalize(stmt);
+    // return this.get(input.ownerId, input.threadId)!;
+    return ClaudeSessionStore_get(store, ownerId_ptr, ownerId_len, threadId_ptr, threadId_len, out);
+}
+
+// listByOwner(ownerId): records ordered by updated_at DESC (page cap 32, see list struct DEFECT).
+fn ClaudeSessionStore_listByOwner(store: &ClaudeSessionStore, ownerId_ptr: ptr, ownerId_len: u64, out: &ClaudeSessionRecordList) -> i32 {
+    out.count = 0;
+    let stmt = runtime_db_prepare(store.db, STR_PTR("SELECT * FROM claude_sessions WHERE owner_id = ? ORDER BY updated_at DESC"), STR_LEN("SELECT * FROM claude_sessions WHERE owner_id = ? ORDER BY updated_at DESC"));
+    if stmt == 0 { return 2; };
+    css_bind_text(stmt, 1, ownerId_ptr, ownerId_len);
+    while out.count < 32 && css_step(stmt) {
+        css_fill_record(stmt, &out.items[out.count]);
+        out.count = out.count + 1;
+    }
+    css_finalize(stmt);
+    return 0;
+}
+
+// delete(threadId, ownerId): boolean in TS (changes > 0). Returns changes count.
+fn ClaudeSessionStore_delete(store: &ClaudeSessionStore, threadId_ptr: ptr, threadId_len: u64, ownerId_ptr: ptr, ownerId_len: u64) -> u64 {
+    let stmt = runtime_db_prepare(store.db, STR_PTR("DELETE FROM claude_sessions WHERE thread_id = ? AND owner_id = ?"), STR_LEN("DELETE FROM claude_sessions WHERE thread_id = ? AND owner_id = ?"));
+    if stmt == 0 { return 0; };
+    css_bind_text(stmt, 1, threadId_ptr, threadId_len);
+    css_bind_text(stmt, 2, ownerId_ptr, ownerId_len);
+    let drained = css_step(stmt);
+    css_finalize(stmt);
+    return css_changes(store.db);
+}
+
+// deleteByThread(threadId): number of changes.
+fn ClaudeSessionStore_deleteByThread(store: &ClaudeSessionStore, threadId_ptr: ptr, threadId_len: u64) -> u64 {
+    let stmt = runtime_db_prepare(store.db, STR_PTR("DELETE FROM claude_sessions WHERE thread_id = ?"), STR_LEN("DELETE FROM claude_sessions WHERE thread_id = ?"));
+    if stmt == 0 { return 0; };
+    css_bind_text(stmt, 1, threadId_ptr, threadId_len);
+    let drained = css_step(stmt);
+    css_finalize(stmt);
+    return css_changes(store.db);
+}
+
+// findByExternalSession(externalSessionId): record or null (same rc convention as get).
+fn ClaudeSessionStore_findByExternalSession(store: &ClaudeSessionStore, externalSessionId_ptr: ptr, externalSessionId_len: u64, out: &ClaudeSessionRecord) -> i32 {
+    let stmt = runtime_db_prepare(store.db, STR_PTR("SELECT * FROM claude_sessions WHERE external_session_id = ? LIMIT 1"), STR_LEN("SELECT * FROM claude_sessions WHERE external_session_id = ? LIMIT 1"));
+    if stmt == 0 { return 2; };
+    css_bind_text(stmt, 1, externalSessionId_ptr, externalSessionId_len);
+    let found = css_step(stmt);
+    if found { css_fill_record(stmt, out); };
+    css_finalize(stmt);
+    if found { return 0; };
+    return 1;
+}
+
+// countByConfigDir(configDir): number of threads still bound to the directory.
+fn ClaudeSessionStore_countByConfigDir(store: &ClaudeSessionStore, configDir_ptr: ptr, configDir_len: u64) -> u64 {
+    let stmt = runtime_db_prepare(store.db, STR_PTR("SELECT COUNT(*) AS total FROM claude_sessions WHERE config_dir = ?"), STR_LEN("SELECT COUNT(*) AS total FROM claude_sessions WHERE config_dir = ?"));
+    if stmt == 0 { return 0; };
+    css_bind_text(stmt, 1, configDir_ptr, configDir_len);
+    let n: u64 = 0;
+    if css_step(stmt) { n = css_column_int(stmt, 0); };
+    css_finalize(stmt);
+    return n;
+}
+
+// listConfigDirs(): distinct non-null config dirs.
+fn ClaudeSessionStore_listConfigDirs(store: &ClaudeSessionStore, out: &StrList) -> i32 {
+    out.count = 0;
+    out.items_len = 0;
+    let stmt = runtime_db_prepare(store.db, STR_PTR("SELECT DISTINCT config_dir FROM claude_sessions WHERE config_dir IS NOT NULL"), STR_LEN("SELECT DISTINCT config_dir FROM claude_sessions WHERE config_dir IS NOT NULL"));
+    if stmt == 0 { return 2; };
+    while css_step(stmt) {
+        let p: ptr = PTR_NULL();
+        let l: u64 = 0;
+        css_column_text(stmt, 0, &p, &l);
+        if l > 0 { strlist_push(out, p, l); };
+    }
+    css_finalize(stmt);
+    return 0;
+}
