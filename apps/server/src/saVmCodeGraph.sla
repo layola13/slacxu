@@ -13,7 +13,7 @@
 @import "sa_std/string.sa"
 
 @import "./saVmTreeSitter.sla" // getLanguageNameForFile, loadLanguageForFile, TreeSitterState, StrBuf + sb_* helpers, ts_node_* surface (was commented in bulk pass)
-// @import "../../../backends/vmtool-security/src/security/saVmPolicy.sla" // checkSaVmPath, normalizeSaVmPolicy, NormalizedSaVmPolicy
+@import "../../../backends/vmtool-security/src/security/saVmPolicy.sla" // checkSaVmPath, normalizeSaVmPolicy, NormalizedSaVmPolicy
 // @import "./saVmResultKind.sla"   // SaVmRunResult
 // DEFECT: node:fs (existsSync/readdirSync/statSync via require),
 // node:fs/promises (readFile/writeFile), node:path — no sa_std
@@ -23,23 +23,49 @@
 // path_dirname/path_extname/path_join2/path_resolve2/path_relative/is_absolute.
 
 // ---- cross-unit types (referenced, owned by other units) ----
-// DEFECT: SaVmPolicyConfig is a dynamic options object from
-// @codex-ui/shared; NormalizedSaVmPolicy is the vmtool-security unit's
-// normalized form. Both are opaque handles here.
+// SaVmPolicyConfig is a dynamic options object from @codex-ui/shared,
+// flattened here to its JSON doc handle. NormalizedSaVmPolicy is the
+// vmtool-security unit's normalized form, imported from saVmPolicy.sla
+// above together with checkSaVmPath / normalizeSaVmPolicy.
 struct SaVmPolicyConfig { handle: u64, has_value: bool }
-struct NormalizedSaVmPolicy { handle: u64 }
 
-// checkSaVmPath(policy, action "read"|"write", absPath, cwd) ->
-// { allowed, reason? } from the vmtool-security unit.
-fn checkSaVmPath(policy: &NormalizedSaVmPolicy, action_p: ptr, action_n: u64, absPath: &StrBuf, cwd: &StrBuf, reasonOut: &StrBuf) -> bool {
-    // DEFECT: foreign-unit function — declared here as the assumed
-    // extern signature; implementation lives in saVmPolicy.sla.
-    return cg_policy_check_extern(policy.handle, action_p, action_n, absPath, cwd, reasonOut);
+// Policy gate for this unit: cgCheckSaVmPath adapts the flattened
+// (policy, action "read"|"write", absPath, cwd) call shape used below
+// onto the vmtool-security unit's checkSaVmPath decision API.
+fn cgCheckSaVmPath(policy: &NormalizedSaVmPolicy, action_p: ptr, action_n: u64, absPath: &StrBuf, cwd: &StrBuf, reasonOut: &StrBuf) -> bool {
+    // Bound to the vmtool-security unit's checkSaVmPath
+    // (saVmPolicy.sla): action "read" -> operation 0, "write" ->
+    // operation 1 (the SaVmPathOperation tags of that unit). The
+    // decision's reason text is copied into reasonOut.
+    let op: u32 = 0;
+    let ab = StrBuf { bytes: [0u8; 65536], len: 0 };
+    sb_append(&ab, action_p, action_n);
+    if sb_eq_lit(&ab, STR_PTR("write"), STR_LEN("write")) { op = 1; };
+    let decision = SaVmPolicyDecision { allowed: false, reason: [0u8; 2048], reason_len: 0, path: [0u8; 1024], path_len: 0, path_has: false };
+    let pp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pp, &absPath.bytes, 0);
+    let cp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cp, &cwd.bytes, 0);
+    checkSaVmPath(policy, op, pp, absPath.len, cp, cwd.len, &decision);
+    if !decision.allowed {
+        sb_clear(reasonOut);
+        let rp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp, &decision.reason, 0);
+        sb_append(reasonOut, rp, decision.reason_len);
+        return false;
+    };
+    return true;
 }
 
-fn normalizeSaVmPolicy(policy: &SaVmPolicyConfig, cwd: &StrBuf, out: &NormalizedSaVmPolicy) {
-    // DEFECT: foreign-unit function (saVmPolicy.sla).
-    out.handle = cg_policy_normalize_extern(policy.handle, cwd);
+fn cgNormalizeSaVmPolicy(policy: &SaVmPolicyConfig, cwd: &StrBuf, out: &NormalizedSaVmPolicy) {
+    // Bound to the vmtool-security unit's normalizeSaVmPolicy
+    // (saVmPolicy.sla): config_doc is the policy config's JSON doc
+    // handle (this unit's flattened SaVmPolicyConfig.handle); the
+    // code graph supplies no additional roots.
+    let roots = StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 };
+    let cp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cp, &cwd.bytes, 0);
+    normalizeSaVmPolicy(policy.handle, cp, cwd.len, &roots, out);
 }
 
 // SaVmRunResult (saVmResultKind unit): events/violation are dynamic
@@ -177,16 +203,17 @@ struct CodeGraphOptions {
 
 // ---- shared node-type helper (same surface as saVmTreeSitter unit) ----
 fn cg_node_type_is(n: u64, p: ptr, len: u64) -> bool {
+    // Same shape as the saVmTreeSitter unit's node_type_is: the type
+    // string is materialized via ts_node_type_sb (sa_ts_node_type).
     if n == 0 { return false; };
-    if ts_node_type_len(n) != len { return false; };
-    let tp = ts_node_type_ptr(n);
+    let tb = StrBuf { bytes: [0u8; 65536], len: 0 };
+    ts_node_type_sb(n, &tb);
+    if tb.len != len { return false; };
     let i: u64 = 0;
     while i < len {
-        let a: u8 = 0;
         let b: u8 = 0;
-        PTR_BYTE_AT(a, tp, i);
         PTR_BYTE_AT(b, p, i);
-        if a != b { return false; };
+        if tb.bytes[i] != b { return false; };
         i = i + 1;
     }
     return true;
@@ -204,25 +231,41 @@ fn cg_field_text(n: u64, p: ptr, len: u64, out: &StrBuf) {
 }
 
 fn cg_copy_into(field: &[u8; 256], out_len: &u64, src: &StrBuf) {
-    out_len = 0;
+    *out_len = 0;
     let i: u64 = 0;
-    while i < src.len && i < 256 { field[i] = src.bytes[i]; out_len = out_len + 1; i = i + 1; }
+    while i < src.len && i < 256 {
+        field[i] = src.bytes[i];
+        let n = *out_len;
+        *out_len = n + 1;
+        i = i + 1;
+    }
 }
 
-fn cg_buf_eq(field: &[u8; 1024], n: u64, other: &StrBuf) -> bool {
+fn cg_buf_eq(field: ptr, n: u64, other: &StrBuf) -> bool {
+    // ptr + len form: the compared fields have different capacities
+    // at the call sites (the flattened helper takes ptr/len).
     if n != other.len { return false; };
     let i: u64 = 0;
     while i < n {
-        if field[i] != other.bytes[i] { return false; };
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, field, i);
+        if c != other.bytes[i] { return false; };
         i = i + 1;
     }
     return true;
 }
 
-fn cg_field_to_sb(field: &[u8; 4096], n: u64, out: &StrBuf) {
+fn cg_field_to_sb(field: ptr, n: u64, out: &StrBuf) {
+    // field is a byte pointer + length (the call sites' arrays have
+    // different capacities, so the flattened helper takes ptr/len).
     sb_clear(out);
     let i: u64 = 0;
-    while i < n { sb_append_byte(out, field[i]); i = i + 1; }
+    while i < n {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, field, i);
+        sb_append_byte(out, c);
+        i = i + 1;
+    }
 }
 
 // dedup-append to a ", "-joined list (source: [...new Set(xs)])
@@ -914,7 +957,7 @@ fn extractRegexFallback(content: &StrBuf, filePath: &StrBuf, classes: &Extracted
 
 fn regexFallbackLine(line: &StrBuf, lineNo: u64, classes: &ExtractedClassList, imports: &ExtractedImportList, out: &ExtractedFileInfo) {
     let lt = StrBuf { bytes: [0u8; 65536], len: 0 };
-    sb_trim(&line, &lt);
+    sb_trim(line, &lt);
     // class: (?:export\s+)?(?:default\s+)?class\s+(NAME)(?:\s+extends\s+([A-Za-z0-9_$.]+))?(?:\s+implements\s+([A-Za-z0-9_$,\s]+))?
     let rest = StrBuf { bytes: [0u8; 65536], len: 0 };
     strip_export_default(&lt, &rest);
@@ -936,7 +979,7 @@ fn regexFallbackLine(line: &StrBuf, lineNo: u64, classes: &ExtractedClassList, i
                 while w < b.len && w < 2048 { classes.items[slot].bases[w] = b.bytes[w]; classes.items[slot].bases_len = classes.items[slot].bases_len + 1; w = w + 1; }
             };
             // implements list: split(",").map(trim).filter(Boolean)
-            let impl_sb = StrBuf { bytes: [u8; 65536], len: 0 };
+            let impl_sb = StrBuf { bytes: [0u8; 65536], len: 0 };
             if find_kw_value(&rest, STR_PTR("implements"), STR_LEN("implements"), &impl_sb) {
                 classes.items[slot].interfaces_len = 0;
                 let w: u64 = 0;
@@ -1560,7 +1603,9 @@ fn graph_add_node(gs: &GraphState, id: &StrBuf, kind: u64, file: &StrBuf, hasFil
     // nodes.set when absent; returns false when the id already exists
     let i: u64 = 0;
     while i < gs.nodes.len {
-        if cg_buf_eq(&gs.nodes.items[i].id, gs.nodes.items[i].id_len, id) { return false; };
+        let fp_201: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_201, &gs.nodes.items[i].id, 0);
+        if cg_buf_eq(fp_201, gs.nodes.items[i].id_len, id) { return false; };
         i = i + 1;
     }
     if gs.nodes.len >= 256 { return false; };
@@ -1587,7 +1632,9 @@ fn graph_add_node(gs: &GraphState, id: &StrBuf, kind: u64, file: &StrBuf, hasFil
 fn graph_has_node(gs: &GraphState, id: &StrBuf) -> bool {
     let i: u64 = 0;
     while i < gs.nodes.len {
-        if cg_buf_eq(&gs.nodes.items[i].id, gs.nodes.items[i].id_len, id) { return true; };
+        let fp_202: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_202, &gs.nodes.items[i].id, 0);
+        if cg_buf_eq(fp_202, gs.nodes.items[i].id_len, id) { return true; };
         i = i + 1;
     }
     return false;
@@ -1610,7 +1657,9 @@ fn graph_add_edge(gs: &GraphState, source: &StrBuf, target: &StrBuf, kind: u64, 
     PTR_BYTE_ADD(kp, &kn.bytes, 0);
     sb_append(&key, kp, kn.len);
     let keys = StrBuf { bytes: [0u8; 65536], len: 0 };
-    cg_field_to_sb(&gs.edgeKeys, gs.edgeKeys_len, &keys);
+    let fp_1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp_1, &gs.edgeKeys, 0);
+    cg_field_to_sb(fp_1, gs.edgeKeys_len, &keys);
     if joined_contains(&keys, &key) { return; };
     if gs.edgeKeys_len > 0 && gs.edgeKeys_len < 65536 {
         gs.edgeKeys[gs.edgeKeys_len] = 10;
@@ -1650,7 +1699,9 @@ fn rel_slash(cwd: &StrBuf, absPath: &StrBuf, out: &StrBuf) {
 fn getFileAST(tsh: &TreeSitterState, cache: &FileCache, classes: &ExtractedClassList, imports: &ExtractedImportList, policy: &NormalizedSaVmPolicy, cwd: &StrBuf, absPath: &StrBuf) -> i64 {
     let i: u64 = 0;
     while i < cache.len {
-        if cg_buf_eq(&cache.entries[i].path, cache.entries[i].path_len, absPath) {
+        let fp_203: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_203, &cache.entries[i].path, 0);
+        if cg_buf_eq(fp_203, cache.entries[i].path_len, absPath) {
             if cache.entries[i].ok { return i as i64; };
             return -1;
         };
@@ -1664,7 +1715,7 @@ fn getFileAST(tsh: &TreeSitterState, cache: &FileCache, classes: &ExtractedClass
     cache.entries[slot].ok = false;
     cache.len = cache.len + 1;
     let reason = StrBuf { bytes: [0u8; 65536], len: 0 };
-    if !checkSaVmPath(policy, STR_PTR("read"), STR_LEN("read"), absPath, cwd, &reason) { return -1; };
+    if !cgCheckSaVmPath(policy, STR_PTR("read"), STR_LEN("read"), absPath, cwd, &reason) { return -1; };
     let content = StrBuf { bytes: [0u8; 65536], len: 0 };
     let ap: ptr = PTR_NULL();
     PTR_BYTE_ADD(ap, &absPath.bytes, 0);
@@ -1707,9 +1758,11 @@ fn queue_push(q: &PathQueue, path: &StrBuf, depth: u64) {
 fn queue_front(q: &PathQueue, outPath: &StrBuf, outDepth: &u64) -> bool {
     if q.head >= q.count { return false; };
     let joined = StrBuf { bytes: [0u8; 65536], len: 0 };
-    cg_field_to_sb(&q.paths, q.paths_len, &joined);
+    let fp_2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp_2, &q.paths, 0);
+    cg_field_to_sb(fp_2, q.paths_len, &joined);
     joined_line(&joined, q.head, outPath);
-    outDepth = q.depths[q.head];
+    *outDepth = q.depths[q.head];
     q.head = q.head + 1;
     return true;
 }
@@ -1721,7 +1774,9 @@ fn buildScopedCodeGraph(tsh: &TreeSitterState, options: &CodeGraphOptions, polic
     gs.truncated = false;
     let target = StrBuf { bytes: [0u8; 65536], len: 0 };
     // options.target is a struct field; copy via generic field buffer
-    cg_field_to_sb(&options.target, options.target_len, &target);
+    let fp_3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp_3, &options.target, 0);
+    cg_field_to_sb(fp_3, options.target_len, &target);
     let targetT = StrBuf { bytes: [0u8; 65536], len: 0 };
     sb_trim(&target, &targetT);
     target = targetT;
@@ -1769,10 +1824,14 @@ fn candidate_list(options: &CodeGraphOptions, cwd: &StrBuf, fallbackDir: &StrBuf
     let joined = StrBuf { bytes: [0u8; 65536], len: 0 };
     let has = false;
     if options.has_candidate_files {
-        cg_field_to_sb(&options.candidate_files, options.candidate_files_len, &joined);
+        let fp_4: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_4, &options.candidate_files, 0);
+        cg_field_to_sb(fp_4, options.candidate_files_len, &joined);
         has = options.candidate_files_len > 0;
     } else if options.has_files {
-        cg_field_to_sb(&options.files, options.files_len, &joined);
+        let fp_5: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_5, &options.files, 0);
+        cg_field_to_sb(fp_5, options.files_len, &joined);
         has = options.files_len > 0;
     };
     if has {
@@ -1864,7 +1923,9 @@ fn buildModuleDependency(tsh: &TreeSitterState, options: &CodeGraphOptions, poli
             while ii < info.imports_len {
                 let imp = imports.items[info.imports_first + ii];
                 let spec = StrBuf { bytes: [0u8; 65536], len: 0 };
-                cg_field_to_sb(&imp.specifier, imp.specifier_len, &spec);
+                let fp_6: ptr = PTR_NULL();
+                PTR_BYTE_ADD(fp_6, &imp.specifier, 0);
+                cg_field_to_sb(fp_6, imp.specifier_len, &spec);
                 let resolved = StrBuf { bytes: [0u8; 65536], len: 0 };
                 if resolveImportFilePath(&curPath, &spec, &resolved) {
                     let targetRel = StrBuf { bytes: [0u8; 65536], len: 0 };
@@ -1917,7 +1978,9 @@ fn buildModuleDependency(tsh: &TreeSitterState, options: &CodeGraphOptions, poli
                         while ii < candInfo.imports_len {
                             let imp = imports.items[candInfo.imports_first + ii];
                             let spec = StrBuf { bytes: [0u8; 65536], len: 0 };
-                            cg_field_to_sb(&imp.specifier, imp.specifier_len, &spec);
+                            let fp_7: ptr = PTR_NULL();
+                            PTR_BYTE_ADD(fp_7, &imp.specifier, 0);
+                            cg_field_to_sb(fp_7, imp.specifier_len, &spec);
                             let resolved = StrBuf { bytes: [0u8; 65536], len: 0 };
                             if resolveImportFilePath(&candAbs, &spec, &resolved) && sb_eq_buf(&resolved, &curPath) {
                                 candImportsTarget = true;
@@ -1978,7 +2041,9 @@ fn fnmap_put(m: &FnMap, name: &StrBuf, callsJoined: &StrBuf, fileRel: &StrBuf, h
     // Map.set only when absent (source: if (!allFunctions.has(name)))
     let i: u64 = 0;
     while i < m.len {
-        if cg_buf_eq(&m.items[i].name, m.items[i].name_len, name) { return; };
+        let fp_204: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_204, &m.items[i].name, 0);
+        if cg_buf_eq(fp_204, m.items[i].name_len, name) { return; };
         i = i + 1;
     }
     if m.len >= 1024 { return; };
@@ -2001,7 +2066,9 @@ fn fnmap_put(m: &FnMap, name: &StrBuf, callsJoined: &StrBuf, fileRel: &StrBuf, h
 fn fnmap_get(m: &FnMap, name: &StrBuf) -> i64 {
     let i: u64 = 0;
     while i < m.len {
-        if cg_buf_eq(&m.items[i].name, m.items[i].name_len, name) { return i as i64; };
+        let fp_205: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_205, &m.items[i].name, 0);
+        if cg_buf_eq(fp_205, m.items[i].name_len, name) { return i as i64; };
         i = i + 1;
     }
     return -1;
@@ -2039,9 +2106,13 @@ fn runCallQueue(gs: &GraphState, q: &CallQueue, visited: &StrBuf, allFunctions: 
         let item = q.items[q.head];
         q.head = q.head + 1;
         let callerName = StrBuf { bytes: [0u8; 65536], len: 0 };
-        cg_field_to_sb(&item.callerName, item.callerName_len, &callerName);
+        let fp_8: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_8, &item.callerName, 0);
+        cg_field_to_sb(fp_8, item.callerName_len, &callerName);
         let callsJoined = StrBuf { bytes: [0u8; 65536], len: 0 };
-        cg_field_to_sb(&item.calls, item.calls_len, &callsJoined);
+        let fp_9: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_9, &item.calls, 0);
+        cg_field_to_sb(fp_9, item.calls_len, &callsJoined);
         // iterate ", "-joined callees
         let pos: u64 = 0;
         while pos <= callsJoined.len {
@@ -2058,7 +2129,9 @@ fn runCallQueue(gs: &GraphState, q: &CallQueue, visited: &StrBuf, allFunctions: 
                     let hasFile = false;
                     if calleeIdx != -1 && allFunctions.items[calleeIdx as u64].has_file {
                         hasFile = true;
-                        cg_field_to_sb(&allFunctions.items[calleeIdx as u64].fileRel, allFunctions.items[calleeIdx as u64].fileRel_len, &fileRel);
+                        let fp_301: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(fp_301, &allFunctions.items[calleeIdx as u64].fileRel, 0);
+                        cg_field_to_sb(fp_301, allFunctions.items[calleeIdx as u64].fileRel_len, &fileRel);
                     };
                     graph_add_node(gs, &callee, 3, &fileRel, hasFile, 0, false);
                 };
@@ -2073,7 +2146,9 @@ fn runCallQueue(gs: &GraphState, q: &CallQueue, visited: &StrBuf, allFunctions: 
                     let calleeIdx = fnmap_get(allFunctions, &callee);
                     if calleeIdx != -1 && allFunctions.items[calleeIdx as u64].calls_len > 0 {
                         let cc2 = StrBuf { bytes: [0u8; 65536], len: 0 };
-                        cg_field_to_sb(&allFunctions.items[calleeIdx as u64].calls, allFunctions.items[calleeIdx as u64].calls_len, &cc2);
+                        let fp_302: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(fp_302, &allFunctions.items[calleeIdx as u64].calls, 0);
+                        cg_field_to_sb(fp_302, allFunctions.items[calleeIdx as u64].calls_len, &cc2);
                         call_queue_push(q, &callee, &cc2, item.depth + 1);
                     };
                 };
@@ -2088,7 +2163,9 @@ fn find_class_in_info(classes: &ExtractedClassList, info: &ExtractedFileInfo, na
     let i: u64 = 0;
     while i < info.classes_len {
         let c = classes.items[info.classes_first + i];
-        if cg_buf_eq(&c.name, c.name_len, name) { return (info.classes_first + i) as i64; };
+        let fp_206: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_206, &c.name, 0);
+        if cg_buf_eq(fp_206, c.name_len, name) { return (info.classes_first + i) as i64; };
         i = i + 1;
     }
     return -1;
@@ -2098,7 +2175,9 @@ fn find_func_in_info(info: &ExtractedFileInfo, name: &StrBuf) -> i64 {
     let i: u64 = 0;
     while i < info.functions_len {
         let f = info.functions[i];
-        if cg_buf_eq(&f.name, f.name_len, name) { return i as i64; };
+        let fp_207: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_207, &f.name, 0);
+        if cg_buf_eq(fp_207, f.name_len, name) { return i as i64; };
         i = i + 1;
     }
     return -1;
@@ -2139,7 +2218,9 @@ fn buildCallFlow(tsh: &TreeSitterState, options: &CodeGraphOptions, policy: &Nor
                     sb_clear(&foundFile);
                     sb_append(&foundFile, fp, p.len);
                     hasFoundFunc = true;
-                    cg_field_to_sb(&info.functions[mf as u64].calls, info.functions[mf as u64].calls_len, &foundFuncCalls);
+                    let fp_303: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(fp_303, &info.functions[mf as u64].calls, 0);
+                    cg_field_to_sb(fp_303, info.functions[mf as u64].calls_len, &foundFuncCalls);
                     break;
                 };
             };
@@ -2172,9 +2253,13 @@ fn buildCallFlow(tsh: &TreeSitterState, options: &CodeGraphOptions, policy: &Nor
                 while fi < info.functions_len {
                     let fnItem = info.functions[fi];
                     let nm = StrBuf { bytes: [0u8; 65536], len: 0 };
-                    cg_field_to_sb(&fnItem.name, fnItem.name_len, &nm);
+                    let fp_10: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(fp_10, &fnItem.name, 0);
+                    cg_field_to_sb(fp_10, fnItem.name_len, &nm);
                     let cl = StrBuf { bytes: [0u8; 65536], len: 0 };
-                    cg_field_to_sb(&fnItem.calls, fnItem.calls_len, &cl);
+                    let fp_11: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(fp_11, &fnItem.calls, 0);
+                    cg_field_to_sb(fp_11, fnItem.calls_len, &cl);
                     fnmap_put(&allFunctions, &nm, &cl, &fRel, true);
                     fi = fi + 1;
                 }
@@ -2182,12 +2267,16 @@ fn buildCallFlow(tsh: &TreeSitterState, options: &CodeGraphOptions, policy: &Nor
                 while ci < info.classes_len {
                     let cls = classes.items[info.classes_first + ci];
                     let clsName = StrBuf { bytes: [0u8; 65536], len: 0 };
-                    cg_field_to_sb(&cls.name, cls.name_len, &clsName);
+                    let fp_12: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(fp_12, &cls.name, 0);
+                    cg_field_to_sb(fp_12, cls.name_len, &clsName);
                     let mi: u64 = 0;
                     while mi < cls.methods_len {
                         let m = cls.methods[mi];
                         let mName = StrBuf { bytes: [0u8; 65536], len: 0 };
-                        cg_field_to_sb(&m.name, m.name_len, &mName);
+                        let fp_13: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(fp_13, &m.name, 0);
+                        cg_field_to_sb(fp_13, m.name_len, &mName);
                         let qualified = StrBuf { bytes: [0u8; 65536], len: 0 };
                         let cp: ptr = PTR_NULL();
                         PTR_BYTE_ADD(cp, &clsName.bytes, 0);
@@ -2197,7 +2286,9 @@ fn buildCallFlow(tsh: &TreeSitterState, options: &CodeGraphOptions, policy: &Nor
                         PTR_BYTE_ADD(mp, &mName.bytes, 0);
                         sb_append(&qualified, mp, mName.len);
                         let cl = StrBuf { bytes: [0u8; 65536], len: 0 };
-                        cg_field_to_sb(&m.calls, m.calls_len, &cl);
+                        let fp_14: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(fp_14, &m.calls, 0);
+                        cg_field_to_sb(fp_14, m.calls_len, &cl);
                         fnmap_put(&allFunctions, &qualified, &cl, &fRel, true);
                         fnmap_put(&allFunctions, &mName, &cl, &fRel, true);
                         mi = mi + 1;
@@ -2216,7 +2307,9 @@ fn buildCallFlow(tsh: &TreeSitterState, options: &CodeGraphOptions, policy: &Nor
         while mi < cls.methods_len {
             let m = cls.methods[mi];
             let mName = StrBuf { bytes: [0u8; 65536], len: 0 };
-            cg_field_to_sb(&m.name, m.name_len, &mName);
+            let fp_15: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_15, &m.name, 0);
+            cg_field_to_sb(fp_15, m.name_len, &mName);
             let callerName = StrBuf { bytes: [0u8; 65536], len: 0 };
             let tp: ptr = PTR_NULL();
             PTR_BYTE_ADD(tp, &target.bytes, 0);
@@ -2231,7 +2324,9 @@ fn buildCallFlow(tsh: &TreeSitterState, options: &CodeGraphOptions, policy: &Nor
             sb_append(&lbl, STR_PTR("has_method"), STR_LEN("has_method"));
             graph_add_edge(gs, target, &callerName, EDGE_CALLS, &lbl, true);
             let cl = StrBuf { bytes: [0u8; 65536], len: 0 };
-            cg_field_to_sb(&m.calls, m.calls_len, &cl);
+            let fp_16: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_16, &m.calls, 0);
+            cg_field_to_sb(fp_16, m.calls_len, &cl);
             call_queue_push(&queue, &callerName, &cl, 1);
             if visited.len > 0 { sb_append_byte(&visited, 10); };
             let vp: ptr = PTR_NULL();
@@ -2306,7 +2401,9 @@ fn buildSymbolHierarchy(tsh: &TreeSitterState, options: &CodeGraphOptions, polic
     };
     let cls = classes.items[foundClassIdx as u64];
     let clsName = StrBuf { bytes: [0u8; 65536], len: 0 };
-    cg_field_to_sb(&cls.name, cls.name_len, &clsName);
+    let fp_17: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp_17, &cls.name, 0);
+    cg_field_to_sb(fp_17, cls.name_len, &clsName);
     set_root_id(gs, &clsName);
     let relPath = StrBuf { bytes: [0u8; 65536], len: 0 };
     let hasRel = false;
@@ -2326,7 +2423,9 @@ fn buildSymbolHierarchy(tsh: &TreeSitterState, options: &CodeGraphOptions, polic
         let f = cls.fields[fi];
         if f.has_type {
             let typeText = StrBuf { bytes: [0u8; 65536], len: 0 };
-            cg_field_to_sb(&f.type_, f.type_len, &typeText);
+            let fp_18: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_18, &f.type_, 0);
+            cg_field_to_sb(fp_18, f.type_len, &typeText);
             // typeName = field.type_.replace(/<.*>$/, "").trim()
             let typeName = StrBuf { bytes: [0u8; 65536], len: 0 };
             strip_generic_suffix(&typeText, &typeName);
@@ -2359,9 +2458,13 @@ fn buildSymbolHierarchy(tsh: &TreeSitterState, options: &CodeGraphOptions, polic
             let fileInfo = cache.entries[entryIdx as u64].info;
             // iterate bases + interfaces
             let allBases = StrBuf { bytes: [0u8; 65536], len: 0 };
-            cg_field_to_sb(&cls.bases, cls.bases_len, &allBases);
+            let fp_19: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_19, &cls.bases, 0);
+            cg_field_to_sb(fp_19, cls.bases_len, &allBases);
             let ifaces = StrBuf { bytes: [0u8; 65536], len: 0 };
-            cg_field_to_sb(&cls.interfaces, cls.interfaces_len, &ifaces);
+            let fp_20: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_20, &cls.interfaces, 0);
+            cg_field_to_sb(fp_20, cls.interfaces_len, &ifaces);
             if ifaces.len > 0 {
                 if allBases.len > 0 { sb_append(&allBases, STR_PTR(", "), STR_LEN(", ")); };
                 let ip: ptr = PTR_NULL();
@@ -2379,7 +2482,9 @@ fn buildSymbolHierarchy(tsh: &TreeSitterState, options: &CodeGraphOptions, polic
                     let imp = imports.items[fileInfo.imports_first + ii];
                     if import_has_local(&imp, &baseName) {
                         let spec = StrBuf { bytes: [0u8; 65536], len: 0 };
-                        cg_field_to_sb(&imp.specifier, imp.specifier_len, &spec);
+                        let fp_21: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(fp_21, &imp.specifier, 0);
+                        cg_field_to_sb(fp_21, imp.specifier_len, &spec);
                         let baseAbs = StrBuf { bytes: [0u8; 65536], len: 0 };
                         if resolveImportFilePath(&foundFile, &spec, &baseAbs) {
                             let baseIdx = getFileAST(tsh, cache, classes, imports, policy, cwd, &baseAbs);
@@ -2389,10 +2494,14 @@ fn buildSymbolHierarchy(tsh: &TreeSitterState, options: &CodeGraphOptions, polic
                                 if parentIdx != -1 {
                                     let parent = classes.items[parentIdx as u64];
                                     let gi: u64 = 0;
-                                    let gtotal = cg_join_count_from(&parent.bases, parent.bases_len);
+                                    let fp_208: ptr = PTR_NULL();
+                                    PTR_BYTE_ADD(fp_208, &parent.bases, 0);
+                                    let gtotal = cg_join_count_from(fp_208, parent.bases_len);
                                     while gi < gtotal {
                                         let gBase = StrBuf { bytes: [0u8; 65536], len: 0 };
-                                        joined_segment_from(&parent.bases, parent.bases_len, gi, &gBase);
+                                        let fp_101: ptr = PTR_NULL();
+                                        PTR_BYTE_ADD(fp_101, &parent.bases, 0);
+                                        joined_segment_from(fp_101, parent.bases_len, gi, &gBase);
                                         let emptyFile = StrBuf { bytes: [0u8; 65536], len: 0 };
                                         graph_add_node(gs, &gBase, 0, &emptyFile, false, 0, false);
                                         let lbl = StrBuf { bytes: [0u8; 65536], len: 0 };
@@ -2429,9 +2538,13 @@ fn append_path_line(joined: &StrBuf, path: &StrBuf) {
 fn add_related_nodes(gs: &GraphState, clsName: &StrBuf, cls: &ExtractedClassInfo, useBases: bool, kind: u64, labelP: ptr, labelN: u64) {
     let joined = StrBuf { bytes: [0u8; 65536], len: 0 };
     if useBases {
-        cg_field_to_sb(&cls.bases, cls.bases_len, &joined);
+        let fp_22: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_22, &cls.bases, 0);
+        cg_field_to_sb(fp_22, cls.bases_len, &joined);
     } else {
-        cg_field_to_sb(&cls.interfaces, cls.interfaces_len, &joined);
+        let fp_23: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_23, &cls.interfaces, 0);
+        cg_field_to_sb(fp_23, cls.interfaces_len, &joined);
     };
     let nodeKind: u64 = 0;
     if !useBases { nodeKind = 1; };
@@ -2467,13 +2580,13 @@ fn joined_segment(joined: &StrBuf, idxWanted: u64, out: &StrBuf) {
     }
 }
 
-fn cg_join_count_from(field: &[u8; 2048], n: u64) -> u64 {
+fn cg_join_count_from(field: ptr, n: u64) -> u64 {
     let b = StrBuf { bytes: [0u8; 65536], len: 0 };
     cg_field_to_sb(field, n, &b);
     return cg_join_count(&b);
 }
 
-fn joined_segment_from(field: &[u8; 2048], n: u64, idxWanted: u64, out: &StrBuf) {
+fn joined_segment_from(field: ptr, n: u64, idxWanted: u64, out: &StrBuf) {
     let b = StrBuf { bytes: [0u8; 65536], len: 0 };
     cg_field_to_sb(field, n, &b);
     joined_segment(&b, idxWanted, out);
@@ -2500,7 +2613,9 @@ fn strip_generic_suffix(typeText: &StrBuf, out: &StrBuf) {
 fn import_has_local(imp: &ExtractedImportInfo, name: &StrBuf) -> bool {
     let i: u64 = 0;
     while i < imp.symbols_len {
-        if cg_buf_eq(&imp.symbols[i].local, imp.symbols[i].local_len, name) { return true; };
+        let fp_209: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_209, &imp.symbols[i].local, 0);
+        if cg_buf_eq(fp_209, imp.symbols[i].local_len, name) { return true; };
         i = i + 1;
     }
     return false;
@@ -2568,7 +2683,9 @@ fn formatAsDot(nodes: &CodeGraphNodeList, edges: &CodeGraphEdgeList, rootId: &St
                 build_edge_key(&e2, &k2);
                 if sb_eq_buf(&k2, &key) {
                     if targets.len > 0 { sb_append_byte(&targets, 10); };
-                    cg_field_to_sb(&e2.target, e2.target_len, &targets);
+                    let fp_24: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(fp_24, &e2.target, 0);
+                    cg_field_to_sb(fp_24, e2.target_len, &targets);
                     // NOTE: cg_field_to_sb clears; rebuild properly below
                     targetCount = targetCount + 1;
                 };
@@ -2585,7 +2702,9 @@ fn formatAsDot(nodes: &CodeGraphNodeList, edges: &CodeGraphEdgeList, rootId: &St
                 if sb_eq_buf(&k3, &key) {
                     if targetCount > 0 { sb_append_byte(&targets, 10); };
                     let tb = StrBuf { bytes: [0u8; 65536], len: 0 };
-                    cg_field_to_sb(&e3.target, e3.target_len, &tb);
+                    let fp_25: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(fp_25, &e3.target, 0);
+                    cg_field_to_sb(fp_25, e3.target_len, &tb);
                     let tp2: ptr = PTR_NULL();
                     PTR_BYTE_ADD(tp2, &tb.bytes, 0);
                     sb_append(&targets, tp2, tb.len);
@@ -2594,12 +2713,16 @@ fn formatAsDot(nodes: &CodeGraphNodeList, edges: &CodeGraphEdgeList, rootId: &St
                 ek = ek + 1;
             }
             let src = StrBuf { bytes: [0u8; 65536], len: 0 };
-            cg_field_to_sb(&e.source, e.source_len, &src);
+            let fp_26: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_26, &e.source, 0);
+            cg_field_to_sb(fp_26, e.source_len, &src);
             let attrs = StrBuf { bytes: [0u8; 65536], len: 0 };
             if e.has_label && e.label_len > 0 {
                 sb_append(&attrs, STR_PTR("label=\""), STR_LEN("label=\""));
                 let lb = StrBuf { bytes: [0u8; 65536], len: 0 };
-                cg_field_to_sb(&e.label, e.label_len, &lb);
+                let fp_27: ptr = PTR_NULL();
+                PTR_BYTE_ADD(fp_27, &e.label, 0);
+                cg_field_to_sb(fp_27, e.label_len, &lb);
                 let lp: ptr = PTR_NULL();
                 PTR_BYTE_ADD(lp, &lb.bytes, 0);
                 sb_append(&attrs, lp, lb.len);
@@ -2660,7 +2783,9 @@ fn formatAsDot(nodes: &CodeGraphNodeList, edges: &CodeGraphEdgeList, rootId: &St
         while ni < nodes.len {
             sb_append(out, STR_PTR("\n  \""), STR_LEN("\n  \""));
             let idb = StrBuf { bytes: [0u8; 65536], len: 0 };
-            cg_field_to_sb(&nodes.items[ni].id, nodes.items[ni].id_len, &idb);
+            let fp_304: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_304, &nodes.items[ni].id, 0);
+            cg_field_to_sb(fp_304, nodes.items[ni].id_len, &idb);
             let ip: ptr = PTR_NULL();
             PTR_BYTE_ADD(ip, &idb.bytes, 0);
             sb_append(out, ip, idb.len);
@@ -2680,7 +2805,9 @@ fn build_edge_key(e: &CodeGraphEdge, out: &StrBuf) {
     // would break there too; kept 1:1).
     sb_clear(out);
     let src = StrBuf { bytes: [0u8; 65536], len: 0 };
-    cg_field_to_sb(&e.source, e.source_len, &src);
+    let fp_28: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp_28, &e.source, 0);
+    cg_field_to_sb(fp_28, e.source_len, &src);
     let sp: ptr = PTR_NULL();
     PTR_BYTE_ADD(sp, &src.bytes, 0);
     sb_append(out, sp, src.len);
@@ -2693,7 +2820,9 @@ fn build_edge_key(e: &CodeGraphEdge, out: &StrBuf) {
     sb_append_byte(out, 124);
     if e.has_label {
         let lb = StrBuf { bytes: [0u8; 65536], len: 0 };
-        cg_field_to_sb(&e.label, e.label_len, &lb);
+        let fp_29: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_29, &e.label, 0);
+        cg_field_to_sb(fp_29, e.label_len, &lb);
         let lp: ptr = PTR_NULL();
         PTR_BYTE_ADD(lp, &lb.bytes, 0);
         sb_append(out, lp, lb.len);
@@ -2711,7 +2840,9 @@ fn formatAsPyStub(nodes: &CodeGraphNodeList, edges: &CodeGraphEdgeList, out: &St
     while ni < nodes.len {
         let node = nodes.items[ni];
         let idb = StrBuf { bytes: [0u8; 65536], len: 0 };
-        cg_field_to_sb(&node.id, node.id_len, &idb);
+        let fp_30: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_30, &node.id, 0);
+        cg_field_to_sb(fp_30, node.id_len, &idb);
         // bases/fields for this node from extends/implements/owns edges
         let bases = StrBuf { bytes: [0u8; 65536], len: 0 };
         let fields = StrBuf { bytes: [0u8; 65536], len: 0 };
@@ -2719,10 +2850,14 @@ fn formatAsPyStub(nodes: &CodeGraphNodeList, edges: &CodeGraphEdgeList, out: &St
         while ei < edges.len {
             let e = edges.items[ei];
             let src = StrBuf { bytes: [0u8; 65536], len: 0 };
-            cg_field_to_sb(&e.source, e.source_len, &src);
+            let fp_31: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_31, &e.source, 0);
+            cg_field_to_sb(fp_31, e.source_len, &src);
             if sb_eq_buf(&src, &idb) {
                 let tgt = StrBuf { bytes: [0u8; 65536], len: 0 };
-                cg_field_to_sb(&e.target, e.target_len, &tgt);
+                let fp_32: ptr = PTR_NULL();
+                PTR_BYTE_ADD(fp_32, &e.target, 0);
+                cg_field_to_sb(fp_32, e.target_len, &tgt);
                 if e.kind == EDGE_EXTENDS || e.kind == EDGE_IMPLEMENTS {
                     cg_join_add(&bases, &tgt);
                 } else if e.kind == EDGE_OWNS {
@@ -2748,7 +2883,9 @@ fn formatAsPyStub(nodes: &CodeGraphNodeList, edges: &CodeGraphEdgeList, out: &St
         if node.has_file {
             sb_append(out, STR_PTR("\n    \"\"\"Defined in "), STR_LEN("\n    \"\"\"Defined in "));
             let fb = StrBuf { bytes: [0u8; 65536], len: 0 };
-            cg_field_to_sb(&node.file, node.file_len, &fb);
+            let fp_33: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_33, &node.file, 0);
+            cg_field_to_sb(fp_33, node.file_len, &fb);
             let fp: ptr = PTR_NULL();
             PTR_BYTE_ADD(fp, &fb.bytes, 0);
             sb_append(out, fp, fb.len);
@@ -2794,7 +2931,9 @@ fn formatAsNetworkX(nodes: &CodeGraphNodeList, edges: &CodeGraphEdgeList, rootId
         let node = nodes.items[ni];
         sb_append(out, STR_PTR("\nG.add_node(\""), STR_LEN("\nG.add_node(\""));
         let idb = StrBuf { bytes: [0u8; 65536], len: 0 };
-        cg_field_to_sb(&node.id, node.id_len, &idb);
+        let fp_34: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_34, &node.id, 0);
+        cg_field_to_sb(fp_34, node.id_len, &idb);
         let ip: ptr = PTR_NULL();
         PTR_BYTE_ADD(ip, &idb.bytes, 0);
         sb_append(out, ip, idb.len);
@@ -2808,7 +2947,9 @@ fn formatAsNetworkX(nodes: &CodeGraphNodeList, edges: &CodeGraphEdgeList, rootId
         if node.has_file {
             sb_append(out, STR_PTR(", file=\""), STR_LEN(", file=\""));
             let fb = StrBuf { bytes: [0u8; 65536], len: 0 };
-            cg_field_to_sb(&node.file, node.file_len, &fb);
+            let fp_35: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_35, &node.file, 0);
+            cg_field_to_sb(fp_35, node.file_len, &fb);
             let fp: ptr = PTR_NULL();
             PTR_BYTE_ADD(fp, &fb.bytes, 0);
             sb_append(out, fp, fb.len);
@@ -2823,13 +2964,17 @@ fn formatAsNetworkX(nodes: &CodeGraphNodeList, edges: &CodeGraphEdgeList, rootId
         let e = edges.items[ei];
         sb_append(out, STR_PTR("\nG.add_edge(\""), STR_LEN("\nG.add_edge(\""));
         let src = StrBuf { bytes: [0u8; 65536], len: 0 };
-        cg_field_to_sb(&e.source, e.source_len, &src);
+        let fp_36: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_36, &e.source, 0);
+        cg_field_to_sb(fp_36, e.source_len, &src);
         let sp: ptr = PTR_NULL();
         PTR_BYTE_ADD(sp, &src.bytes, 0);
         sb_append(out, sp, src.len);
         sb_append(out, STR_PTR("\", \""), STR_LEN("\", \""));
         let tgt = StrBuf { bytes: [0u8; 65536], len: 0 };
-        cg_field_to_sb(&e.target, e.target_len, &tgt);
+        let fp_37: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_37, &e.target, 0);
+        cg_field_to_sb(fp_37, e.target_len, &tgt);
         let tp: ptr = PTR_NULL();
         PTR_BYTE_ADD(tp, &tgt.bytes, 0);
         sb_append(out, tp, tgt.len);
@@ -2843,7 +2988,9 @@ fn formatAsNetworkX(nodes: &CodeGraphNodeList, edges: &CodeGraphEdgeList, rootId
         if e.has_label && e.label_len > 0 {
             sb_append(out, STR_PTR(", label=\""), STR_LEN(", label=\""));
             let lb = StrBuf { bytes: [0u8; 65536], len: 0 };
-            cg_field_to_sb(&e.label, e.label_len, &lb);
+            let fp_38: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp_38, &e.label, 0);
+            cg_field_to_sb(fp_38, e.label_len, &lb);
             let lp: ptr = PTR_NULL();
             PTR_BYTE_ADD(lp, &lb.bytes, 0);
             sb_append(out, lp, lb.len);
@@ -2898,8 +3045,8 @@ fn nativeCodeGraph(tsh: &TreeSitterState, rawInputJson: &StrBuf, policyCfg: &SaV
         fill_run_result(out, false, STR_PTR("sa_error"), STR_LEN("sa_error"), 1, &empty_sb(), &msg, startedAt, false, &empty_sb());
         return;
     };
-    let normalized = NormalizedSaVmPolicy { handle: 0 };
-    normalizeSaVmPolicy(policyCfg, cwd, &normalized);
+    let normalized = NormalizedSaVmPolicy { engine: 0, fs: NormalizedFs { entries: FsEntryList { items: [SaVmFsEntry { path: [0u8; 1024], path_len: 0, access: 0 }; 128], len: 0 }, read: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, write: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, transfer: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, delete: 0, backupDir: [0u8; 1024], backupDir_len: 0, backupDir_has: false }, http_allow: HttpRuleList { items: [SaVmHttpAllowRule { host: [0u8; 512], host_len: 0, methods: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_methods: false, paths: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_paths: false }; 128], len: 0 }, env_allow: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, process: NormalizedProcess { spawn: false, exec: ExecRuleList { items: [SaVmProcessExecRule { path: [0u8; 4096], path_len: 0, args: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_args: false }; 128], len: 0 }, bunProfiles: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_bunProfiles: false, bun_enabled: false, bun_allowedSubcommands: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_bun: false }, execution_javascript: false, execution_python: false, tools: NormalizedTools { replaceRead: false, replaceWrite: false, replaceApplyPatch: false, replaceExec: false, readFiles: false, editFiles: false, applyPatch: false, fastSearch: false, clearToolHistory: false, findReferences: false, renameSymbol: false, fileOutline: false, moveWithImports: false, findDefinition: false, extractToFile: false, addImport: false, getDiagnostics: false, organizeImports: false, analyzeScope: false, codeGraph: false }, contextSavings: SaVmContextSavingsConfig { locateBeforeRead: false, maxReadFileBytes: 0, maxReadFileBytes_has: false, grepCircuitBreaker: false, grepMaxResults: 0, grepMaxResults_has: false, grepMaxTokens: 0, grepMaxTokens_has: false, slimRunnerOutput: false, parallelBudget: false, parallelMaxTotalBytes: 0, parallelMaxTotalBytes_has: false, parallelMaxReadFiles: 0, parallelMaxReadFiles_has: false, parallelDeduplication: false, tieredSkillInjection: false, foldWaterfallEvents: false, foldHistoryReadSummaries: false, historyReadFoldTurns: 0, historyReadFoldTurns_has: false }, contextSavings_has: false };
+    cgNormalizeSaVmPolicy(policyCfg, cwd, &normalized);
     let options = CodeGraphOptions { target: [0u8; 1024], target_len: 0, mode: 0, has_mode: false, depth: 0, has_depth: false, direction: 2, has_direction: false, format: 0, has_format: true, max_nodes: 0, has_max_nodes: false, max_tokens: 0, has_max_tokens: false, output_file: [0u8; 1024], output_file_len: 0, has_output_file: false, candidate_files: [0u8; 16384], candidate_files_len: 0, has_candidate_files: false, files: [0u8; 16384], files_len: 0, has_files: false, timeout_ms: 0, has_timeout_ms: false };
     let tq: u64 = 0;
     while tq < target.len && tq < 1024 { options.target[tq] = target.bytes[tq]; options.target_len = options.target_len + 1; tq = tq + 1; }
@@ -2907,7 +3054,9 @@ fn nativeCodeGraph(tsh: &TreeSitterState, rawInputJson: &StrBuf, policyCfg: &SaV
     let gs = GraphState { nodes: CodeGraphNodeList { items: [CodeGraphNode { id: [0u8; 1024], id_len: 0, label: [0u8; 1024], label_len: 0, kind: 0, file: [0u8; 1024], file_len: 0, has_file: false, line: 0, has_line: false }; 256], len: 0 }, edges: CodeGraphEdgeList { items: [CodeGraphEdge { source: [0u8; 1024], source_len: 0, target: [0u8; 1024], target_len: 0, kind: 0, label: [0u8; 256], label_len: 0, has_label: false }; 1024], len: 0 }, edgeKeys: [0u8; 65536], edgeKeys_len: 0, rootId: [0u8; 1024], rootId_len: 0, truncated: false };
     buildScopedCodeGraph(tsh, &options, &normalized, cwd, &gs);
     let rootId = StrBuf { bytes: [0u8; 65536], len: 0 };
-    cg_field_to_sb(&gs.rootId, gs.rootId_len, &rootId);
+    let fp_39: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp_39, &gs.rootId, 0);
+    cg_field_to_sb(fp_39, gs.rootId_len, &rootId);
     let output = StrBuf { bytes: [0u8; 65536], len: 0 };
     if options.format == 1 {
         formatAsPyStub(&gs.nodes, &gs.edges, &output);
@@ -2920,7 +3069,9 @@ fn nativeCodeGraph(tsh: &TreeSitterState, rawInputJson: &StrBuf, policyCfg: &SaV
     // Optional explicit disk write (policy-gated)
     if options.has_output_file {
         let outFile = StrBuf { bytes: [0u8; 65536], len: 0 };
-        cg_field_to_sb(&options.output_file, options.output_file_len, &outFile);
+        let fp_40: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp_40, &options.output_file, 0);
+        cg_field_to_sb(fp_40, options.output_file_len, &outFile);
         let outAbs = StrBuf { bytes: [0u8; 65536], len: 0 };
         if path_is_absolute(&outFile) {
             let p: ptr = PTR_NULL();
@@ -2930,7 +3081,7 @@ fn nativeCodeGraph(tsh: &TreeSitterState, rawInputJson: &StrBuf, policyCfg: &SaV
             path_resolve2(cwd, &outFile, &outAbs);
         };
         let reason = StrBuf { bytes: [0u8; 65536], len: 0 };
-        if !checkSaVmPath(&normalized, STR_PTR("write"), STR_LEN("write"), &outAbs, cwd, &reason) {
+        if !cgCheckSaVmPath(&normalized, STR_PTR("write"), STR_LEN("write"), &outAbs, cwd, &reason) {
             let stderr = StrBuf { bytes: [0u8; 65536], len: 0 };
             sb_append(&stderr, STR_PTR("Policy violation for output_file: "), STR_LEN("Policy violation for output_file: "));
             if reason.len > 0 {
@@ -3096,7 +3247,7 @@ fn json_get_number(json: &StrBuf, keyP: ptr, keyN: u64, outVal: &u64) -> bool {
         i = i + 1;
     }
     if !anyDigit { return false; };
-    outVal = n;
+    *outVal = n;
     return true;
 }
 
@@ -3208,8 +3359,8 @@ fn path_is_absolute(p: &StrBuf) -> bool {
 }
 
 // Assumed externs referenced above (not in sa_std; see defect log):
-//   cg_policy_check_extern(handle, action, path, cwd, reasonOut) -> bool
-//   cg_policy_normalize_extern(handle, cwd) -> u64
+//   (policy surface bound to saVmPolicy.sla — see cgCheckSaVmPath /
+//   cgNormalizeSaVmPolicy at the top of this file)
 //   fs_exists / fs_stat_is_file / fs_read_file / fs_write_file / fs_readdir
 //   path_dirname / path_extname / path_join2 / path_resolve2 / path_relative
 //   ts_parser_new / ts_parser_set_language / ts_parser_parse / ts_tree_root

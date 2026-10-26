@@ -16,6 +16,7 @@
 @import "sa_std/globals.sai"
 @import "sa_std/env.sai"
 @import "sa_std/fs.sai"
+@import "sa_std/time.sai"
 
 // DEFECT: node:fs existsSync, node:module createRequire, node:path
 // (dirname/extname/join/resolve/relative), node:url fileURLToPath,
@@ -750,25 +751,109 @@ fn truncateSignature(text: &StrBuf, maxLen: u64, out: &StrBuf) {
 // maps to sa_ts_* (tree_sitter.sai); languages are grammar NAMES in
 // sa_ts, so ts_language_load reduces a .wasm path to its grammar name
 // and registers it in a joined-name cell table (id = line number).
-// Node position/parent queries take only a node in the original API;
-// every walk in this module roots its tree via ts_tree_root right
-// before querying, so a single active parse context (source/tree/root
-// in sa_global cells, set by ts_parser_parse/ts_tree_root) is faithful
-// for this module's call flow.
-// TRUE GAP (four-source checked 2026-10-26: sala docs, sa_plugin_sla
-// demos + tests, sa_std tree_sitter.sai, sci sa_tree_sitter.zig):
-// sa_ts binds only 16 externs; the C API's ts_node_parent /
-// ts_node_start_position / ts_node_is_named / ts_node_is_missing /
-// ts_node_has_error are NOT bound. Positions below are computed
-// exactly from byte ranges + the registered source; parent via
-// deepest-match DFS (exact except same-type + same-range wrapper
-// chains); has_error via the tree's own sexp rendering (exact);
-// is_missing approximated as an empty-range leaf (noted at its def).
+// Node position/parent/flag queries take only a node in the original
+// API and are node-local in the C core; the accessors below call the
+// bound sa_ts_* externs directly. GAP CLOSED 2026-10-26 (sci
+// 41b9f82d): sa_ts now binds node_parent / node_start_point /
+// node_end_point / node_is_named / node_is_missing / node_has_error
+// (four-source checked: sala docs recorded the gap, sla demos/tests
+// zero usage, sa_std had no binding; the pinned tree-sitter core
+// exports all six C symbols). Retired compensations: positions from
+// byte ranges + registered source text, parent via deepest-match
+// DFS, has_error via sexp scan, is_missing as empty-range leaf.
+// The single active parse context (source/tree/root in sa_global
+// cells, set by ts_parser_parse/ts_tree_root) remains in use by the
+// language registry and this module's walk state.
 // =====================================================================
 
 fn fs_exists(p: ptr, n: u64) -> bool {
     // status-code surface: 0 = exists (see FIX notes on fs_exists).
     return sa_std_fs_exists(p, n) == 0;
+}
+
+fn fs_stat_is_file(p: ptr, n: u64) -> bool {
+    // statSync(path).isFile() via the sa_std metadata surface
+    // (same pattern as sdk-backend's sa_fs_stat_mtime_ms).
+    let md: u64 = 0;
+    if sa_std_fs_metadata(p, n, &md) != 0 { return false; };
+    let f = sa_fs_metadata_is_file(md);
+    sa_std_fs_metadata_free(md);
+    return f != 0;
+}
+
+fn path_join2(a: &StrBuf, b: &StrBuf, out: &StrBuf) {
+    // node:path join: concatenate with a single "/" separator, then
+    // normalize (path_normalize_sb collapses "." / ".." segments and
+    // duplicate slashes, as path.join does).
+    let joined = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let ap: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ap, &a.bytes, 0);
+    sb_append(&joined, ap, a.len);
+    if a.len > 0 && b.len > 0 && a.bytes[a.len - 1] != 47 && b.bytes[0] != 47 { sb_append_byte(&joined, 47); };
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &b.bytes, 0);
+    sb_append(&joined, bp, b.len);
+    path_normalize_sb(&joined, out);
+}
+
+fn time_now_ms() -> u64 {
+    // Date.now()
+    let ms = sa_time_unix_ms();
+    if ms < 0 { return 0; };
+    return ms as u64;
+}
+
+fn fs_read_file(p: ptr, n: u64, out: &StrBuf) -> bool {
+    // readFileSync flattened to this module's 64K StrBuf surface:
+    // the sa_std read fails (non-zero status) when the file exceeds
+    // max_bytes, matching the registered-source cap used for parses.
+    sb_clear(out);
+    let h: u64 = 0;
+    if sa_std_fs_read_file(p, n, 65536, &h) != 0 { return false; };
+    let len = sa_fs_read_buffer_len(h);
+    let bp: ptr = sa_fs_read_buffer_data(h);
+    sb_append(out, bp, len);
+    sa_fs_read_buffer_free(h);
+    return true;
+}
+
+fn fs_write_file(p: ptr, n: u64, content: &StrBuf) -> bool {
+    // writeFileSync (truncate + write whole buffer)
+    let cp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cp, &content.bytes, 0);
+    return sa_fs_write_file(p, n, cp, content.len) == 0;
+}
+
+fn fs_readdir(p: ptr, n: u64, out: &StrBuf, dirs: &StrBuf) -> bool {
+    // readdirSync(dir, { withFileTypes: true }) flattened to two
+    // newline-joined name lists: non-directory entries in out,
+    // directories in dirs. sa_std kind tags: 1 regular, 2 directory,
+    // 3 symlink, 255 other; a symlink is not a directory, matching
+    // Dirent.isDirectory().
+    sb_clear(out);
+    sb_clear(dirs);
+    let entries: u64 = 0;
+    if sa_std_fs_read_dir_entries(p, n, 4096, &entries) != 0 { return false; };
+    let total = sa_fs_dir_entries_len(entries);
+    let i: u64 = 0;
+    while i < total {
+        let e: u64 = 0;
+        if sa_std_fs_dir_entries_get(entries, i, &e) == 0 {
+            let np: ptr = sa_fs_dir_entry_name_ptr(e);
+            let nl = sa_fs_dir_entry_name_len(e);
+            if sa_fs_dir_entry_kind(e) == 2 {
+                if dirs.len > 0 { sb_append_byte(dirs, 10); };
+                sb_append(dirs, np, nl);
+            } else {
+                if out.len > 0 { sb_append_byte(out, 10); };
+                sb_append(out, np, nl);
+            };
+            sa_fs_dir_entry_free(e);
+        };
+        i = i + 1;
+    }
+    sa_fs_dir_entries_free(entries);
+    return true;
 }
 
 fn proc_cwd(out: &StrBuf) {
@@ -1116,38 +1201,56 @@ fn ts_node_end_index(node: u64) -> u64 {
     return e;
 }
 
-fn ts_pos_row_col(byte: u64, want_col: bool) -> u64 {
-    let src = StrBuf { bytes: [0u8; 65536], len: 0 };
-    if !ts_current_src(&src) { return 0; };
-    let lim = byte;
-    if lim > src.len { lim = src.len; };
-    let row: u64 = 0;
-    let line_start: u64 = 0;
-    let i: u64 = 0;
-    while i < lim {
-        if src.bytes[i] == 10 { row = row + 1; line_start = i + 1; };
-        i = i + 1;
-    }
-    if want_col { return byte - line_start; };
-    return row;
+fn ts_node_start_row(node: u64) -> u64 {
+    let r: u32 = 0;
+    let c: u32 = 0;
+    let st = sa_ts_node_start_point(node, &r, &c);
+    if st != 0 { return 0; };
+    return r as u64;
 }
 
-fn ts_node_start_row(node: u64) -> u64 { return ts_pos_row_col(ts_node_start_index(node), false); }
-fn ts_node_end_row(node: u64) -> u64 { return ts_pos_row_col(ts_node_end_index(node), false); }
-fn ts_node_start_col(node: u64) -> u64 { return ts_pos_row_col(ts_node_start_index(node), true); }
+fn ts_node_end_row(node: u64) -> u64 {
+    let r: u32 = 0;
+    let c: u32 = 0;
+    let st = sa_ts_node_end_point(node, &r, &c);
+    if st != 0 { return 0; };
+    return r as u64;
+}
+
+fn ts_node_start_col(node: u64) -> u64 {
+    let r: u32 = 0;
+    let c: u32 = 0;
+    let st = sa_ts_node_start_point(node, &r, &c);
+    if st != 0 { return 0; };
+    return c as u64;
+}
+
+fn ts_node_end_col(node: u64) -> u64 {
+    let r: u32 = 0;
+    let c: u32 = 0;
+    let st = sa_ts_node_end_point(node, &r, &c);
+    if st != 0 { return 0; };
+    return c as u64;
+}
 
 fn ts_node_is_error(node: u64) -> bool {
     return node_type_is(node, STR_PTR("ERROR"), STR_LEN("ERROR"));
 }
 
 fn ts_node_is_missing(node: u64) -> bool {
-    // APPROXIMATION (see header): sa_ts binds no is_missing; in the C
-    // API a MISSING node is an inserted zero-width token, i.e. an
-    // empty-range leaf here. Legitimate empty-range leaves are rare
-    // in the typescript/tsx grammars this module loads.
     if node == 0 { return false; };
-    if ts_node_start_index(node) != ts_node_end_index(node) { return false; };
-    return ts_node_child_count(node) == 0;
+    let f: u32 = 0;
+    let st = sa_ts_node_is_missing(node, &f);
+    if st != 0 { return false; };
+    return f != 0;
+}
+
+fn ts_node_is_named(node: u64) -> bool {
+    if node == 0 { return false; };
+    let f: u32 = 0;
+    let st = sa_ts_node_is_named(node, &f);
+    if st != 0 { return false; };
+    return f != 0;
 }
 
 fn ts_node_last_named_child(node: u64) -> u64 {
@@ -1156,76 +1259,20 @@ fn ts_node_last_named_child(node: u64) -> u64 {
     return ts_node_named_child(node, c - 1);
 }
 
-fn ts_subtree_has_error(node: u64) -> bool {
-    if node == 0 { return false; };
-    if ts_node_is_error(node) { return true; };
-    let cc = ts_node_child_count(node);
-    let i: u64 = 0;
-    while i < cc {
-        let ch = ts_node_child(node, i);
-        if ch != 0 && ts_subtree_has_error(ch) { return true; };
-        i = i + 1;
-    }
-    return false;
-}
-
 fn ts_node_has_error(node: u64) -> bool {
-    // Exact via the tree's own sexp rendering ((ERROR / (MISSING
-    // markers are emitted by ts_node_to_string in the C core).
-    let tree: u64 = 0;
-    let st = sa_global_u64_get(STR_PTR("srv.ts.tree"), STR_LEN("srv.ts.tree"), &tree);
-    if st == 0 && tree != 0 {
-        let sx = StrBuf { bytes: [0u8; 65536], len: 0 };
-        let n: u64 = 0;
-        let sxp: ptr = PTR_NULL();
-        PTR_BYTE_ADD(sxp, &sx.bytes, 0);
-        let s2 = sa_ts_tree_sexp(tree, sxp, 65536, &n);
-        if s2 == 0 {
-            sx.len = n;
-            if sb_contains(&sx, STR_PTR("(ERROR"), STR_LEN("(ERROR")) { return true; };
-            if sb_contains(&sx, STR_PTR("(MISSING"), STR_LEN("(MISSING")) { return true; };
-            return false;
-        };
-    };
-    return ts_subtree_has_error(node);
-}
-
-fn ts_parent_search(cur: u64, t_start: u64, t_end: u64, t_type: &StrBuf, depth: u64, best: &u64, best_depth: &u64) {
-    let cc = ts_node_child_count(cur);
-    let i: u64 = 0;
-    while i < cc {
-        let ch = ts_node_child(cur, i);
-        if ch != 0 {
-            let cs = ts_node_start_index(ch);
-            let ce = ts_node_end_index(ch);
-            if cs == t_start && ce == t_end {
-                let ct = StrBuf { bytes: [0u8; 65536], len: 0 };
-                ts_node_type_sb(ch, &ct);
-                if sb_eq_buf(&ct, t_type) {
-                    if depth > *best_depth { *best = cur; *best_depth = depth; };
-                };
-            };
-            if cs <= t_start && t_end <= ce {
-                ts_parent_search(ch, t_start, t_end, t_type, depth + 1, best, best_depth);
-            };
-        };
-        i = i + 1;
-    }
+    if node == 0 { return false; };
+    let f: u32 = 0;
+    let st = sa_ts_node_has_error(node, &f);
+    if st != 0 { return false; };
+    return f != 0;
 }
 
 fn ts_node_parent(node: u64) -> u64 {
     if node == 0 { return 0; };
-    let root: u64 = 0;
-    let st = sa_global_u64_get(STR_PTR("srv.ts.root"), STR_LEN("srv.ts.root"), &root);
-    if st != 0 || root == 0 || root == node { return 0; };
-    let t_start = ts_node_start_index(node);
-    let t_end = ts_node_end_index(node);
-    let t_type = StrBuf { bytes: [0u8; 65536], len: 0 };
-    ts_node_type_sb(node, &t_type);
-    let best: u64 = 0;
-    let best_depth: u64 = 0;
-    ts_parent_search(root, t_start, t_end, &t_type, 1, &best, &best_depth);
-    return best;
+    let p: u64 = 0;
+    let st = sa_ts_node_parent(node, &p);
+    if st != 0 { return 0; };
+    return p;
 }
 
 // ---- end host layer ----
