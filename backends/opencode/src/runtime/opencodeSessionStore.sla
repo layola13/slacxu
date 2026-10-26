@@ -2,6 +2,9 @@
 @import "sa_std/ptr.sa"
 @import "sa_std/string.sa"
 @import "sa_std/time.sai"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/globals.sai"
+@import "sa_std/plugin_sqlite.sa"
 
 // TS: import type { RuntimeDatabase } from "@cxu/sdk-backend";
 // DEFECT: RuntimeDatabase (better-sqlite3-shaped prepare/exec API) has no
@@ -525,4 +528,164 @@ fn OpencodeSessionStore_mapRow(self_s: &OpencodeSessionStore, row: &OpencodeSess
     out.has_state_json = row.has_state_json;
     out.created_at = row.created_at;
     out.updated_at = row.updated_at;
+}
+
+// ---------------------------------------------------------------------------
+// SQLite binding layer (licenseStore model, oss_ prefix): the
+// sa_sqlite_* shims route to the SA_SQLITE_* facade macros; row
+// JSON from SA_SQLITE_STEP_JSON is cached per statement in a
+// global u64 cell keyed "sqlite.doc.<stmt>"; columns are read
+// by INDEX (SELECT * order = table definition order).
+// ---------------------------------------------------------------------------
+
+struct OssKeyBuf {
+    bytes: [u8; 64],
+    len: u64,
+}
+
+fn oss_key_append(b: &OssKeyBuf, src: ptr, src_len: u64) -> void {
+    let i: u64 = 0;
+    while i < src_len && b.len < 64 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, src, i);
+        b.bytes[b.len] = v;
+        b.len = b.len + 1;
+        i = i + 1;
+    }
+}
+
+fn oss_key_append_u64(b: &OssKeyBuf, v: u64) -> void {
+    if v >= 10 { oss_key_append_u64(b, v / 10); };
+    let d: u8 = 48 + ((v % 10) as u8);
+    if b.len < 64 { b.bytes[b.len] = d; b.len = b.len + 1; };
+}
+
+fn oss_row_key(out: &OssKeyBuf, stmt: u64) -> void {
+    out.len = 0;
+    oss_key_append(out, STR_PTR("sqlite.doc."), STR_LEN("sqlite.doc."));
+    oss_key_append_u64(out, stmt);
+}
+
+fn oss_row_doc(stmt: u64) -> u64 {
+    let key = OssKeyBuf { bytes: [0u8; 64], len: 0 };
+    oss_row_key(&key, stmt);
+    let kp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(kp, &key.bytes, 0);
+    let doc: u64 = 0;
+    let ig = sa_global_u64_get(kp, key.len, &doc);
+    return doc;
+}
+
+fn oss_set_row_doc(stmt: u64, doc: u64) -> void {
+    let key = OssKeyBuf { bytes: [0u8; 64], len: 0 };
+    oss_row_key(&key, stmt);
+    let kp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(kp, &key.bytes, 0);
+    let ig = sa_global_u64_set(kp, key.len, doc);
+}
+
+fn oss_column_node(stmt: u64, idx: u64) -> u64 {
+    let doc = oss_row_doc(stmt);
+    if doc == 0 { return 0; };
+    let kp: ptr = PTR_NULL();
+    let kl: u64 = 0;
+    if sa_json_object_key_at(doc, idx, &kp, &kl) != 0 { return 0; };
+    let node: u64 = 0;
+    if sa_json_object_get(doc, kp, kl, &node) != 0 { return 0; };
+    return node;
+}
+
+fn sa_time_now_ms() -> u64 {
+    return (sa_time_unix_ms() as u64);
+}
+
+fn sa_sqlite_exec(db: u64, sql_ptr: ptr, sql_len: u64) -> void {
+    let st: u64 = 0;
+    SA_SQLITE_EXEC(st, db, sql_ptr, sql_len);
+}
+
+fn sa_sqlite_prepare(db: u64, sql_ptr: ptr, sql_len: u64) -> u64 {
+    let st: u64 = 0;
+    let stmt: u64 = 0;
+    SA_SQLITE_PREPARE(st, stmt, db, sql_ptr, sql_len);
+    return stmt;
+}
+
+fn sa_sqlite_bind_text(stmt: u64, idx: u64, val_ptr: ptr, val_len: u64) -> void {
+    let st: u64 = 0;
+    SA_SQLITE_BIND_TEXT(st, stmt, idx, val_ptr, val_len);
+}
+
+fn sa_sqlite_bind_int(stmt: u64, idx: u64, value: u64) -> void {
+    let st: u64 = 0;
+    SA_SQLITE_BIND_INT(st, stmt, idx, value);
+}
+
+fn sa_sqlite_bind_null(stmt: u64, idx: u64) -> void {
+    let st: u64 = 0;
+    SA_SQLITE_BIND_NULL(st, stmt, idx);
+}
+
+fn sa_sqlite_step(stmt: u64) -> bool {
+    let old = oss_row_doc(stmt);
+    if old != 0 {
+        let ig = sa_json_free(old);
+        oss_set_row_doc(stmt, 0);
+    };
+    let st: u64 = 0;
+    let ready: u64 = 0;
+    let rp: ptr = PTR_NULL();
+    let rl: u64 = 0;
+    SA_SQLITE_STEP_JSON(st, ready, rp, rl, stmt);
+    if ready == 0 { return false; };
+    let doc = sa_json_parse(rp, rl);
+    oss_set_row_doc(stmt, doc);
+    return doc != 0;
+}
+
+fn sa_sqlite_finalize(stmt: u64) -> void {
+    let old = oss_row_doc(stmt);
+    if old != 0 {
+        let ig = sa_json_free(old);
+        oss_set_row_doc(stmt, 0);
+    };
+    let st: u64 = 0;
+    SA_SQLITE_FINALIZE(st, stmt);
+}
+
+fn sa_sqlite_column_is_null(stmt: u64, col: u64) -> i32 {
+    let node = oss_column_node(stmt, col);
+    if node == 0 { return 1; };
+    if sa_json_kind(node) == 0 { return 1; };
+    return 0;
+}
+
+fn sa_sqlite_column_text(stmt: u64, col: u64, out_ptr: &ptr, out_len: &u64) -> i32 {
+    *out_ptr = PTR_NULL();
+    *out_len = 0;
+    let node = oss_column_node(stmt, col);
+    if node == 0 { return 1; };
+    if sa_json_kind(node) != 5 { return 1; };
+    let sp: ptr = PTR_NULL();
+    sp = sa_json_string_ptr(node);
+    *out_ptr = sp;
+    *out_len = sa_json_string_len(node);
+    return 0;
+}
+
+fn sa_sqlite_column_int(stmt: u64, col: u64, out: &u64) -> void {
+    *out = 0;
+    let node = oss_column_node(stmt, col);
+    if node == 0 { return; };
+    let v: i64 = 0;
+    if sa_json_as_i64(node, &v) != 0 { return; };
+    *out = v as u64;
+}
+
+fn sa_sqlite_changes(db: u64, out: &u64) -> void {
+    *out = 0;
+    let stmt = sa_sqlite_prepare(db, STR_PTR("SELECT changes()"), STR_LEN("SELECT changes()"));
+    if stmt == 0 { return; };
+    if sa_sqlite_step(stmt) { sa_sqlite_column_int(stmt, 0, out); };
+    sa_sqlite_finalize(stmt);
 }
