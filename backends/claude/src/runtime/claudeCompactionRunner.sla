@@ -3,6 +3,8 @@
 @import "sa_std/ptr.sa"
 @import "sa_std/encoding/json.sai"
 @import "sa_std/process.sai"
+@import "sa_std/io.sai"
+@import "sa_std/time.sai"
 @import "sa_std/env.sai"
 @import "claudeCompatibleProbe.sla"
 
@@ -161,13 +163,15 @@ fn compactionErrnoDetails(error_json_ptr: ptr, error_json_len: u64, out: &Compac
     let doc = sa_json_parse(error_json_ptr, error_json_len);
     if doc == 0 { return; };
     // pick(key): typeof value === "string" || typeof value === "number" ? value : undefined
-    out.has_code = sa_json_get_string_or_number(doc, STR_PTR("code"), STR_LEN("code"), &out.code, 128, &out.code_num, &out.code_is_number);
-    out.has_errno = sa_json_get_string_or_number(doc, STR_PTR("errno"), STR_LEN("errno"), &out.errno, 128, &out.errno_num, &out.errno_is_number);
+    let cap_cr1: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr1, &out.code, 0);
+    out.has_code = sa_json_get_string_or_number(doc, STR_PTR("code"), STR_LEN("code"), cap_cr1, 128, &out.code_num, &out.code_is_number);
+    let cap_cr2: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr2, &out.errno, 0);
+    out.has_errno = sa_json_get_string_or_number(doc, STR_PTR("errno"), STR_LEN("errno"), cap_cr2, 128, &out.errno_num, &out.errno_is_number);
     let jgs_p1: ptr = PTR_NULL(); PTR_BYTE_ADD(jgs_p1, &out.syscall, 0);
-    out.has_syscall = json_get_string_copy(doc, STR_PTR("syscall"), STR_LEN("syscall"), jgs_p1, 128) > 0 || sa_json_has(doc, STR_PTR("syscall"), STR_LEN("syscall"));
+    out.has_syscall = json_get_string_copy(doc, STR_PTR("syscall"), STR_LEN("syscall"), jgs_p1, 128) > 0 || json_has(doc, STR_PTR("syscall"), STR_LEN("syscall"));
     let jgs_p2: ptr = PTR_NULL(); PTR_BYTE_ADD(jgs_p2, &out.syscall, 0);
     out.syscall_len = json_get_string_copy(doc, STR_PTR("syscall"), STR_LEN("syscall"), jgs_p2, 128);
-    out.has_path = sa_json_has(doc, STR_PTR("path"), STR_LEN("path"));
+    out.has_path = json_has(doc, STR_PTR("path"), STR_LEN("path"));
     let jgs_p3: ptr = PTR_NULL(); PTR_BYTE_ADD(jgs_p3, &out.path, 0);
     out.path_len = json_get_string_copy(doc, STR_PTR("path"), STR_LEN("path"), jgs_p3, 1024);
     sa_json_free(doc);
@@ -194,7 +198,10 @@ fn logCompactionEvent(level: u64, event_ptr: ptr, event_len: u64, details_json_p
     let cap_p1: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p1, &redacted.bytes, 0);
     buf_append_bytes(&line, cap_p1, n);
     if level == LOG_LEVEL_ERROR {
-        sa_print_stderr(&line.bytes, line.len);
+        // FIX(be2): sa_print_stderr is fabricated; stderr goes through
+        // sa_io_stderr + sa_io_write_all (io.sai), the Probe hub pattern.
+        let lp: ptr = PTR_NULL(); PTR_BYTE_ADD(lp, &line.bytes, 0);
+        let st = sa_io_write_all(sa_io_stderr(), lp, line.len);
     } else {
         println_buf(&line);
     };
@@ -219,10 +226,61 @@ fn createClaudeCompactionRunner(spawnCommand_kind: u64, terminateChild_kind: u64
 // approximated by a blocking read loop over the child's stdout with line buffering;
 // the 5-minute timeout is approximated by a poll counter.
 // DEFECT: encodeURIComponent approximated by uri_encode_into helper (placeholder).
+// FIX(be2): buf_append_u64 exists only in the Jev domain (not imported
+// here). CR-local decimal appender over the Probe hub's buf_append_byte.
+fn cr_buf_append_u64(out: &ByteBuf, v: u64) -> void {
+    if v == 0 { buf_append_byte(out, 48); return; };
+    let digits: [u8; 20] = [0u8; 20];
+    let n: u64 = 0;
+    let x = v;
+    while x > 0 {
+        digits[n] = (x % 10) as u8 + 48;
+        n = n + 1;
+        x = x / 10;
+    }
+    while n > 0 {
+        n = n - 1;
+        buf_append_byte(out, digits[n]);
+    }
+}
+
+// FIX(be2): the fictional sa_std_process_poll(handle, &code, &signal)
+// (2=error / 1=exited / 0=running) is rebound to the real
+// sa_std_process_try_wait_raw + exit_status_signal faces (process.sai).
+fn cr_buf_append_i64(b: &ByteBuf, v: i64) -> void {
+    if v < 0 {
+        buf_append_lit(b, STR_PTR("-"), STR_LEN("-"));
+        cr_buf_append_u64(b, (0 - v) as u64);
+    } else {
+        cr_buf_append_u64(b, v as u64);
+    };
+    return;
+}
+
+fn cr_poll_child(handle: u64, exit_code: &i64, exit_signal: &i64) -> u64 {
+    let ready: u8 = 0;
+    let raw: i32 = 0;
+    if sa_std_process_try_wait_raw(handle, &ready, &raw) != 0 { return 2; };
+    if ready == 0 { return 0; };
+    *exit_code = (sa_std_process_exit_status_code(raw) as i64);
+    *exit_signal = (sa_std_process_exit_status_signal(raw) as i64);
+    return 1;
+}
+
+// DEFECT(host-wiring): TS writes the prompt via child.stdin.write(line).
+// The ClaudeChildProcess model carries no stdin handle (the Probe spawn
+// wrapper discards the bidi hin), so the write goes through the generic
+// io face on the child handle and its status is ignored — registered as
+// a B-class gap: the spawn wrapper must expose the stdin handle.
+fn cr_write_child_stdin(handle: u64, bytes_ptr: ptr, len: u64) -> void {
+    let st = sa_io_write_all(handle, bytes_ptr, len);
+}
+
 fn claudeCompactionRunner_run(runner: &ClaudeCompactionRunner, input: &ClaudeCompactionInput, out_summary: &ByteBuf, err: &ByteBuf) -> i32 {
     // const gatewayToken = input.runtimeEnv.CODEX_UI_RELAY_GATEWAY_TOKEN?.trim();
     let token = ByteBuf { bytes: [0u8; 65536], len: 0 };
-    env_get_trimmed(&input.runtimeEnv, input.runtimeEnv_len, STR_PTR("CODEX_UI_RELAY_GATEWAY_TOKEN"), STR_LEN("CODEX_UI_RELAY_GATEWAY_TOKEN"), &token);
+    let cap_cr3: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr3, &input.runtimeEnv, 0);
+    env_get_trimmed(cap_cr3, input.runtimeEnv_len, STR_PTR("CODEX_UI_RELAY_GATEWAY_TOKEN"), STR_LEN("CODEX_UI_RELAY_GATEWAY_TOKEN"), &token);
     // if (!gatewayToken) throw new Error("Claude compaction requires a relay gateway credential");
     if token.len == 0 {
         buf_append_lit(err, STR_PTR("Claude compaction requires a relay gateway credential"), STR_LEN("Claude compaction requires a relay gateway credential"));
@@ -230,7 +288,8 @@ fn claudeCompactionRunner_run(runner: &ClaudeCompactionRunner, input: &ClaudeCom
     };
     // const gatewayPort = input.runtimeEnv.CODEX_UI_PORT?.trim() || "43110";
     let port = ByteBuf { bytes: [0u8; 65536], len: 0 };
-    env_get_trimmed(&input.runtimeEnv, input.runtimeEnv_len, STR_PTR("CODEX_UI_PORT"), STR_LEN("CODEX_UI_PORT"), &port);
+    let cap_cr4: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr4, &input.runtimeEnv, 0);
+    env_get_trimmed(cap_cr4, input.runtimeEnv_len, STR_PTR("CODEX_UI_PORT"), STR_LEN("CODEX_UI_PORT"), &port);
     if port.len == 0 { buf_append_lit(&port, STR_PTR("43110"), STR_LEN("43110")); };
     // const relayCustomHeaders = input.threadId?.trim() ? `thread-id: ${...}` : undefined;
     let has_relayCustomHeaders: bool = input.threadId_len > 0;
@@ -244,26 +303,38 @@ fn claudeCompactionRunner_run(runner: &ClaudeCompactionRunner, input: &ClaudeCom
     buf_append_lit(&base_url, STR_PTR("/"), STR_LEN("/"));
     uri_encode_into(&base_url, &input.route.groupId, input.route.groupId_len);
     let env = ByteBuf { bytes: [0u8; 65536], len: 0 };
-    buildSafeClaudeEnv(&input.runtimeEnv, input.runtimeEnv_len, &env);
-    env_set(&env, STR_PTR("ANTHROPIC_BASE_URL"), STR_LEN("ANTHROPIC_BASE_URL"), &base_url.bytes, base_url.len);
-    env_set(&env, STR_PTR("ANTHROPIC_API_KEY"), STR_LEN("ANTHROPIC_API_KEY"), &token.bytes, token.len);
+    // FIX(be2): Probe's buildSafeClaudeEnv takes (base, overrides, out);
+    // this unit applies the overrides itself via env_set below, so the
+    // overrides argument is the empty map text.
+    let cap_cr5: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr5, &input.runtimeEnv, 0);
+    buildSafeClaudeEnv(cap_cr5, input.runtimeEnv_len, STR_PTR(""), 0, &env);
+    let cap_cr1001: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr1001, &base_url.bytes, 0);
+    env_set(&env, STR_PTR("ANTHROPIC_BASE_URL"), STR_LEN("ANTHROPIC_BASE_URL"), cap_cr1001, base_url.len);
+    let cap_cr1002: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr1002, &token.bytes, 0);
+    env_set(&env, STR_PTR("ANTHROPIC_API_KEY"), STR_LEN("ANTHROPIC_API_KEY"), cap_cr1002, token.len);
     env_set(&env, STR_PTR("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"), STR_LEN("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"), STR_PTR("1"), STR_LEN("1"));
     if has_relayCustomHeaders {
         let hdr = ByteBuf { bytes: [0u8; 65536], len: 0 };
         buf_append_lit(&hdr, STR_PTR("thread-id: "), STR_LEN("thread-id: "));
-        buf_append_bytes(&hdr, &input.threadId, input.threadId_len);
-        env_set(&env, STR_PTR("ANTHROPIC_CUSTOM_HEADERS"), STR_LEN("ANTHROPIC_CUSTOM_HEADERS"), &hdr.bytes, hdr.len);
+        let cap_cr1004: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr1004, &input.threadId, 0);
+        buf_append_bytes(&hdr, cap_cr1004, input.threadId_len);
+        let cap_cr1003: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr1003, &hdr.bytes, 0);
+        env_set(&env, STR_PTR("ANTHROPIC_CUSTOM_HEADERS"), STR_LEN("ANTHROPIC_CUSTOM_HEADERS"), cap_cr1003, hdr.len);
     };
     // const args = [...buildClaudeSpawnArgs(input.route.model, "bypassPermissions"), "--bare", "--no-session-persistence", "--tools", ""];
     let args = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
-    buildClaudeSpawnArgs(&input.route.model, input.route.model_len, STR_PTR("bypassPermissions"), STR_LEN("bypassPermissions"), &args);
+    // FIX(be2): Probe's buildClaudeSpawnArgs takes the full 13-arg
+    // has_/value form; this call supplies model + permissionMode only.
+    let cap_cr6: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr6, &input.route.model, 0);
+    buildClaudeSpawnArgs(input.route.model_len > 0, cap_cr6, input.route.model_len, true, STR_PTR("bypassPermissions"), STR_LEN("bypassPermissions"), false, STR_PTR(""), 0, false, STR_PTR(""), 0, &args);
     strlist_push(&args, STR_PTR("--bare"), STR_LEN("--bare"));
     strlist_push(&args, STR_PTR("--no-session-persistence"), STR_LEN("--no-session-persistence"));
     strlist_push(&args, STR_PTR("--tools"), STR_LEN("--tools"));
     strlist_push(&args, STR_PTR(""), 0);
     // const bin = findClaudeBin(input.runtimeEnv);
     let bin = ByteBuf { bytes: [0u8; 65536], len: 0 };
-    let has_bin: bool = findClaudeBin(&input.runtimeEnv, input.runtimeEnv_len, &bin);
+    let cap_cr9001: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr9001, &input.runtimeEnv, 0);
+    let has_bin: bool = findClaudeBin( cap_cr9001, input.runtimeEnv_len, &bin);
     // if (!bin) throw new Error("Claude CLI is not installed. Set CODEX_UI_CLAUDE_BIN ...");
     if !(has_bin) {
         buf_append_lit(err, STR_PTR("Claude CLI is not installed. Set CODEX_UI_CLAUDE_BIN to a runnable claude executable."), STR_LEN("Claude CLI is not installed. Set CODEX_UI_CLAUDE_BIN to a runnable claude executable."));
@@ -273,7 +344,8 @@ fn claudeCompactionRunner_run(runner: &ClaudeCompactionRunner, input: &ClaudeCom
     // DEFECT: details object literal -> hand-built JSON text.
     let details = ByteBuf { bytes: [0u8; 65536], len: 0 };
     buf_append_lit(&details, STR_PTR("{\"threadId\":\""), STR_LEN("{\"threadId\":\""));
-    buf_append_bytes(&details, &input.threadId, input.threadId_len);
+    let cap_cr1005: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr1005, &input.threadId, 0);
+    buf_append_bytes(&details, cap_cr1005, input.threadId_len);
     buf_append_lit(&details, STR_PTR("\",\"bin\":\""), STR_LEN("\",\"bin\":\""));
     let cap_p3: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p3, &bin.bytes, 0);
     buf_append_bytes(&details, cap_p3, bin.len);
@@ -281,25 +353,41 @@ fn claudeCompactionRunner_run(runner: &ClaudeCompactionRunner, input: &ClaudeCom
     let cap_p4: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p4, &input.cwd, 0);
     buf_append_bytes(&details, cap_p4, input.cwd_len);
     buf_append_lit(&details, STR_PTR("\",\"transcriptChars\":"), STR_LEN("\",\"transcriptChars\":"));
-    buf_append_u64(&details, input.transcript_len);
+    cr_buf_append_u64(&details, input.transcript_len);
     buf_append_lit(&details, STR_PTR("}"), STR_LEN("}"));
-    logCompactionEvent(LOG_LEVEL_LOG, STR_PTR("start-attempt"), STR_LEN("start-attempt"), &details.bytes, details.len);
+    let cap_cr5001: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr5001, &details.bytes, 0);
+    logCompactionEvent(LOG_LEVEL_LOG, STR_PTR("start-attempt"), STR_LEN("start-attempt"), cap_cr5001, details.len);
     // let child; try { child = spawnCommand(bin, args, { cwd, env }); } catch (error) { log...; throw error; }
     let child = ccr_ClaudeChildProcess { handle: 0, pid: -1, has_pid: false };
-    let spawn_rc = spawnClaudeCommand(&bin.bytes, bin.len, &args, &input.cwd, input.cwd_len, &env.bytes, env.len, &child);
+    // FIX(be2): cross-unit adapter for Probe's spawnClaudeCommand — it
+    // takes &ClaudeSpawnOptions plus a process-env fallback and a Probe
+    // ClaudeChildProcess out; this unit's ccr_ child is field-identical.
+    let opts = ClaudeSpawnOptions { has_cwd: input.cwd_len > 0, cwd: input.cwd, cwd_len: input.cwd_len, has_env: true, env: env.bytes, env_len: env.len };
+    let pchild = ClaudeChildProcess { handle: 0, pid: -1, has_pid: false };
+    let cap_cr7: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr7, &bin.bytes, 0);
+    let cap_cr8: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr8, &input.runtimeEnv, 0);
+    let spawn_rc = spawnClaudeCommand(cap_cr7, bin.len, &args, &opts, cap_cr8, input.runtimeEnv_len, &pchild, err);
+    child.handle = pchild.handle;
+    child.pid = pchild.pid;
+    child.has_pid = pchild.has_pid;
     if spawn_rc != 0 {
         // logCompactionEvent("error", "start-spawn-sync-failed", { threadId, bin, cwd, ...compactionErrnoDetails(error), message })
         buf_append_lit(err, STR_PTR("spawn failed"), STR_LEN("spawn failed"));
         return 3;
     };
     // logCompactionEvent("log", "start-ok", { threadId, bin, cwd, pid: child.pid ?? null })
-    logCompactionEvent(LOG_LEVEL_LOG, STR_PTR("start-ok"), STR_LEN("start-ok"), &details.bytes, details.len);
+    let cap_cr5002: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr5002, &details.bytes, 0);
+    logCompactionEvent(LOG_LEVEL_LOG, STR_PTR("start-ok"), STR_LEN("start-ok"), cap_cr5002, details.len);
     // return await new Promise<string>((resolve, reject) => { ... })
     // DEFECT: event-driven Promise body -> blocking loop state below.
     let settled: bool = false;
     let failed: bool = false;
     let stdoutBuffer = ByteBuf { bytes: [0u8; 65536], len: 0 };
-    let assistantParts = StrList { items: [0u8; 1048576], items_len: 0, lens: [0u64; 256], count: 0 };
+    // FIX(be2): the bulk pass invented a 1MiB/256 StrList literal; the
+    // family's only nominal StrList (Probe hub) is 16384 bytes / 64 items.
+    // DEFECT: TS string[] is unbounded; the shared StrList capacity bounds
+    // the accumulated transcript parts (family-wide model limit).
+    let assistantParts = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
     let result_summary = ByteBuf { bytes: [0u8; 65536], len: 0 };
     let has_result_summary: bool = false;
     // const prompt = [...].join("\n"); child.stdin.write(JSON.stringify({type:"user", message:{role:"user", content: prompt}, parent_tool_use_id: null}) + "\n");
@@ -308,15 +396,19 @@ fn claudeCompactionRunner_run(runner: &ClaudeCompactionRunner, input: &ClaudeCom
     buf_append_lit(&prompt, STR_PTR("Preserve user requirements, architectural decisions, completed work, unresolved tasks, exact paths/commands/identifiers, and important failures.\n"), STR_LEN("Preserve user requirements, architectural decisions, completed work, unresolved tasks, exact paths/commands/identifiers, and important failures.\n"));
     buf_append_lit(&prompt, STR_PTR("Do not answer the conversation. Output only the continuation summary for another coding agent.\n\n"), STR_LEN("Do not answer the conversation. Output only the continuation summary for another coding agent.\n\n"));
     buf_append_lit(&prompt, STR_PTR("<conversation thread_id=\""), STR_LEN("<conversation thread_id=\""));
-    buf_append_bytes(&prompt, &input.threadId, input.threadId_len);
+    let cap_cr1006: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr1006, &input.threadId, 0);
+    buf_append_bytes(&prompt, cap_cr1006, input.threadId_len);
     buf_append_lit(&prompt, STR_PTR("\">\n"), STR_LEN("\">\n"));
-    buf_append_bytes(&prompt, &input.transcript, input.transcript_len);
+    let cap_cr1007: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr1007, &input.transcript, 0);
+    buf_append_bytes(&prompt, cap_cr1007, input.transcript_len);
     buf_append_lit(&prompt, STR_PTR("\n</conversation>"), STR_LEN("\n</conversation>"));
     let stdin_line = ByteBuf { bytes: [0u8; 65536], len: 0 };
     buf_append_lit(&stdin_line, STR_PTR("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\""), STR_LEN("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\""));
-    json_escape_into(&stdin_line, &prompt.bytes, prompt.len);
+    let cap_cr7701: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr7701, &prompt.bytes, 0);
+    json_escape_into(&stdin_line, cap_cr7701, prompt.len);
     buf_append_lit(&stdin_line, STR_PTR("\"},\"parent_tool_use_id\":null}\n"), STR_LEN("\"},\"parent_tool_use_id\":null}\n"));
-    sa_std_process_write_stdin(child.handle, &stdin_line.bytes, stdin_line.len);
+    let cap_cr7702: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr7702, &stdin_line.bytes, 0);
+    cr_write_child_stdin(child.handle, cap_cr7702, stdin_line.len);
     // Blocking consume loop standing in for stdout "data" / stderr "data" / "error" / "exit" handlers + setTimeout.
     let elapsed_ms: u64 = 0;
     let exit_code: i64 = -1;
@@ -325,13 +417,16 @@ fn claudeCompactionRunner_run(runner: &ClaudeCompactionRunner, input: &ClaudeCom
     while !(settled) {
         // setTimeout(COMPACTION_TIMEOUT_MS) approximation
         if elapsed_ms >= COMPACTION_TIMEOUT_MS {
-            logCompactionEvent(LOG_LEVEL_ERROR, STR_PTR("timeout"), STR_LEN("timeout"), &details.bytes, details.len);
+            let cap_cr5003: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr5003, &details.bytes, 0);
+            logCompactionEvent(LOG_LEVEL_ERROR, STR_PTR("timeout"), STR_LEN("timeout"), cap_cr5003, details.len);
             buf_append_lit(err, STR_PTR("Claude compaction timed out after 5 minutes"), STR_LEN("Claude compaction timed out after 5 minutes"));
             terminateChild_default(&child);
             return 6;
         };
         let chunk = ByteBuf { bytes: [0u8; 65536], len: 0 };
-        let n = sa_std_process_read_stdout(child.handle, &chunk.bytes, 65536);
+        let nr: u64 = 0;
+        let rdst = sa_std_process_read_stdout(child.handle, &chunk.bytes, 65536, &nr);
+        let n = if rdst == 0 { nr } else { 0 };
         if n > 0 {
             chunk.len = n;
             // stdoutBuffer += chunk.toString("utf8"); split lines; consumeLine each full line.
@@ -343,7 +438,8 @@ fn claudeCompactionRunner_run(runner: &ClaudeCompactionRunner, input: &ClaudeCom
                 if stdoutBuffer.bytes[i] == 10 {
                     let line_len: u64 = i - line_start;
                     if line_len > 0 && stdoutBuffer.bytes[i - 1] == 13 { line_len = line_len - 1; };
-                    let st = consumeLine(&stdoutBuffer.bytes, line_start + stdoutBuffer.bytes, line_len, &assistantParts, &result_summary, &has_result_summary, err);
+                    let cap_cr24317: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr24317, &stdoutBuffer.bytes, line_start);
+                    let st = consumeLine(cap_cr24317, PTR_NULL(), line_len, &assistantParts, &result_summary, &has_result_summary, err);
                     // DEFECT: pointer arithmetic on buffer field approximated.
                     if st == 1 { settled = true; failed = true; };
                     if st == 2 { settled = true; };
@@ -356,48 +452,56 @@ fn claudeCompactionRunner_run(runner: &ClaudeCompactionRunner, input: &ClaudeCom
         };
         // stderr drain: redact + slice(0, 2000) + logCompactionEvent("warn", "child-stderr", ...)
         let echunk = ByteBuf { bytes: [0u8; 65536], len: 0 };
-        let en = sa_std_process_read_stderr(child.handle, &echunk.bytes, 65536);
+        let enr: u64 = 0;
+        let edst = sa_std_process_read_stderr(child.handle, &echunk.bytes, 65536, &enr);
+        let en = if edst == 0 { enr } else { 0 };
         if en > 0 {
             echunk.len = en;
             let red = ByteBuf { bytes: [0u8; 65536], len: 0 };
-            redactCompactionText(&echunk.bytes, echunk.len, &red);
+            let cap_cr24345: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr24345, &echunk.bytes, 0);
+            redactCompactionText( cap_cr24345, echunk.len, &red);
             if red.len > 2000 { red.len = 2000; };
             if red.len > 0 {
-                logCompactionEvent(LOG_LEVEL_WARN, STR_PTR("child-stderr"), STR_LEN("child-stderr"), &red.bytes, red.len);
+                let cap_cr5004: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr5004, &red.bytes, 0);
+                logCompactionEvent(LOG_LEVEL_WARN, STR_PTR("child-stderr"), STR_LEN("child-stderr"), cap_cr5004, red.len);
             };
         };
-        let poll = sa_std_process_poll(child.handle, &exit_code, &exit_signal);
+        let poll = cr_poll_child(child.handle, &exit_code, &exit_signal);
         if poll == 2 { child_error = true; break; };
         if poll == 1 { break; }; // exited
         elapsed_ms = elapsed_ms + 50;
-        sa_sleep_ms(50);
+        let slp = sa_time_sleep_ms(50);
     }
     if child_error {
         // child.once("error", ...) -> logCompactionEvent("error", "child-error", {...errnoDetails, message}); finish(error)
-        logCompactionEvent(LOG_LEVEL_ERROR, STR_PTR("child-error"), STR_LEN("child-error"), &details.bytes, details.len);
+        let cap_cr5005: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr5005, &details.bytes, 0);
+        logCompactionEvent(LOG_LEVEL_ERROR, STR_PTR("child-error"), STR_LEN("child-error"), cap_cr5005, details.len);
         terminateChild_default(&child);
         if err.len == 0 { buf_append_lit(err, STR_PTR("child process error"), STR_LEN("child process error")); };
         return 4;
     };
     // child.once("exit", ...): if (stdoutBuffer) consumeLine(stdoutBuffer);
     if !(settled) && stdoutBuffer.len > 0 {
-        let st = consumeLine(&stdoutBuffer.bytes, stdoutBuffer.bytes, stdoutBuffer.len, &assistantParts, &result_summary, &has_result_summary, err);
+        let cap_cr24318: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr24318, &stdoutBuffer.bytes, 0);
+        let st = consumeLine(cap_cr24318, PTR_NULL(), stdoutBuffer.len, &assistantParts, &result_summary, &has_result_summary, err);
         if st == 1 { failed = true; settled = true; };
         if st == 2 { settled = true; };
     };
     if !(settled) {
         // logCompactionEvent("error", "child-exit-before-result", {...}); finish(new Error(`Claude compaction exited before a result (code ${code ?? "null"}, signal ${signal ?? "null"})`))
-        logCompactionEvent(LOG_LEVEL_ERROR, STR_PTR("child-exit-before-result"), STR_LEN("child-exit-before-result"), &details.bytes, details.len);
+        let cap_cr5006: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr5006, &details.bytes, 0);
+        logCompactionEvent(LOG_LEVEL_ERROR, STR_PTR("child-exit-before-result"), STR_LEN("child-exit-before-result"), cap_cr5006, details.len);
         buf_append_lit(err, STR_PTR("Claude compaction exited before a result (code "), STR_LEN("Claude compaction exited before a result (code "));
-        buf_append_i64(err, exit_code);
+        cr_buf_append_i64(err, exit_code);
         buf_append_lit(err, STR_PTR(", signal "), STR_LEN(", signal "));
-        buf_append_i64(err, exit_signal);
+        cr_buf_append_i64(err, exit_signal);
         buf_append_lit(err, STR_PTR(")"), STR_LEN(")"));
         terminateChild_default(&child);
         return 5;
     };
     // logCompactionEvent("log", "child-exit", {...}) on the settled path
-    logCompactionEvent(LOG_LEVEL_LOG, STR_PTR("child-exit"), STR_LEN("child-exit"), &details.bytes, details.len);
+    let cap_cr5007: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr5007, &details.bytes, 0);
+    logCompactionEvent(LOG_LEVEL_LOG, STR_PTR("child-exit"), STR_LEN("child-exit"), cap_cr5007, details.len);
     // finish(): clearTimeout + terminateChild(child) (errors swallowed) + resolve/reject
     terminateChild_default(&child);
     if failed { return 4; };
@@ -411,12 +515,81 @@ fn claudeCompactionRunner_run(runner: &ClaudeCompactionRunner, input: &ClaudeCom
     buf_trim_in_place(out_summary);
     // }).then((summary) => { if (!summary) { log "empty-summary"; throw ... } log "done"; return summary; })
     if out_summary.len == 0 {
-        logCompactionEvent(LOG_LEVEL_ERROR, STR_PTR("empty-summary"), STR_LEN("empty-summary"), &details.bytes, details.len);
+        let cap_cr5008: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr5008, &details.bytes, 0);
+        logCompactionEvent(LOG_LEVEL_ERROR, STR_PTR("empty-summary"), STR_LEN("empty-summary"), cap_cr5008, details.len);
         buf_append_lit(err, STR_PTR("Claude compaction returned an empty summary"), STR_LEN("Claude compaction returned an empty summary"));
         return 7;
     };
-    logCompactionEvent(LOG_LEVEL_LOG, STR_PTR("done"), STR_LEN("done"), &details.bytes, details.len);
+    let cap_cr5009: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr5009, &details.bytes, 0);
+    logCompactionEvent(LOG_LEVEL_LOG, STR_PTR("done"), STR_LEN("done"), cap_cr5009, details.len);
     return 0;
+}
+
+fn cr_json_get_bool(doc: u64, key_ptr: ptr, key_len: u64) -> bool {
+    let v: u8 = 0;
+    if sa_json_object_get_bool(doc, key_ptr, key_len, &v) != 0 { return false; };
+    return v != 0;
+}
+
+// FIX(be2): the fictional sa_json_message_content_count /
+// sa_json_content_block_* accessors are implemented here over the real
+// json.sai navigation faces, mirroring the TurnProjector tp_json_*
+// helpers (same paths: message.content[i].type / .text).
+fn cr_json_nav(doc: u64, key_ptr: ptr, key_len: u64, out: &u64) -> bool {
+    let h: u64 = 0;
+    if sa_json_object_get(doc, key_ptr, key_len, &h) != 0 { return false; };
+    *out = h;
+    return true;
+}
+
+fn cr_json_msg_block(doc: u64, idx: u64, out: &u64) -> bool {
+    let msg: u64 = 0;
+    if !cr_json_nav(doc, STR_PTR("message"), STR_LEN("message"), &msg) { return false; };
+    let content: u64 = 0;
+    if !cr_json_nav(msg, STR_PTR("content"), STR_LEN("content"), &content) { return false; };
+    if sa_json_kind(content) != 6 { return false; };
+    let blk: u64 = 0;
+    if sa_json_array_get(content, idx, &blk) != 0 { return false; };
+    *out = blk;
+    return true;
+}
+
+fn cr_json_message_content_count(doc: u64) -> u64 {
+    let msg: u64 = 0;
+    if !cr_json_nav(doc, STR_PTR("message"), STR_LEN("message"), &msg) { return 0; };
+    let content: u64 = 0;
+    if !cr_json_nav(msg, STR_PTR("content"), STR_LEN("content"), &content) { return 0; };
+    if sa_json_kind(content) != 6 { return 0; };
+    let cnt: u64 = 0;
+    if sa_json_value_count(content, &cnt) != 0 { return 0; };
+    return cnt;
+}
+
+fn cr_json_block_string(doc: u64, idx: u64, key_ptr: ptr, key_len: u64, dst: ptr, cap: u64) -> u64 {
+    let blk: u64 = 0;
+    if !cr_json_msg_block(doc, idx, &blk) { return 0; };
+    let sp: ptr = PTR_NULL();
+    let sl: u64 = 0;
+    if sa_json_object_get_string(blk, key_ptr, key_len, &sp, &sl) != 0 { return 0; };
+    let n = sl;
+    if n > cap { n = cap; };
+    let i: u64 = 0;
+    while i < n {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, sp, i);
+        let wp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(wp, dst, i);
+        PTR_WRITE_U8(wp, v);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn cr_json_block_has(doc: u64, idx: u64, key_ptr: ptr, key_len: u64) -> bool {
+    let blk: u64 = 0;
+    if !cr_json_msg_block(doc, idx, &blk) { return false; };
+    let h: u64 = 0;
+    return cr_json_nav(blk, key_ptr, key_len, &h);
 }
 
 // consumeLine(line) closure from the Promise body, lifted to a function.
@@ -436,18 +609,19 @@ fn consumeLine(line_ptr: ptr, unused_base: ptr, line_len: u64, assistantParts: &
     let type_buf_p: ptr = PTR_NULL(); PTR_BYTE_ADD(type_buf_p, &type_buf, 0);
     type_len = json_get_string_copy(doc, STR_PTR("type"), STR_LEN("type"), type_buf_p, 64);
     // if (message.type === "assistant") { const content = message.message?.content; if (Array.isArray(content)) for (block of content) if (block.type === "text" && typeof block.text === "string") assistantParts.push(block.text); }
-    if bytes_eq(type_buf_p, type_len, STR_PTR("assistant"), STR_LEN("assistant")) {
-        let count: u64 = sa_json_message_content_count(doc);
+    if bytes_eq_buf(type_buf_p, type_len, STR_PTR("assistant"), STR_LEN("assistant")) {
+        let count: u64 = cr_json_message_content_count(doc);
         let i: u64 = 0;
         while i < count {
             let btype: [u8; 64] = [0u8; 64];
             let btype_p: ptr = PTR_NULL(); PTR_BYTE_ADD(btype_p, &btype, 0);
-            let btype_len: u64 = sa_json_content_block_type(doc, i, btype_p, 64);
-            if bytes_eq(btype_p, btype_len, STR_PTR("text"), STR_LEN("text")) {
+            let btype_len: u64 = cr_json_block_string(doc, i, STR_PTR("type"), STR_LEN("type"), btype_p, 64);
+            if bytes_eq_buf(btype_p, btype_len, STR_PTR("text"), STR_LEN("text")) {
                 let text = ByteBuf { bytes: [0u8; 65536], len: 0 };
-                let tl: u64 = sa_json_content_block_text(doc, i, &text.bytes, 262144);
+                let cap_cr7703: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_cr7703, &text.bytes, 0);
+                let tl: u64 = cr_json_block_string(doc, i, STR_PTR("text"), STR_LEN("text"), cap_cr7703, 262144);
                 text.len = tl;
-                if tl > 0 || sa_json_content_block_has_text(doc, i) {
+                if tl > 0 || cr_json_block_has(doc, i, STR_PTR("text"), STR_LEN("text")) {
                     strlist_push_buf(assistantParts, &text.bytes, text.len);
                 };
             };
@@ -455,12 +629,12 @@ fn consumeLine(line_ptr: ptr, unused_base: ptr, line_len: u64, assistantParts: &
         }
     };
     // if (message.type === "result") { const isError = message.is_error === true || (typeof message.subtype === "string" && message.subtype !== "success"); ... }
-    if bytes_eq(type_buf_p, type_len, STR_PTR("result"), STR_LEN("result")) {
-        let is_error: bool = sa_json_get_bool(doc, STR_PTR("is_error"), STR_LEN("is_error"));
+    if bytes_eq_buf(type_buf_p, type_len, STR_PTR("result"), STR_LEN("result")) {
+        let is_error: bool = cr_json_get_bool(doc, STR_PTR("is_error"), STR_LEN("is_error"));
         let subtype: [u8; 64] = [0u8; 64];
         let subtype_p: ptr = PTR_NULL(); PTR_BYTE_ADD(subtype_p, &subtype, 0);
         let subtype_len: u64 = json_get_string_copy(doc, STR_PTR("subtype"), STR_LEN("subtype"), subtype_p, 64);
-        if subtype_len > 0 && !(bytes_eq(subtype_p, subtype_len, STR_PTR("success"), STR_LEN("success"))) { is_error = true; };
+        if subtype_len > 0 && !(bytes_eq_buf(subtype_p, subtype_len, STR_PTR("success"), STR_LEN("success"))) { is_error = true; };
         if is_error {
             // finish(new Error(typeof message.result === "string" ? message.result : "Claude compaction failed"))
             let jgs_p4: ptr = PTR_NULL(); PTR_BYTE_ADD(jgs_p4, &err.bytes, 0);
@@ -476,7 +650,7 @@ fn consumeLine(line_ptr: ptr, unused_base: ptr, line_len: u64, assistantParts: &
         // finish(undefined, typeof message.result === "string" ? message.result : undefined)
         let jgs_p5: ptr = PTR_NULL(); PTR_BYTE_ADD(jgs_p5, &result_summary.bytes, 0);
         let rl2: u64 = json_get_string_copy(doc, STR_PTR("result"), STR_LEN("result"), jgs_p5, 262144);
-        if sa_json_has(doc, STR_PTR("result"), STR_LEN("result")) {
+        if json_has(doc, STR_PTR("result"), STR_LEN("result")) {
             result_summary.len = rl2;
             *has_result_summary = true;
         };
@@ -490,6 +664,6 @@ fn consumeLine(line_ptr: ptr, unused_base: ptr, line_len: u64, assistantParts: &
 // Default terminateChild: (child) => child.kill("SIGTERM")
 // DEFECT: signal-by-name; approximated with sa_std_process_kill(handle, 15).
 fn terminateChild_default(child: &ccr_ClaudeChildProcess) -> void {
-    let ignored = sa_std_process_kill(child.handle, 15);
+    let ignored = sa_std_process_kill(child.handle);
     return;
 }
