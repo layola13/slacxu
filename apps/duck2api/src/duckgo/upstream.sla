@@ -192,12 +192,38 @@ fn is_duck_fetch_degraded(state: &UpstreamState) -> bool {
 // sa_env_get(&buf, key, klen) out-param form does not exist.
 fn env_read_buf(out: &ByteBuf, kp: ptr, kl: u64) -> void {
     buf_reset(out);
+    // Test seam: sa_env_set writes an override cell that wins over
+    // the process env (the TS tests assign process.env directly).
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&nm, STR_PTR("env.override."), STR_LEN("env.override."));
+    buf_append_lit(&nm, kp, kl);
+    let np: ptr = PTR_NULL();
+    PTR_BYTE_ADD(np, nm.bytes, 0);
+    let scratch = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, scratch.bytes, 0);
+    let got: u64 = 0;
+    if sa_global_bytes_get(np, nm.len, sp, 40960, &got) == 0 {
+        buf_append_lit(out, sp, got);
+        return;
+    };
     let h = sa_env_get(kp, kl);
     if h != 0 {
         let p: ptr = sa_env_buffer_data(h);
         buf_append_lit(out, p, sa_env_buffer_len(h));
         sa_env_buffer_free(h);
     };
+}
+
+// TS tests assign process.env entries; std env is read-only, so the
+// assignment lands in the override cells env_read_buf consults.
+fn sa_env_set(key_ptr: ptr, key_len: u64, val_ptr: ptr, val_len: u64) -> void {
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&nm, STR_PTR("env.override."), STR_LEN("env.override."));
+    buf_append_lit(&nm, key_ptr, key_len);
+    let np: ptr = PTR_NULL();
+    PTR_BYTE_ADD(np, nm.bytes, 0);
+    sa_global_bytes_set(np, nm.len, val_ptr, val_len);
 }
 
 // TS: async function getFetch(): Promise<FetchFn>
@@ -253,6 +279,14 @@ fn sa_http_impersonate_available(preset_ptr: ptr, preset_len: u64) -> i32 {
 
 fn http_fetch_send(method: u8, url_ptr: ptr, url_len: u64, h: &HeaderList, body_ptr: ptr, body_len: u64, has_body: bool, out_res: &u64) -> i32 {
     *out_res = 0;
+    // Test seam: an installed fetch stub (upstream-retry tests)
+    // serves canned responses instead of the network.
+    let __stub_nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let __stub_mp = up_cell_fixed(&__stub_nm, STR_PTR("fetch.stub.mode"), STR_LEN("fetch.stub.mode"));
+    let __stub_mode: u64 = 0;
+    if sa_global_u64_get(__stub_mp, __stub_nm.len, &__stub_mode) == 0 && __stub_mode != 0 {
+        return stub_fetch_send(method, url_ptr, url_len, body_ptr, body_len, out_res);
+    };
     let use_tls: u8 = 0;
     if starts_with(url_ptr, url_len, STR_PTR("https://"), STR_LEN("https://")) { use_tls = 1; };
     let client: ptr = PTR_NULL();
@@ -298,6 +332,146 @@ fn http_fetch_send(method: u8, url_ptr: ptr, url_len: u64, h: &HeaderList, body_
     return 0;
 }
 
+// --- fetch test stub (the TS tests stub globalThis.fetch; the seam
+// is this file's fetch layer, exactly where the converted test
+// header puts it). Installed via sa_test_fetch_stub_install; while a
+// mode cell is set, http_fetch_send serves canned responses:
+//   * URL contains /duckchat/v1/status -> 200, x-vqd-hash-1: the
+//     installed challenge, empty body
+//   * URL contains /duckchat/v1/chat -> the request body is recorded
+//     (fetch.stub.body.<idx>) and the chat counter bumps; mode 1:
+//     first call 400 ERR_BAD_REQUEST, later calls 200 "data: done";
+//     mode 2: every call 400 ERR_BAD_REQUEST (the TS scripts,
+//     branch-for-branch)
+//   * any other URL -> 200 "<html></html>"
+// Stub response handles are tagged (bit 63 set) so the
+// sa_http_response_* wrappers serve them from cells and never hand
+// them to the std client.
+fn resp_is_stub(res: u64) -> bool {
+    return res >= 9223372036854775808u64;
+}
+
+fn up_cell_fixed(out: &ByteBuf, name_ptr: ptr, name_len: u64) -> ptr {
+    buf_reset(out);
+    buf_append_lit(out, name_ptr, name_len);
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, out.bytes, 0);
+    return p;
+}
+
+fn up_cell_id(out: &ByteBuf, prefix_ptr: ptr, prefix_len: u64, id: u64) -> ptr {
+    buf_reset(out);
+    buf_append_lit(out, prefix_ptr, prefix_len);
+    buf_append_u64(out, id);
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, out.bytes, 0);
+    return p;
+}
+
+fn stub_fetch_send(method: u8, url_ptr: ptr, url_len: u64, body_ptr: ptr, body_len: u64, out_res: &u64) -> i32 {
+    *out_res = 0;
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let kp = up_cell_fixed(&nm, STR_PTR("fetch.stub.next"), STR_LEN("fetch.stub.next"));
+    let nxt: u64 = 0;
+    if sa_global_u64_get(kp, nm.len, &nxt) != 0 { nxt = 0; };
+    let h = 9223372036854775808u64 + nxt;
+    let kp2 = up_cell_fixed(&nm, STR_PTR("fetch.stub.next"), STR_LEN("fetch.stub.next"));
+    sa_global_u64_set(kp2, nm.len, nxt + 1);
+    let status: u64 = 200;
+    let rbody = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let vqd = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let has_vqd = false;
+    if find_sub_buf(url_ptr, url_len, STR_PTR("/duckchat/v1/status"), STR_LEN("/duckchat/v1/status")) < url_len {
+        let cp = up_cell_fixed(&nm, STR_PTR("fetch.stub.challenge"), STR_LEN("fetch.stub.challenge"));
+        let vp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(vp, vqd.bytes, 0);
+        let vl: u64 = 0;
+        if sa_global_bytes_get(cp, nm.len, vp, 40960, &vl) == 0 { vqd.len = vl; has_vqd = true; };
+    } else {
+        if find_sub_buf(url_ptr, url_len, STR_PTR("/duckchat/v1/chat"), STR_LEN("/duckchat/v1/chat")) < url_len {
+            let cp2 = up_cell_fixed(&nm, STR_PTR("fetch.stub.chat.count"), STR_LEN("fetch.stub.chat.count"));
+            let cnt: u64 = 0;
+            if sa_global_u64_get(cp2, nm.len, &cnt) != 0 { cnt = 0; };
+            let bp = up_cell_id(&nm, STR_PTR("fetch.stub.body."), STR_LEN("fetch.stub.body."), cnt);
+            sa_global_bytes_set(bp, nm.len, body_ptr, body_len);
+            cnt = cnt + 1;
+            let cp3 = up_cell_fixed(&nm, STR_PTR("fetch.stub.chat.count"), STR_LEN("fetch.stub.chat.count"));
+            sa_global_u64_set(cp3, nm.len, cnt);
+            let mp = up_cell_fixed(&nm, STR_PTR("fetch.stub.mode"), STR_LEN("fetch.stub.mode"));
+            let mode: u64 = 0;
+            if sa_global_u64_get(mp, nm.len, &mode) != 0 { mode = 0; };
+            if mode == 2 || (mode == 1 && cnt == 1) {
+                status = 400;
+                buf_append_lit(&rbody, STR_PTR("{\"action\":\"error\",\"status\":400,\"type\":\"ERR_BAD_REQUEST\"}"), STR_LEN("{\"action\":\"error\",\"status\":400,\"type\":\"ERR_BAD_REQUEST\"}"));
+            } else {
+                buf_append_lit(&rbody, STR_PTR("data: done"), STR_LEN("data: done"));
+            };
+        } else {
+            buf_append_lit(&rbody, STR_PTR("<html></html>"), STR_LEN("<html></html>"));
+        };
+    };
+    let sp = up_cell_id(&nm, STR_PTR("fetch.stub.resp.status."), STR_LEN("fetch.stub.resp.status."), h);
+    sa_global_u64_set(sp, nm.len, status);
+    let bp2 = up_cell_id(&nm, STR_PTR("fetch.stub.resp.body."), STR_LEN("fetch.stub.resp.body."), h);
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, rbody.bytes, 0);
+    sa_global_bytes_set(bp2, nm.len, rp, rbody.len);
+    if has_vqd {
+        let vp2 = up_cell_id(&nm, STR_PTR("fetch.stub.resp.vqd."), STR_LEN("fetch.stub.resp.vqd."), h);
+        let vpp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(vpp, vqd.bytes, 0);
+        sa_global_bytes_set(vp2, nm.len, vpp, vqd.len);
+    };
+    *out_res = h;
+    return 0;
+}
+
+fn sa_test_fetch_stub_install(challenge_ptr: ptr, challenge_len: u64, mode: u64) -> void {
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let mp = up_cell_fixed(&nm, STR_PTR("fetch.stub.mode"), STR_LEN("fetch.stub.mode"));
+    sa_global_u64_set(mp, nm.len, mode);
+    let cp = up_cell_fixed(&nm, STR_PTR("fetch.stub.challenge"), STR_LEN("fetch.stub.challenge"));
+    sa_global_bytes_set(cp, nm.len, challenge_ptr, challenge_len);
+    let kp = up_cell_fixed(&nm, STR_PTR("fetch.stub.chat.count"), STR_LEN("fetch.stub.chat.count"));
+    sa_global_u64_set(kp, nm.len, 0);
+    let np2 = up_cell_fixed(&nm, STR_PTR("fetch.stub.next"), STR_LEN("fetch.stub.next"));
+    sa_global_u64_set(np2, nm.len, 0);
+}
+
+fn sa_test_fetch_stub_chat_count() -> u64 {
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let kp = up_cell_fixed(&nm, STR_PTR("fetch.stub.chat.count"), STR_LEN("fetch.stub.chat.count"));
+    let cnt: u64 = 0;
+    if sa_global_u64_get(kp, nm.len, &cnt) != 0 { return 0; };
+    return cnt;
+}
+
+fn sa_test_fetch_stub_chat_body(idx: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    *out_ptr = PTR_NULL();
+    *out_len = 0;
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let cp = up_cell_fixed(&nm, STR_PTR("fetch.stub.body.scratch"), STR_LEN("fetch.stub.body.scratch"));
+    let prev: u64 = 0;
+    if sa_global_u64_get(cp, nm.len, &prev) == 0 && prev != 0 {
+        sa_fmt_buffer_free(prev);
+        let cp0 = up_cell_fixed(&nm, STR_PTR("fetch.stub.body.scratch"), STR_LEN("fetch.stub.body.scratch"));
+        sa_global_u64_set(cp0, nm.len, 0);
+    };
+    let bp = up_cell_id(&nm, STR_PTR("fetch.stub.body."), STR_LEN("fetch.stub.body."), idx);
+    let scratch = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, scratch.bytes, 0);
+    let bl: u64 = 0;
+    if sa_global_bytes_get(bp, nm.len, sp, 40960, &bl) != 0 { return; };
+    let h = sa_fmt_bytes(sp, bl);
+    if h == 0 { return; };
+    let cp2 = up_cell_fixed(&nm, STR_PTR("fetch.stub.body.scratch"), STR_LEN("fetch.stub.body.scratch"));
+    sa_global_u64_set(cp2, nm.len, h);
+    let dp: ptr = sa_fmt_buffer_data(h);
+    *out_ptr = dp;
+    *out_len = sa_fmt_buffer_len(h);
+}
+
 fn sa_http_fetch_get(state: &UpstreamState, url_ptr: ptr, url_len: u64, h: &HeaderList, out_res: &u64) -> i32 {
     return http_fetch_send(1, url_ptr, url_len, h, PTR_NULL(), 0, false, out_res);
 }
@@ -308,6 +482,13 @@ fn sa_http_fetch_post(state: &UpstreamState, url_ptr: ptr, url_len: u64, h: &Hea
 
 fn sa_http_response_status(res: u64) -> u64 {
     if res == 0 { return 0; };
+    if resp_is_stub(res) {
+        let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let sp = up_cell_id(&nm, STR_PTR("fetch.stub.resp.status."), STR_LEN("fetch.stub.resp.status."), res);
+        let v: u64 = 0;
+        if sa_global_u64_get(sp, nm.len, &v) == 0 { return v; };
+        return 0;
+    };
     let resp: ptr = PTR_NULL();
     PTR_CAST(resp, res);
     return sa_http_client_resp_status(resp) as u64;
@@ -317,6 +498,28 @@ fn sa_http_response_header(res: u64, name_ptr: ptr, name_len: u64, out_ptr: &ptr
     *out_ptr = PTR_NULL();
     *out_len = 0;
     if res == 0 { return 1; };
+    if resp_is_stub(res) {
+        // The stub serves exactly one header (x-vqd-hash-1).
+        if !bytes_eq_str(name_ptr, name_len, STR_PTR("x-vqd-hash-1"), STR_LEN("x-vqd-hash-1")) { return 1; };
+        let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let vp = up_cell_id(&nm, STR_PTR("fetch.stub.resp.vqd."), STR_LEN("fetch.stub.resp.vqd."), res);
+        let scratch = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, scratch.bytes, 0);
+        let vl: u64 = 0;
+        if sa_global_bytes_get(vp, nm.len, sp, 40960, &vl) != 0 { return 1; };
+        let fh = sa_fmt_bytes(sp, vl);
+        if fh == 0 { return 1; };
+        let cp = up_cell_id(&nm, STR_PTR("fetch.stub.resp.scratch."), STR_LEN("fetch.stub.resp.scratch."), res);
+        let prev: u64 = 0;
+        if sa_global_u64_get(cp, nm.len, &prev) == 0 && prev != 0 { sa_fmt_buffer_free(prev); };
+        let cp2 = up_cell_id(&nm, STR_PTR("fetch.stub.resp.scratch."), STR_LEN("fetch.stub.resp.scratch."), res);
+        sa_global_u64_set(cp2, nm.len, fh);
+        let dp: ptr = sa_fmt_buffer_data(fh);
+        *out_ptr = dp;
+        *out_len = sa_fmt_buffer_len(fh);
+        return 0;
+    };
     let resp: ptr = PTR_NULL();
     PTR_CAST(resp, res);
     if sa_http_client_resp_get_header(resp, name_ptr, name_len, out_ptr, out_len) != 0 {
@@ -330,6 +533,16 @@ fn sa_http_response_header(res: u64, name_ptr: ptr, name_len: u64, out_ptr: &ptr
 fn sa_http_response_text(res: u64, out: &ByteBuf) -> void {
     buf_reset(out);
     if res == 0 { return; };
+    if resp_is_stub(res) {
+        let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let bp = up_cell_id(&nm, STR_PTR("fetch.stub.resp.body."), STR_LEN("fetch.stub.resp.body."), res);
+        let scratch = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, scratch.bytes, 0);
+        let bl: u64 = 0;
+        if sa_global_bytes_get(bp, nm.len, sp, 40960, &bl) == 0 { buf_append_lit(out, sp, bl); };
+        return;
+    };
     let resp: ptr = PTR_NULL();
     PTR_CAST(resp, res);
     let bp = sa_http_client_resp_body_ptr(resp);
@@ -338,6 +551,7 @@ fn sa_http_response_text(res: u64, out: &ByteBuf) -> void {
 }
 
 fn sa_http_response_set_cookie_count(res: u64) -> u64 {
+    if resp_is_stub(res) { return 0; };
     let vp: ptr = PTR_NULL();
     let vl: u64 = 0;
     if sa_http_response_header(res, STR_PTR("set-cookie"), STR_LEN("set-cookie"), &vp, &vl) != 0 || vl == 0 { return 0; };
@@ -347,12 +561,24 @@ fn sa_http_response_set_cookie_count(res: u64) -> u64 {
 fn sa_http_response_set_cookie(res: u64, idx: u64, out_ptr: &ptr, out_len: &u64) -> void {
     *out_ptr = PTR_NULL();
     *out_len = 0;
+    if resp_is_stub(res) { return; };
     if idx != 0 { return; };
     sa_http_response_header(res, STR_PTR("set-cookie"), STR_LEN("set-cookie"), out_ptr, out_len);
 }
 
 fn sa_http_response_release(res: u64) -> void {
     if res == 0 { return; };
+    if resp_is_stub(res) {
+        let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+        let cp = up_cell_id(&nm, STR_PTR("fetch.stub.resp.scratch."), STR_LEN("fetch.stub.resp.scratch."), res);
+        let prev: u64 = 0;
+        if sa_global_u64_get(cp, nm.len, &prev) == 0 && prev != 0 {
+            sa_fmt_buffer_free(prev);
+            let cp2 = up_cell_id(&nm, STR_PTR("fetch.stub.resp.scratch."), STR_LEN("fetch.stub.resp.scratch."), res);
+            sa_global_u64_set(cp2, nm.len, 0);
+        };
+        return;
+    };
     let resp: ptr = PTR_NULL();
     PTR_CAST(resp, res);
     sa_http_client_resp_free(resp);
@@ -819,6 +1045,17 @@ fn post_conversation(state: &UpstreamState, out: &ConversationResult, request: &
             conversation_result_clear(out);
             out.has_error_body = true;
             buf_append_lit(&out.error_body, STR_PTR("no x-vqd-hash-1 token"), STR_LEN("no x-vqd-hash-1 token"));
+            state.last_conversation_end = (sa_time_unix_ms() as u64);
+            return;
+        };
+        if rc == 3 {
+            // generateVQDHash rejected (the TS await throws and
+            // propagates): in this build the solver is unsupported
+            // (no JS runtime in sa_std — see vqd.sla). Represented
+            // like the rc==2 throw: status 0 + the solver's message.
+            conversation_result_clear(out);
+            out.has_error_body = true;
+            buf_append_lit(&out.error_body, STR_PTR("vqd challenge execution unsupported: no JS runtime in sa_std"), STR_LEN("vqd challenge execution unsupported: no JS runtime in sa_std"));
             state.last_conversation_end = (sa_time_unix_ms() as u64);
             return;
         };
