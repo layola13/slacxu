@@ -1,6 +1,7 @@
 // Converted 1:1 from apps/free-key-server/src/adminAuth.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
 @import "sa_std/ptr.sa"
 @import "sa_std/string.sa"
+@import "sa_std/crypto.sai"
 @import "config.sla"
 
 // TS: import { createHmac, scryptSync, timingSafeEqual } from "node:crypto";
@@ -35,6 +36,123 @@ struct AdminSession {
     found: bool,
     username: [u8; 256],
     username_len: u64,
+}
+
+// Hex nibble for the hex->raw digest decode below.
+fn hex_nibble(c: u8) -> u64 {
+    if c >= 97 && c <= 102 { return (c - 87) as u64; };
+    if c >= 65 && c <= 70 { return (c - 55) as u64; };
+    if c >= 48 && c <= 57 { return (c - 48) as u64; };
+    return 0;
+}
+
+// createHmac("sha256", key).digest() — rebound to sa_hmac_sha256_hex
+// (crypto.sai); the std surface returns hex, decoded back to the
+// raw 32 bytes the session format signs with.
+fn hmac_sha256_raw(key_ptr: ptr, key_len: u64, msg_ptr: ptr, msg_len: u64, out32: ptr) -> void {
+    let hexbuf = [0u8; 64];
+    let __ap_hx: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_hx, hexbuf, 0);
+    let hex_len: u64 = 0;
+    sa_hmac_sha256_hex(key_ptr, key_len, msg_ptr, msg_len, __ap_hx, 64, &hex_len);
+    for i in 0..32 {
+        let c1: u8 = 0;
+        PTR_BYTE_AT(c1, __ap_hx, i * 2);
+        let c2: u8 = 0;
+        PTR_BYTE_AT(c2, __ap_hx, i * 2 + 1);
+        let b = ((hex_nibble(c1) << 4) | hex_nibble(c2)) as u8;
+        let __wp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(__wp, out32, i);
+        PTR_WRITE_U8(__wp, b);
+    }
+}
+
+// timingSafeEqual — local constant-time compare (0 = equal).
+fn timing_safe_equal(a: ptr, b: ptr, len: u64) -> i32 {
+    let diff: u64 = 0;
+    for i in 0..len {
+        let x: u8 = 0;
+        PTR_BYTE_AT(x, a, i);
+        let y: u8 = 0;
+        PTR_BYTE_AT(y, b, i);
+        diff = diff | ((x ^ y) as u64);
+    }
+    if diff == 0 { return 0; };
+    return 1;
+}
+
+// Buffer.toString("base64url") — local implementation (URL-safe
+// alphabet, no padding), same as adminTotp.sla's copy.
+fn base64url_encode(data: ptr, data_len: u64, out: &ByteBuf) -> void {
+    buf_reset(out);
+    let alpha = STR_PTR("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_");
+    let i: u64 = 0;
+    while i + 3 <= data_len {
+        let b0: u8 = 0;
+        PTR_BYTE_AT(b0, data, i);
+        let b1: u8 = 0;
+        PTR_BYTE_AT(b1, data, i + 1);
+        let b2: u8 = 0;
+        PTR_BYTE_AT(b2, data, i + 2);
+        let n = ((b0 as u64) << 16) | ((b1 as u64) << 8) | (b2 as u64);
+        for k in 0..4 {
+            let ch: u8 = 0;
+            PTR_BYTE_AT(ch, alpha, (n >> (18 - k * 6)) & 63);
+            buf_append_byte(out, ch);
+        }
+        i = i + 3;
+    }
+    let rem = data_len - i;
+    if rem == 1 {
+        let b0: u8 = 0;
+        PTR_BYTE_AT(b0, data, i);
+        let n = (b0 as u64) << 16;
+        for k in 0..2 {
+            let ch: u8 = 0;
+            PTR_BYTE_AT(ch, alpha, (n >> (18 - k * 6)) & 63);
+            buf_append_byte(out, ch);
+        }
+    };
+    if rem == 2 {
+        let b0: u8 = 0;
+        PTR_BYTE_AT(b0, data, i);
+        let b1: u8 = 0;
+        PTR_BYTE_AT(b1, data, i + 1);
+        let n = ((b0 as u64) << 16) | ((b1 as u64) << 8);
+        for k in 0..3 {
+            let ch: u8 = 0;
+            PTR_BYTE_AT(ch, alpha, (n >> (18 - k * 6)) & 63);
+            buf_append_byte(out, ch);
+        }
+    };
+}
+
+// Buffer.from(s, "base64url") — local implementation; 1 on an
+// invalid character (TS throws).
+fn base64url_decode(data: ptr, data_len: u64, out: &ByteBuf) -> i32 {
+    buf_reset(out);
+    let value: u64 = 0;
+    let bits: u64 = 0;
+    for i in 0..data_len {
+        let ch: u8 = 0;
+        PTR_BYTE_AT(ch, data, i);
+        if ch == 61 { break; };
+        let idx: u64 = 4294967295;
+        if ch >= 65 && ch <= 90 { idx = (ch - 65) as u64; };
+        if ch >= 97 && ch <= 122 { idx = (ch - 71) as u64; };
+        if ch >= 48 && ch <= 57 { idx = (ch + 4) as u64; };
+        if ch == 45 { idx = 62; };
+        if ch == 95 { idx = 63; };
+        if idx == 4294967295 { return 1; };
+        value = (value << 6) | idx;
+        bits = bits + 6;
+        if bits >= 8 {
+            let b = (value >> (bits - 8)) & 255;
+            buf_append_byte(out, b as u8);
+            bits = bits - 8;
+        };
+    }
+    return 0;
 }
 
 // TS: export function verifyAdminPasswordHash(password: string, encoded: string): boolean
@@ -76,12 +194,14 @@ fn verify_admin_password_hash(pw_ptr: ptr, pw_len: u64, enc_ptr: ptr, enc_len: u
     let __ap260: ptr = PTR_NULL();
     PTR_BYTE_ADD(__ap260, expected, 0);
     hex_decode(hex_ptr, hex_len, __ap260);
-    let actual = [0u8; 128];
-    // sa_crypto_scrypt(password, salt, out_len, &out) — MISSING in sa_std.
-    let src = sa_crypto_scrypt(pw_ptr, pw_len, salt_ptr, salt_len, expected_len, &actual);
-    if src != 0 { return false; };
-    // sa_crypto_timing_safe_equal(a, b, len) — MISSING in sa_std.
-    return sa_crypto_timing_safe_equal(&expected, &actual, expected_len) == 0;
+    // DEFECT (B-class, four-source verdict): scrypt has NO
+    // counterpart in sala docs, SLA demos/tests, the sa_plugin_sla
+    // corpus, or the sa_std inventory — password verification is
+    // UNSUPPORTED in this build and fails closed (false) at the
+    // derivation step; the format/hex validation above is genuine
+    // and the timing-safe compare exists locally for the session
+    // path. Registered in FIX_OTHER_APPS.md.
+    return false;
 }
 
 // TS: export function createAdminSession(username: string, secret: string, now = Date.now()): string
@@ -90,7 +210,7 @@ fn create_admin_session(out: &ByteBuf, un_ptr: ptr, un_len: u64, sec_ptr: ptr, s
     // DEFECT: Date.now() default parameter — caller passes now_ms explicitly.
     let exp = now_ms + 8 * 60 * 60000;
     // JSON.stringify({ username, exp }) approximated by manual assembly.
-    let payload_json = ByteBuf { bytes: [0u8; 512], len: 0 };
+    let payload_json = ByteBuf { bytes: [0u8; 40960], len: 0 };
     buf_append_lit(&payload_json, STR_PTR("{\"username\":\""), STR_LEN("{\"username\":\""));
     buf_append_escaped(&payload_json, un_ptr, un_len);
     buf_append_lit(&payload_json, STR_PTR("\",\"exp\":"), STR_LEN("\",\"exp\":"));
@@ -98,13 +218,18 @@ fn create_admin_session(out: &ByteBuf, un_ptr: ptr, un_len: u64, sec_ptr: ptr, s
     buf_append_lit(&payload_json, STR_PTR("}"), STR_LEN("}"));
     // DEFECT: Buffer base64url encode + createHmac("sha256") — MISSING std
     // externs sa_crypto_base64url_encode / sa_crypto_hmac_sha256.
-    let payload = ByteBuf { bytes: [0u8; 1024], len: 0 };
-    sa_crypto_base64url_encode(&payload_json.bytes, payload_json.len, &payload);
-    let sig = ByteBuf { bytes: [0u8; 1024], len: 0 };
+    let payload = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let __ap_pj: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_pj, payload_json.bytes, 0);
+    base64url_encode(__ap_pj, payload_json.len, &payload);
     let sig_raw = [0u8; 32];
-    sa_crypto_hmac_sha256(sec_ptr, sec_len, &payload.bytes, payload.len, &sig_raw);
-    let sig_enc = ByteBuf { bytes: [0u8; 128], len: 0 };
-    sa_crypto_base64url_encode(&sig_raw, 32, &sig_enc);
+    let __ap_pl: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_pl, payload.bytes, 0);
+    let __ap_sr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_sr, sig_raw, 0);
+    hmac_sha256_raw(sec_ptr, sec_len, __ap_pl, payload.len, __ap_sr);
+    let sig_enc = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    base64url_encode(__ap_sr, 32, &sig_enc);
     buf_reset(out);
     buf_append_buf(out, &payload);
     buf_append_lit(out, STR_PTR("."), STR_LEN("."));
@@ -129,18 +254,24 @@ fn read_admin_session(out: &AdminSession, tok_ptr: ptr, tok_len: u64, sec_ptr: p
     // Recompute expected signature and compare in constant time.
     // DEFECT: same missing sa_crypto_hmac_sha256 / base64url externs.
     let sig_raw = [0u8; 32];
-    sa_crypto_hmac_sha256(sec_ptr, sec_len, tok_ptr, dot, &sig_raw);
-    let expected = ByteBuf { bytes: [0u8; 128], len: 0 };
-    sa_crypto_base64url_encode(&sig_raw, 32, &expected);
+    let __ap_sr2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_sr2, sig_raw, 0);
+    hmac_sha256_raw(sec_ptr, sec_len, tok_ptr, dot, __ap_sr2);
+    let expected = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    base64url_encode(__ap_sr2, 32, &expected);
     if sig_len != expected.len { return; };
-    if sa_crypto_timing_safe_equal(sig_ptr, &expected.bytes, sig_len) != 0 { return; };
+    let __ap_ex: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_ex, expected.bytes, 0);
+    if timing_safe_equal(sig_ptr, __ap_ex, sig_len) != 0 { return; };
     // Decode payload JSON and check username/exp.
     // DEFECT: Buffer.from(payload, "base64url").toString("utf8") + JSON.parse
     // with a typed cast — approximated with sa_crypto_base64url_decode +
     // sa_json_parse.
-    let payload = ByteBuf { bytes: [0u8; 1024], len: 0 };
-    if sa_crypto_base64url_decode(tok_ptr, dot, &payload) != 0 { return; };
-    let doc = sa_json_parse(&payload.bytes, payload.len);
+    let payload = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    if base64url_decode(tok_ptr, dot, &payload) != 0 { return; };
+    let __ap_pay: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_pay, payload.bytes, 0);
+    let doc = sa_json_parse(__ap_pay, payload.len);
     if doc == 0 { return; };
     let un_ptr: ptr = PTR_NULL();
     let un_len: u64 = 0;
