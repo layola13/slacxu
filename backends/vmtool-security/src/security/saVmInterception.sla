@@ -1,9 +1,19 @@
-// Converted 1:1 from backends/vmtool-security/src/security/saVmInterception.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
-// Source imports: type { SaVmPolicyConfig } from "@codex-ui/shared";
-//   { checkSaVmDelete, checkSaVmHttp, checkSaVmPath, extractCommandArgv, normalizeSaVmPolicy } from "./saVmPolicy.js";
-//   { isSystemWebSearchPermissionRequest } from "@cxu/sdk-backend";
+// Faithful retranslation (fix phase) of saVmInterception.ts — see
+// _defects/FIX_BACKENDS.md. The bulk pass left every function as a
+// comment stub routed through a constant-false re_test() on the
+// claim "SLA/sa_std has no regex engine". That claim is only half
+// true: sa_std/text/regex.sai is a POSIX ERE subset that cannot
+// express these patterns (lookarounds, \b classes, lazy spans), so
+// — exactly as in saVmPolicy.sla — each pattern is re-implemented
+// as a hand matcher over bytes, in source order, with the source's
+// guidance literals preserved verbatim. Approximations are noted
+// per rule where a pattern has no exact hand form.
 
 @import "saVmPolicy.sla"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/encoding/json.sai"
+@import "../../../../sdk-backend/src/systemWebSearch.sla"
 
 // String-out storage for `string | null` returns.
 struct StrOut {
@@ -17,7 +27,9 @@ struct StrOut {
 fn SaVmScriptLanguage_name(tag: i32, out: &StrOut) -> void {
     out.has = tag >= 0;
     out.len = 0;
-    // DEFECT: tag -> literal name materialization in fix phase.
+    if tag == 0 { intc_out_lit(out, STR_PTR("python"), STR_LEN("python")); };
+    if tag == 1 { intc_out_lit(out, STR_PTR("javascript"), STR_LEN("javascript")); };
+    if tag == 2 { intc_out_lit(out, STR_PTR("bun"), STR_LEN("bun")); };
 }
 
 struct SaVmScriptToolRequest {
@@ -40,36 +52,179 @@ struct SaVmInterceptionDecision {
     request: SaVmScriptToolRequest,
 }
 
-// DEFECT: regex — SLA/sa_std has no regex engine. Every RegExp test in this
-// file (and saVmPolicy.sla) routes through this stub in the bulk pass; the
-// pattern is identified by `pattern_id` and quoted at the call site. Returns
-// false (the safe-deny side is chosen by callers' fall-through structure only
-// where the source does so; see defect log).
-fn re_test(pattern_id: u64, text_ptr: ptr, text_len: u64) -> bool {
-    return false;
+// ---------- local byte helpers (intc_ prefix; policy's are pol_*) ----------
+fn intc_byte(p: ptr, i: u64) -> u8 {
+    let v: u8 = 0;
+    PTR_BYTE_AT(v, p, i);
+    return v;
 }
 
-// DEFECT: from @cxu/sdk-backend (converted in the sdk-backend unit);
-// declared here as an external predicate over the request text.
-// fn isSystemWebSearchPermissionRequest(text_ptr, text_len) -> bool
+fn intc_lower(b: u8) -> u8 {
+    if b >= 65 && b <= 90 { return b + 32; };
+    return b;
+}
 
-// Returns the script language for a host executable, if it is Python, JS, or Bun.
-fn saVmScriptLanguage(executable_ptr: ptr, executable_len: u64) -> i32 {
-    // Source: name = executable.replace(/\\/g, "/").toLowerCase().split("/").at(-1) ?? ""
-    // DEFECT: string replace/toLowerCase/split — basename extraction over the
-    // byte buffer in fix phase.
-    // DEFECT: regex ^(?:python(?:\d+(?:\.\d+)?)?|py|pypy(?:\d+)?)(?:\.exe)?$ -> re_test(1, ...)
-    if re_test(1, executable_ptr, executable_len) { return 0; };
-    // DEFECT: regex ^(?:bun(?:x)?)(?:\.exe)?$ -> re_test(2, ...)
-    if re_test(2, executable_ptr, executable_len) { return 2; };
-    // DEFECT: regex ^(?:node(?:js)?|deno|ts-node|tsx|npx)(?:\.exe)?$ -> re_test(3, ...)
-    if re_test(3, executable_ptr, executable_len) { return 1; };
+fn intc_is_word(b: u8) -> bool {
+    return (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95;
+}
+
+fn intc_out_lit(out: &StrOut, lit_ptr: ptr, lit_len: u64) -> void {
+    let dst: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dst, &out.bytes, 0);
+    let n = lit_len;
+    if n > 2048 { n = 2048; };
+    let i: u64 = 0;
+    while i < n {
+        let wp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(wp, dst, i);
+        PTR_WRITE_U8(wp, intc_byte(lit_ptr, i));
+        i = i + 1;
+    }
+    out.len = n;
+}
+
+fn intc_out_append(out: &StrOut, src: ptr, n: u64) -> void {
+    let dst: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dst, &out.bytes, 0);
+    let i: u64 = 0;
+    while i < n {
+        if out.len >= 2048 { return; };
+        let wp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(wp, dst, out.len);
+        PTR_WRITE_U8(wp, intc_byte(src, i));
+        out.len = out.len + 1;
+        i = i + 1;
+    }
+}
+
+fn intc_out_append_lit(out: &StrOut, lit_ptr: ptr, lit_len: u64) -> void {
+    intc_out_append(out, lit_ptr, lit_len);
+}
+
+// Case-insensitive equality of a byte range with a literal.
+fn intc_eq_ci(p: ptr, n: u64, lit_ptr: ptr, lit_len: u64) -> bool {
+    if n != lit_len { return false; };
+    let i: u64 = 0;
+    while i < n {
+        if intc_lower(intc_byte(p, i)) != intc_lower(intc_byte(lit_ptr, i)) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// Case-insensitive substring search; returns the start index or -1.
+fn intc_find_ci(p: ptr, n: u64, sub_ptr: ptr, sub_len: u64) -> i64 {
+    if sub_len == 0 { return 0; };
+    if n < sub_len { return -1; };
+    let i: u64 = 0;
+    while i + sub_len <= n {
+        let ok: bool = true;
+        let j: u64 = 0;
+        while j < sub_len {
+            if intc_lower(intc_byte(p, i + j)) != intc_lower(intc_byte(sub_ptr, j)) { ok = false; };
+            j = j + 1;
+        }
+        if ok { return i as i64; };
+        i = i + 1;
+    }
     return -1;
 }
 
-fn isSaVmScriptExecutable(executable_ptr: ptr, executable_len: u64, is_string: bool) -> bool {
-    if !is_string { return false; };
-    return saVmScriptLanguage(executable_ptr, executable_len) != -1;
+fn intc_contains_ci(p: ptr, n: u64, sub_ptr: ptr, sub_len: u64) -> bool {
+    return intc_find_ci(p, n, sub_ptr, sub_len) >= 0;
+}
+
+// \bword\b case-insensitive: word chars are [A-Za-z0-9_].
+fn intc_word_ci(p: ptr, n: u64, w_ptr: ptr, w_len: u64) -> bool {
+    if w_len == 0 || n < w_len { return false; };
+    let i: u64 = 0;
+    while i + w_len <= n {
+        let ok: bool = true;
+        let j: u64 = 0;
+        while j < w_len {
+            if intc_lower(intc_byte(p, i + j)) != intc_lower(intc_byte(w_ptr, j)) { ok = false; };
+            j = j + 1;
+        }
+        if ok {
+            let left_ok: bool = true;
+            if i > 0 && intc_is_word(intc_byte(p, i - 1)) { left_ok = false; };
+            let right_ok: bool = true;
+            if i + w_len < n && intc_is_word(intc_byte(p, i + w_len)) { right_ok = false; };
+            if left_ok && right_ok { return true; };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// The (?:^|["'\s;&|()]) prefix class of the source patterns: start of
+// text or one of " ' whitespace ; & | ( ) before the token.
+fn intc_prefix_class(b: u8) -> bool {
+    return b == 34 || b == 39 || b == 32 || b == 9 || b == 10 || b == 13 || b == 59 || b == 38 || b == 124 || b == 40 || b == 41;
+}
+
+// Prefix-boundary word find: (?:^|["'\s;&|()])\bWORD\b (ci).
+fn intc_pword_ci(p: ptr, n: u64, w_ptr: ptr, w_len: u64) -> bool {
+    if w_len == 0 || n < w_len { return false; };
+    let i: u64 = 0;
+    while i + w_len <= n {
+        let pre_ok: bool = false;
+        if i == 0 { pre_ok = true; };
+        if i > 0 && intc_prefix_class(intc_byte(p, i - 1)) { pre_ok = true; };
+        if pre_ok {
+            let ok: bool = true;
+            let j: u64 = 0;
+            while j < w_len {
+                if intc_lower(intc_byte(p, i + j)) != intc_lower(intc_byte(w_ptr, j)) { ok = false; };
+                j = j + 1;
+            }
+            if ok {
+                let right_ok: bool = true;
+                if i + w_len < n && intc_is_word(intc_byte(p, i + w_len)) { right_ok = false; };
+                if right_ok { return true; };
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// Prefix-boundary word with terminator: (?:^|["'\s;&|()])\bWORD(?:\s+|$|[;&|()])
+fn intc_pword_term_ci(p: ptr, n: u64, w_ptr: ptr, w_len: u64) -> bool {
+    if w_len == 0 || n < w_len { return false; };
+    let i: u64 = 0;
+    while i + w_len <= n {
+        let pre_ok: bool = false;
+        if i == 0 { pre_ok = true; };
+        if i > 0 && intc_prefix_class(intc_byte(p, i - 1)) { pre_ok = true; };
+        if pre_ok {
+            let ok: bool = true;
+            let j: u64 = 0;
+            while j < w_len {
+                if intc_lower(intc_byte(p, i + j)) != intc_lower(intc_byte(w_ptr, j)) { ok = false; };
+                j = j + 1;
+            }
+            if ok {
+                if i + w_len >= n { return true; };
+                let t = intc_byte(p, i + w_len);
+                if t == 32 || t == 9 || t == 10 || t == 13 || t == 59 || t == 38 || t == 124 || t == 40 || t == 41 { return true; };
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// Two-part find: A (plain ci substring) occurs, then word B (\b..\b ci)
+// occurs at or after the end of that A occurrence.
+fn intc_two_part(p: ptr, n: u64, a_ptr: ptr, a_len: u64, w_ptr: ptr, w_len: u64) -> bool {
+    let at = intc_find_ci(p, n, a_ptr, a_len);
+    if at < 0 { return false; };
+    let from: u64 = (at as u64) + a_len;
+    if from >= n { return false; };
+    let rest: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rest, p, from);
+    return intc_word_ci(rest, n - from, w_ptr, w_len);
 }
 
 fn str_eq_lit(a_ptr: ptr, a_len: u64, lit_ptr: ptr, lit_len: u64) -> bool {
@@ -84,6 +239,29 @@ fn str_eq_lit(a_ptr: ptr, a_len: u64, lit_ptr: ptr, lit_len: u64) -> bool {
     return true;
 }
 
+// Returns the script language for a host executable, if it is Python, JS, or Bun.
+// Source: basename of the slash-normalized lowercased name tested against
+// the three anchored family patterns — the same hand matchers the policy
+// unit built (pol_*_family over pol_norm_slash_lower + pol_basename_start).
+fn saVmScriptLanguage(executable_ptr: ptr, executable_len: u64) -> i32 {
+    let norm = StrItem { bytes: [0u8; 1024], len: 0 };
+    pol_norm_slash_lower(&norm, executable_ptr, executable_len);
+    let np: ptr = pol_item_ptr(&norm);
+    let bs: u64 = pol_basename_start(np, norm.len);
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, np, bs);
+    let bl: u64 = norm.len - bs;
+    if pol_py_family(bp, bl) { return 0; };
+    if pol_bun_family(bp, bl) { return 2; };
+    if pol_node_family(bp, bl) { return 1; };
+    return -1;
+}
+
+fn isSaVmScriptExecutable(executable_ptr: ptr, executable_len: u64, is_string: bool) -> bool {
+    if !is_string { return false; };
+    return saVmScriptLanguage(executable_ptr, executable_len) != -1;
+}
+
 fn isSaVmDirectCommandMethod(method_ptr: ptr, method_len: u64) -> bool {
     if str_eq_lit(method_ptr, method_len, STR_PTR("command/exec"), STR_LEN("command/exec")) { return true; };
     if str_eq_lit(method_ptr, method_len, STR_PTR("command/exec/write"), STR_LEN("command/exec/write")) { return true; };
@@ -96,68 +274,920 @@ fn isSaVmDirectCommandMethod(method_ptr: ptr, method_len: u64) -> bool {
     return false;
 }
 
-// DEFECT: dynamic object — asRecord(params: unknown) over a JSON doc handle
-// (same approximation as the free-mode unit).
-fn asRecord(value_doc: u64, value_is_object: bool, value_is_array: bool) -> u64 {
-    if value_is_object && !value_is_array { return value_doc; };
+
+// ---------- JSON record probes (asRecord over the doc handle) ----------
+// The skeleton's asRecord(value_doc, is_object, is_array) collapsed to
+// "the doc or 0"; the faithful form needs no wrapper at all: every
+// probe below goes through sa_json_object_get on the params doc, and
+// a non-object doc (kind != 7) or a 0 handle simply fails every probe,
+// which is exactly asRecord(...) = {} behavior.
+fn rec_node(doc: u64, key_ptr: ptr, key_len: u64) -> u64 {
+    if doc == 0 { return 0; };
+    let node: u64 = 0;
+    if sa_json_object_get(doc, key_ptr, key_len, &node) != 0 { return 0; };
+    return node;
+}
+
+fn node_str(node: u64, item: &StrItem) -> bool {
+    if node == 0 { return false; };
+    if sa_json_kind(node) != 5 { return false; };
+    let sp: ptr = sa_json_string_ptr(node);
+    let sl: u64 = sa_json_string_len(node);
+    let dst: ptr = pol_item_ptr(item);
+    let n = sl;
+    if n > 1024 { n = 1024; };
+    let i: u64 = 0;
+    while i < n {
+        let wp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(wp, dst, i);
+        PTR_WRITE_U8(wp, intc_byte(sp, i));
+        i = i + 1;
+    }
+    item.len = n;
+    return true;
+}
+
+fn rec_str(doc: u64, key_ptr: ptr, key_len: u64, item: &StrItem) -> bool {
+    item.len = 0;
+    let node = rec_node(doc, key_ptr, key_len);
+    if node == 0 { return false; };
+    return node_str(node, item);
+}
+
+// record.command ?? record.cmd ?? record.argv — nullish: the key is
+// present and its value is not JSON null (kind 0).
+fn raw_cmd_node(record: u64) -> u64 {
+    let n1 = rec_node(record, STR_PTR("command"), STR_LEN("command"));
+    if n1 != 0 && sa_json_kind(n1) != 0 { return n1; };
+    let n2 = rec_node(record, STR_PTR("cmd"), STR_LEN("cmd"));
+    if n2 != 0 && sa_json_kind(n2) != 0 { return n2; };
+    let n3 = rec_node(record, STR_PTR("argv"), STR_LEN("argv"));
+    if n3 != 0 && sa_json_kind(n3) != 0 { return n3; };
     return 0;
+}
+
+fn req_set_executable(out: &SaVmScriptToolRequest, src_ptr: ptr, src_len: u64) -> void {
+    let dst: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dst, &out.executable, 0);
+    let n = src_len;
+    if n > 1024 { n = 1024; };
+    let i: u64 = 0;
+    while i < n {
+        let wp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(wp, dst, i);
+        PTR_WRITE_U8(wp, intc_byte(src_ptr, i));
+        i = i + 1;
+    }
+    out.executable_len = n;
+}
+
+fn req_set_args(out: &SaVmScriptToolRequest, args: &StrList) -> void {
+    // TS args is string[]; the fixed shape stores the items joined
+    // with '\n' (lossless) plus the element count.
+    let dst: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dst, &out.args, 0);
+    out.args_len = 0;
+    out.args_count = args.len;
+    let j: u64 = 0;
+    while j < args.len {
+        if j > 0 && out.args_len < 4096 {
+            let wp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(wp, dst, out.args_len);
+            PTR_WRITE_U8(wp, 10);
+            out.args_len = out.args_len + 1;
+        };
+        let ip: ptr = pol_item_ptr(&args.items[j]);
+        let il: u64 = args.items[j].len;
+        let i: u64 = 0;
+        while i < il {
+            if out.args_len >= 4096 { return; };
+            let wp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(wp, dst, out.args_len);
+            PTR_WRITE_U8(wp, intc_byte(ip, i));
+            out.args_len = out.args_len + 1;
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+}
+
+fn req_finish(out: &SaVmScriptToolRequest, language: i32, has: &bool) -> void {
+    out.language = language;
+    let dst: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dst, &out.reason, 0);
+    let lit: ptr = STR_PTR("direct-script-execution-requires-sa-vm");
+    let n: u64 = STR_LEN("direct-script-execution-requires-sa-vm");
+    let i: u64 = 0;
+    while i < n {
+        let wp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(wp, dst, i);
+        PTR_WRITE_U8(wp, intc_byte(lit, i));
+        i = i + 1;
+    }
+    out.reason_len = n;
+    *has = true;
+}
+
+// Joined-args family scan (shell path): extract maximal [A-Za-z0-9._-]
+// runs, lowercase them, and test the policy family matchers — the
+// hand form of \b(?:python...|py|pypy...)\b etc. over the joined text.
+fn joined_family_language(text_ptr: ptr, text_len: u64) -> i32 {
+    let py: bool = false;
+    let bun: bool = false;
+    let js: bool = false;
+    let tok = StrItem { bytes: [0u8; 1024], len: 0 };
+    let tp: ptr = pol_item_ptr(&tok);
+    let i: u64 = 0;
+    while i < text_len {
+        let b = intc_byte(text_ptr, i);
+        let is_tok: bool = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 46 || b == 95 || b == 45;
+        if is_tok {
+            tok.len = 0;
+            while i < text_len {
+                let c = intc_byte(text_ptr, i);
+                let ok: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 46 || c == 95 || c == 45;
+                if !ok { break; };
+                if tok.len < 1024 {
+                    let wp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(wp, tp, tok.len);
+                    PTR_WRITE_U8(wp, intc_lower(c));
+                    tok.len = tok.len + 1;
+                };
+                i = i + 1;
+            }
+            if pol_py_family(tp, tok.len) { py = true; };
+            if pol_bun_family(tp, tok.len) { bun = true; };
+            if pol_node_family(tp, tok.len) { js = true; };
+        } else {
+            i = i + 1;
+        };
+    }
+    if py { return 0; };
+    if bun { return 2; };
+    if js { return 1; };
+    return -1;
+}
+
+fn is_shell_executable(executable_ptr: ptr, executable_len: u64) -> bool {
+    let norm = StrItem { bytes: [0u8; 1024], len: 0 };
+    pol_norm_slash_lower(&norm, executable_ptr, executable_len);
+    let np: ptr = pol_item_ptr(&norm);
+    let bs: u64 = pol_basename_start(np, norm.len);
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, np, bs);
+    let bl: u64 = norm.len - bs;
+    // strip a trailing ".exe" (the source pattern allows (?:\.exe)?)
+    let stem = bl;
+    if stem > 4 {
+        let tail: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tail, bp, stem - 4);
+        if intc_eq_ci(tail, 4, STR_PTR(".exe"), STR_LEN(".exe")) { stem = stem - 4; };
+    };
+    if intc_eq_ci(bp, stem, STR_PTR("bash"), STR_LEN("bash")) { return true; };
+    if intc_eq_ci(bp, stem, STR_PTR("sh"), STR_LEN("sh")) { return true; };
+    if intc_eq_ci(bp, stem, STR_PTR("zsh"), STR_LEN("zsh")) { return true; };
+    if intc_eq_ci(bp, stem, STR_PTR("cmd"), STR_LEN("cmd")) { return true; };
+    if intc_eq_ci(bp, stem, STR_PTR("powershell"), STR_LEN("powershell")) { return true; };
+    if intc_eq_ci(bp, stem, STR_PTR("pwsh"), STR_LEN("pwsh")) { return true; };
+    return false;
 }
 
 // Identifies a real host command/tool invocation. Plain model text is not
 // inspected, so asking the model to write Python or JavaScript remains safe.
-// DEFECT: params is `unknown` — a JSON doc handle; dynamic member probes
-// (record.command ?? record.cmd ?? record.argv, tool-name candidate chain
-// [record.tool, record.toolName, record.name, record.item.tool,
-// record.item.name].find(string)) go through sa_json_object_get_* in source
-// order. Returns has=true on a hit.
-fn classifySaVmScriptToolRequest(method_ptr: ptr, method_len: u64, params_doc: u64, out: &SaVmScriptToolRequest, has: &bool) {
-    has = false;
-    // Command methods: parse argv via extractCommandArgv (saVmPolicy.sla);
-    // language = saVmScriptLanguage(parsed.executable); if the executable is
-    // a shell (bash|sh|zsh|cmd|powershell|pwsh — DEFECT: regex -> re_test(4)),
-    // scan joined args for python/bun/node mentions
-    // (DEFECT: regexes -> re_test(5..7)) and classify accordingly.
-    // Tool-name path: cleanTool basename -> saVmScriptLanguage, else literal
-    // name sets (run_py|exec_py|run_python|python), (run_bun|exec_bun|bun),
-    // (run_js|exec_js|run_node|javascript|js|node) — DEFECT: regexes ->
-    // re_test(8..10). Reason literal on every hit:
-    // "direct-script-execution-requires-sa-vm".
+fn classifySaVmScriptToolRequest(method_ptr: ptr, method_len: u64, params_doc: u64, out: &SaVmScriptToolRequest, has: &bool) -> void {
+    *has = false;
+    out.language = -1;
+    out.executable_len = 0;
+    out.args_len = 0;
+    out.args_count = 0;
+    out.reason_len = 0;
+    if isSaVmDirectCommandMethod(method_ptr, method_len) {
+        let raw = raw_cmd_node(params_doc);
+        if raw != 0 {
+            let kind = sa_json_kind(raw);
+            let argv = ArgvResult { executable: [0u8; 1024], executable_len: 0, args: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has: false };
+            extractCommandArgv(raw, kind == 6, kind == 5, &argv);
+            if argv.has {
+                let ep: ptr = PTR_NULL();
+                PTR_BYTE_ADD(ep, &argv.executable, 0);
+                let lang = saVmScriptLanguage(ep, argv.executable_len);
+                if lang >= 0 {
+                    req_set_executable(out, ep, argv.executable_len);
+                    req_set_args(out, &argv.args);
+                    req_finish(out, lang, has);
+                    return;
+                };
+                if is_shell_executable(ep, argv.executable_len) {
+                    // fullArgs = parsed.args.join(" ")
+                    let joined = StrOut { bytes: [0u8; 2048], len: 0, has: false };
+                    let j: u64 = 0;
+                    while j < argv.args.len {
+                        if j > 0 { intc_out_append(&joined, STR_PTR(" "), STR_LEN(" ")); };
+                        intc_out_append(&joined, pol_item_ptr(&argv.args.items[j]), argv.args.items[j].len);
+                        j = j + 1;
+                    }
+                    let jp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(jp, &joined.bytes, 0);
+                    let jlang = joined_family_language(jp, joined.len);
+                    if jlang >= 0 {
+                        req_set_executable(out, ep, argv.executable_len);
+                        req_set_args(out, &argv.args);
+                        req_finish(out, jlang, has);
+                        return;
+                    };
+                };
+            };
+        };
+    };
+    // Tool-name path: first string among record.tool, record.toolName,
+    // record.name, record.item.tool, record.item.name.
+    let cand = StrItem { bytes: [0u8; 1024], len: 0 };
+    let found: bool = false;
+    if rec_str(params_doc, STR_PTR("tool"), STR_LEN("tool"), &cand) { found = true; };
+    if !found && rec_str(params_doc, STR_PTR("toolName"), STR_LEN("toolName"), &cand) { found = true; };
+    if !found && rec_str(params_doc, STR_PTR("name"), STR_LEN("name"), &cand) { found = true; };
+    if !found {
+        let item_node = rec_node(params_doc, STR_PTR("item"), STR_LEN("item"));
+        if item_node != 0 && sa_json_kind(item_node) == 7 {
+            if rec_str(item_node, STR_PTR("tool"), STR_LEN("tool"), &cand) { found = true; };
+            if !found && rec_str(item_node, STR_PTR("name"), STR_LEN("name"), &cand) { found = true; };
+        };
+    };
+    if !found { return; };
+    let cp: ptr = pol_item_ptr(&cand);
+    let lang2 = saVmScriptLanguage(cp, cand.len);
+    if lang2 >= 0 {
+        req_set_executable(out, cp, cand.len);
+        out.args_len = 0;
+        out.args_count = 0;
+        req_finish(out, lang2, has);
+        return;
+    };
+    // Literal tool-name sets, tested on the lowercased basename
+    // (source regexes are anchored and case-insensitive).
+    let norm = StrItem { bytes: [0u8; 1024], len: 0 };
+    pol_norm_slash_lower(&norm, cp, cand.len);
+    let np: ptr = pol_item_ptr(&norm);
+    let bs: u64 = pol_basename_start(np, norm.len);
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, np, bs);
+    let bl: u64 = norm.len - bs;
+    if intc_eq_ci(bp, bl, STR_PTR("run_py"), STR_LEN("run_py")) || intc_eq_ci(bp, bl, STR_PTR("exec_py"), STR_LEN("exec_py")) || intc_eq_ci(bp, bl, STR_PTR("run_python"), STR_LEN("run_python")) || intc_eq_ci(bp, bl, STR_PTR("python"), STR_LEN("python")) {
+        req_set_executable(out, cp, cand.len);
+        out.args_len = 0;
+        out.args_count = 0;
+        req_finish(out, 0, has);
+        return;
+    };
+    if intc_eq_ci(bp, bl, STR_PTR("run_bun"), STR_LEN("run_bun")) || intc_eq_ci(bp, bl, STR_PTR("exec_bun"), STR_LEN("exec_bun")) || intc_eq_ci(bp, bl, STR_PTR("bun"), STR_LEN("bun")) {
+        req_set_executable(out, cp, cand.len);
+        out.args_len = 0;
+        out.args_count = 0;
+        req_finish(out, 2, has);
+        return;
+    };
+    if intc_eq_ci(bp, bl, STR_PTR("run_js"), STR_LEN("run_js")) || intc_eq_ci(bp, bl, STR_PTR("exec_js"), STR_LEN("exec_js")) || intc_eq_ci(bp, bl, STR_PTR("run_node"), STR_LEN("run_node")) || intc_eq_ci(bp, bl, STR_PTR("javascript"), STR_LEN("javascript")) || intc_eq_ci(bp, bl, STR_PTR("js"), STR_LEN("js")) || intc_eq_ci(bp, bl, STR_PTR("node"), STR_LEN("node")) {
+        req_set_executable(out, cp, cand.len);
+        out.args_len = 0;
+        out.args_count = 0;
+        req_finish(out, 1, has);
+        return;
+    };
 }
 
-// Detects common PowerShell anti-patterns and returns specific guidance
-// pointing to equivalent native sa_vm_run actions. out.has=false means null.
-// The source is an ordered chain of ~24 regex tests, each returning a fixed
-// guidance literal (preserved verbatim in the fix-phase table). Bulk pass:
-// each branch is a re_test stub in source order; the guidance literals are:
-//  1 vm-read missing            13 Format-*/Out-String
-//  2 git via subprocess/bun -e  14 Select-String
-//  3 .git internals             15 Where-Object pipeline
-//  4 for/foreach loops          16 which/where.exe
-//  5 ';' chained file ops       17 find with -name/-type
-//  6 cmd /c wrapper             18 rg/grep/findstr
-//  7 cd/Set-Location            19 head/tail truncation
-//  8 && chaining                20 Select -First/-Last
-//  9 Get-Process/ps             21 -ErrorAction SilentlyContinue
-// 10 Get-Date/date              22 2>$null / Out-Host / 2>&1
-// 11 (reserved)                 23 '>'/'>>' redirection
-// 12 Format-* (see 13)          24 Set-Content/Out-File piping
-// 25 Test-Path                  26 Get-ChildItem/dir/ls
-// 27 Get-Content/gc/cat/type    28 git <verb> direct
-// 29 bun/node/python/zig shell invocation with help/build/test/version
-// DEFECT: regex — all branches route through re_test(100 + branch_no).
+
+// ---------- detectPowerShellAntiPattern ----------
+// Ordered chain of the source's ~24 regex tests, each returning a
+// fixed guidance literal. The patterns use lookarounds, \b classes
+// and lazy spans that the sa_std POSIX ERE subset cannot express;
+// each is a hand matcher below, in source order. Where a pattern's
+// full form has no exact hand equivalent the approximation is
+// noted inline.
+fn ap_hit(out: &StrOut, lit_ptr: ptr, lit_len: u64) -> bool {
+    out.has = true;
+    out.len = 0;
+    intc_out_append(out, lit_ptr, lit_len);
+    return true;
+}
+
+// A occurs (ci substring), then B occurs (ci substring) after it,
+// then the word W (\b..\b ci) after that. For the subprocess/bun -e
+// git-bypass shapes.
+fn intc_chain3(p: ptr, n: u64, a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64, w_ptr: ptr, w_len: u64) -> bool {
+    let at = intc_find_ci(p, n, a_ptr, a_len);
+    if at < 0 { return false; };
+    let from1: u64 = (at as u64) + a_len;
+    if from1 >= n { return false; };
+    let rest1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rest1, p, from1);
+    let bt = intc_find_ci(rest1, n - from1, b_ptr, b_len);
+    if bt < 0 { return false; };
+    let from2: u64 = from1 + (bt as u64) + b_len;
+    if from2 >= n { return false; };
+    let rest2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rest2, p, from2);
+    return intc_word_ci(rest2, n - from2, w_ptr, w_len);
+}
+
+// After a word occurrence of W (ci, \b), the next non-space char is
+// one of the given set — for `for [%/(]` shapes.
+fn intc_word_then_char(p: ptr, n: u64, w_ptr: ptr, w_len: u64, c1: u8, c2: u8, c3: u8) -> bool {
+    if w_len == 0 || n < w_len { return false; };
+    let i: u64 = 0;
+    while i + w_len <= n {
+        let ok: bool = true;
+        let j: u64 = 0;
+        while j < w_len {
+            if intc_lower(intc_byte(p, i + j)) != intc_lower(intc_byte(w_ptr, j)) { ok = false; };
+            j = j + 1;
+        }
+        if ok {
+            let left_ok: bool = true;
+            if i > 0 && intc_is_word(intc_byte(p, i - 1)) { left_ok = false; };
+            let right_ok: bool = true;
+            if i + w_len < n && intc_is_word(intc_byte(p, i + w_len)) { right_ok = false; };
+            if left_ok && right_ok {
+                let k: u64 = i + w_len;
+                while k < n && (intc_byte(p, k) == 32 || intc_byte(p, k) == 9) { k = k + 1; }
+                if k < n {
+                    let c = intc_byte(p, k);
+                    if c == c1 || c == c2 || c == c3 { return true; };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// ';' then optional spaces then a word from the set (\b .. \b ci).
+fn intc_semi_then_word(p: ptr, n: u64) -> bool {
+    let i: u64 = 0;
+    while i < n {
+        if intc_byte(p, i) == 59 {
+            let k: u64 = i + 1;
+            while k < n && (intc_byte(p, k) == 32 || intc_byte(p, k) == 9) { k = k + 1; }
+            if k < n {
+                let rest: ptr = PTR_NULL();
+                PTR_BYTE_ADD(rest, p, k);
+                let rn: u64 = n - k;
+                if intc_starts_word_ci(rest, rn, STR_PTR("Set-Content"), STR_LEN("Set-Content")) { return true; };
+                if intc_starts_word_ci(rest, rn, STR_PTR("Get-Content"), STR_LEN("Get-Content")) { return true; };
+                if intc_starts_word_ci(rest, rn, STR_PTR("gc"), STR_LEN("gc")) { return true; };
+                if intc_starts_word_ci(rest, rn, STR_PTR("cat"), STR_LEN("cat")) { return true; };
+                if intc_starts_word_ci(rest, rn, STR_PTR("type"), STR_LEN("type")) { return true; };
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// '|' then optional spaces then a word (ci) starting at that point.
+fn intc_pipe_then_word(p: ptr, n: u64, w_ptr: ptr, w_len: u64) -> bool {
+    let i: u64 = 0;
+    while i < n {
+        if intc_byte(p, i) == 124 {
+            let k: u64 = i + 1;
+            while k < n && (intc_byte(p, k) == 32 || intc_byte(p, k) == 9) { k = k + 1; }
+            if k + w_len <= n {
+                let rest: ptr = PTR_NULL();
+                PTR_BYTE_ADD(rest, p, k);
+                if intc_eq_ci(rest, w_len, w_ptr, w_len) {
+                    let after: u64 = k + w_len;
+                    if after >= n { return true; };
+                    if !intc_is_word(intc_byte(p, after)) { return true; };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// word W (ci \b) followed by \s+ and then one of the literal verbs
+// (ci, word-bounded) — for `git <verb>` and `.git/<part>` shapes.
+fn intc_word_ws_lit(p: ptr, n: u64, w_ptr: ptr, w_len: u64, lit_ptr: ptr, lit_len: u64) -> bool {
+    if w_len == 0 || n < w_len { return false; };
+    let i: u64 = 0;
+    while i + w_len <= n {
+        let ok: bool = true;
+        let j: u64 = 0;
+        while j < w_len {
+            if intc_lower(intc_byte(p, i + j)) != intc_lower(intc_byte(w_ptr, j)) { ok = false; };
+            j = j + 1;
+        }
+        if ok {
+            let left_ok: bool = true;
+            if i > 0 && intc_is_word(intc_byte(p, i - 1)) { left_ok = false; };
+            if left_ok {
+                let k: u64 = i + w_len;
+                let spaced: bool = false;
+                while k < n && (intc_byte(p, k) == 32 || intc_byte(p, k) == 9) { k = k + 1; spaced = true; }
+                if spaced && k + lit_len <= n {
+                    let rest: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(rest, p, k);
+                    if intc_eq_ci(rest, lit_len, lit_ptr, lit_len) {
+                        let after: u64 = k + lit_len;
+                        if after >= n { return true; };
+                        if !intc_is_word(intc_byte(p, after)) { return true; };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
 fn detectPowerShellAntiPattern(cmd_ptr: ptr, cmd_len: u64, out: &StrOut) -> void {
     out.has = false;
     out.len = 0;
     if cmd_len == 0 { return; };
-    for branch in 1..30 {
-        if re_test(100 + branch, cmd_ptr, cmd_len) {
-            out.has = true;
-            // DEFECT: guidance literal for `branch` selected from the
-            // fix-phase table (literals in the .ts source, lines 129-208).
-            return;
+    // 1. vm-read / vm_read
+    if intc_word_ci(cmd_ptr, cmd_len, STR_PTR("vm-read"), STR_LEN("vm-read")) || intc_word_ci(cmd_ptr, cmd_len, STR_PTR("vm_read"), STR_LEN("vm_read")) {
+        if ap_hit(out, STR_PTR("Tool 'vm-read' does not exist; use sa_vm_run({ action: 'read_lines', path: '...' }) for line ranges or sa_vm_run({ action: 'read_file', path: '...' }) for complete files."), STR_LEN("Tool 'vm-read' does not exist; use sa_vm_run({ action: 'read_lines', path: '...' }) for line ranges or sa_vm_run({ action: 'read_file', path: '...' }) for complete files.")) { return; };
+    };
+    // 2. git via subprocess / child_process / Bun.spawn / python -c / bun -e
+    if intc_two_part(cmd_ptr, cmd_len, STR_PTR("subprocess"), STR_LEN("subprocess"), STR_PTR("git"), STR_LEN("git"))
+        || intc_two_part(cmd_ptr, cmd_len, STR_PTR("child_process"), STR_LEN("child_process"), STR_PTR("git"), STR_LEN("git"))
+        || intc_two_part(cmd_ptr, cmd_len, STR_PTR("execSync"), STR_LEN("execSync"), STR_PTR("git"), STR_LEN("git"))
+        || intc_two_part(cmd_ptr, cmd_len, STR_PTR("spawnSync"), STR_LEN("spawnSync"), STR_PTR("git"), STR_LEN("git"))
+        || intc_two_part(cmd_ptr, cmd_len, STR_PTR("Bun.spawn"), STR_LEN("Bun.spawn"), STR_PTR("git"), STR_LEN("git"))
+        || intc_chain3(cmd_ptr, cmd_len, STR_PTR("python"), STR_LEN("python"), STR_PTR("-c"), STR_LEN("-c"), STR_PTR("git"), STR_LEN("git"))
+        || intc_chain3(cmd_ptr, cmd_len, STR_PTR("bun"), STR_LEN("bun"), STR_PTR("-e"), STR_LEN("-e"), STR_PTR("git"), STR_LEN("git")) {
+        if ap_hit(out, STR_PTR("Bypassing git via 'python -c subprocess(git)' / 'bun -e Bun.spawnSync(git)' / temp scripts is prohibited; call sa_vm_run({ action: 'git_status' }) or sa_vm_run({ action: 'git_diff' }) instead."), STR_LEN("Bypassing git via 'python -c subprocess(git)' / 'bun -e Bun.spawnSync(git)' / temp scripts is prohibited; call sa_vm_run({ action: 'git_status' }) or sa_vm_run({ action: 'git_diff' }) instead.")) { return; };
+    };
+    // 3. .git/<part> internals
+    if intc_two_part(cmd_ptr, cmd_len, STR_PTR(".git"), STR_LEN(".git"), STR_PTR("HEAD"), STR_LEN("HEAD"))
+        || intc_two_part(cmd_ptr, cmd_len, STR_PTR(".git"), STR_LEN(".git"), STR_PTR("config"), STR_LEN("config"))
+        || intc_two_part(cmd_ptr, cmd_len, STR_PTR(".git"), STR_LEN(".git"), STR_PTR("index"), STR_LEN("index"))
+        || intc_two_part(cmd_ptr, cmd_len, STR_PTR(".git"), STR_LEN(".git"), STR_PTR("refs"), STR_LEN("refs"))
+        || intc_two_part(cmd_ptr, cmd_len, STR_PTR(".git"), STR_LEN(".git"), STR_PTR("objects"), STR_LEN("objects"))
+        || intc_two_part(cmd_ptr, cmd_len, STR_PTR(".git"), STR_LEN(".git"), STR_PTR("FETCH_HEAD"), STR_LEN("FETCH_HEAD")) {
+        // Note: the source pattern requires .git\s*/\s*<part>; two_part
+        // is the documented approximation (any later word occurrence).
+        if ap_hit(out, STR_PTR("Reading '.git/*' internals directly is prohibited; use sa_vm_run({ action: 'git_status' }) for branch/state or sa_vm_run({ action: 'git_diff' }) for changes."), STR_LEN("Reading '.git/*' internals directly is prohibited; use sa_vm_run({ action: 'git_status' }) for branch/state or sa_vm_run({ action: 'git_diff' }) for changes.")) { return; };
+    };
+    // 4. for / foreach loops
+    if intc_word_then_char(cmd_ptr, cmd_len, STR_PTR("for"), STR_LEN("for"), 37, 47, 40)
+        || intc_word_ci(cmd_ptr, cmd_len, STR_PTR("foreach"), STR_LEN("foreach"))
+        || intc_word_ci(cmd_ptr, cmd_len, STR_PTR("ForEach-Object"), STR_LEN("ForEach-Object")) {
+        if ap_hit(out, STR_PTR("Batch loops via 'for / foreach / ForEach-Object' are prohibited in the shell: loop pipelines cause quoting collapse and encoding damage. For batch search use sa_vm_run({ action: 'grep_search', pattern: '*.ext', query: '...' }) or sa_vm_run({ action: 'grep_search_async', queries: [...] }); for batch writes use parallel: [{ action: 'edit_file', ... }]."), STR_LEN("Batch loops via 'for / foreach / ForEach-Object' are prohibited in the shell: loop pipelines cause quoting collapse and encoding damage. For batch search use sa_vm_run({ action: 'grep_search', pattern: '*.ext', query: '...' }) or sa_vm_run({ action: 'grep_search_async', queries: [...] }); for batch writes use parallel: [{ action: 'edit_file', ... }].")) { return; };
+    };
+    // 5. ';'-chained file ops
+    if intc_semi_then_word(cmd_ptr, cmd_len)
+        || ap_word_then_semi(cmd_ptr, cmd_len, STR_PTR("Set-Content"), STR_LEN("Set-Content"))
+        || ap_word_then_semi(cmd_ptr, cmd_len, STR_PTR("Get-Content"), STR_LEN("Get-Content")) {
+        if ap_hit(out, STR_PTR("Chaining multiple commands with ';' combining file operations and execution is prohibited. Follow the 3-step recipe: 1. sa_vm_run write_file -> 2. single host compile/test command -> 3. sa_vm_run read_lines/read_file_tail."), STR_LEN("Chaining multiple commands with ';' combining file operations and execution is prohibited. Follow the 3-step recipe: 1. sa_vm_run write_file -> 2. single host compile/test command -> 3. sa_vm_run read_lines/read_file_tail.")) { return; };
+    };
+    // 6. cmd /c wrapper
+    if intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("cmd"), STR_LEN("cmd"), STR_PTR("/c"), STR_LEN("/c"))
+        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("cmd"), STR_LEN("cmd"), STR_PTR("/k"), STR_LEN("/k"))
+        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("cmd.exe"), STR_LEN("cmd.exe"), STR_PTR("/c"), STR_LEN("/c"))
+        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("cmd.exe"), STR_LEN("cmd.exe"), STR_PTR("/k"), STR_LEN("/k")) {
+        if ap_hit(out, STR_PTR("Wrapping commands with 'cmd /c' is prohibited. Direct binary invocation must use sa_vm_run({ action: 'run_host', exe: '...', args: [...] }); execute binaries directly without shell wrappers."), STR_LEN("Wrapping commands with 'cmd /c' is prohibited. Direct binary invocation must use sa_vm_run({ action: 'run_host', exe: '...', args: [...] }); execute binaries directly without shell wrappers.")) { return; };
+    };
+    // 7. cd / Set-Location / pushd / chdir
+    if intc_pword_term_ci(cmd_ptr, cmd_len, STR_PTR("cd"), STR_LEN("cd"))
+        || intc_pword_term_ci(cmd_ptr, cmd_len, STR_PTR("Set-Location"), STR_LEN("Set-Location"))
+        || intc_pword_term_ci(cmd_ptr, cmd_len, STR_PTR("pushd"), STR_LEN("pushd"))
+        || intc_pword_term_ci(cmd_ptr, cmd_len, STR_PTR("chdir"), STR_LEN("chdir")) {
+        if ap_hit(out, STR_PTR("Manual directory changing via 'cd' / 'Set-Location' / 'pushd' is prohibited to prevent workspace path drift. Never change directory in the shell; execute commands directly using workspace-relative or absolute paths, or use sa_vm_run tools ('list_dir', 'grep_search', 'read_lines', 'write_file', 'run_host')."), STR_LEN("Manual directory changing via 'cd' / 'Set-Location' / 'pushd' is prohibited to prevent workspace path drift. Never change directory in the shell; execute commands directly using workspace-relative or absolute paths, or use sa_vm_run tools ('list_dir', 'grep_search', 'read_lines', 'write_file', 'run_host').")) { return; };
+    };
+    // 8. && chaining (not surrounded by &)
+    {
+        let i: u64 = 0;
+        let hit: bool = false;
+        while i + 1 < cmd_len {
+            if intc_byte(cmd_ptr, i) == 38 && intc_byte(cmd_ptr, i + 1) == 38 {
+                let left_ok: bool = true;
+                if i > 0 && intc_byte(cmd_ptr, i - 1) == 38 { left_ok = false; };
+                let right_ok: bool = true;
+                if i + 2 < cmd_len && intc_byte(cmd_ptr, i + 2) == 38 { right_ok = false; };
+                if left_ok && right_ok { hit = true; };
+            };
+            i = i + 1;
+        }
+        if hit {
+            if ap_hit(out, STR_PTR("Command chaining via '&&' is prohibited. Execute commands independently, use parallel batches, or use sa_vm_run({ action: 'run_host', ... })."), STR_LEN("Command chaining via '&&' is prohibited. Execute commands independently, use parallel batches, or use sa_vm_run({ action: 'run_host', ... }).")) { return; };
         };
     }
+    // 9. Get-Process / gps / ps
+    if intc_pword_ci(cmd_ptr, cmd_len, STR_PTR("Get-Process"), STR_LEN("Get-Process"))
+        || intc_pword_ci(cmd_ptr, cmd_len, STR_PTR("gps"), STR_LEN("gps"))
+        || intc_pword_term_ci(cmd_ptr, cmd_len, STR_PTR("ps"), STR_LEN("ps")) {
+        if ap_hit(out, STR_PTR("Process inspection via 'Get-Process' / 'ps' is prohibited; process polling causes instability and should use internal diagnostics APIs or run_project_check instead."), STR_LEN("Process inspection via 'Get-Process' / 'ps' is prohibited; process polling causes instability and should use internal diagnostics APIs or run_project_check instead.")) { return; };
+    };
+    // 10. Get-Date / date
+    if intc_pword_ci(cmd_ptr, cmd_len, STR_PTR("Get-Date"), STR_LEN("Get-Date"))
+        || intc_pword_term_ci(cmd_ptr, cmd_len, STR_PTR("date"), STR_LEN("date")) {
+        if ap_hit(out, STR_PTR("'Get-Date' / 'date' terminal invocation is unnecessary noise; omit timestamp polling and rely on runner timestamps."), STR_LEN("'Get-Date' / 'date' terminal invocation is unnecessary noise; omit timestamp polling and rely on runner timestamps.")) { return; };
+    };
+    // 11. Format-* / Out-String
+    if intc_word_ci(cmd_ptr, cmd_len, STR_PTR("Format-Table"), STR_LEN("Format-Table"))
+        || intc_word_ci(cmd_ptr, cmd_len, STR_PTR("Format-List"), STR_LEN("Format-List"))
+        || intc_word_ci(cmd_ptr, cmd_len, STR_PTR("Format-Wide"), STR_LEN("Format-Wide"))
+        || intc_word_ci(cmd_ptr, cmd_len, STR_PTR("Out-String"), STR_LEN("Out-String")) {
+        if ap_hit(out, STR_PTR("Format-* / Out-String formatting is prohibited; use sa_vm_run({ action: 'list_dir' }) or sa_vm_run({ action: 'read_lines' }) which returns structured JSON natively."), STR_LEN("Format-* / Out-String formatting is prohibited; use sa_vm_run({ action: 'list_dir' }) or sa_vm_run({ action: 'read_lines' }) which returns structured JSON natively.")) { return; };
+    };
+    // 12. Select-String
+    if intc_word_ci(cmd_ptr, cmd_len, STR_PTR("Select-String"), STR_LEN("Select-String")) {
+        if ap_hit(out, STR_PTR("Select-String pipeline search is prohibited; use sa_vm_run({ action: 'grep_search', query: '...' }) which runs in-process with token-safe output."), STR_LEN("Select-String pipeline search is prohibited; use sa_vm_run({ action: 'grep_search', query: '...' }) which runs in-process with token-safe output.")) { return; };
+    };
+    // 13. Where-Object family, guarded by absence of Get-ChildItem/gci
+    if !(intc_word_ci(cmd_ptr, cmd_len, STR_PTR("Get-ChildItem"), STR_LEN("Get-ChildItem")) || intc_word_ci(cmd_ptr, cmd_len, STR_PTR("gci"), STR_LEN("gci"))) {
+        if intc_word_ci(cmd_ptr, cmd_len, STR_PTR("Where-Object"), STR_LEN("Where-Object"))
+            || intc_pipe_then_word(cmd_ptr, cmd_len, STR_PTR("Where"), STR_LEN("Where"))
+            || intc_pipe_then_word(cmd_ptr, cmd_len, STR_PTR("?"), STR_LEN("?")) {
+            if ap_hit(out, STR_PTR("Pipeline filtering via 'Where-Object / Where / ?' is prohibited; use sa_vm_run({ action: 'find_files', pattern: '*xyz*', path_pattern: '...' }) for name filtering or sa_vm_run({ action: 'grep_search', query: '...' }) for content filtering."), STR_LEN("Pipeline filtering via 'Where-Object / Where / ?' is prohibited; use sa_vm_run({ action: 'find_files', pattern: '*xyz*', path_pattern: '...' }) for name filtering or sa_vm_run({ action: 'grep_search', query: '...' }) for content filtering.")) { return; };
+        };
+    };
+    // 14. which / where.exe / where <arg> (stop-word lookahead approximated
+    // by an exclusion list on the following token)
+    if intc_pword_ci(cmd_ptr, cmd_len, STR_PTR("which"), STR_LEN("which"))
+        || intc_pword_ci(cmd_ptr, cmd_len, STR_PTR("where.exe"), STR_LEN("where.exe"))
+        || ap_where_with_arg(cmd_ptr, cmd_len) {
+        if ap_hit(out, STR_PTR("Binary locating via 'which / where.exe' is prohibited; call sa_vm_run({ action: 'run_host', exe: 'bun|node|python|zig|git', args: [...] }) directly and let the server resolve PATH/env/fallback. For workspace binaries use sa_vm_run({ action: 'find_files', pattern: 'name*' })."), STR_LEN("Binary locating via 'which / where.exe' is prohibited; call sa_vm_run({ action: 'run_host', exe: 'bun|node|python|zig|git', args: [...] }) directly and let the server resolve PATH/env/fallback. For workspace binaries use sa_vm_run({ action: 'find_files', pattern: 'name*' }).")) { return; };
+    };
+    // 15. find with -name/-iname/-path/-type/-not/-exec on the same line
+    if ap_find_with_flags(cmd_ptr, cmd_len) {
+        if ap_hit(out, STR_PTR("Filesystem discovery via 'find' is prohibited; use sa_vm_run({ action: 'find_files', dir: '...', pattern: '...' }) with path_pattern or max_depth instead of shell traversal."), STR_LEN("Filesystem discovery via 'find' is prohibited; use sa_vm_run({ action: 'find_files', dir: '...', pattern: '...' }) with path_pattern or max_depth instead of shell traversal.")) { return; };
+    };
+    // 16. rg / grep / findstr
+    if intc_pword_ci(cmd_ptr, cmd_len, STR_PTR("rg"), STR_LEN("rg"))
+        || intc_pword_ci(cmd_ptr, cmd_len, STR_PTR("grep"), STR_LEN("grep"))
+        || intc_pword_ci(cmd_ptr, cmd_len, STR_PTR("findstr"), STR_LEN("findstr")) {
+        if ap_hit(out, STR_PTR("Direct text search via 'rg' / 'grep' / 'findstr' shell command is prohibited; use sa_vm_run({ action: 'grep_search', query: '...', is_regex: true }) or sa_vm_run({ action: 'run_host', exe: '...', filter: '...' }) which runs in-process with token-safe output."), STR_LEN("Direct text search via 'rg' / 'grep' / 'findstr' shell command is prohibited; use sa_vm_run({ action: 'grep_search', query: '...', is_regex: true }) or sa_vm_run({ action: 'run_host', exe: '...', filter: '...' }) which runs in-process with token-safe output.")) { return; };
+    };
+    // 17. head / tail truncation
+    if ap_head_tail(cmd_ptr, cmd_len) {
+        if ap_hit(out, STR_PTR("Shell output truncation via 'head' / 'tail' is prohibited; use sa_vm_run({ action: 'read_lines' }), read_file_tail, or run_host({ head_lines: N, tail_lines: N }) for bounded output."), STR_LEN("Shell output truncation via 'head' / 'tail' is prohibited; use sa_vm_run({ action: 'read_lines' }), read_file_tail, or run_host({ head_lines: N, tail_lines: N }) for bounded output.")) { return; };
+    };
+    // 18. Select -First/-Last
+    if ap_select_first_last(cmd_ptr, cmd_len) {
+        if ap_hit(out, STR_PTR("Select -First/-Last line truncation via shell is prohibited; use sa_vm_run({ action: 'read_lines', start_line: 1, end_line: N }), sa_vm_run({ action: 'list_dir', max_entries: N }), or sa_vm_run({ action: 'run_host', exe: '...', head_lines: N, tail_lines: N })."), STR_LEN("Select -First/-Last line truncation via shell is prohibited; use sa_vm_run({ action: 'read_lines', start_line: 1, end_line: N }), sa_vm_run({ action: 'list_dir', max_entries: N }), or sa_vm_run({ action: 'run_host', exe: '...', head_lines: N, tail_lines: N }).")) { return; };
+    };
+    // 19. -ErrorAction SilentlyContinue
+    if ap_error_action(cmd_ptr, cmd_len) {
+        if ap_hit(out, STR_PTR("-ErrorAction SilentlyContinue is prohibited; do not hide filesystem failures in shell. Use sa_vm_run({ action: 'test_path' }) or inspect exitCode explicitly."), STR_LEN("-ErrorAction SilentlyContinue is prohibited; do not hide filesystem failures in shell. Use sa_vm_run({ action: 'test_path' }) or inspect exitCode explicitly.")) { return; };
+    };
+    // 20. error suppression: 2>$null / >nul / | Out-Host / 2>&1
+    if intc_contains_ci(cmd_ptr, cmd_len, STR_PTR("2>&1"), STR_LEN("2>&1"))
+        || intc_pipe_then_word(cmd_ptr, cmd_len, STR_PTR("Out-Host"), STR_LEN("Out-Host"))
+        || ap_null_redirect(cmd_ptr, cmd_len) {
+        if ap_hit(out, STR_PTR("Shell error suppression (2>$null / >nul), Out-Host, or 2>&1 pipeline filtering is prohibited; execute binaries cleanly without pipe wrapping or use sa_vm_run({ action: 'run_host', exe: '...', args: [...] })."), STR_LEN("Shell error suppression (2>$null / >nul), Out-Host, or 2>&1 pipeline filtering is prohibited; execute binaries cleanly without pipe wrapping or use sa_vm_run({ action: 'run_host', exe: '...', args: [...] }).")) { return; };
+    };
+    // 21. '>' / '>>' redirection (suppressed when => / -> present)
+    if !(intc_contains_ci(cmd_ptr, cmd_len, STR_PTR("=>"), STR_LEN("=>")) || intc_contains_ci(cmd_ptr, cmd_len, STR_PTR("->"), STR_LEN("->"))) {
+        if ap_redirection(cmd_ptr, cmd_len) {
+            if ap_hit(out, STR_PTR("Shell redirection ('>' / '>>') is prohibited. To execute binaries and inspect or filter output, use sa_vm_run({ action: 'run_host', exe: '...', args: [...], tail_lines: N, filter: '...' }) or sa_vm_run({ action: 'write_file' })."), STR_LEN("Shell redirection ('>' / '>>') is prohibited. To execute binaries and inspect or filter output, use sa_vm_run({ action: 'run_host', exe: '...', args: [...], tail_lines: N, filter: '...' }) or sa_vm_run({ action: 'write_file' }).")) { return; };
+        };
+    };
+    // 22. pipe to Set-Content/Out-File/sc, or heredoc + those verbs
+    if intc_pipe_then_word(cmd_ptr, cmd_len, STR_PTR("Set-Content"), STR_LEN("Set-Content"))
+        || intc_pipe_then_word(cmd_ptr, cmd_len, STR_PTR("Out-File"), STR_LEN("Out-File"))
+        || intc_pipe_then_word(cmd_ptr, cmd_len, STR_PTR("sc"), STR_LEN("sc"))
+        || ((intc_contains_ci(cmd_ptr, cmd_len, STR_PTR("@\""), STR_LEN("@\"")) || intc_contains_ci(cmd_ptr, cmd_len, STR_PTR("@'"), STR_LEN("@'")))
+            && (intc_word_ci(cmd_ptr, cmd_len, STR_PTR("Set-Content"), STR_LEN("Set-Content")) || intc_word_ci(cmd_ptr, cmd_len, STR_PTR("Out-File"), STR_LEN("Out-File")) || intc_word_ci(cmd_ptr, cmd_len, STR_PTR("sc"), STR_LEN("sc")))) {
+        if ap_hit(out, STR_PTR("Piping or heredoc writing via Set-Content / Out-File is prohibited to prevent Windows encoding corruption; use sa_vm_run({ action: 'write_file' }) or sa_vm_run({ action: 'apply_patch' })."), STR_LEN("Piping or heredoc writing via Set-Content / Out-File is prohibited to prevent Windows encoding corruption; use sa_vm_run({ action: 'write_file' }) or sa_vm_run({ action: 'apply_patch' }).")) { return; };
+    };
+    // 23. Test-Path
+    if intc_word_ci(cmd_ptr, cmd_len, STR_PTR("Test-Path"), STR_LEN("Test-Path")) {
+        if ap_hit(out, STR_PTR("Existence probing via 'Test-Path' is prohibited; use sa_vm_run({ action: 'test_path', path: '...' }) which returns exists:true/false with exitCode 0 and zero caching."), STR_LEN("Existence probing via 'Test-Path' is prohibited; use sa_vm_run({ action: 'test_path', path: '...' }) which returns exists:true/false with exitCode 0 and zero caching.")) { return; };
+    };
+    // 24. Get-ChildItem / gci / dir / ls
+    if intc_pword_ci(cmd_ptr, cmd_len, STR_PTR("Get-ChildItem"), STR_LEN("Get-ChildItem"))
+        || intc_pword_ci(cmd_ptr, cmd_len, STR_PTR("gci"), STR_LEN("gci"))
+        || intc_pword_term_ci(cmd_ptr, cmd_len, STR_PTR("dir"), STR_LEN("dir"))
+        || intc_pword_term_ci(cmd_ptr, cmd_len, STR_PTR("ls"), STR_LEN("ls")) {
+        if ap_hit(out, STR_PTR("Directory enumeration via 'Get-ChildItem' / 'gci' / 'dir' / 'ls' is prohibited. Use sa_vm_run({ action: 'list_dir', dir: '...', depth: 1, type: 'file' }) or sa_vm_run({ action: 'find_files', pattern: '...' }) which runs in-process with zero caching and token protection."), STR_LEN("Directory enumeration via 'Get-ChildItem' / 'gci' / 'dir' / 'ls' is prohibited. Use sa_vm_run({ action: 'list_dir', dir: '...', depth: 1, type: 'file' }) or sa_vm_run({ action: 'find_files', pattern: '...' }) which runs in-process with zero caching and token protection.")) { return; };
+    };
+    // 25. Get-Content / gc / cat / type
+    if intc_pword_ci(cmd_ptr, cmd_len, STR_PTR("Get-Content"), STR_LEN("Get-Content"))
+        || intc_pword_ci(cmd_ptr, cmd_len, STR_PTR("gc"), STR_LEN("gc"))
+        || intc_pword_term_ci(cmd_ptr, cmd_len, STR_PTR("cat"), STR_LEN("cat"))
+        || intc_pword_term_ci(cmd_ptr, cmd_len, STR_PTR("type"), STR_LEN("type")) {
+        if ap_hit(out, STR_PTR("Direct file reading via 'Get-Content' / 'gc' / 'cat' / 'type' is prohibited. Use sa_vm_run({ action: 'read_lines', path: '...', start_line: 1, end_line: 100 }) for slicing, or sa_vm_run({ action: 'read_file', path: '...' }) for complete files (with max_tokens safety)."), STR_LEN("Direct file reading via 'Get-Content' / 'gc' / 'cat' / 'type' is prohibited. Use sa_vm_run({ action: 'read_lines', path: '...', start_line: 1, end_line: 100 }) for slicing, or sa_vm_run({ action: 'read_file', path: '...' }) for complete files (with max_tokens safety).")) { return; };
+    };
+    // 26. git <verb>
+    if intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("git"), STR_LEN("git"), STR_PTR("status"), STR_LEN("status"))
+        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("git"), STR_LEN("git"), STR_PTR("diff"), STR_LEN("diff"))
+        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("git"), STR_LEN("git"), STR_PTR("log"), STR_LEN("log"))
+        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("git"), STR_LEN("git"), STR_PTR("show"), STR_LEN("show"))
+        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("git"), STR_LEN("git"), STR_PTR("branch"), STR_LEN("branch"))
+        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("git"), STR_LEN("git"), STR_PTR("merge-base"), STR_LEN("merge-base"))
+        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("git"), STR_LEN("git"), STR_PTR("rev-parse"), STR_LEN("rev-parse"))
+        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("git"), STR_LEN("git"), STR_PTR("checkout"), STR_LEN("checkout"))
+        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("git"), STR_LEN("git"), STR_PTR("fetch"), STR_LEN("fetch"))
+        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("git"), STR_LEN("git"), STR_PTR("pull"), STR_LEN("pull"))
+        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("git"), STR_LEN("git"), STR_PTR("push"), STR_LEN("push")) {
+        if ap_hit(out, STR_PTR("Direct 'git ...' shell invocation is prohibited; use sa_vm_run({ action: 'git_status' }) for worktree cleanliness or sa_vm_run({ action: 'git_diff' }) for uncommitted changes, or sa_vm_run({ action: 'run_host', exe: 'git', args: [...] }) for other repo operations (destructive reset --hard/clean/revert is blocked only when VM safe exec interception is on)."), STR_LEN("Direct 'git ...' shell invocation is prohibited; use sa_vm_run({ action: 'git_status' }) for worktree cleanliness or sa_vm_run({ action: 'git_diff' }) for uncommitted changes, or sa_vm_run({ action: 'run_host', exe: 'git', args: [...] }) for other repo operations (destructive reset --hard/clean/revert is blocked only when VM safe exec interception is on).")) { return; };
+    };
+    // 27. bun/node/python/zig invocation with help/build/test/version
+    if ap_runtime_invoke(cmd_ptr, cmd_len) {
+        if ap_hit(out, STR_PTR("Invoking bun/node/python/zig with shell wrappers, pipes, or redirection is prohibited. Use sa_vm_run({ action: 'run_host', exe: 'bun|node|python|zig|git', args: [...], tail_lines: N, filter: '...' }) with structured args and automatic help caching. Git status/diff should prefer sa_vm_run({ action: 'git_status' }) / sa_vm_run({ action: 'git_diff' }); destructive git (reset --hard/clean/revert) is blocked only when VM safe exec interception is on."), STR_LEN("Invoking bun/node/python/zig with shell wrappers, pipes, or redirection is prohibited. Use sa_vm_run({ action: 'run_host', exe: 'bun|node|python|zig|git', args: [...], tail_lines: N, filter: '...' }) with structured args and automatic help caching. Git status/diff should prefer sa_vm_run({ action: 'git_status' }) / sa_vm_run({ action: 'git_diff' }); destructive git (reset --hard/clean/revert) is blocked only when VM safe exec interception is on.")) { return; };
+    };
 }
+
+
+// ---------- remaining anti-pattern helpers ----------
+fn intc_starts_word_ci(p: ptr, n: u64, w_ptr: ptr, w_len: u64) -> bool {
+    if n < w_len { return false; };
+    if !intc_eq_ci(p, w_len, w_ptr, w_len) { return false; };
+    if n == w_len { return true; };
+    return !intc_is_word(intc_byte(p, w_len));
+}
+
+// prefix-boundary occurrence positions of W (ci): helper for the
+// token-after analyses below. Returns the end index of the first
+// occurrence (after an optional ".exe"), or -1.
+fn intc_pword_end(p: ptr, n: u64, w_ptr: ptr, w_len: u64, allow_exe: bool) -> i64 {
+    if w_len == 0 || n < w_len { return -1; };
+    let i: u64 = 0;
+    while i + w_len <= n {
+        let pre_ok: bool = false;
+        if i == 0 { pre_ok = true; };
+        if i > 0 && intc_prefix_class(intc_byte(p, i - 1)) { pre_ok = true; };
+        if pre_ok {
+            let ok: bool = true;
+            let j: u64 = 0;
+            while j < w_len {
+                if intc_lower(intc_byte(p, i + j)) != intc_lower(intc_byte(w_ptr, j)) { ok = false; };
+                j = j + 1;
+            }
+            if ok {
+                let after: u64 = i + w_len;
+                let bounded: bool = true;
+                if after < n && intc_is_word(intc_byte(p, after)) { bounded = false; };
+                if bounded {
+                    if allow_exe && after + 4 <= n {
+                        let tail: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(tail, p, after);
+                        if intc_eq_ci(tail, 4, STR_PTR(".exe"), STR_LEN(".exe")) { return (after + 4) as i64; };
+                    };
+                    return after as i64;
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ap_word_then_semi(p: ptr, n: u64, w_ptr: ptr, w_len: u64) -> bool {
+    let at = intc_find_ci(p, n, w_ptr, w_len);
+    if at < 0 { return false; };
+    let from: u64 = (at as u64) + w_len;
+    let i: u64 = from;
+    while i < n {
+        if intc_byte(p, i) == 59 { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ap_where_with_arg(p: ptr, n: u64) -> bool {
+    let end = intc_pword_end(p, n, STR_PTR("where"), STR_LEN("where"), false);
+    if end < 0 { return false; };
+    let i: u64 = end as u64;
+    let spaced: bool = false;
+    while i < n && (intc_byte(p, i) == 32 || intc_byte(p, i) == 9) { i = i + 1; spaced = true; }
+    if !spaced || i >= n { return false; };
+    let c0 = intc_byte(p, i);
+    if c0 == 123 || c0 == 36 { return false; };
+    // token = run of non-space chars, compared lowercased to the
+    // source's negative lookahead list.
+    let tok = StrItem { bytes: [0u8; 1024], len: 0 };
+    let tp: ptr = pol_item_ptr(&tok);
+    while i < n {
+        let c = intc_byte(p, i);
+        if c == 32 || c == 9 || c == 10 || c == 13 { break; };
+        if tok.len < 1024 {
+            let wp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(wp, tp, tok.len);
+            PTR_WRITE_U8(wp, intc_lower(c));
+            tok.len = tok.len + 1;
+        };
+        i = i + 1;
+    }
+    if tok.len == 0 { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("is"), STR_LEN("is")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("are"), STR_LEN("are")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("was"), STR_LEN("was")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("were"), STR_LEN("were")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("the"), STR_LEN("the")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("do"), STR_LEN("do")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("does"), STR_LEN("does")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("did"), STR_LEN("did")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("can"), STR_LEN("can")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("could"), STR_LEN("could")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("should"), STR_LEN("should")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("would"), STR_LEN("would")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("to"), STR_LEN("to")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("from"), STR_LEN("from")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("in"), STR_LEN("in")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("at"), STR_LEN("at")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("for"), STR_LEN("for")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("with"), STR_LEN("with")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("about"), STR_LEN("about")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("and"), STR_LEN("and")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("or"), STR_LEN("or")) { return false; };
+    if intc_eq_ci(tp, tok.len, STR_PTR("not"), STR_LEN("not")) { return false; };
+    return true;
+}
+
+fn ap_find_with_flags(p: ptr, n: u64) -> bool {
+    let end = intc_pword_end(p, n, STR_PTR("find"), STR_LEN("find"), true);
+    if end < 0 { return false; };
+    let i: u64 = end as u64;
+    while i < n {
+        let c = intc_byte(p, i);
+        if c == 59 || c == 38 || c == 124 || c == 10 { return false; };
+        if c == 32 || c == 9 {
+            // look for -name/-iname/-path/-type/-not/-exec
+            let k: u64 = i + 1;
+            if k < n && intc_byte(p, k) == 45 {
+                let rest: ptr = PTR_NULL();
+                PTR_BYTE_ADD(rest, p, k + 1);
+                let rn: u64 = n - k - 1;
+                if intc_starts_word_ci(rest, rn, STR_PTR("name"), STR_LEN("name")) { return true; };
+                if intc_starts_word_ci(rest, rn, STR_PTR("iname"), STR_LEN("iname")) { return true; };
+                if intc_starts_word_ci(rest, rn, STR_PTR("path"), STR_LEN("path")) { return true; };
+                if intc_starts_word_ci(rest, rn, STR_PTR("type"), STR_LEN("type")) { return true; };
+                if intc_starts_word_ci(rest, rn, STR_PTR("not"), STR_LEN("not")) { return true; };
+                if intc_starts_word_ci(rest, rn, STR_PTR("exec"), STR_LEN("exec")) { return true; };
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ap_head_tail(p: ptr, n: u64) -> bool {
+    if intc_pipe_then_word(p, n, STR_PTR("head"), STR_LEN("head")) { return true; };
+    if intc_pipe_then_word(p, n, STR_PTR("tail"), STR_LEN("tail")) { return true; };
+    // prefix form: word + \s+ (the source's third alternative), or
+    // the -N / --lines forms — all begin with whitespace after the
+    // word (and optional .exe), which the \s+ alternative subsumes.
+    let e1 = intc_pword_end(p, n, STR_PTR("head"), STR_LEN("head"), true);
+    if e1 >= 0 && (e1 as u64) < n {
+        let c = intc_byte(p, e1 as u64);
+        if c == 32 || c == 9 { return true; };
+    };
+    let e2 = intc_pword_end(p, n, STR_PTR("tail"), STR_LEN("tail"), true);
+    if e2 >= 0 && (e2 as u64) < n {
+        let c = intc_byte(p, e2 as u64);
+        if c == 32 || c == 9 { return true; };
+    };
+    return false;
+}
+
+fn ap_select_first_last(p: ptr, n: u64) -> bool {
+    let e1 = intc_pword_end(p, n, STR_PTR("Select-Object"), STR_LEN("Select-Object"), false);
+    let e2 = intc_pword_end(p, n, STR_PTR("Select"), STR_LEN("Select"), false);
+    let start: i64 = e1;
+    if start < 0 { start = e2; };
+    if start < 0 { return false; };
+    let i: u64 = start as u64;
+    while i < n {
+        while i < n && (intc_byte(p, i) == 32 || intc_byte(p, i) == 9) { i = i + 1; }
+        if i >= n || intc_byte(p, i) != 45 { return false; };
+        // flag token: -[A-Za-z]+
+        let fs: u64 = i + 1;
+        let fe: u64 = fs;
+        while fe < n {
+            let c = intc_byte(p, fe);
+            let alpha: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+            if !alpha { break; };
+            fe = fe + 1;
+        }
+        if fe > fs {
+            let fp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp, p, fs);
+            let fl: u64 = fe - fs;
+            if intc_eq_ci(fp, fl, STR_PTR("First"), STR_LEN("First")) { return true; };
+            if intc_eq_ci(fp, fl, STR_PTR("Last"), STR_LEN("Last")) { return true; };
+        };
+        i = fe;
+        // skip a possible flag value token (e.g. -First 5 is terminal;
+        // -Property name continues) — the source pattern allows
+        // (?:-[A-Za-z]+\s+)* before -(First|Last), i.e. flag tokens
+        // only; a bare value ends the flag run.
+        let j: u64 = i;
+        while j < n && (intc_byte(p, j) == 32 || intc_byte(p, j) == 9) { j = j + 1; }
+        if j < n && intc_byte(p, j) != 45 { return false; };
+        i = j;
+    }
+    return false;
+}
+
+fn ap_error_action(p: ptr, n: u64) -> bool {
+    let at = intc_find_ci(p, n, STR_PTR("-ErrorAction"), STR_LEN("-ErrorAction"));
+    if at < 0 { return false; };
+    let i: u64 = (at as u64) + STR_LEN("-ErrorAction");
+    let spaced: bool = false;
+    while i < n && (intc_byte(p, i) == 32 || intc_byte(p, i) == 9) { i = i + 1; spaced = true; }
+    if !spaced || i >= n { return false; };
+    let c = intc_byte(p, i);
+    if c == 39 || c == 34 { i = i + 1; };
+    let rest: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rest, p, i);
+    let rn: u64 = n - i;
+    if intc_starts_word_ci(rest, rn, STR_PTR("SilentlyContinue"), STR_LEN("SilentlyContinue")) { return true; };
+    if rn >= 1 && intc_byte(p, i) == 48 {
+        if rn == 1 || !intc_is_word(intc_byte(p, i + 1)) { return true; };
+    };
+    return false;
+}
+
+fn ap_null_redirect(p: ptr, n: u64) -> bool {
+    let i: u64 = 0;
+    while i < n {
+        if intc_byte(p, i) == 62 {
+            let k: u64 = i + 1;
+            while k < n && (intc_byte(p, k) == 32 || intc_byte(p, k) == 9) { k = k + 1; }
+            if k < n && (intc_byte(p, k) == 39 || intc_byte(p, k) == 34) { k = k + 1; };
+            if k < n {
+                let rest: ptr = PTR_NULL();
+                PTR_BYTE_ADD(rest, p, k);
+                let rn: u64 = n - k;
+                if rn >= 5 && intc_eq_ci(rest, 5, STR_PTR("$null"), STR_LEN("$null")) { return true; };
+                if intc_starts_word_ci(rest, rn, STR_PTR("nul"), STR_LEN("nul")) { return true; };
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ap_redirection(p: ptr, n: u64) -> bool {
+    let i: u64 = 0;
+    while i < n {
+        if intc_byte(p, i) == 62 {
+            // prefix condition on the char before the (optional
+            // fd digit +) '>' run: start, or a non-word non-'>' char.
+            let pre_ok: bool = false;
+            if i == 0 { pre_ok = true; };
+            if i > 0 {
+                let prev = intc_byte(p, i - 1);
+                if prev >= 48 && prev <= 50 {
+                    if i == 1 { pre_ok = true; };
+                    if i > 1 {
+                        let pp = intc_byte(p, i - 2);
+                        if !intc_is_word(pp) && pp != 62 { pre_ok = true; };
+                    };
+                } else {
+                    if !intc_is_word(prev) && prev != 62 { pre_ok = true; };
+                };
+            };
+            if pre_ok {
+                let k: u64 = i + 1;
+                if k < n && intc_byte(p, k) == 62 { k = k + 1; };
+                while k < n && (intc_byte(p, k) == 32 || intc_byte(p, k) == 9) { k = k + 1; }
+                if k < n {
+                    let c = intc_byte(p, k);
+                    if c != 38 && c != 36 { return true; };
+                };
+            };
+            // skip the >> run
+            if i + 1 < n && intc_byte(p, i + 1) == 62 { i = i + 1; };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ap_runtime_invoke(p: ptr, n: u64) -> bool {
+    let ends: [i64; 4] = [intc_pword_end(p, n, STR_PTR("bun"), STR_LEN("bun"), true), intc_pword_end(p, n, STR_PTR("node"), STR_LEN("node"), true), intc_pword_end(p, n, STR_PTR("python"), STR_LEN("python"), true), intc_pword_end(p, n, STR_PTR("zig"), STR_LEN("zig"), true)];
+    let w: u64 = 0;
+    while w < 4 {
+        let e = ends[w];
+        if e >= 0 {
+            let i: u64 = e as u64;
+            let spaced: bool = false;
+            while i < n && (intc_byte(p, i) == 32 || intc_byte(p, i) == 9) { i = i + 1; spaced = true; }
+            if spaced && i < n {
+                // rest of the line
+                let le: u64 = i;
+                while le < n && intc_byte(p, le) != 10 { le = le + 1; }
+                let rest: ptr = PTR_NULL();
+                PTR_BYTE_ADD(rest, p, i);
+                let rn: u64 = le - i;
+                if intc_contains_ci(rest, rn, STR_PTR("--help"), STR_LEN("--help")) { return true; };
+                if intc_contains_ci(rest, rn, STR_PTR("-h"), STR_LEN("-h")) { return true; };
+                if intc_word_ci(rest, rn, STR_PTR("help"), STR_LEN("help")) { return true; };
+                if intc_word_ci(rest, rn, STR_PTR("build"), STR_LEN("build")) { return true; };
+                if intc_word_ci(rest, rn, STR_PTR("test"), STR_LEN("test")) { return true; };
+                if intc_word_ci(rest, rn, STR_PTR("compile"), STR_LEN("compile")) { return true; };
+                if intc_word_ci(rest, rn, STR_PTR("version"), STR_LEN("version")) { return true; };
+            };
+        };
+        w = w + 1;
+    }
+    return false;
+}
+
 
 struct InterceptInput {
     cwd: [u8; 1024],
@@ -166,44 +1196,319 @@ struct InterceptInput {
     policy_doc: u64,          // SaVmPolicyConfig as JSON doc handle, 0 = undefined
 }
 
+fn dec_set_reason(out: &SaVmInterceptionDecision, src_ptr: ptr, src_len: u64) -> void {
+    let dst: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dst, &out.reason, 0);
+    let n = src_len;
+    if n > 2048 { n = 2048; };
+    let i: u64 = 0;
+    while i < n {
+        let wp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(wp, dst, i);
+        PTR_WRITE_U8(wp, intc_byte(src_ptr, i));
+        i = i + 1;
+    }
+    out.reason_len = n;
+}
+
+fn dec_allow(out: &SaVmInterceptionDecision, lit_ptr: ptr, lit_len: u64) -> void {
+    out.action = 0;
+    dec_set_reason(out, lit_ptr, lit_len);
+}
+
+fn dec_deny(out: &SaVmInterceptionDecision, lit_ptr: ptr, lit_len: u64) -> void {
+    out.action = 1;
+    dec_set_reason(out, lit_ptr, lit_len);
+}
+
+fn dec_from_policy(out: &SaVmInterceptionDecision, dec: &SaVmPolicyDecision) -> void {
+    if dec.allowed {
+        dec_allow(out, STR_PTR("policy-allowed"), STR_LEN("policy-allowed"));
+        return;
+    };
+    out.action = 1;
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &dec.reason, 0);
+    dec_set_reason(out, rp, dec.reason_len);
+}
+
+fn zero_str_list() -> StrList {
+    return StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 };
+}
+
+fn zero_policy() -> NormalizedSaVmPolicy {
+    return NormalizedSaVmPolicy {
+        engine: 0,
+        fs: NormalizedFs {
+            entries: FsEntryList { items: [SaVmFsEntry { path: [0u8; 1024], path_len: 0, access: 0 }; 128], len: 0 },
+            read: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 },
+            write: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 },
+            transfer: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 },
+            delete: 0,
+            backupDir: [0u8; 1024],
+            backupDir_len: 0,
+            backupDir_has: false,
+        },
+        http_allow: HttpRuleList { items: [SaVmHttpAllowRule { host: [0u8; 512], host_len: 0, methods: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_methods: false, paths: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_paths: false }; 128], len: 0 },
+        env_allow: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 },
+        process: NormalizedProcess {
+            spawn: false,
+            exec: ExecRuleList { items: [SaVmProcessExecRule { path: [0u8; 4096], path_len: 0, args: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_args: false }; 128], len: 0 },
+            bunProfiles: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 },
+            has_bunProfiles: false,
+            bun_enabled: false,
+            bun_allowedSubcommands: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 },
+            has_bun: false,
+        },
+        execution_javascript: false,
+        execution_python: false,
+        tools: NormalizedTools { replaceRead: false, replaceWrite: false, replaceApplyPatch: false, replaceExec: false, readFiles: false, editFiles: false, applyPatch: false, fastSearch: false, clearToolHistory: false, findReferences: false, renameSymbol: false, fileOutline: false, moveWithImports: false, findDefinition: false, extractToFile: false, addImport: false, getDiagnostics: false, organizeImports: false, analyzeScope: false, codeGraph: false },
+        contextSavings: SaVmContextSavingsConfig { locateBeforeRead: false, maxReadFileBytes: 0, maxReadFileBytes_has: false, grepCircuitBreaker: false, grepMaxResults: 0, grepMaxResults_has: false, grepMaxTokens: 0, grepMaxTokens_has: false, slimRunnerOutput: false, parallelBudget: false, parallelMaxTotalBytes: 0, parallelMaxTotalBytes_has: false, parallelMaxReadFiles: 0, parallelMaxReadFiles_has: false, parallelDeduplication: false, tieredSkillInjection: false, foldWaterfallEvents: false, foldHistoryReadSummaries: false, historyReadFoldTurns: 0, historyReadFoldTurns_has: false },
+        contextSavings_has: false,
+    };
+}
+
+// fullCmd for the direct-command branch: array -> elements joined
+// with " " (string and number-string elements contribute their
+// text; other element kinds contribute nothing — TS String()
+// stringification of arbitrary JSON values has no byte form here),
+// string -> itself, anything else -> "".
+fn build_full_cmd(record: u64, buf: &StrOut) -> void {
+    buf.len = 0;
+    buf.has = false;
+    let raw = raw_cmd_node(record);
+    if raw == 0 { return; };
+    let kind = sa_json_kind(raw);
+    if kind == 5 {
+        let sp: ptr = sa_json_string_ptr(raw);
+        intc_out_append(buf, sp, sa_json_string_len(raw));
+        return;
+    };
+    if kind == 6 {
+        let idx: u64 = 0;
+        let elem: u64 = 0;
+        let first: bool = true;
+        while sa_json_array_get(raw, idx, &elem) == 0 {
+            let ek = sa_json_kind(elem);
+            if ek == 5 || ek == 4 {
+                if !first { intc_out_append(buf, STR_PTR(" "), STR_LEN(" ")); };
+                let ep: ptr = sa_json_string_ptr(elem);
+                intc_out_append(buf, ep, sa_json_string_len(elem));
+                first = false;
+            };
+            idx = idx + 1;
+        }
+        return;
+    };
+}
+
 // Deterministic broker decision used by tests and request routing. Host
 // Python/Node execution is never allowed directly, even when the legacy UI
 // execution toggle is enabled; callers must submit an `sa_vm_run` request.
 fn interceptSaVmRequest(method_ptr: ptr, method_len: u64, params_doc: u64, input: &InterceptInput, out: &SaVmInterceptionDecision) -> void {
-    // 1. script = classifySaVmScriptToolRequest(method, params)
-    //    -> { action: "require_sa_vm", request: script }
-    // 2. Direct command methods: fullCmd = command/cmd/argv joined;
-    //    antiPattern = detectPowerShellAntiPattern(fullCmd)
-    //    -> deny with "direct host command execution is disabled in SA-VM
-    //       mode; use sa_vm_run" (+ ". Prohibited shell anti-pattern
-    //       detected: <antiPattern>" when present).
-    // 3. Web-search bypass: text = [query, prompt, text, url] strings joined;
-    //    isSystemWebSearchPermissionRequest(text) && url not http(s)://
-    //    -> allow "web-search-bypass". DEFECT: SDK predicate (see above) +
-    //    regex ^https?:// -> re_test(200).
-    // 4. policy = normalizeSaVmPolicy(input.policy, input.cwd, input.additionalRoots ?? [])
-    // 5. Method table (string equality, in source order):
-    //    gitDiffToRemote -> deny "gitDiffToRemote requires an explicit git argv allowlist"
-    //    applyPatchApproval -> deny "native apply_patch is disabled in SA-VM mode; use packaged sa_vm_run tools"
-    //    item/fileChange/requestApproval -> deny "native file change/apply_patch execution is disabled in SA-VM mode; use packaged sa_vm_run tools"
-    //    fs/readFile|fs/readDirectory|fs/getMetadata|fs/watch -> checkSaVmPath(policy,"read",path,cwd)
-    //    fs/writeFile|fs/createDirectory|fs/mkdir -> checkSaVmPath(policy,"write",...)
-    //    fs/copy -> read(source) then write(destination)
-    //    fs/rename|fs/move -> checkSaVmDelete(source) then checkSaVmPath(write, destination)
-    //    fs/remove|fs/delete|fs/deleteFile|fs/removeFile (+rename/move dup) -> checkSaVmDelete(path)
-    //    network/request|http/request|fetch -> checkSaVmHttp(policy, url, method ?? "GET")
-    //    fuzzyFileSearch -> every root must pass checkSaVmPath "read"
-    //    mcpServer/tool/call|mcpServer/resource/read -> deny "MCP host tools/resources are disabled in SA-VM mode; use policy-approved sa_vm_run actions"
-    //    default -> allow "not-a-tool"
-    //    Allowed policy checks map to allow "policy-allowed"; denied ones to
-    //    deny with decision.reason. Missing required fields deny with the
-    //    source's literal reasons ("filesystem path is required", "copy
-    //    sourcePath and destinationPath are required", "rename source and
-    //    destination paths are required", "network URL is required",
-    //    "search roots are required").
-    // DEFECT: dynamic params probing (record.path/sourcePath/destination/
-    // oldPath/newPath/to/url/method/roots spellings) via sa_json_object_get_*
-    // in source precedence order — full chain in the defect log.
     out.action = 0;
     out.reason_len = 0;
+    // 1. Script classification.
+    let req = SaVmScriptToolRequest { language: -1, executable: [0u8; 1024], executable_len: 0, args: [0u8; 4096], args_len: 0, args_count: 0, reason: [0u8; 128], reason_len: 0 };
+    let has: bool = false;
+    classifySaVmScriptToolRequest(method_ptr, method_len, params_doc, &req, &has);
+    if has {
+        out.action = 2;
+        out.request = req;
+        out.reason_len = 0;
+        return;
+    };
+    // 2. Direct command methods.
+    if isSaVmDirectCommandMethod(method_ptr, method_len) {
+        let full = StrOut { bytes: [0u8; 2048], len: 0, has: false };
+        build_full_cmd(params_doc, &full);
+        let fp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp, &full.bytes, 0);
+        let anti = StrOut { bytes: [0u8; 2048], len: 0, has: false };
+        detectPowerShellAntiPattern(fp, full.len, &anti);
+        if anti.has {
+            let msg = StrOut { bytes: [0u8; 2048], len: 0, has: true };
+            intc_out_append(&msg, STR_PTR("direct host command execution is disabled in SA-VM mode; use sa_vm_run. Prohibited shell anti-pattern detected: "), STR_LEN("direct host command execution is disabled in SA-VM mode; use sa_vm_run. Prohibited shell anti-pattern detected: "));
+            let ap: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ap, &anti.bytes, 0);
+            intc_out_append(&msg, ap, anti.len);
+            out.action = 1;
+            let mp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(mp, &msg.bytes, 0);
+            dec_set_reason(out, mp, msg.len);
+            return;
+        };
+        dec_deny(out, STR_PTR("direct host command execution is disabled in SA-VM mode; use sa_vm_run"), STR_LEN("direct host command execution is disabled in SA-VM mode; use sa_vm_run"));
+        return;
+    };
+    // 3. Web-search bypass.
+    {
+        let text = StrOut { bytes: [0u8; 2048], len: 0, has: false };
+        let item = StrItem { bytes: [0u8; 1024], len: 0 };
+        if rec_str(params_doc, STR_PTR("query"), STR_LEN("query"), &item) {
+            if text.len > 0 { intc_out_append(&text, STR_PTR(" "), STR_LEN(" ")); };
+            intc_out_append(&text, pol_item_ptr(&item), item.len);
+        };
+        if rec_str(params_doc, STR_PTR("prompt"), STR_LEN("prompt"), &item) {
+            if text.len > 0 { intc_out_append(&text, STR_PTR(" "), STR_LEN(" ")); };
+            intc_out_append(&text, pol_item_ptr(&item), item.len);
+        };
+        if rec_str(params_doc, STR_PTR("text"), STR_LEN("text"), &item) {
+            if text.len > 0 { intc_out_append(&text, STR_PTR(" "), STR_LEN(" ")); };
+            intc_out_append(&text, pol_item_ptr(&item), item.len);
+        };
+        let url_item = StrItem { bytes: [0u8; 1024], len: 0 };
+        let has_url: bool = rec_str(params_doc, STR_PTR("url"), STR_LEN("url"), &url_item);
+        if has_url {
+            if text.len > 0 { intc_out_append(&text, STR_PTR(" "), STR_LEN(" ")); };
+            intc_out_append(&text, pol_item_ptr(&url_item), url_item.len);
+        };
+        let tp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp, &text.bytes, 0);
+        let url_is_http: bool = false;
+        if has_url {
+            let up: ptr = pol_item_ptr(&url_item);
+            if url_item.len >= 7 && intc_eq_ci(up, 7, STR_PTR("http://"), STR_LEN("http://")) { url_is_http = true; };
+            if url_item.len >= 8 && intc_eq_ci(up, 8, STR_PTR("https://"), STR_LEN("https://")) { url_is_http = true; };
+        };
+        if isSystemWebSearchPermissionRequest(tp, text.len) && !url_is_http {
+            dec_allow(out, STR_PTR("web-search-bypass"), STR_LEN("web-search-bypass"));
+            return;
+        };
+    }
+    // 4. Policy.
+    let roots = StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 };
+    if input.additionalRoots_doc != 0 && sa_json_kind(input.additionalRoots_doc) == 6 {
+        let idx: u64 = 0;
+        let elem: u64 = 0;
+        let rit = StrItem { bytes: [0u8; 1024], len: 0 };
+        while sa_json_array_get(input.additionalRoots_doc, idx, &elem) == 0 {
+            if node_str(elem, &rit) { pol_list_push(&roots, pol_item_ptr(&rit), rit.len); };
+            idx = idx + 1;
+        }
+    };
+    let pol = zero_policy();
+    let cwd_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cwd_p, &input.cwd, 0);
+    normalizeSaVmPolicy(input.policy_doc, cwd_p, input.cwd_len, &roots, &pol);
+    let dec = SaVmPolicyDecision { allowed: false, reason: [0u8; 2048], reason_len: 0, path: [0u8; 1024], path_len: 0, path_has: false };
+    let field = StrItem { bytes: [0u8; 1024], len: 0 };
+    let field2 = StrItem { bytes: [0u8; 1024], len: 0 };
+    // 5. Method table, in source order.
+    if str_eq_lit(method_ptr, method_len, STR_PTR("gitDiffToRemote"), STR_LEN("gitDiffToRemote")) {
+        dec_deny(out, STR_PTR("gitDiffToRemote requires an explicit git argv allowlist"), STR_LEN("gitDiffToRemote requires an explicit git argv allowlist"));
+        return;
+    };
+    if str_eq_lit(method_ptr, method_len, STR_PTR("applyPatchApproval"), STR_LEN("applyPatchApproval")) {
+        dec_deny(out, STR_PTR("native apply_patch is disabled in SA-VM mode; use packaged sa_vm_run tools"), STR_LEN("native apply_patch is disabled in SA-VM mode; use packaged sa_vm_run tools"));
+        return;
+    };
+    if str_eq_lit(method_ptr, method_len, STR_PTR("item/fileChange/requestApproval"), STR_LEN("item/fileChange/requestApproval")) {
+        dec_deny(out, STR_PTR("native file change/apply_patch execution is disabled in SA-VM mode; use packaged sa_vm_run tools"), STR_LEN("native file change/apply_patch execution is disabled in SA-VM mode; use packaged sa_vm_run tools"));
+        return;
+    };
+    if str_eq_lit(method_ptr, method_len, STR_PTR("fs/readFile"), STR_LEN("fs/readFile")) || str_eq_lit(method_ptr, method_len, STR_PTR("fs/readDirectory"), STR_LEN("fs/readDirectory")) || str_eq_lit(method_ptr, method_len, STR_PTR("fs/getMetadata"), STR_LEN("fs/getMetadata")) || str_eq_lit(method_ptr, method_len, STR_PTR("fs/watch"), STR_LEN("fs/watch")) {
+        if !rec_str(params_doc, STR_PTR("path"), STR_LEN("path"), &field) || field.len == 0 {
+            dec_deny(out, STR_PTR("filesystem path is required"), STR_LEN("filesystem path is required"));
+            return;
+        };
+        checkSaVmPath(&pol, 0, pol_item_ptr(&field), field.len, cwd_p, input.cwd_len, &dec);
+        dec_from_policy(out, &dec);
+        return;
+    };
+    if str_eq_lit(method_ptr, method_len, STR_PTR("fs/writeFile"), STR_LEN("fs/writeFile")) || str_eq_lit(method_ptr, method_len, STR_PTR("fs/createDirectory"), STR_LEN("fs/createDirectory")) || str_eq_lit(method_ptr, method_len, STR_PTR("fs/mkdir"), STR_LEN("fs/mkdir")) {
+        if !rec_str(params_doc, STR_PTR("path"), STR_LEN("path"), &field) || field.len == 0 {
+            dec_deny(out, STR_PTR("filesystem path is required"), STR_LEN("filesystem path is required"));
+            return;
+        };
+        checkSaVmPath(&pol, 1, pol_item_ptr(&field), field.len, cwd_p, input.cwd_len, &dec);
+        dec_from_policy(out, &dec);
+        return;
+    };
+    if str_eq_lit(method_ptr, method_len, STR_PTR("fs/copy"), STR_LEN("fs/copy")) {
+        let has_src: bool = rec_str(params_doc, STR_PTR("sourcePath"), STR_LEN("sourcePath"), &field);
+        if !has_src { has_src = rec_str(params_doc, STR_PTR("source"), STR_LEN("source"), &field); };
+        let has_dst: bool = rec_str(params_doc, STR_PTR("destinationPath"), STR_LEN("destinationPath"), &field2);
+        if !has_dst { has_dst = rec_str(params_doc, STR_PTR("destination"), STR_LEN("destination"), &field2); };
+        if !has_src || !has_dst || field.len == 0 || field2.len == 0 {
+            dec_deny(out, STR_PTR("copy sourcePath and destinationPath are required"), STR_LEN("copy sourcePath and destinationPath are required"));
+            return;
+        };
+        checkSaVmPath(&pol, 0, pol_item_ptr(&field), field.len, cwd_p, input.cwd_len, &dec);
+        if !dec.allowed { dec_from_policy(out, &dec); return; };
+        checkSaVmPath(&pol, 1, pol_item_ptr(&field2), field2.len, cwd_p, input.cwd_len, &dec);
+        dec_from_policy(out, &dec);
+        return;
+    };
+    if str_eq_lit(method_ptr, method_len, STR_PTR("fs/rename"), STR_LEN("fs/rename")) || str_eq_lit(method_ptr, method_len, STR_PTR("fs/move"), STR_LEN("fs/move")) {
+        let has_src: bool = rec_str(params_doc, STR_PTR("source"), STR_LEN("source"), &field);
+        if !has_src { has_src = rec_str(params_doc, STR_PTR("oldPath"), STR_LEN("oldPath"), &field); };
+        if !has_src { has_src = rec_str(params_doc, STR_PTR("path"), STR_LEN("path"), &field); };
+        let has_dst: bool = rec_str(params_doc, STR_PTR("destination"), STR_LEN("destination"), &field2);
+        if !has_dst { has_dst = rec_str(params_doc, STR_PTR("destinationPath"), STR_LEN("destinationPath"), &field2); };
+        if !has_dst { has_dst = rec_str(params_doc, STR_PTR("newPath"), STR_LEN("newPath"), &field2); };
+        if !has_dst { has_dst = rec_str(params_doc, STR_PTR("to"), STR_LEN("to"), &field2); };
+        if !has_src || !has_dst || field.len == 0 || field2.len == 0 {
+            dec_deny(out, STR_PTR("rename source and destination paths are required"), STR_LEN("rename source and destination paths are required"));
+            return;
+        };
+        checkSaVmDelete(&pol, pol_item_ptr(&field), field.len, cwd_p, input.cwd_len, &dec);
+        if !dec.allowed { dec_from_policy(out, &dec); return; };
+        checkSaVmPath(&pol, 1, pol_item_ptr(&field2), field2.len, cwd_p, input.cwd_len, &dec);
+        dec_from_policy(out, &dec);
+        return;
+    };
+    if str_eq_lit(method_ptr, method_len, STR_PTR("fs/remove"), STR_LEN("fs/remove")) || str_eq_lit(method_ptr, method_len, STR_PTR("fs/delete"), STR_LEN("fs/delete")) || str_eq_lit(method_ptr, method_len, STR_PTR("fs/deleteFile"), STR_LEN("fs/deleteFile")) || str_eq_lit(method_ptr, method_len, STR_PTR("fs/removeFile"), STR_LEN("fs/removeFile")) {
+        let has_p: bool = rec_str(params_doc, STR_PTR("path"), STR_LEN("path"), &field);
+        if !has_p { has_p = rec_str(params_doc, STR_PTR("source"), STR_LEN("source"), &field); };
+        if !has_p { has_p = rec_str(params_doc, STR_PTR("oldPath"), STR_LEN("oldPath"), &field); };
+        if !has_p || field.len == 0 {
+            dec_deny(out, STR_PTR("filesystem path is required"), STR_LEN("filesystem path is required"));
+            return;
+        };
+        checkSaVmDelete(&pol, pol_item_ptr(&field), field.len, cwd_p, input.cwd_len, &dec);
+        dec_from_policy(out, &dec);
+        return;
+    };
+    if str_eq_lit(method_ptr, method_len, STR_PTR("network/request"), STR_LEN("network/request")) || str_eq_lit(method_ptr, method_len, STR_PTR("http/request"), STR_LEN("http/request")) || str_eq_lit(method_ptr, method_len, STR_PTR("fetch"), STR_LEN("fetch")) {
+        if !rec_str(params_doc, STR_PTR("url"), STR_LEN("url"), &field) || field.len == 0 {
+            dec_deny(out, STR_PTR("network URL is required"), STR_LEN("network URL is required"));
+            return;
+        };
+        let has_m: bool = rec_str(params_doc, STR_PTR("method"), STR_LEN("method"), &field2);
+        if has_m {
+            checkSaVmHttp(&pol, pol_item_ptr(&field), field.len, pol_item_ptr(&field2), field2.len, &dec);
+        } else {
+            checkSaVmHttp(&pol, pol_item_ptr(&field), field.len, STR_PTR("GET"), STR_LEN("GET"), &dec);
+        };
+        dec_from_policy(out, &dec);
+        return;
+    };
+    if str_eq_lit(method_ptr, method_len, STR_PTR("fuzzyFileSearch"), STR_LEN("fuzzyFileSearch")) {
+        let roots_node = rec_node(params_doc, STR_PTR("roots"), STR_LEN("roots"));
+        let count: u64 = 0;
+        if roots_node != 0 && sa_json_kind(roots_node) == 6 {
+            let idx: u64 = 0;
+            let elem: u64 = 0;
+            while sa_json_array_get(roots_node, idx, &elem) == 0 {
+                if node_str(elem, &field) {
+                    count = count + 1;
+                    checkSaVmPath(&pol, 0, pol_item_ptr(&field), field.len, cwd_p, input.cwd_len, &dec);
+                    if !dec.allowed { dec_from_policy(out, &dec); return; };
+                };
+                idx = idx + 1;
+            }
+        };
+        if count == 0 {
+            dec_deny(out, STR_PTR("search roots are required"), STR_LEN("search roots are required"));
+            return;
+        };
+        dec_allow(out, STR_PTR("policy-allowed"), STR_LEN("policy-allowed"));
+        return;
+    };
+    if str_eq_lit(method_ptr, method_len, STR_PTR("mcpServer/tool/call"), STR_LEN("mcpServer/tool/call")) || str_eq_lit(method_ptr, method_len, STR_PTR("mcpServer/resource/read"), STR_LEN("mcpServer/resource/read")) {
+        dec_deny(out, STR_PTR("MCP host tools/resources are disabled in SA-VM mode; use policy-approved sa_vm_run actions"), STR_LEN("MCP host tools/resources are disabled in SA-VM mode; use policy-approved sa_vm_run actions"));
+        return;
+    };
+    dec_allow(out, STR_PTR("not-a-tool"), STR_LEN("not-a-tool"));
 }

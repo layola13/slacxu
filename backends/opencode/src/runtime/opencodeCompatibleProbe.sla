@@ -1,6 +1,279 @@
 // Converted 1:1 from backends/opencode/src/runtime/opencodeCompatibleProbe.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
 @import "sa_std/ptr.sa"
+@import "sa_std/process.sai"
+@import "sa_std/fmt.sai"
 @import "opencodeCompatibleProtocol.sla"
+@import "sa_std/string.sa"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/env.sai"
+@import "sa_std/ptr.sa"
+
+struct SpawnArg {
+    data: ptr,
+    len: u64,
+}
+
+
+// FIX (host services): sa_host_cli_preferred was an assumed face
+// for the host cli preference lookup — the same sdk-backend
+// host-services table story as the command/probe shims in this
+// domain (see _defects/FIX_BACKENDS.md): the cli table's
+// getPreferredCliBinary field is an untyped ptr at this phase,
+// so a registered implementation cannot be invoked from SLA
+// yet; report "no preference" so callers fall through to
+// env/PATH resolution, exactly the TS optional-call outcome.
+@import "../../../../sdk-backend/src/hostServices.sla"
+
+// FIX: sa_host_spawn_sync_ex was an assumed host face. Bound to
+// sa_std_process_exec_capture like host_spawn_collect, but with
+// separate stdout/stderr buffers and an error channel: on a
+// spawn-level failure the error buffer receives a short ASCII
+// note and has_err is set. Timeout dropped (documented).
+fn host_spawn_sync_ex(bin_ptr: ptr, bin_len: u64, args_ptr: ptr, args_len: u64, timeout_ms: u64, so_buf: ptr, so_cap: u64, so_len: &u64, se_buf: ptr, se_cap: u64, se_len: &u64, status_out: &i32, err_buf: ptr, err_cap: u64, err_len: &u64, has_err: &bool) -> i32 {
+    *so_len = 0;
+    *se_len = 0;
+    *err_len = 0;
+    *has_err = false;
+    *status_out = -1;
+    let argv: [SpawnArg; 64] = [SpawnArg { data: PTR_NULL(), len: 0 }; 64];
+    argv[0].data = bin_ptr;
+    argv[0].len = bin_len;
+    let argc: u64 = 1;
+    let doc = sa_json_parse(args_ptr, args_len);
+    if doc != 0 && sa_json_kind(doc) == 6 {
+        let idx: u64 = 0;
+        let elem: u64 = 0;
+        while sa_json_array_get(doc, idx, &elem) == 0 {
+            if sa_json_kind(elem) == 5 && argc < 64 {
+                let esp: ptr = sa_json_string_ptr(elem);
+                argv[argc].data = esp;
+                argv[argc].len = sa_json_string_len(elem);
+                argc = argc + 1;
+            };
+            idx = idx + 1;
+        }
+    };
+    let argv_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(argv_p, &argv, 0);
+    let code: u32 = 0;
+    let so: u64 = 0;
+    let se: u64 = 0;
+    let st = sa_std_process_exec_capture(argv_p, argc, &code, &so, &se);
+    if st != 0 {
+        *has_err = true;
+        let note = "spawn failed";
+        let nl = STR_LEN(note);
+        let n = nl;
+        if n > err_cap { n = err_cap; };
+        for i in 0..n {
+            let b: u8 = 0;
+            let sp2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(sp2, STR_PTR(note), i);
+            PTR_BYTE_AT(b, sp2, 0);
+            let wp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(wp, err_buf, i);
+            PTR_WRITE_U8(wp, b);
+        }
+        *err_len = n;
+        return st;
+    };
+    *status_out = code as i32;
+    if so != 0 {
+        let dp: ptr = sa_fmt_buffer_data(so);
+        let dl: u64 = sa_fmt_buffer_len(so);
+        let n = dl;
+        if n > so_cap { n = so_cap; };
+        for i in 0..n {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, dp, i);
+            let wp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(wp, so_buf, i);
+            PTR_WRITE_U8(wp, b);
+        }
+        *so_len = n;
+    };
+    if se != 0 {
+        let dp: ptr = sa_fmt_buffer_data(se);
+        let dl: u64 = sa_fmt_buffer_len(se);
+        let n = dl;
+        if n > se_cap { n = se_cap; };
+        for i in 0..n {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, dp, i);
+            let wp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(wp, se_buf, i);
+            PTR_WRITE_U8(wp, b);
+        }
+        *se_len = n;
+    };
+    return 0;
+}
+
+
+// FIX: sa_json_object_get_number does not exist in sa_std;
+// it is sa_json_object_get + sa_json_as_f64 (encoding/json.sai).
+fn json_object_get_number(doc: u64, key_ptr: ptr, key_len: u64, out: &f64) -> i32 {
+    let node: u64 = 0;
+    if sa_json_object_get(doc, key_ptr, key_len, &node) != 0 { return 1; };
+    return sa_json_as_f64(node, out);
+}
+
+
+// FIX: sa_host_spawn_collect was an assumed host face. The real
+// mechanism is sa_std_process_exec_capture (process.sai) over
+// SaProcessArgv {data, len} records; the args JSON array is
+// parsed with the real json.sai API and each string element
+// becomes one argv record after the command itself. The
+// timeout argument has no exec_capture counterpart and is
+// dropped (documented approximation). stdout is an fmt buffer
+// (sa_fmt_buffer_data/len), copied into the caller's buffer.
+// Return: spawn status on failure, else the exit code.
+
+fn host_spawn_collect(command_ptr: ptr, command_len: u64, args_ptr: ptr, args_len: u64, timeout_ms: u64, out: ptr, out_cap: u64, out_len: &u64) -> i32 {
+    *out_len = 0;
+    let argv: [SpawnArg; 64] = [SpawnArg { data: PTR_NULL(), len: 0 }; 64];
+    argv[0].data = command_ptr;
+    argv[0].len = command_len;
+    let argc: u64 = 1;
+    let doc = sa_json_parse(args_ptr, args_len);
+    if doc != 0 && sa_json_kind(doc) == 6 {
+        let idx: u64 = 0;
+        let elem: u64 = 0;
+        while sa_json_array_get(doc, idx, &elem) == 0 {
+            if sa_json_kind(elem) == 5 && argc < 64 {
+                let esp: ptr = sa_json_string_ptr(elem);
+                argv[argc].data = esp;
+                argv[argc].len = sa_json_string_len(elem);
+                argc = argc + 1;
+            };
+            idx = idx + 1;
+        }
+    };
+    let argv_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(argv_p, &argv, 0);
+    let code: u32 = 0;
+    let so: u64 = 0;
+    let se: u64 = 0;
+    let st = sa_std_process_exec_capture(argv_p, argc, &code, &so, &se);
+    if st != 0 { return st; };
+    if so != 0 {
+        let dp: ptr = sa_fmt_buffer_data(so);
+        let dl: u64 = sa_fmt_buffer_len(so);
+        let n = dl;
+        if n > out_cap { n = out_cap; };
+        let i: u64 = 0;
+        while i < n {
+            let v: u8 = 0;
+            PTR_BYTE_AT(v, dp, i);
+            let wp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(wp, out, i);
+            PTR_WRITE_U8(wp, v);
+            i = i + 1;
+        }
+        *out_len = n;
+    };
+    return code as i32;
+}
+
+
+// FIX: sa_json_node_is_object does not exist in sa_std; the
+// kind face is sa_json_kind (7 = object).
+fn json_node_is_object(node: u64, out: &bool) -> void { *out = sa_json_kind(node) == 7; }
+
+
+// FIX (host services): sa_host_cli_enumerate_at — per-index
+// form of the enumerateCliCandidates lookup; same
+// host-services limitation as the other cli shims in this
+// file (untyped ptr field, not invocable from SLA yet), so
+// report no candidate at any index.
+fn host_cli_enumerate_at_probe(kind_ptr: ptr, kind_len: u64, idx: u64, out_ptr: &ptr, out_len: &u64, has: &bool) -> void {
+    *has = false;
+    *out_len = 0;
+    let t = zeroPluginHostServices();
+    if !tryPluginHostServices(&t) { return; };
+    if t.cli.enumerateCliCandidates == PTR_NULL() { return; };
+    return;
+}
+
+
+// FIX (host services): sa_host_cli_cached_latest — same
+// host-services table story as host_cli_preferred_probe
+// (cli.getCachedLatestCliPath is an untyped ptr field at
+// this phase); report no cached path so callers fall
+// through to PATH/standard locations.
+fn host_cli_cached_latest_probe(kind_ptr: ptr, kind_len: u64, out_ptr: &ptr, out_len: &u64, has: &bool) -> void {
+    *has = false;
+    *out_len = 0;
+    let t = zeroPluginHostServices();
+    if !tryPluginHostServices(&t) { return; };
+    if t.cli.getCachedLatestCliPath == PTR_NULL() { return; };
+    return;
+}
+
+fn host_cli_preferred_probe(kind_ptr: ptr, kind_len: u64, out_ptr: &ptr, out_len: &u64, has: &bool) -> void {
+    *has = false;
+    *out_len = 0;
+    let t = zeroPluginHostServices();
+    if !tryPluginHostServices(&t) { return; };
+    if t.cli.getPreferredCliBinary == PTR_NULL() { return; };
+    return;
+}
+
+
+// FIX: sa_std_env_get does not exist in sa_std; the env face is
+// sa_env_get (env.sai) returning a buffer handle read via
+// sa_env_buffer_data / sa_env_buffer_len. This wrapper preserves
+// the converted call shape (out ptr/len + has flag).
+fn env_get_probe(key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64, has: &bool) -> void {
+    let h = sa_env_get(key_ptr, key_len);
+    if h == 0 {
+        *has = false;
+        *out_len = 0;
+        return;
+    };
+    let dp: ptr = sa_env_buffer_data(h);
+    *out_ptr = dp;
+    *out_len = sa_env_buffer_len(h);
+    *has = true;
+}
+
+
+// FIX: sa_std_fs_stat does not exist in sa_std; the stat face is
+// sa_fs_metadata (fs.sai) returning a metadata handle, with
+// is_file / mode accessors. Status form preserved: 0 on success.
+fn fs_stat_probe(path_ptr: ptr, path_len: u64, is_file: &bool, mode: &u64) -> i32 {
+    let md = sa_fs_metadata(path_ptr, path_len);
+    if md == 0 { return 1; };
+    *is_file = sa_fs_metadata_is_file(md) == 1;
+    *mode = sa_fs_metadata_mode(md);
+    return 0;
+}
+
+
+// FIX: process.platform has no sa_std face (four-source check:
+// env.sai / process.sai expose no platform query). The probe reads
+// the OS environment variable, which Windows sets to "Windows_NT";
+// on the POSIX hosts this port targets it is unset.
+fn platform_is_win32() -> i32 {
+    let h = sa_env_get(STR_PTR("OS"), STR_LEN("OS"));
+    if h == 0 { return 0; };
+    let p: ptr = sa_env_buffer_data(h);
+    let l = sa_env_buffer_len(h);
+    if l != 10 { return 0; };
+    let want: ptr = STR_PTR("Windows_NT");
+    let i: u64 = 0;
+    while i < 10 {
+        let a: u8 = 0;
+        let b: u8 = 0;
+        PTR_BYTE_AT(a, p, i);
+        PTR_BYTE_AT(b, want, i);
+        if a != b { return 0; };
+        i = i + 1;
+    }
+    return 1;
+}
+
 
 // TS imports:
 //   existsSync, statSync from "node:fs"        -> intent externs sa_std_fs_exists / sa_std_fs_stat
@@ -33,7 +306,7 @@ fn pcopy(dst: ptr, cap: u64, src: ptr, src_len: u64) -> u64 {
     while i < n {
         let c: u8 = 0;
         PTR_BYTE_AT(c, src, i);
-        PTR_BYTE_SET(dst, i, c);
+        let __pbs0: ptr = PTR_NULL(); PTR_BYTE_ADD(__pbs0, dst, i); PTR_WRITE_U8(__pbs0, c);
         i = i + 1;
     }
     return n;
@@ -106,7 +379,7 @@ fn pjoin2(slot: &ProbePath, a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> v
     PTR_BYTE_ADD(dst, &slot.bytes, 0);
     let n = pcopy(dst, 1024, a_ptr, a_len);
     if n > 0 && n < 1024 {
-        PTR_BYTE_SET(dst, n, 47);
+        let __pbs1: ptr = PTR_NULL(); PTR_BYTE_ADD(__pbs1, dst, n); PTR_WRITE_U8(__pbs1, 47);
         n = n + 1;
     };
     let rest: ptr = PTR_NULL();
@@ -143,11 +416,11 @@ struct OpencodeCliProbeResult {
 //         return stats.isFile() && (stats.mode & 0o111) !== 0; } catch { return false; }
 // DEFECT: try/catch -> stat status code.
 fn isLaunchable(path_ptr: ptr, path_len: u64) -> bool {
-    if sa_std_fs_exists(path_ptr, path_len) == 0 { return false; };
-    if sa_std_platform_is_win32() != 0 { return true; };
+    if sa_std_fs_exists(path_ptr, path_len) != 0 { return false; }; // FIX (fs_exists sweep): !existsSync(path) -> false (polarity was inverted)
+    if platform_is_win32() != 0 { return true; };
     let is_file = false;
     let mode: u64 = 0;
-    if sa_std_fs_stat(path_ptr, path_len, &is_file, &mode) != 0 { return false; };
+    if fs_stat_probe(path_ptr, path_len, &is_file, &mode) != 0 { return false; };
     return is_file && (mode & 73) != 0;
 }
 
@@ -162,10 +435,10 @@ fn findOpencodeBin(out: &ProbePath) -> void {
     let cfg_ptr: ptr = PTR_NULL();
     let cfg_len: u64 = 0;
     let has_cfg = false;
-    sa_std_env_get(STR_PTR("OPENCODE_BIN"), STR_LEN("OPENCODE_BIN"), &cfg_ptr, &cfg_len, &has_cfg);
+    env_get_probe(STR_PTR("OPENCODE_BIN"), STR_LEN("OPENCODE_BIN"), &cfg_ptr, &cfg_len, &has_cfg);
     if !has_cfg || cfg_len == 0 {
         // TS `||`: empty string also falls through.
-        sa_std_env_get(STR_PTR("CODEX_UI_OPENCODE_BIN"), STR_LEN("CODEX_UI_OPENCODE_BIN"), &cfg_ptr, &cfg_len, &has_cfg);
+        env_get_probe(STR_PTR("CODEX_UI_OPENCODE_BIN"), STR_LEN("CODEX_UI_OPENCODE_BIN"), &cfg_ptr, &cfg_len, &has_cfg);
     };
     // if (configured && typeof configured === "string" && configured.trim())
     if has_cfg {
@@ -184,7 +457,7 @@ fn findOpencodeBin(out: &ProbePath) -> void {
     let pref_ptr: ptr = PTR_NULL();
     let pref_len: u64 = 0;
     let has_pref = false;
-    sa_host_cli_preferred(STR_PTR("opencode"), STR_LEN("opencode"), &pref_ptr, &pref_len, &has_pref);
+    host_cli_preferred_probe(STR_PTR("opencode"), STR_LEN("opencode"), &pref_ptr, &pref_len, &has_pref);
     if has_pref && isLaunchable(pref_ptr, pref_len) {
         let dst: ptr = PTR_NULL();
         PTR_BYTE_ADD(dst, &out.bytes, 0);
@@ -195,7 +468,7 @@ fn findOpencodeBin(out: &ProbePath) -> void {
     let lc_ptr: ptr = PTR_NULL();
     let lc_len: u64 = 0;
     let has_lc = false;
-    sa_host_cli_cached_latest(STR_PTR("opencode"), STR_LEN("opencode"), &lc_ptr, &lc_len, &has_lc);
+    host_cli_cached_latest_probe(STR_PTR("opencode"), STR_LEN("opencode"), &lc_ptr, &lc_len, &has_lc);
     if has_lc && isLaunchable(lc_ptr, lc_len) {
         let dst: ptr = PTR_NULL();
         PTR_BYTE_ADD(dst, &out.bytes, 0);
@@ -207,7 +480,7 @@ fn findOpencodeBin(out: &ProbePath) -> void {
     let c0_ptr: ptr = PTR_NULL();
     let c0_len: u64 = 0;
     let has_c0 = false;
-    sa_host_cli_enumerate_at(STR_PTR("opencode"), STR_LEN("opencode"), 0, &c0_ptr, &c0_len, &has_c0);
+    host_cli_enumerate_at_probe(STR_PTR("opencode"), STR_LEN("opencode"), 0, &c0_ptr, &c0_len, &has_c0);
     if has_c0 {
         let dst: ptr = PTR_NULL();
         PTR_BYTE_ADD(dst, &out.bytes, 0);
@@ -221,15 +494,15 @@ fn findOpencodeBin(out: &ProbePath) -> void {
     let home_ptr: ptr = PTR_NULL();
     let home_len: u64 = 0;
     let has_home = false;
-    sa_std_env_get(STR_PTR("USERPROFILE"), STR_LEN("USERPROFILE"), &home_ptr, &home_len, &has_home);
+    env_get_probe(STR_PTR("USERPROFILE"), STR_LEN("USERPROFILE"), &home_ptr, &home_len, &has_home);
     if !has_home {
-        sa_std_env_get(STR_PTR("HOME"), STR_LEN("HOME"), &home_ptr, &home_len, &has_home);
+        env_get_probe(STR_PTR("HOME"), STR_LEN("HOME"), &home_ptr, &home_len, &has_home);
     };
     if !has_home { home_len = 0; };
     // const exeName = win32 ? "opencode.exe" : "opencode";
     let exe_ptr = STR_PTR("opencode");
     let exe_len = STR_LEN("opencode");
-    if sa_std_platform_is_win32() != 0 {
+    if platform_is_win32() != 0 {
         exe_ptr = STR_PTR("opencode.exe");
         exe_len = STR_LEN("opencode.exe");
     };
@@ -249,7 +522,7 @@ fn findOpencodeBin(out: &ProbePath) -> void {
     let np_ptr: ptr = PTR_NULL();
     let np_len: u64 = 0;
     let has_np = false;
-    sa_std_env_get(STR_PTR("npm_config_prefix"), STR_LEN("npm_config_prefix"), &np_ptr, &np_len, &has_np);
+    env_get_probe(STR_PTR("npm_config_prefix"), STR_LEN("npm_config_prefix"), &np_ptr, &np_len, &has_np);
     if has_np {
         pjoin3(&cand, np_ptr, np_len, STR_PTR("bin"), STR_LEN("bin"), exe_ptr, exe_len);
         if probe_try_candidate(&cand) { copy_path(out, &cand); return; };
@@ -258,7 +531,7 @@ fn findOpencodeBin(out: &ProbePath) -> void {
     let nv_ptr: ptr = PTR_NULL();
     let nv_len: u64 = 0;
     let has_nv = false;
-    sa_std_env_get(STR_PTR("NVM_BIN"), STR_LEN("NVM_BIN"), &nv_ptr, &nv_len, &has_nv);
+    env_get_probe(STR_PTR("NVM_BIN"), STR_LEN("NVM_BIN"), &nv_ptr, &nv_len, &has_nv);
     if has_nv {
         let tp2: ptr = PTR_NULL();
         let tl2: u64 = 0;
@@ -283,7 +556,7 @@ fn findOpencodeBin(out: &ProbePath) -> void {
         if probe_try_home(home_ptr, home_len, STR_PTR(".linuxbrew/bin"), STR_LEN(".linuxbrew/bin"), exe_ptr, exe_len, &cand) { copy_path(out, &cand); return; };
     };
     // [11..16] absolute POSIX locations (undefined on win32)
-    if sa_std_platform_is_win32() == 0 {
+    if platform_is_win32() == 0 {
         if probe_try_literal(STR_PTR("/tools/node/bin/opencode"), STR_LEN("/tools/node/bin/opencode"), &cand) { copy_path(out, &cand); return; };
         if probe_try_literal(STR_PTR("/usr/local/bin/opencode"), STR_LEN("/usr/local/bin/opencode"), &cand) { copy_path(out, &cand); return; };
         if probe_try_literal(STR_PTR("/usr/bin/opencode"), STR_LEN("/usr/bin/opencode"), &cand) { copy_path(out, &cand); return; };
@@ -337,7 +610,7 @@ fn probe_try_dir_or_bin(env_name_ptr: ptr, env_name_len: u64, exe_ptr: ptr, exe_
     let v_ptr: ptr = PTR_NULL();
     let v_len: u64 = 0;
     let has_v = false;
-    sa_std_env_get(env_name_ptr, env_name_len, &v_ptr, &v_len, &has_v);
+    env_get_probe(env_name_ptr, env_name_len, &v_ptr, &v_len, &has_v);
     if !has_v { return false; };
     let tp: ptr = PTR_NULL();
     let tl: u64 = 0;
@@ -458,9 +731,10 @@ fn models_flush_pending(st: &ModelsParseState) -> void {
         let node: u64 = 0;
         // DEFECT: try/catch around JSON.parse -> status code; truncated or
         // non-JSON noise keeps the bare ID line (source comment).
-        if sa_json_parse(jp, st.json_lines_len, &node) == 0 {
+        node = sa_json_parse(jp, st.json_lines_len);
+        if node != 0 {
             let is_obj = false;
-            sa_json_node_is_object(node, &is_obj);
+            json_node_is_object(node, &is_obj);
             if is_obj {
                 let d: ptr = PTR_NULL();
                 PTR_BYTE_ADD(d, &st.pending.detail_json, 0);
@@ -496,7 +770,7 @@ fn models_flush_pending(st: &ModelsParseState) -> void {
 // machine extracts groups (ID line starts a group, following balanced
 // {...} lines are collected as detail).
 fn parseOpencodeModelsVerboseOutput(out_ptr: ptr, out_len: u64, result: &OpencodeModelDetailList) -> void {
-    let st = ModelsParseState { models: OpencodeModelDetailList { items: [OpencodeModelDetail; 256], len: 0 }, pending: OpencodeModelDetail { id: [0u8; 512], id_len: 0, provider: [0u8; 128], provider_len: 0, model: [0u8; 512], model_len: 0, detail_json: [0u8; 8192], detail_json_len: 0, has_detail: false, detail_node: 0 }, has_pending: false, json_lines: [0u8; 8192], json_lines_len: 0, brace_depth: 0 };
+    let st = ModelsParseState { models: OpencodeModelDetailList { items: [OpencodeModelDetail { id: [0u8; 512], id_len: 0, provider: [0u8; 128], provider_len: 0, model: [0u8; 512], model_len: 0, detail_json: [0u8; 8192], detail_json_len: 0, has_detail: false, detail_node: 0 }; 256], len: 0 }, pending: OpencodeModelDetail { id: [0u8; 512], id_len: 0, provider: [0u8; 128], provider_len: 0, model: [0u8; 512], model_len: 0, detail_json: [0u8; 8192], detail_json_len: 0, has_detail: false, detail_node: 0 }, has_pending: false, json_lines: [0u8; 8192], json_lines_len: 0, brace_depth: 0 };
     // const lines = output.split(/\r?\n/);
     let line_start: u64 = 0;
     let i: u64 = 0;
@@ -554,7 +828,7 @@ fn models_consume_line(st: &ModelsParseState, line_ptr: ptr, line_len: u64) -> v
             let dst: ptr = PTR_NULL();
             PTR_BYTE_ADD(dst, &st.json_lines, st.json_lines_len);
             if st.json_lines_len > 0 && st.json_lines_len < 8192 {
-                PTR_BYTE_SET(dst, 0, 10);
+                let __pbs2: ptr = PTR_NULL(); PTR_BYTE_ADD(__pbs2, dst, 0); PTR_WRITE_U8(__pbs2, 10);
                 st.json_lines_len = st.json_lines_len + 1;
                 PTR_BYTE_ADD(dst, &st.json_lines, st.json_lines_len);
             };
@@ -585,7 +859,7 @@ fn models_consume_line(st: &ModelsParseState, line_ptr: ptr, line_len: u64) -> v
     PTR_BYTE_ADD(d, &st.pending.id, 0);
     let n = pcopy(d, 512, prov_ptr, prov_len);
     if n < 512 {
-        PTR_BYTE_SET(d, n, 47);
+        let __pbs3: ptr = PTR_NULL(); PTR_BYTE_ADD(__pbs3, d, n); PTR_WRITE_U8(__pbs3, 47);
         n = n + 1;
         let rest: ptr = PTR_NULL();
         PTR_BYTE_ADD(rest, d, n);
@@ -601,7 +875,7 @@ fn models_consume_line(st: &ModelsParseState, line_ptr: ptr, line_len: u64) -> v
 // TS: export function parseOpencodeModelsOutput(output: string): string[]
 //   return parseOpencodeModelsVerboseOutput(output).map((m) => m.id);
 fn parseOpencodeModelsOutput(out_ptr: ptr, out_len: u64, result: &ProbeStringList) -> void {
-    let details = OpencodeModelDetailList { items: [OpencodeModelDetail; 256], len: 0 };
+    let details = OpencodeModelDetailList { items: [OpencodeModelDetail { id: [0u8; 512], id_len: 0, provider: [0u8; 128], provider_len: 0, model: [0u8; 512], model_len: 0, detail_json: [0u8; 8192], detail_json_len: 0, has_detail: false, detail_node: 0 }; 256], len: 0 };
     parseOpencodeModelsVerboseOutput(out_ptr, out_len, &details);
     result.len = 0;
     let i: u64 = 0;
@@ -619,7 +893,7 @@ fn parseOpencodeModelsOutput(out_ptr: ptr, out_len: u64, result: &ProbeStringLis
 // ---- TS: function runOpencodeModelsCommand(args, bin, env, timeoutMs): Promise<string> ----
 // DEFECT: async/Promise + EventEmitter child streams + setTimeout timer +
 // settle-once `done` closure -> blocking collect extern
-// sa_host_spawn_collect(command, argsJson, timeoutMs, out) (intent,
+// host_spawn_collect(command, argsJson, timeoutMs, out) (intent,
 // MISSING): runs to exit/timeout, kills on timeout like the source timer,
 // concatenates stdout and stderr chunks in arrival order (approximation:
 // the extern interleaves as received; a stdout-then-stderr concat would
@@ -655,10 +929,11 @@ fn runOpencodeModelsCommand(args_ptr: ptr, args_len: u64, bin_ptr: ptr, bin_len:
     // out is a ProbePath (1024) in this signature — DEFECT: output capacity
     // mismatch; the collect writes into a 64KB scratch then truncates.
     let scratch = [0u8; 65536];
+    let scratch_p: ptr = PTR_NULL(); PTR_BYTE_ADD(scratch_p, &scratch, 0);
     let scratch_len: u64 = 0;
     let sp: ptr = PTR_NULL();
-    PTR_BYTE_ADD(sp, &scratch, 0);
-    sa_host_spawn_collect(cp, cmd.len, args_ptr, args_len, timeout_ms, sp, 65536, &scratch_len);
+    PTR_BYTE_ADD(sp, scratch_p, 0);
+    host_spawn_collect(cp, cmd.len, args_ptr, args_len, timeout_ms, sp, 65536, &scratch_len);
     let d2: ptr = PTR_NULL();
     PTR_BYTE_ADD(d2, &out.bytes, 0);
     out.len = pcopy(d2, 1024, sp, scratch_len);
@@ -691,7 +966,7 @@ fn runOpencodeModelsCommandBig(args_ptr: ptr, args_len: u64, bin_ptr: ptr, bin_l
     let sp: ptr = PTR_NULL();
     PTR_BYTE_ADD(sp, &out.bytes, 0);
     out.len = 0;
-    sa_host_spawn_collect(cp, cmd.len, args_ptr, args_len, timeout_ms, sp, 65536, &out.len);
+    host_spawn_collect(cp, cmd.len, args_ptr, args_len, timeout_ms, sp, 65536, &out.len);
 }
 
 // TS: export function listOpencodeModelsAsync(bin?, env, timeoutMs = 30_000): Promise<string[]>
@@ -724,7 +999,7 @@ fn isOpencodeFreeModel(id_ptr: ptr, id_len: u64, detail: &OpencodeModelDetail, h
     while i < lowered.len {
         let b: u8 = 0;
         PTR_BYTE_AT(b, ld, i);
-        if b >= 65 && b <= 90 { PTR_BYTE_SET(ld, i, b + 32); };
+        if b >= 65 && b <= 90 { let __pbs4: ptr = PTR_NULL(); PTR_BYTE_ADD(__pbs4, ld, i); PTR_WRITE_U8(__pbs4, b + 32); };
         i = i + 1;
     }
     // const bare = normalized.replace(/^opencode\//i, "");
@@ -748,12 +1023,12 @@ fn isOpencodeFreeModel(id_ptr: ptr, id_len: u64, detail: &OpencodeModelDetail, h
         let cost_node: u64 = 0;
         if sa_json_object_get(detail.detail_node, STR_PTR("cost"), STR_LEN("cost"), &cost_node) == 0 {
             let is_obj = false;
-            sa_json_node_is_object(cost_node, &is_obj);
+            json_node_is_object(cost_node, &is_obj);
             if is_obj {
                 let input_v: f64 = 0.0;
                 let output_v: f64 = 0.0;
-                sa_json_object_get_number(cost_node, STR_PTR("input"), STR_LEN("input"), &input_v);
-                sa_json_object_get_number(cost_node, STR_PTR("output"), STR_LEN("output"), &output_v);
+                json_object_get_number(cost_node, STR_PTR("input"), STR_LEN("input"), &input_v);
+                json_object_get_number(cost_node, STR_PTR("output"), STR_LEN("output"), &output_v);
                 if input_v == 0.0 && output_v == 0.0 { return true; };
             };
         };
@@ -790,7 +1065,7 @@ fn filterOpencodeFreeModels(models: &ProbeStringList, result: &ProbeStringList) 
 //   return listOpencodeModelsAsync(...).then(filterOpencodeFreeModels);
 // DEFECT: async + .then -> sequential calls.
 fn listOpencodeFreeModelsAsync(bin_ptr: ptr, bin_len: u64, has_bin: bool, timeout_ms: u64, result: &ProbeStringList) -> void {
-    let all = ProbeStringList { items: [ProbePath; 256], len: 0 };
+    let all = ProbeStringList { items: [ProbePath { bytes: [0u8; 1024], len: 0 }; 256], len: 0 };
     listOpencodeModelsAsync(bin_ptr, bin_len, has_bin, timeout_ms, &all);
     filterOpencodeFreeModels(&all, result);
 }
@@ -908,20 +1183,23 @@ fn probeOpencodeCliCommand(bin_ptr: ptr, bin_len: u64, out: &OpencodeCliProbeRes
     out.has_error = false;
     out.error_len = 0;
     let stdout_buf = [0u8; 8192];
+    let stdout_buf_p: ptr = PTR_NULL(); PTR_BYTE_ADD(stdout_buf_p, &stdout_buf, 0);
     let stdout_len: u64 = 0;
     let stderr_buf = [0u8; 8192];
+    let stderr_buf_p: ptr = PTR_NULL(); PTR_BYTE_ADD(stderr_buf_p, &stderr_buf, 0);
     let stderr_len: u64 = 0;
     let status: i32 = -1;
     let err_msg = [0u8; 2048];
+    let err_msg_p: ptr = PTR_NULL(); PTR_BYTE_ADD(err_msg_p, &err_msg, 0);
     let err_len: u64 = 0;
     let has_err = false;
     let sop: ptr = PTR_NULL();
-    PTR_BYTE_ADD(sop, &stdout_buf, 0);
+    PTR_BYTE_ADD(sop, stdout_buf_p, 0);
     let sep: ptr = PTR_NULL();
-    PTR_BYTE_ADD(sep, &stderr_buf, 0);
+    PTR_BYTE_ADD(sep, stderr_buf_p, 0);
     let emp: ptr = PTR_NULL();
-    PTR_BYTE_ADD(emp, &err_msg, 0);
-    let rc = sa_host_spawn_sync_ex(bin_ptr, bin_len, STR_PTR("[\"--version\"]"), STR_LEN("[\"--version\"]"), 5000, sop, 8192, &stdout_len, sep, 8192, &stderr_len, &status, emp, 2048, &err_len, &has_err);
+    PTR_BYTE_ADD(emp, err_msg_p, 0);
+    let rc = host_spawn_sync_ex(bin_ptr, bin_len, STR_PTR("[\"--version\"]"), STR_LEN("[\"--version\"]"), 5000, sop, 8192, &stdout_len, sep, 8192, &stderr_len, &status, emp, 2048, &err_len, &has_err);
     if rc != 0 {
         // catch branch: error = thrown message (extern fills err_msg)
         out.has_error = true;
@@ -1109,9 +1387,9 @@ fn findOpencodeV2Bin(out: &ProbePath) -> void {
     let cfg_ptr: ptr = PTR_NULL();
     let cfg_len: u64 = 0;
     let has_cfg = false;
-    sa_std_env_get(STR_PTR("OPENCODE_V2_BIN"), STR_LEN("OPENCODE_V2_BIN"), &cfg_ptr, &cfg_len, &has_cfg);
+    env_get_probe(STR_PTR("OPENCODE_V2_BIN"), STR_LEN("OPENCODE_V2_BIN"), &cfg_ptr, &cfg_len, &has_cfg);
     if !has_cfg || cfg_len == 0 {
-        sa_std_env_get(STR_PTR("CODEX_UI_OPENCODE_V2_BIN"), STR_LEN("CODEX_UI_OPENCODE_V2_BIN"), &cfg_ptr, &cfg_len, &has_cfg);
+        env_get_probe(STR_PTR("CODEX_UI_OPENCODE_V2_BIN"), STR_LEN("CODEX_UI_OPENCODE_V2_BIN"), &cfg_ptr, &cfg_len, &has_cfg);
     };
     if has_cfg {
         let tp: ptr = PTR_NULL();
@@ -1128,34 +1406,34 @@ fn findOpencodeV2Bin(out: &ProbePath) -> void {
     let home_ptr: ptr = PTR_NULL();
     let home_len: u64 = 0;
     let has_home = false;
-    sa_std_env_get(STR_PTR("USERPROFILE"), STR_LEN("USERPROFILE"), &home_ptr, &home_len, &has_home);
+    env_get_probe(STR_PTR("USERPROFILE"), STR_LEN("USERPROFILE"), &home_ptr, &home_len, &has_home);
     if !has_home {
-        sa_std_env_get(STR_PTR("HOME"), STR_LEN("HOME"), &home_ptr, &home_len, &has_home);
+        env_get_probe(STR_PTR("HOME"), STR_LEN("HOME"), &home_ptr, &home_len, &has_home);
     };
     if !has_home { home_len = 0; };
     let exe_ptr = STR_PTR("opencode");
     let exe_len = STR_LEN("opencode");
     let v2exe_ptr = STR_PTR("opencode2");
     let v2exe_len = STR_LEN("opencode2");
-    if sa_std_platform_is_win32() != 0 {
+    if platform_is_win32() != 0 {
         exe_ptr = STR_PTR("opencode.exe");
         exe_len = STR_LEN("opencode.exe");
         v2exe_ptr = STR_PTR("opencode2.exe");
         v2exe_len = STR_LEN("opencode2.exe");
     };
     // const candidates: string[] = [];
-    let candidates = ProbePathList { items: [ProbePath; 64], len: 0 };
+    let candidates = ProbePathList { items: [ProbePath { bytes: [0u8; 1024], len: 0 }; 64], len: 0 };
     // const preferred = ...getPreferredCliBinary("opencode-v2"); if (preferred) push
     let pref_ptr: ptr = PTR_NULL();
     let pref_len: u64 = 0;
     let has_pref = false;
-    sa_host_cli_preferred(STR_PTR("opencode-v2"), STR_LEN("opencode-v2"), &pref_ptr, &pref_len, &has_pref);
+    host_cli_preferred_probe(STR_PTR("opencode-v2"), STR_LEN("opencode-v2"), &pref_ptr, &pref_len, &has_pref);
     if has_pref { v2_push_candidate(&candidates, pref_ptr, pref_len); };
     // const cached = ...getCachedLatestCliPath("opencode-v2"); if (cached) push
     let lc_ptr: ptr = PTR_NULL();
     let lc_len: u64 = 0;
     let has_lc = false;
-    sa_host_cli_cached_latest(STR_PTR("opencode-v2"), STR_LEN("opencode-v2"), &lc_ptr, &lc_len, &has_lc);
+    host_cli_cached_latest_probe(STR_PTR("opencode-v2"), STR_LEN("opencode-v2"), &lc_ptr, &lc_len, &has_lc);
     if has_lc { v2_push_candidate(&candidates, lc_ptr, lc_len); };
     // const dirs = [OPENCODE_V2_INSTALL_DIR?, ~/.opencode-v2/bin, OPENCODE_INSTALL_DIR?,
     //   XDG_BIN_DIR?, ~/.opencode/bin, ~/bin, ~/.bun/bin, ~/.npm-global/bin]
@@ -1244,7 +1522,7 @@ fn v2_push_env_dir(list: &ProbePathList, name_ptr: ptr, name_len: u64, exe_ptr: 
     let v_ptr: ptr = PTR_NULL();
     let v_len: u64 = 0;
     let has_v = false;
-    sa_std_env_get(name_ptr, name_len, &v_ptr, &v_len, &has_v);
+    env_get_probe(name_ptr, name_len, &v_ptr, &v_len, &has_v);
     if !has_v { return; };
     let tp: ptr = PTR_NULL();
     let tl: u64 = 0;
@@ -1263,7 +1541,7 @@ fn v2_push_enumerated(list: &ProbePathList, kind_ptr: ptr, kind_len: u64) -> voi
         let p: ptr = PTR_NULL();
         let l: u64 = 0;
         let has = false;
-        sa_host_cli_enumerate_at(kind_ptr, kind_len, idx, &p, &l, &has);
+        host_cli_enumerate_at_probe(kind_ptr, kind_len, idx, &p, &l, &has);
         if !has { break; };
         v2_push_candidate(list, p, l);
         idx = idx + 1;

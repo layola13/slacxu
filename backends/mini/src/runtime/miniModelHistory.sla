@@ -1,5 +1,68 @@
 // Converted 1:1 from backends/mini/src/runtime/miniModelHistory.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
 @import "sa_std/io/print.sai"
+@import "sa_std/net.sai"
+@import "sa_std/identity.sai"
+@import "sa_std/ptr.sa"
+
+// ---------------------------------------------------------------------------
+// FIX (WeakMap rebind, sci 17323ae4): blob helpers for the
+// sa_idmap-backed history table. Blob layout:
+// [compat_len u64][compat bytes][messagesKey 64 bytes][items_count
+// u64][per item: json_len u64 + json bytes].
+// ---------------------------------------------------------------------------
+
+fn mmh_put_u64(p: ptr, off: u64, v: u64) -> void {
+    let x = v;
+    let k: u64 = 0;
+    while k < 8 {
+        let dst: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dst, p, off + k);
+        PTR_WRITE_U8(dst, (x % 256) as u8);
+        x = x / 256;
+        k = k + 1;
+    }
+}
+
+fn mmh_get_u64(p: ptr, off: u64) -> u64 {
+    let acc: u64 = 0;
+    let mult: u64 = 1;
+    let k: u64 = 0;
+    while k < 8 {
+        let b: u8 = 0;
+        let src: ptr = PTR_NULL();
+        PTR_BYTE_ADD(src, p, off + k);
+        PTR_BYTE_AT(b, src, 0);
+        acc = acc + (b as u64) * mult;
+        mult = mult * 256;
+        k = k + 1;
+    }
+    return acc;
+}
+
+fn mmh_copy(dst_base: ptr, dst_off: u64, src_base: ptr, src_off: u64, n: u64) -> void {
+    for i in 0..n {
+        let b: u8 = 0;
+        let src: ptr = PTR_NULL();
+        PTR_BYTE_ADD(src, src_base, src_off + i);
+        PTR_BYTE_AT(b, src, 0);
+        let dst: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dst, dst_base, dst_off + i);
+        PTR_WRITE_U8(dst, b);
+    }
+}
+
+fn mmh_bytes_eq(a: ptr, a_len: u64, b: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    for i in 0..a_len {
+        let x: u8 = 0;
+        PTR_BYTE_AT(x, a, i);
+        let y: u8 = 0;
+        PTR_BYTE_AT(y, b, i);
+        if x != y { return false; };
+    }
+    return true;
+}
+
 
 // TS: import { createHash } from "node:crypto"
 // DEFECT: Node API — node:crypto createHash("sha256") assumed via sa_std hash extern in fix pass; no direct node:crypto counterpart named here.
@@ -16,43 +79,130 @@ struct CachedHistory {
 }
 
 fn messagesKey(messages_json_ptr: ptr, messages_json_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
-    // return createHash("sha256").update(JSON.stringify(messages)).digest("hex")
-    // DEFECT: dynamic JSON — JSON.stringify of unknown[] approximated by caller-supplied JSON text buffer.
-    out_len = 64;
-    return 0;
+    // FIX: real binding — createHash("sha256").update(text)
+    // .digest("hex") is sa_std_net_sha256_hex (net.sai). The
+    // JSON.stringify(messages) input is approximated by the
+    // caller-supplied JSON text (documented conversion limit).
+    *out_len = 0;
+    return sa_std_net_sha256_hex(messages_json_ptr, messages_json_len, out_ptr, 64, out_len);
 }
 
 // TS: export class MiniModelHistoryCache { private readonly histories = new WeakMap<object, CachedHistory>(); ... }
 // DEFECT: class — converted to struct + functions taking &MiniModelHistoryCache as first arg (per brief).
-// DEFECT: WeakMap — no WeakMap / object-identity keys / GC semantics in SLA; approximated by fixed table keyed by session_id u64 supplied by caller.
+// FIX: WeakMap rebound to sa_idmap (identity.sai) — identity-keyed
+// side table with strong references; the session object is an
+// opaque u64 identity token supplied by the caller. No GC
+// reclamation is needed for correctness (TS deletes explicitly
+// on key mismatch and on delete()).
 struct MiniModelHistoryCache {
-    histories_keys: [u64; 64],
-    histories: [CachedHistory; 64],
-    histories_len: u64,
+    // FIX: sa_idmap handle (0 = not yet created) replaces the
+    // fixed 64-entry table; scratch packs/unpacks value blobs
+    // (1 MiB shape limit, documented in the header FIX note).
+    idmap: u64,
+    scratch: [u8; 1048576],
 }
 
 fn MiniModelHistoryCache_get(cache: &MiniModelHistoryCache, session_id: u64, compatibilityKey_ptr: ptr, compatibilityKey_len: u64, messages_json_ptr: ptr, messages_json_len: u64, out_items: &WireItem, out_items_len: &u64, out_found: &bool) -> i32 {
-    // history = this.histories.get(session); if (!history) return null
-    // try { if (history.compatibilityKey===compatibilityKey && history.messagesKey===messagesKey(messages))
-    //         return JSON.parse(JSON.stringify(history.items)) as WireItem[] } catch {}
-    // this.delete(session); return null
-    // DEFECT: dynamic JSON — deep-copy via JSON round-trip approximated by copying JSON buffers.
-    out_found = false;
+    *out_found = false;
+    *out_items_len = 0;
+    if cache.idmap == 0 { return 0; };
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &cache.scratch, 0);
+    let blen: u64 = 0;
+    if sa_idmap_get(cache.idmap, session_id, bp, 1048576, &blen) != 0 { return 0; };
+    // key check: compatibilityKey and messagesKey(messages) must
+    // both match, else delete + miss (TS control flow).
+    let clen = mmh_get_u64(bp, 0);
+    let compat_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(compat_p, bp, 8);
+    let key_ok = mmh_bytes_eq(compat_p, clen, compatibilityKey_ptr, compatibilityKey_len);
+    let mk: [u8; 64] = [0u8; 64];
+    let mk_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(mk_p, &mk, 0);
+    let mk_len: u64 = 0;
+    messagesKey(messages_json_ptr, messages_json_len, mk_p, &mk_len);
+    let stored_mk: ptr = PTR_NULL();
+    PTR_BYTE_ADD(stored_mk, bp, 8 + clen);
+    if key_ok { key_ok = mmh_bytes_eq(stored_mk, 64, mk_p, 64); };
+    if !key_ok {
+        sa_idmap_remove(cache.idmap, session_id);
+        return 0;
+    };
+    // unpack items (deep copy mirrors the TS JSON round-trip).
+    let cur = 8 + clen + 64;
+    let count = mmh_get_u64(bp, cur);
+    cur = cur + 8;
+    let out_base: ptr = PTR_NULL();
+    PTR_BYTE_ADD(out_base, &out_items.json, 0);
+    let n = count;
+    if n > 256 { n = 256; };
+    for idx in 0..n {
+        let jlen = mmh_get_u64(bp, cur);
+        cur = cur + 8;
+        let slot: ptr = PTR_NULL();
+        PTR_BYTE_ADD(slot, out_base, idx * 16392);
+        mmh_copy(slot, 0, bp, cur, jlen);
+        cur = cur + jlen;
+        mmh_put_u64(slot, 16384, jlen);
+    }
+    *out_items_len = n;
+    *out_found = true;
     return 0;
 }
 
 fn MiniModelHistoryCache_set(cache: &MiniModelHistoryCache, session_id: u64, compatibilityKey_ptr: ptr, compatibilityKey_len: u64, messages_json_ptr: ptr, messages_json_len: u64, items: &WireItem, items_len: u64, maxChars: u64, maxChars_finite: bool) -> bool {
-    // this.delete(session)
-    // if (!Number.isFinite(maxChars) || maxChars < 0) return false
+    // TS: this.delete(session) happens first, unconditionally.
+    if cache.idmap != 0 { sa_idmap_remove(cache.idmap, session_id); };
     if !maxChars_finite { return false; };
-    // try { serialized = JSON.stringify(items); if (serialized.length > maxChars) return false;
-    //       this.histories.set(session, { compatibilityKey, messagesKey: messagesKey(messages), items: JSON.parse(serialized) }); return true }
-    // catch { return false }
-    // DEFECT: dynamic JSON — serialization length / parse approximated over JSON text buffers.
-    return false;
+    // serialized length of the items array as JSON text:
+    // sum of item JSON lengths + brackets/commas (the caller
+    // supplies item JSON text; stringify approximated — see the
+    // header note for messagesKey).
+    let items_base: ptr = PTR_NULL();
+    PTR_BYTE_ADD(items_base, &items.json, 0);
+    let ser_len: u64 = 2;
+    for idx in 0..items_len {
+        let slot: ptr = PTR_NULL();
+        PTR_BYTE_ADD(slot, items_base, idx * 16392);
+        ser_len = ser_len + mmh_get_u64(slot, 16384);
+        if idx > 0 { ser_len = ser_len + 1; };
+    }
+    if ser_len > maxChars { return false; };
+    if cache.idmap == 0 {
+        let h: u64 = 0;
+        sa_idmap_new(&h);
+        cache.idmap = h;
+    };
+    if cache.idmap == 0 { return false; };
+    // pack the blob: compat, messagesKey, count, items.
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &cache.scratch, 0);
+    mmh_put_u64(bp, 0, compatibilityKey_len);
+    mmh_copy(bp, 8, compatibilityKey_ptr, 0, compatibilityKey_len);
+    let cur = 8 + compatibilityKey_len;
+    let mk_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(mk_p, bp, cur);
+    let mk_len: u64 = 0;
+    messagesKey(messages_json_ptr, messages_json_len, mk_p, &mk_len);
+    cur = cur + 64;
+    mmh_put_u64(bp, cur, items_len);
+    cur = cur + 8;
+    for idx in 0..items_len {
+        let slot: ptr = PTR_NULL();
+        PTR_BYTE_ADD(slot, items_base, idx * 16392);
+        let jlen = mmh_get_u64(slot, 16384);
+        if cur + 8 + jlen > 1048576 { return false; };
+        mmh_put_u64(bp, cur, jlen);
+        cur = cur + 8;
+        mmh_copy(bp, cur, slot, 0, jlen);
+        cur = cur + jlen;
+    }
+    sa_idmap_set(cache.idmap, session_id, bp, cur);
+    return true;
 }
 
 fn MiniModelHistoryCache_delete(cache: &MiniModelHistoryCache, session_id: u64) -> i32 {
-    // this.histories.delete(session) — linear table removal in fix pass
+    // FIX: real removal via sa_idmap_remove (was a no-op stub).
+    if cache.idmap != 0 { sa_idmap_remove(cache.idmap, session_id); };
     return 0;
 }

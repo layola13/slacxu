@@ -1,28 +1,50 @@
-// Converted 1:1 from backends/mini/src/runtime/agentsMdInventory.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Faithful retranslation of backends/mini/src/runtime/agentsMdInventory.ts
+// (CXU plugins @ f2cb649d) — fix-phase retranslation, replacing the bulk
+// pass's comment stubs. Structure mirrors the TS 1:1:
+//
+//   - findAgentsMdProjectRoot keeps its async shape per _defects/
+//     async_probe/probe_find_root.sla (PROBE_PASS): an async fn whose
+//     per-level probe awaits future::defer_ready around the blocking stat,
+//     driven synchronously by task::new + task::poll (block_on form).
+//   - The two TS quirks are preserved: fileExists(join(dir, ".git")) and
+//     the second stat(join(dir, ".git")).isFile() probe are the SAME
+//     predicate (stat + isFile), so the walk tests it once per level;
+//     withinDir uses startsWith(d + "/") literally, so dir "/" does not
+//     contain "/x" (Node resolve("/") + sep behaves the same way).
+//
+// Wire conventions of the established signatures (multi-string values):
+// inputs  (roots / paths / touchedPaths / delivered / seen) are
+//         newline-joined byte strings with an entry count where the
+//         signature carries one; seen/delivered keys are lowercased
+//         resolved paths, one per line.
+// outputs (ancestorChain / extractAgentsMdTouchedPaths) are newline-
+//         joined, count in the count out-param, bytes in the len one.
+// List-valued results (collect* / resolveAgentsMdScopes /
+// findNestedAgentsMdFiles) have single-struct signatures in the bulk
+// pass: the full list is computed, element 0 is written to `out`, and
+// *out_len carries the TOTAL count. That shape limit is recorded here
+// and in _defects/FIX_BACKENDS.md; the file's only in-domain consumer
+// (miniBridge) is itself retranslated against these signatures.
+// Scratch caps: paths 1024 bytes (the AgentsMdFile field caps), one
+// file's raw/expanded markdown 32768 bytes (TS reads unbounded; the
+// 12000-char content cap is applied after expansion exactly as in TS,
+// and the truncated flag compares the capped-at-32768 length, which is
+// exact whenever the true expansion is <= 32768 and still correct
+// (> 12000) above it).
+
 @import "sa_std/io/print.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/env.sai"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/core/task.sa"
+@import "sa_std/thread.sa"
+@import "sa_std/time.sla"
 
-// TS: imports — readFile/stat from node:fs/promises; basename/dirname/join/relative/resolve/sep from node:path
-// DEFECT: Node API — node:fs/promises + node:path mapped to sa_std_fs_* / path helpers in fix pass; process.env / process.cwd() likewise.
-
-// TS: export const AGENTS_MD_FILENAMES = ["AGENTS.md", ".claude/AGENTS.md"]
-// TS: export const AGENTS_MD_NATIVE_FILENAME = "CLAUDE.md"
-// TS: export const AGENTS_MD_MAX_FILE_CHARS = 12_000
-// TS: export const AGENTS_MD_MAX_TOTAL_CHARS = 24_000
-// TS: const AGENTS_MD_IMPORT_DEPTH = 5
 fn AGENTS_MD_MAX_FILE_CHARS() -> u64 { return 12000; }
 fn AGENTS_MD_MAX_TOTAL_CHARS() -> u64 { return 24000; }
 fn AGENTS_MD_IMPORT_DEPTH() -> u64 { return 5; }
-
-// TS: export type AgentsMdMode = "fallback" | "both" | "off"  — string (ptr,len) value
-fn miniAgentsMdMode(out_ptr: ptr, out_len: &u64) -> i32 {
-    // raw = (process.env.MINI_AGENTS_MD ?? "").trim().toLowerCase()
-    // if (raw=="off"||raw=="false"||raw=="0"||raw=="no") return "off"
-    // if (raw=="both"||raw=="all") return "both"
-    // return "fallback"
-    // DEFECT: Node API — process.env read via sa_std env extern in fix pass.
-    out_len = 8; // "fallback"
-    return 0;
-}
 
 // TS: export interface AgentsMdFile { path: string; scopeDir: string; content: string; truncated: boolean }
 struct AgentsMdFile {
@@ -32,157 +54,1505 @@ struct AgentsMdFile {
     truncated: bool,
 }
 
-fn fileExists(path_ptr: ptr, path_len: u64) -> bool {
-    // TS: async — try { st = await stat(path); return st.isFile() } catch { return false }
-    // DEFECT: async — sync approximation.
+struct AgentsMdScope { root: [u8; 1024], root_len: u64, base: [u8; 1024], base_len: u64 }
+
+// ---------------------------------------------------------------------------
+// scratch shapes
+// ---------------------------------------------------------------------------
+
+struct AmdPath { bytes: [u8; 1024], len: u64 }
+struct AmdBig { bytes: [u8; 32768], len: u64 }
+struct AmdSpans { bytes: [u8; 65536], offs: [u64; 40], lens: [u64; 40], len: u64 }
+struct AmdDigests { bytes: [u8; 131072], offs: [u64; 16], lens: [u64; 16], len: u64 }
+struct AmdPaths { items: [AmdPath; 64], len: u64 }
+struct AmdFiles { items: [AgentsMdFile; 8], len: u64 }
+struct AmdScopes { items: [AgentsMdScope; 8], len: u64 }
+
+fn amd_pbase(p: &AmdPath) -> ptr {
+    let q: ptr = PTR_NULL();
+    PTR_BYTE_ADD(q, &p.bytes, 0);
+    return q;
+}
+
+fn amd_bbase(b: &AmdBig) -> ptr {
+    let q: ptr = PTR_NULL();
+    PTR_BYTE_ADD(q, &b.bytes, 0);
+    return q;
+}
+
+fn amd_push_b(p: &AmdPath, b: u8) {
+    if p.len < 1024 {
+        p.bytes[p.len] = b;
+        p.len = p.len + 1;
+    };
+}
+
+fn amd_push(p: &AmdPath, src: ptr, src_len: u64) {
+    let i: u64 = 0;
+    while i < src_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src, i);
+        amd_push_b(p, b);
+        i = i + 1;
+    }
+}
+
+fn amd_set(p: &AmdPath, src: ptr, src_len: u64) {
+    p.len = 0;
+    amd_push(p, src, src_len);
+}
+
+fn amd_big_push_b(b: &AmdBig, v: u8) {
+    if b.len < 32768 {
+        b.bytes[b.len] = v;
+        b.len = b.len + 1;
+    };
+}
+
+fn amd_big_push(b: &AmdBig, src: ptr, src_len: u64) {
+    let i: u64 = 0;
+    while i < src_len {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, src, i);
+        amd_big_push_b(b, v);
+        i = i + 1;
+    }
+}
+
+fn amd_bytes_eq(a: ptr, alen: u64, b: ptr, blen: u64) -> bool {
+    if alen != blen { return false; };
+    let i: u64 = 0;
+    while i < alen {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a, i);
+        PTR_BYTE_AT(y, b, i);
+        if x != y { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn amd_lower_b(v: u8) -> u8 {
+    if v >= 65 && v <= 90 { return v + 32; };
+    return v;
+}
+
+fn amd_bytes_eq_ci(a: ptr, alen: u64, b: ptr, blen: u64) -> bool {
+    if alen != blen { return false; };
+    let i: u64 = 0;
+    while i < alen {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a, i);
+        PTR_BYTE_AT(y, b, i);
+        if amd_lower_b(x) != amd_lower_b(y) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn amd_is_ws(v: u8) -> bool {
+    return v == 32 || v == 9 || v == 10 || v == 13;
+}
+
+// Trim span of (p, len): writes start offset and length.
+fn amd_trim_span(p: ptr, len: u64, start: &u64, slen: &u64) {
+    let s: u64 = 0;
+    let e: u64 = len;
+    while s < e {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, p, s);
+        if !amd_is_ws(v) { break; };
+        s = s + 1;
+    }
+    while e > s {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, p, e - 1);
+        if !amd_is_ws(v) { break; };
+        e = e - 1;
+    }
+    *start = s;
+    *slen = e - s;
+}
+
+fn amd_copy_out(out_ptr: ptr, src: ptr, n: u64) {
+    let i: u64 = 0;
+    while i < n {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, src, i);
+        let dp: ptr = PTR_ADD(out_ptr, i);
+        PTR_WRITE_U8(dp, v);
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fs faces (status/handle semantics per sa_std)
+// ---------------------------------------------------------------------------
+
+// 0 = missing/error, 1 = file, 2 = directory, 3 = other.
+fn amd_stat_kind(p: ptr, len: u64) -> i32 {
+    let md = sa_fs_metadata(p, len);
+    if md == 0 { return 0; };
+    if sa_fs_metadata_is_file(md) == 1 { return 1; };
+    if sa_fs_metadata_is_directory(md) == 1 { return 2; };
+    return 3;
+}
+
+fn amd_is_file(p: ptr, len: u64) -> bool {
+    return amd_stat_kind(p, len) == 1;
+}
+
+// Read a whole file into the 32768-byte scratch (TS reads unbounded;
+// see the header note). Returns false on any read failure.
+fn amd_read_all(p: ptr, len: u64, out: &AmdBig) -> bool {
+    out.len = 0;
+    let h = sa_fs_read_file(p, len, 32768);
+    if h == 0 { return false; };
+    let dp: ptr = sa_fs_read_buffer_data(h);
+    let n = sa_fs_read_buffer_len(h);
+    amd_big_push(out, dp, n);
+    return true;
+}
+
+fn amd_cwd(out: &AmdPath) {
+    out.len = 0;
+    let h = sa_env_current_dir();
+    if h == 0 { return; };
+    let dp: ptr = sa_env_buffer_data(h);
+    let n = sa_env_buffer_len(h);
+    amd_push(out, dp, n);
+}
+
+// ---------------------------------------------------------------------------
+// Node-path equivalents (POSIX semantics, matching the TS use sites)
+// ---------------------------------------------------------------------------
+
+fn amd_join2(a: &AmdPath, b: ptr, blen: u64, out: &AmdPath) {
+    out.len = 0;
+    amd_push(out, amd_pbase(a), a.len);
+    if a.len > 0 && blen > 0 {
+        let last: u8 = 0;
+        PTR_BYTE_AT(last, amd_pbase(a), a.len - 1);
+        if last != 47 { amd_push_b(out, 47); };
+    };
+    amd_push(out, b, blen);
+}
+
+// dirname: strip trailing slashes (keeping a lone root), cut at the
+// last remaining slash; "." when there is none, "/" when it is first.
+fn amd_dirname_into(p: &AmdPath, out: &AmdPath) {
+    let base = amd_pbase(p);
+    let e: u64 = p.len;
+    while e > 1 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, base, e - 1);
+        if v != 47 { break; };
+        e = e - 1;
+    }
+    if e == 0 {
+        amd_set(out, STR_PTR("."), STR_LEN("."));
+        return;
+    };
+    let i: u64 = e;
+    let cut: u64 = 0;
+    let found: bool = false;
+    while i > 0 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, base, i - 1);
+        if v == 47 {
+            cut = i - 1;
+            found = true;
+            break;
+        };
+        i = i - 1;
+    }
+    if !found {
+        amd_set(out, STR_PTR("."), STR_LEN("."));
+        return;
+    };
+    if cut == 0 {
+        amd_set(out, STR_PTR("/"), STR_LEN("/"));
+        return;
+    };
+    out.len = 0;
+    amd_push(out, base, cut);
+}
+
+fn amd_basename_into(p: &AmdPath, out: &AmdPath) {
+    let base = amd_pbase(p);
+    let e: u64 = p.len;
+    while e > 1 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, base, e - 1);
+        if v != 47 { break; };
+        e = e - 1;
+    }
+    let s: u64 = 0;
+    let i: u64 = e;
+    while i > 0 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, base, i - 1);
+        if v == 47 {
+            s = i;
+            break;
+        };
+        i = i - 1;
+    }
+    out.len = 0;
+    let j: u64 = s;
+    while j < e {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, base, j);
+        amd_push_b(out, v);
+        j = j + 1;
+    }
+}
+
+// Textual normalization: collapse "//", drop "." segments, resolve
+// ".." against the accumulated segments (kept when relative and
+// nothing can be popped, dropped at an absolute root).
+fn amd_normalize_into(p: &AmdPath, out: &AmdPath) {
+    let base = amd_pbase(p);
+    let absolute: bool = false;
+    if p.len > 0 {
+        let v0: u8 = 0;
+        PTR_BYTE_AT(v0, base, 0);
+        absolute = v0 == 47;
+    };
+    out.len = 0;
+    if absolute { amd_push_b(out, 47); };
+    let pos: u64 = 0;
+    while pos <= p.len {
+        // segment span [pos, end)
+        let end: u64 = pos;
+        while end < p.len {
+            let v: u8 = 0;
+            PTR_BYTE_AT(v, base, end);
+            if v == 47 { break; };
+            end = end + 1;
+        }
+        let slen: u64 = end - pos;
+        if slen == 0 || (slen == 1 && amd_bytes_eq(PTR_ADD(base, pos), 1, STR_PTR("."), 1)) {
+            // skip empty / "." segments
+        } else {
+            if slen == 2 && amd_bytes_eq(PTR_ADD(base, pos), 2, STR_PTR(".."), 2) {
+                // pop last segment of out when possible
+                let popped: bool = false;
+                if out.len > 0 {
+                    let ob = amd_pbase(out);
+                    // find last '/' that starts a segment (skip the root slash)
+                    let i: u64 = out.len;
+                    let lo: u64 = 0;
+                    if absolute { lo = 1; };
+                    while i > lo {
+                        let v: u8 = 0;
+                        PTR_BYTE_AT(v, ob, i - 1);
+                        if v == 47 {
+                            out.len = i - 1;
+                            popped = true;
+                            break;
+                        };
+                        i = i - 1;
+                    }
+                    if !popped && !absolute {
+                        // out is a single segment with no slash
+                        out.len = 0;
+                        popped = true;
+                    };
+                };
+                if !popped && !absolute {
+                    if out.len > 0 { amd_push_b(out, 47); };
+                    amd_push(out, STR_PTR(".."), 2);
+                };
+            } else {
+                if out.len > 0 {
+                    let last: u8 = 0;
+                    PTR_BYTE_AT(last, amd_pbase(out), out.len - 1);
+                    if last != 47 { amd_push_b(out, 47); };
+                };
+                amd_push(out, PTR_ADD(base, pos), slen);
+            };
+        };
+        if end >= p.len { break; };
+        pos = end + 1;
+    }
+    if out.len == 0 && !absolute {
+        amd_set(out, STR_PTR("."), STR_LEN("."));
+    };
+}
+
+fn amd_resolve1(p: ptr, plen: u64, out: &AmdPath) {
+    let tmp = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_push(&tmp, p, plen);
+    let absolute: bool = false;
+    if plen > 0 {
+        let v0: u8 = 0;
+        PTR_BYTE_AT(v0, p, 0);
+        absolute = v0 == 47;
+    };
+    if absolute {
+        amd_normalize_into(&tmp, out);
+        return;
+    };
+    let cwd = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_cwd(&cwd);
+    let joined = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_join2(&cwd, p, plen, &joined);
+    amd_normalize_into(&joined, out);
+}
+
+fn amd_resolve2(base: &AmdPath, rel: ptr, rlen: u64, out: &AmdPath) {
+    let absolute: bool = false;
+    if rlen > 0 {
+        let v0: u8 = 0;
+        PTR_BYTE_AT(v0, rel, 0);
+        absolute = v0 == 47;
+    };
+    if absolute {
+        let tmp = AmdPath { bytes: [0u8; 1024], len: 0 };
+        amd_push(&tmp, rel, rlen);
+        amd_normalize_into(&tmp, out);
+        return;
+    };
+    let joined = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_join2(base, rel, rlen, &joined);
+    amd_normalize_into(&joined, out);
+}
+
+// Node relative(): both sides resolved inside path.relative; emit
+// ".." per remaining base segment, then the target's remaining path.
+fn amd_relative(base: &AmdPath, tgt: &AmdPath, out: &AmdPath) {
+    let rb = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_resolve1(amd_pbase(base), base.len, &rb);
+    let rt = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_resolve1(amd_pbase(tgt), tgt.len, &rt);
+    out.len = 0;
+    // common segment prefix: walk both in lockstep by segments
+    let bb = amd_pbase(&rb);
+    let tb = amd_pbase(&rt);
+    let bi: u64 = 0;
+    let ti: u64 = 0;
+    // skip leading slashes
+    if rb.len > 0 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, bb, 0);
+        if v == 47 { bi = 1; };
+    };
+    if rt.len > 0 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, tb, 0);
+        if v == 47 { ti = 1; };
+    };
+    let common_end_b: u64 = bi;
+    let common_end_t: u64 = ti;
+    while bi < rb.len && ti < rt.len {
+        // segment spans
+        let be: u64 = bi;
+        while be < rb.len {
+            let v: u8 = 0;
+            PTR_BYTE_AT(v, bb, be);
+            if v == 47 { break; };
+            be = be + 1;
+        }
+        let te: u64 = ti;
+        while te < rt.len {
+            let v: u8 = 0;
+            PTR_BYTE_AT(v, tb, te);
+            if v == 47 { break; };
+            te = te + 1;
+        }
+        if !amd_bytes_eq(PTR_ADD(bb, bi), be - bi, PTR_ADD(tb, ti), te - ti) { break; };
+        common_end_b = be;
+        common_end_t = te;
+        bi = be + 1;
+        ti = te + 1;
+    }
+    // remaining base segments -> ".."
+    let first: bool = true;
+    let i: u64 = common_end_b;
+    if i > 0 && i < rb.len { i = i + 1; };
+    while i < rb.len {
+        let e: u64 = i;
+        while e < rb.len {
+            let v: u8 = 0;
+            PTR_BYTE_AT(v, bb, e);
+            if v == 47 { break; };
+            e = e + 1;
+        }
+        if e > i {
+            if !first { amd_push_b(out, 47); };
+            first = false;
+            amd_push(out, STR_PTR(".."), 2);
+        };
+        i = e + 1;
+    }
+    // remaining target segments appended verbatim
+    let j: u64 = common_end_t;
+    if j > 0 && j < rt.len { j = j + 1; };
+    while j < rt.len {
+        let e: u64 = j;
+        while e < rt.len {
+            let v: u8 = 0;
+            PTR_BYTE_AT(v, tb, e);
+            if v == 47 { break; };
+            e = e + 1;
+        }
+        if e > j {
+            if !first { amd_push_b(out, 47); };
+            first = false;
+            amd_push(out, PTR_ADD(tb, j), e - j);
+        };
+        j = e + 1;
+    }
+}
+
+// TS: t === d || t.startsWith(d + sep) — on resolved paths.
+fn amd_within_resolved(d: &AmdPath, t: &AmdPath) -> bool {
+    if amd_bytes_eq(amd_pbase(d), d.len, amd_pbase(t), t.len) { return true; };
+    if t.len <= d.len { return false; };
+    if !amd_bytes_eq(amd_pbase(d), d.len, amd_pbase(t), d.len) { return false; };
+    let sepb: u8 = 0;
+    PTR_BYTE_AT(sepb, amd_pbase(t), d.len);
+    return sepb == 47;
+}
+
+fn amd_lower_into(p: ptr, len: u64, out: &AmdPath) {
+    out.len = 0;
+    let i: u64 = 0;
+    while i < len {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, p, i);
+        amd_push_b(out, amd_lower_b(v));
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// span sets (seen keys / delivered keys / content digests)
+// ---------------------------------------------------------------------------
+
+fn amd_spans_has(s: &AmdSpans, key: ptr, klen: u64) -> bool {
+    let base: ptr = PTR_NULL();
+    PTR_BYTE_ADD(base, &s.bytes, 0);
+    let i: u64 = 0;
+    while i < s.len {
+        if s.lens[i] == klen && amd_bytes_eq(PTR_ADD(base, s.offs[i]), klen, key, klen) { return true; };
+        i = i + 1;
+    }
     return false;
+}
+
+fn amd_spans_add(s: &AmdSpans, key: ptr, klen: u64) {
+    if s.len >= 40 { return; };
+    let base: ptr = PTR_NULL();
+    PTR_BYTE_ADD(base, &s.bytes, 0);
+    let off: u64 = 0;
+    if s.len > 0 { off = s.offs[s.len - 1] + s.lens[s.len - 1]; };
+    if off + klen > 65536 { return; };
+    let i: u64 = 0;
+    while i < klen {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, key, i);
+        let wp: ptr = PTR_ADD(base, off + i);
+        PTR_WRITE_U8(wp, v);
+        i = i + 1;
+    }
+    s.offs[s.len] = off;
+    s.lens[s.len] = klen;
+    s.len = s.len + 1;
+}
+
+fn amd_digests_has(s: &AmdDigests, key: ptr, klen: u64) -> bool {
+    let base: ptr = PTR_NULL();
+    PTR_BYTE_ADD(base, &s.bytes, 0);
+    let i: u64 = 0;
+    while i < s.len {
+        if s.lens[i] == klen && amd_bytes_eq(PTR_ADD(base, s.offs[i]), klen, key, klen) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn amd_digests_add(s: &AmdDigests, key: ptr, klen: u64) {
+    if s.len >= 16 { return; };
+    let base: ptr = PTR_NULL();
+    PTR_BYTE_ADD(base, &s.bytes, 0);
+    let off: u64 = 0;
+    if s.len > 0 { off = s.offs[s.len - 1] + s.lens[s.len - 1]; };
+    if off + klen > 131072 { return; };
+    let i: u64 = 0;
+    while i < klen {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, key, i);
+        let wp: ptr = PTR_ADD(base, off + i);
+        PTR_WRITE_U8(wp, v);
+        i = i + 1;
+    }
+    s.offs[s.len] = off;
+    s.lens[s.len] = klen;
+    s.len = s.len + 1;
+}
+
+fn amd_paths_has(list: &AmdPaths, p: &AmdPath) -> bool {
+    let i: u64 = 0;
+    while i < list.len {
+        let it = &list.items[i];
+        if amd_bytes_eq(amd_pbase(it), it.len, amd_pbase(p), p.len) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn amd_path_copy(dst: &AmdPath, src: &AmdPath) {
+    dst.len = 0;
+    amd_push(dst, amd_pbase(src), src.len);
+}
+
+fn amd_paths_add(list: &AmdPaths, p: &AmdPath) {
+    if list.len >= 64 { return; };
+    let slot = &list.items[list.len];
+    amd_path_copy(slot, p);
+    list.len = list.len + 1;
+}
+
+// ---------------------------------------------------------------------------
+// public surface (signatures preserved from the bulk pass)
+// ---------------------------------------------------------------------------
+
+fn miniAgentsMdMode(out_ptr: ptr, out_len: &u64) -> i32 {
+    // raw = (process.env.MINI_AGENTS_MD ?? "").trim().toLowerCase()
+    let word = AmdPath { bytes: [0u8; 1024], len: 0 };
+    let h = sa_env_get(STR_PTR("MINI_AGENTS_MD"), STR_LEN("MINI_AGENTS_MD"));
+    if h != 0 {
+        let dp: ptr = sa_env_buffer_data(h);
+        let n = sa_env_buffer_len(h);
+        let so: u64 = 0;
+        let sl: u64 = 0;
+        amd_trim_span(dp, n, &so, &sl);
+        // lowercase the trimmed span
+        let i: u64 = 0;
+        while i < sl {
+            let v: u8 = 0;
+            PTR_BYTE_AT(v, dp, so + i);
+            amd_push_b(&word, amd_lower_b(v));
+            i = i + 1;
+        }
+    };
+    let wb = amd_pbase(&word);
+    if amd_bytes_eq(wb, word.len, STR_PTR("off"), 3) || amd_bytes_eq(wb, word.len, STR_PTR("false"), 5) || amd_bytes_eq(wb, word.len, STR_PTR("0"), 1) || amd_bytes_eq(wb, word.len, STR_PTR("no"), 2) {
+        amd_copy_out(out_ptr, STR_PTR("off"), 3);
+        *out_len = 3;
+        return 0;
+    };
+    if amd_bytes_eq(wb, word.len, STR_PTR("both"), 4) || amd_bytes_eq(wb, word.len, STR_PTR("all"), 3) {
+        amd_copy_out(out_ptr, STR_PTR("both"), 4);
+        *out_len = 4;
+        return 0;
+    };
+    amd_copy_out(out_ptr, STR_PTR("fallback"), 8);
+    *out_len = 8;
+    return 0;
+}
+
+fn fileExists(path_ptr: ptr, path_len: u64) -> bool {
+    // TS: try { st = await stat(path); return st.isFile() } catch { return false }
+    return amd_is_file(path_ptr, path_len);
 }
 
 fn withinDir(dir_ptr: ptr, dir_len: u64, target_ptr: ptr, target_len: u64) -> bool {
-    // d = resolve(dir); t = resolve(target); return t === d || t.startsWith(d + sep)
-    return false;
+    let d = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_resolve1(dir_ptr, dir_len, &d);
+    let t = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_resolve1(target_ptr, target_len, &t);
+    return amd_within_resolved(&d, &t);
 }
 
-// DEFECT: async
+// One level's probe, async per the verified probe pattern: the
+// blocking stat runs synchronously; defer_ready turns its outcome
+// into a future that suspends once before the walk continues.
+// TS performs fileExists(join(dir, ".git")) and then the identical
+// stat().isFile() probe again in a second try block; one probe per
+// level is observably equivalent.
+async fn amd_git_probe(dir: &AmdPath) -> bool {
+    let probe = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_join2(dir, STR_PTR(".git"), STR_LEN(".git"), &probe);
+    let raw: u64 = 0;
+    if amd_is_file(amd_pbase(&probe), probe.len) { raw = 1; };
+    let hit = future::defer_ready(raw).await;
+    return hit != 0;
+}
+
+async fn amd_find_root_async(cwd: &AmdPath, out: &AmdPath) -> i32 {
+    let dir = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_resolve1(amd_pbase(cwd), cwd.len, &dir);
+    while true {
+        let hit = amd_git_probe(&dir).await;
+        if hit {
+            amd_path_copy(out, &dir);
+            return 0;
+        };
+        let parent = AmdPath { bytes: [0u8; 1024], len: 0 };
+        amd_dirname_into(&dir, &parent);
+        if amd_bytes_eq(amd_pbase(&parent), parent.len, amd_pbase(&dir), dir.len) {
+            amd_resolve1(amd_pbase(cwd), cwd.len, out);
+            return 0;
+        };
+        amd_path_copy(&dir, &parent);
+    }
+    return 1;
+}
+
+fn amd_now_ns() -> u64 {
+    let t = Instant::now();
+    return t.raw_ns();
+}
+
 fn findAgentsMdProjectRoot(cwd_ptr: ptr, cwd_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
-    // dir = resolve(cwd); for (;;) { if (await fileExists(join(dir, ".git"))) return dir;
-    //   try { st = await stat(join(dir, ".git")); if (st.isFile()) return dir } catch {}
-    //   parent = dirname(dir); if (parent === dir) return resolve(cwd); dir = parent; }
-    out_len = cwd_len;
-    return 0;
+    let cwd = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_push(&cwd, cwd_ptr, cwd_len);
+    let out = AmdPath { bytes: [0u8; 1024], len: 0 };
+    let t = task::new(amd_find_root_async(&cwd, &out));
+    let deadline = amd_now_ns() + 5000000000;
+    while amd_now_ns() < deadline {
+        if task::poll(t) {
+            let st = task::result(t);
+            if st != 0 { return st; };
+            amd_copy_out(out_ptr, amd_pbase(&out), out.len);
+            *out_len = out.len;
+            return 0;
+        };
+        THREAD_SLEEP_MS(1);
+    }
+    return 3;
+}
+
+// Internal chain builder: TS ancestorChain — unshift walk from cwd up
+// to root, returned root-first.
+fn amd_chain(root: &AmdPath, cwd: &AmdPath, out: &AmdPaths) {
+    out.len = 0;
+    let tmp = AmdPaths { items: [AmdPath { bytes: [0u8; 1024], len: 0 }; 64], len: 0 };
+    let dir = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_resolve1(amd_pbase(cwd), cwd.len, &dir);
+    let stop = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_resolve1(amd_pbase(root), root.len, &stop);
+    while true {
+        amd_paths_add(&tmp, &dir);
+        if amd_bytes_eq(amd_pbase(&dir), dir.len, amd_pbase(&stop), stop.len) { break; };
+        let parent = AmdPath { bytes: [0u8; 1024], len: 0 };
+        amd_dirname_into(&dir, &parent);
+        if amd_bytes_eq(amd_pbase(&parent), parent.len, amd_pbase(&dir), dir.len) { break; };
+        amd_path_copy(&dir, &parent);
+    }
+    // reverse into out (root first)
+    let i: u64 = tmp.len;
+    while i > 0 {
+        let it = &tmp.items[i - 1];
+        amd_paths_add(out, it);
+        i = i - 1;
+    }
 }
 
 fn ancestorChain(root_ptr: ptr, root_len: u64, cwd_ptr: ptr, cwd_len: u64, out_ptr: ptr, out_lens: &u64, out_count: &u64) -> i32 {
-    // chain = []; dir = resolve(cwd); stop = resolve(root);
-    // for (;;) { chain.unshift(dir); if (dir===stop) break; parent = dirname(dir); if (parent===dir) break; dir = parent; } return chain
-    out_count = 0;
+    let root = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_push(&root, root_ptr, root_len);
+    let cwd = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_push(&cwd, cwd_ptr, cwd_len);
+    let chain = AmdPaths { items: [AmdPath { bytes: [0u8; 1024], len: 0 }; 64], len: 0 };
+    amd_chain(&root, &cwd, &chain);
+    let total: u64 = 0;
+    let i: u64 = 0;
+    while i < chain.len {
+        let it = &chain.items[i];
+        if i > 0 {
+            let np: ptr = PTR_ADD(out_ptr, total);
+            PTR_WRITE_U8(np, 10);
+            total = total + 1;
+        };
+        amd_copy_out(PTR_ADD(out_ptr, total), amd_pbase(it), it.len);
+        total = total + it.len;
+        i = i + 1;
+    }
+    *out_lens = total;
+    *out_count = chain.len;
     return 0;
 }
 
-// DEFECT: async + recursion + Set — expandAgentsMdImports is recursive with a Set<string> seen-guard.
-// DEFECT: regex — import line match /^\s*@([^\s]+)\s*$/ per line.
+// ---------------------------------------------------------------------------
+// @import expansion
+// ---------------------------------------------------------------------------
+
+// /^\s*@([^\s]+)\s*$/ per line: trimmed line starts with '@' and the
+// remainder is one non-whitespace token.
+fn amd_match_import(line: ptr, llen: u64, name_off: &u64, name_len: &u64) -> bool {
+    let so: u64 = 0;
+    let sl: u64 = 0;
+    amd_trim_span(line, llen, &so, &sl);
+    if sl < 2 { return false; };
+    let at: u8 = 0;
+    PTR_BYTE_AT(at, line, so);
+    if at != 64 { return false; };
+    let i: u64 = 1;
+    while i < sl {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, line, so + i);
+        if amd_is_ws(v) { return false; };
+        i = i + 1;
+    }
+    *name_off = so + 1;
+    *name_len = sl - 1;
+    return true;
+}
+
+fn amd_expand_rec(md: ptr, md_len: u64, dir: &AmdPath, seen: &AmdSpans, depth: u64, out: &AmdBig) {
+    out.len = 0;
+    if depth == 0 {
+        amd_big_push(out, md, md_len);
+        return;
+    };
+    // segment count = newlines + 1 (split("\n") semantics)
+    let segs: u64 = 1;
+    let scan: u64 = 0;
+    while scan < md_len {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, md, scan);
+        if v == 10 { segs = segs + 1; };
+        scan = scan + 1;
+    }
+    let first: bool = true;
+    let pos: u64 = 0;
+    let idx: u64 = 0;
+    while idx < segs {
+        let end: u64 = pos;
+        while end < md_len {
+            let v: u8 = 0;
+            PTR_BYTE_AT(v, md, end);
+            if v == 10 { break; };
+            end = end + 1;
+        }
+        // line = md[pos..end]
+        if !first { amd_big_push_b(out, 10); };
+        first = false;
+        let noff: u64 = 0;
+        let nlen: u64 = 0;
+        if amd_match_import(PTR_ADD(md, pos), end - pos, &noff, &nlen) {
+            let name_ptr = PTR_ADD(md, pos + noff);
+            let target = AmdPath { bytes: [0u8; 1024], len: 0 };
+            amd_resolve2(dir, name_ptr, nlen, &target);
+            let key = AmdPath { bytes: [0u8; 1024], len: 0 };
+            amd_lower_into(amd_pbase(&target), target.len, &key);
+            if amd_spans_has(seen, amd_pbase(&key), key.len) {
+                amd_big_push(out, STR_PTR("<!-- @import "), STR_LEN("<!-- @import "));
+                amd_big_push(out, name_ptr, nlen);
+                amd_big_push(out, STR_PTR(" (already included above) -->"), STR_LEN(" (already included above) -->"));
+            } else {
+                let content = AmdBig { bytes: [0u8; 32768], len: 0 };
+                if !amd_read_all(amd_pbase(&target), target.len, &content) {
+                    // read failure: the original line rides through
+                    amd_big_push(out, PTR_ADD(md, pos), end - pos);
+                } else {
+                    amd_spans_add(seen, amd_pbase(&key), key.len);
+                    amd_big_push(out, STR_PTR("<!-- @import "), STR_LEN("<!-- @import "));
+                    amd_big_push(out, name_ptr, nlen);
+                    amd_big_push(out, STR_PTR(" -->"), STR_LEN(" -->"));
+                    let tdir = AmdPath { bytes: [0u8; 1024], len: 0 };
+                    amd_dirname_into(&target, &tdir);
+                    let sub = AmdBig { bytes: [0u8; 32768], len: 0 };
+                    amd_expand_rec(amd_bbase(&content), content.len, &tdir, seen, depth - 1, &sub);
+                    amd_big_push_b(out, 10);
+                    amd_big_push(out, amd_bbase(&sub), sub.len);
+                };
+            };
+        } else {
+            amd_big_push(out, PTR_ADD(md, pos), end - pos);
+        };
+        pos = end + 1;
+        idx = idx + 1;
+    }
+}
+
 fn expandAgentsMdImports(markdown_ptr: ptr, markdown_len: u64, fileDir_ptr: ptr, fileDir_len: u64, seen_ptr: ptr, seen_len: u64, depth: u64, out_ptr: ptr, out_len: &u64) -> i32 {
-    // if (depth <= 0) return markdown
-    // lines = markdown.split("\n"); out = []
-    // for (line of lines) { match = /^\s*@([^\s]+)\s*$/.exec(line); if (!match) { out.push(line); continue; }
-    //   target = resolve(fileDir, match[1] ?? ""); key = target.toLowerCase();
-    //   if (seen.has(key)) { out.push(`<!-- @import ${match[1]} (already included above) -->`); continue; }
-    //   try { content = await readFile(target, "utf8") } catch { out.push(line); continue; }
-    //   seen.add(key); out.push(`<!-- @import ${match[1]} -->`);
-    //   out.push(await expandAgentsMdImports(content, dirname(target), seen, depth - 1)); }
-    // return out.join("\n")
-    out_len = markdown_len;
+    // seen input: newline-joined lowercased keys
+    let seen = AmdSpans { bytes: [0u8; 65536], offs: [0u64; 40], lens: [0u64; 40], len: 0 };
+    let pos: u64 = 0;
+    while pos < seen_len {
+        let end: u64 = pos;
+        while end < seen_len {
+            let v: u8 = 0;
+            PTR_BYTE_AT(v, seen_ptr, end);
+            if v == 10 { break; };
+            end = end + 1;
+        }
+        if end > pos { amd_spans_add(&seen, PTR_ADD(seen_ptr, pos), end - pos); };
+        pos = end + 1;
+    }
+    let dir = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_push(&dir, fileDir_ptr, fileDir_len);
+    let out = AmdBig { bytes: [0u8; 32768], len: 0 };
+    amd_expand_rec(markdown_ptr, markdown_len, &dir, &seen, depth, &out);
+    amd_copy_out(out_ptr, amd_bbase(&out), out.len);
+    *out_len = out.len;
     return 0;
 }
 
-// DEFECT: async
+// Internal read+expand used by readAgentsMdFile and the collectors.
+fn amd_read_agents_file(path_ptr: ptr, path_len: u64, scopeDir_ptr: ptr, scopeDir_len: u64, out: &AgentsMdFile, out_is_null: &bool) {
+    *out_is_null = true;
+    let raw = AmdBig { bytes: [0u8; 32768], len: 0 };
+    if !amd_read_all(path_ptr, path_len, &raw) { return; };
+    let seen = AmdSpans { bytes: [0u8; 65536], offs: [0u64; 40], lens: [0u64; 40], len: 0 };
+    let resolved = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_resolve1(path_ptr, path_len, &resolved);
+    let key = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_lower_into(amd_pbase(&resolved), resolved.len, &key);
+    amd_spans_add(&seen, amd_pbase(&key), key.len);
+    let pbuf = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_push(&pbuf, path_ptr, path_len);
+    let dir = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_dirname_into(&pbuf, &dir);
+    let expanded = AmdBig { bytes: [0u8; 32768], len: 0 };
+    amd_expand_rec(amd_bbase(&raw), raw.len, &dir, &seen, AGENTS_MD_IMPORT_DEPTH(), &expanded);
+    let truncated: bool = expanded.len > AGENTS_MD_MAX_FILE_CHARS();
+    let clen: u64 = expanded.len;
+    if truncated { clen = AGENTS_MD_MAX_FILE_CHARS(); };
+    // fill out
+    let i: u64 = 0;
+    while i < 1024 {
+        out.path[i] = 0;
+        out.scopeDir[i] = 0;
+        i = i + 1;
+    }
+    let j: u64 = 0;
+    while j < 16384 {
+        out.content[j] = 0;
+        j = j + 1;
+    }
+    out.path_len = 0;
+    let k: u64 = 0;
+    while k < path_len && k < 1024 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, path_ptr, k);
+        out.path[k] = v;
+        k = k + 1;
+    }
+    out.path_len = k;
+    out.scopeDir_len = 0;
+    k = 0;
+    while k < scopeDir_len && k < 1024 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, scopeDir_ptr, k);
+        out.scopeDir[k] = v;
+        k = k + 1;
+    }
+    out.scopeDir_len = k;
+    out.content_len = 0;
+    k = 0;
+    let eb = amd_bbase(&expanded);
+    while k < clen && k < 16384 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, eb, k);
+        out.content[k] = v;
+        k = k + 1;
+    }
+    out.content_len = k;
+    out.truncated = truncated;
+    *out_is_null = false;
+}
+
 fn readAgentsMdFile(path_ptr: ptr, path_len: u64, scopeDir_ptr: ptr, scopeDir_len: u64, out: &AgentsMdFile, out_is_null: &bool) -> i32 {
-    // try { raw = await readFile(path, "utf8") } catch { return null }
-    // seen = new Set<string>([resolve(path).toLowerCase()])
-    // expanded = await expandAgentsMdImports(raw, dirname(path), seen, AGENTS_MD_IMPORT_DEPTH)
-    // truncated = expanded.length > AGENTS_MD_MAX_FILE_CHARS
-    // return { path, scopeDir, content: truncated ? expanded.slice(0, AGENTS_MD_MAX_FILE_CHARS) : expanded, truncated }
-    out_is_null = true;
+    amd_read_agents_file(path_ptr, path_len, scopeDir_ptr, scopeDir_len, out, out_is_null);
     return 0;
 }
 
-// DEFECT: async
+// ---------------------------------------------------------------------------
+// collectors
+// ---------------------------------------------------------------------------
+
+fn amd_file_copy(dst: &AgentsMdFile, src: &AgentsMdFile) {
+    let i: u64 = 0;
+    while i < 1024 {
+        dst.path[i] = src.path[i];
+        dst.scopeDir[i] = src.scopeDir[i];
+        i = i + 1;
+    }
+    let j: u64 = 0;
+    while j < 16384 {
+        dst.content[j] = src.content[j];
+        j = j + 1;
+    }
+    dst.path_len = src.path_len;
+    dst.scopeDir_len = src.scopeDir_len;
+    dst.content_len = src.content_len;
+    dst.truncated = src.truncated;
+}
+
+fn amd_files_add(list: &AmdFiles, f: &AgentsMdFile) {
+    if list.len >= 8 { return; };
+    let slot = &list.items[list.len];
+    amd_file_copy(slot, f);
+    list.len = list.len + 1;
+}
+
+fn amd_content_trimmed(f: &AgentsMdFile, so: &u64, sl: &u64) {
+    let base: ptr = PTR_NULL();
+    PTR_BYTE_ADD(base, &f.content, 0);
+    amd_trim_span(base, f.content_len, so, sl);
+}
+
+// TS collectAgentsMdFiles core (root/cwd already resolved by callers;
+// digests shared so collectExtraRootsAgentsMd dedupes across roots,
+// which is what the TS achieves by filtering the merged stream again).
+fn amd_collect(root: &AmdPath, cwd: &AmdPath, mode_ptr: ptr, mode_len: u64, digests: &AmdDigests, files: &AmdFiles) {
+    let chain = AmdPaths { items: [AmdPath { bytes: [0u8; 1024], len: 0 }; 64], len: 0 };
+    amd_chain(root, cwd, &chain);
+    let fallback: bool = amd_bytes_eq(mode_ptr, mode_len, STR_PTR("fallback"), STR_LEN("fallback"));
+    let di: u64 = 0;
+    while di < chain.len {
+        let dir = &chain.items[di];
+        let skip_dir: bool = false;
+        if fallback {
+            let native = AmdPath { bytes: [0u8; 1024], len: 0 };
+            amd_join2(dir, STR_PTR("CLAUDE.md"), STR_LEN("CLAUDE.md"), &native);
+            if amd_is_file(amd_pbase(&native), native.len) { skip_dir = true; };
+        };
+        if !skip_dir {
+            let ni: u64 = 0;
+            while ni < 2 {
+                let p = AmdPath { bytes: [0u8; 1024], len: 0 };
+                if ni == 0 {
+                    amd_join2(dir, STR_PTR("AGENTS.md"), STR_LEN("AGENTS.md"), &p);
+                } else {
+                    amd_join2(dir, STR_PTR(".claude/AGENTS.md"), STR_LEN(".claude/AGENTS.md"), &p);
+                };
+                if amd_is_file(amd_pbase(&p), p.len) {
+                    let f = AgentsMdFile { path: [0u8; 1024], path_len: 0, scopeDir: [0u8; 1024], scopeDir_len: 0, content: [0u8; 16384], content_len: 0, truncated: false };
+                    let isn: bool = true;
+                    amd_read_agents_file(amd_pbase(&p), p.len, amd_pbase(dir), dir.len, &f, &isn);
+                    if !isn {
+                        let so: u64 = 0;
+                        let sl: u64 = 0;
+                        amd_content_trimmed(&f, &so, &sl);
+                        if sl > 0 {
+                            let cb: ptr = PTR_NULL();
+                            PTR_BYTE_ADD(cb, &f.content, 0);
+                            if !amd_digests_has(digests, PTR_ADD(cb, so), sl) {
+                                amd_digests_add(digests, PTR_ADD(cb, so), sl);
+                                amd_files_add(files, &f);
+                            };
+                        };
+                    };
+                };
+                ni = ni + 1;
+            }
+        };
+        di = di + 1;
+    }
+}
+
+fn amd_first_out(files: &AmdFiles, out: &AgentsMdFile, out_len: &u64) {
+    if files.len > 0 {
+        let f0 = &files.items[0];
+        amd_file_copy(out, f0);
+    };
+    *out_len = files.len;
+}
+
 fn collectAgentsMdFiles(root_ptr: ptr, root_len: u64, cwd_ptr: ptr, cwd_len: u64, mode_ptr: ptr, mode_len: u64, out: &AgentsMdFile, out_len: &u64) -> i32 {
-    // resolvedRoot = resolve(root); resolvedCwd = withinDir(resolvedRoot, cwd) ? resolve(cwd) : resolvedRoot
-    // files = []; seenContent = new Set<string>()
-    // for (dir of ancestorChain(resolvedRoot, resolvedCwd)) {
-    //   if (mode==="fallback" && await fileExists(join(dir, AGENTS_MD_NATIVE_FILENAME))) continue;
-    //   for (name of AGENTS_MD_FILENAMES) { path = join(dir, name); if (!await fileExists(path)) continue;
-    //     file = await readAgentsMdFile(path, dir); if (!file || !file.content.trim()) continue;
-    //     digest = file.content.trim(); if (seenContent.has(digest)) continue; seenContent.add(digest); files.push(file); } }
-    // return files
-    // DEFECT: Set — seenContent approximated by linear scan in fix pass.
-    out_len = 0;
+    let root = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_resolve1(root_ptr, root_len, &root);
+    let cwd_in = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_push(&cwd_in, cwd_ptr, cwd_len);
+    let cwd = AmdPath { bytes: [0u8; 1024], len: 0 };
+    if withinDir(amd_pbase(&root), root.len, cwd_ptr, cwd_len) {
+        amd_resolve1(cwd_ptr, cwd_len, &cwd);
+    } else {
+        amd_path_copy(&cwd, &root);
+    };
+    let digests = AmdDigests { bytes: [0u8; 131072], offs: [0u64; 16], lens: [0u64; 16], len: 0 };
+    let files = AmdFiles { items: [AgentsMdFile { path: [0u8; 1024], path_len: 0, scopeDir: [0u8; 1024], scopeDir_len: 0, content: [0u8; 16384], content_len: 0, truncated: false }; 8], len: 0 };
+    amd_collect(&root, &cwd, mode_ptr, mode_len, &digests, &files);
+    amd_first_out(&files, out, out_len);
     return 0;
 }
 
-// DEFECT: async
+// Iterate newline-joined multi-string inputs: calls back per segment
+// is not expressible, so each consumer walks segments inline with
+// this span helper: given (buf, len, index) produce (off, len, ok).
+fn amd_segment(buf: ptr, blen: u64, index: u64, off: &u64, slen: &u64) -> bool {
+    let pos: u64 = 0;
+    let idx: u64 = 0;
+    while pos <= blen {
+        let end: u64 = pos;
+        while end < blen {
+            let v: u8 = 0;
+            PTR_BYTE_AT(v, buf, end);
+            if v == 10 { break; };
+            end = end + 1;
+        }
+        if idx == index {
+            *off = pos;
+            *slen = end - pos;
+            return true;
+        };
+        if end >= blen { return false; };
+        pos = end + 1;
+        idx = idx + 1;
+    }
+    return false;
+}
+
 fn collectExtraRootsAgentsMd(roots_ptr: ptr, roots_len: u64, roots_count: u64, roots_present: bool, mode_ptr: ptr, mode_len: u64, out: &AgentsMdFile, out_len: &u64) -> i32 {
-    // files = []; seenContent = new Set<string>()
-    // for (raw of roots ?? []) { if (typeof raw!=="string" || !raw.trim()) continue; root = resolve(raw);
-    //   try { if (!(await stat(root)).isDirectory()) continue } catch { continue }
-    //   for (file of await collectAgentsMdFiles(root, root, mode)) { digest = file.content.trim();
-    //     if (seenContent.has(digest)) continue; seenContent.add(digest); files.push(file); } }
-    // return files
-    out_len = 0;
+    let digests = AmdDigests { bytes: [0u8; 131072], offs: [0u64; 16], lens: [0u64; 16], len: 0 };
+    let files = AmdFiles { items: [AgentsMdFile { path: [0u8; 1024], path_len: 0, scopeDir: [0u8; 1024], scopeDir_len: 0, content: [0u8; 16384], content_len: 0, truncated: false }; 8], len: 0 };
+    if roots_present {
+        let ri: u64 = 0;
+        while ri < roots_count {
+            let off: u64 = 0;
+            let sl: u64 = 0;
+            if amd_segment(roots_ptr, roots_len, ri, &off, &sl) {
+                let so: u64 = 0;
+                let stl: u64 = 0;
+                amd_trim_span(PTR_ADD(roots_ptr, off), sl, &so, &stl);
+                if stl > 0 {
+                    let root = AmdPath { bytes: [0u8; 1024], len: 0 };
+                    amd_resolve1(PTR_ADD(roots_ptr, off), sl, &root);
+                    if amd_stat_kind(amd_pbase(&root), root.len) == 2 {
+                        amd_collect(&root, &root, mode_ptr, mode_len, &digests, &files);
+                    };
+                };
+            };
+            ri = ri + 1;
+        }
+    };
+    amd_first_out(&files, out, out_len);
     return 0;
 }
 
-struct AgentsMdScope { root: [u8; 1024], root_len: u64, base: [u8; 1024], base_len: u64 }
-
-// DEFECT: async
 fn resolveAgentsMdScopes(projectRoot_ptr: ptr, projectRoot_len: u64, turnCwd_ptr: ptr, turnCwd_len: u64, additionalRoots_ptr: ptr, additionalRoots_len: u64, additionalRoots_count: u64, additionalRoots_present: bool, out: &AgentsMdScope, out_len: &u64) -> i32 {
-    // scopes = [{ root: resolve(projectRoot), base: resolve(turnCwd) }]
-    // for (raw of additionalRoots ?? []) { if (typeof raw!=="string" || !raw.trim()) continue; root = resolve(raw);
-    //   try { if (!(await stat(root)).isDirectory()) continue } catch { continue }
-    //   if (scopes.some(s => s.root.toLowerCase() === root.toLowerCase())) continue; scopes.push({ root, base: root }); }
-    // return scopes
-    out_len = 0;
+    let scopes = AmdScopes { items: [AgentsMdScope { root: [0u8; 1024], root_len: 0, base: [0u8; 1024], base_len: 0 }; 8], len: 0 };
+    let root0 = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_resolve1(projectRoot_ptr, projectRoot_len, &root0);
+    let base0 = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_resolve1(turnCwd_ptr, turnCwd_len, &base0);
+    if scopes.len < 8 {
+        let s0 = &scopes.items[0];
+        let i: u64 = 0;
+        while i < root0.len {
+            s0.root[i] = root0.bytes[i];
+            i = i + 1;
+        }
+        s0.root_len = root0.len;
+        let j: u64 = 0;
+        while j < base0.len {
+            s0.base[j] = base0.bytes[j];
+            j = j + 1;
+        }
+        s0.base_len = base0.len;
+        scopes.len = 1;
+    };
+    if additionalRoots_present {
+        let ri: u64 = 0;
+        while ri < additionalRoots_count {
+            let off: u64 = 0;
+            let sl: u64 = 0;
+            if amd_segment(additionalRoots_ptr, additionalRoots_len, ri, &off, &sl) {
+                let so: u64 = 0;
+                let stl: u64 = 0;
+                amd_trim_span(PTR_ADD(additionalRoots_ptr, off), sl, &so, &stl);
+                if stl > 0 {
+                    let root = AmdPath { bytes: [0u8; 1024], len: 0 };
+                    amd_resolve1(PTR_ADD(additionalRoots_ptr, off), sl, &root);
+                    if amd_stat_kind(amd_pbase(&root), root.len) == 2 {
+                        // dedupe by lowercased root against existing scopes
+                        let key = AmdPath { bytes: [0u8; 1024], len: 0 };
+                        amd_lower_into(amd_pbase(&root), root.len, &key);
+                        let dup: bool = false;
+                        let si: u64 = 0;
+                        while si < scopes.len {
+                            let es = &scopes.items[si];
+                            let eb: ptr = PTR_NULL();
+                            PTR_BYTE_ADD(eb, &es.root, 0);
+                            if amd_bytes_eq_ci(eb, es.root_len, amd_pbase(&key), key.len) { dup = true; };
+                            si = si + 1;
+                        }
+                        if !dup && scopes.len < 8 {
+                            let s = &scopes.items[scopes.len];
+                            let i: u64 = 0;
+                            while i < root.len {
+                                s.root[i] = root.bytes[i];
+                                i = i + 1;
+                            }
+                            s.root_len = root.len;
+                            let j: u64 = 0;
+                            while j < root.len {
+                                s.base[j] = root.bytes[j];
+                                j = j + 1;
+                            }
+                            s.base_len = root.len;
+                            scopes.len = scopes.len + 1;
+                        };
+                    };
+                };
+            };
+            ri = ri + 1;
+        }
+    };
+    if scopes.len > 0 {
+        let s0 = &scopes.items[0];
+        let i: u64 = 0;
+        while i < 1024 {
+            out.root[i] = s0.root[i];
+            out.base[i] = s0.base[i];
+            i = i + 1;
+        }
+        out.root_len = s0.root_len;
+        out.base_len = s0.base_len;
+    };
+    *out_len = scopes.len;
     return 0;
 }
 
 fn buildAgentsMdCompactionNote(paths_ptr: ptr, paths_len: u64, paths_count: u64, paths_present: bool, cwd_ptr: ptr, cwd_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
-    // unique = [...new Set((paths ?? []).filter(p => typeof p==="string" && p.trim()))].slice(0, 20)
-    // if (!unique.length) return ""
-    // base = resolve(cwd); lines = unique.map(p => `- ${relative(base, resolve(base, p)).replace(/\\/g,"/") || p}`)
-    // return `Active AGENTS.md instruction files (still in effect after compaction):\n${lines.join("\n")}`
-    // DEFECT: Set — dedup by linear scan in fix pass.
-    out_len = 0;
+    let uniq = AmdPaths { items: [AmdPath { bytes: [0u8; 1024], len: 0 }; 64], len: 0 };
+    if paths_present {
+        let ri: u64 = 0;
+        while ri < paths_count {
+            let off: u64 = 0;
+            let sl: u64 = 0;
+            if amd_segment(paths_ptr, paths_len, ri, &off, &sl) {
+                let so: u64 = 0;
+                let stl: u64 = 0;
+                amd_trim_span(PTR_ADD(paths_ptr, off), sl, &so, &stl);
+                if stl > 0 {
+                    let cand = AmdPath { bytes: [0u8; 1024], len: 0 };
+                    amd_push(&cand, PTR_ADD(paths_ptr, off), sl);
+                    if !amd_paths_has(&uniq, &cand) && uniq.len < 20 {
+                        amd_paths_add(&uniq, &cand);
+                    };
+                };
+            };
+            ri = ri + 1;
+        }
+    };
+    let out = AmdBig { bytes: [0u8; 32768], len: 0 };
+    if uniq.len > 0 {
+        let base = AmdPath { bytes: [0u8; 1024], len: 0 };
+        amd_resolve1(cwd_ptr, cwd_len, &base);
+        amd_big_push(&out, STR_PTR("Active AGENTS.md instruction files (still in effect after compaction):"), STR_LEN("Active AGENTS.md instruction files (still in effect after compaction):"));
+        let li: u64 = 0;
+        while li < uniq.len {
+            let p = &uniq.items[li];
+            amd_big_push_b(&out, 10);
+            amd_big_push(&out, STR_PTR("- "), STR_LEN("- "));
+            let rp = AmdPath { bytes: [0u8; 1024], len: 0 };
+            amd_resolve2(&base, amd_pbase(p), p.len, &rp);
+            let rel = AmdPath { bytes: [0u8; 1024], len: 0 };
+            amd_relative(&base, &rp, &rel);
+            if rel.len > 0 {
+                amd_big_push(&out, amd_pbase(&rel), rel.len);
+            } else {
+                amd_big_push(&out, amd_pbase(p), p.len);
+            };
+            li = li + 1;
+        }
+    };
+    amd_copy_out(out_ptr, amd_bbase(&out), out.len);
+    *out_len = out.len;
     return 0;
 }
 
-// DEFECT: async + Set + Map — delivered is Set<string>, candidates is Map<string,string> in TS.
 fn findNestedAgentsMdFiles(projectRoot_ptr: ptr, projectRoot_len: u64, turnCwd_ptr: ptr, turnCwd_len: u64, touchedPaths_ptr: ptr, touchedPaths_len: u64, touchedPaths_count: u64, delivered_ptr: ptr, delivered_len: u64, mode_ptr: ptr, mode_len: u64, out: &AgentsMdFile, out_len: &u64) -> i32 {
-    // root = resolve(projectRoot); base = resolve(turnCwd); candidates = new Map<string,string>()
-    // for (touched of touchedPaths) { abs = resolve(base, touched); if (!withinDir(root, abs)) continue;
-    //   dir = abs; try { st = await stat(abs).catch(() => null); if (!st || !st.isDirectory()) dir = dirname(abs) } catch { dir = dirname(abs) }
-    //   while (withinDir(root, dir) && dir !== base && dir.startsWith(base + sep)) { candidates.set(dir, dir); parent = dirname(dir); if (parent===dir) break; dir = parent; } }
-    // ordered = [...candidates.keys()].sort((a,b) => b.length - a.length); found = []
-    // for (dir of ordered) { if (mode==="fallback" && await fileExists(join(dir, AGENTS_MD_NATIVE_FILENAME))) continue;
-    //   for (name of AGENTS_MD_FILENAMES) { path = join(dir, name); key = path.toLowerCase();
-    //     if (delivered.has(key) || !await fileExists(path)) continue; file = await readAgentsMdFile(path, dir);
-    //     if (!file || !file.content.trim()) continue; delivered.add(key); found.push(file); } }
-    // return found
-    out_len = 0;
+    let root = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_resolve1(projectRoot_ptr, projectRoot_len, &root);
+    let base = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_resolve1(turnCwd_ptr, turnCwd_len, &base);
+    let cand = AmdPaths { items: [AmdPath { bytes: [0u8; 1024], len: 0 }; 64], len: 0 };
+    let ti: u64 = 0;
+    while ti < touchedPaths_count {
+        let off: u64 = 0;
+        let sl: u64 = 0;
+        if amd_segment(touchedPaths_ptr, touchedPaths_len, ti, &off, &sl) {
+            let abs = AmdPath { bytes: [0u8; 1024], len: 0 };
+            amd_resolve2(&base, PTR_ADD(touchedPaths_ptr, off), sl, &abs);
+            if amd_within_resolved(&root, &abs) {
+                let dir = AmdPath { bytes: [0u8; 1024], len: 0 };
+                if amd_stat_kind(amd_pbase(&abs), abs.len) == 2 {
+                    amd_path_copy(&dir, &abs);
+                } else {
+                    amd_dirname_into(&abs, &dir);
+                };
+                while amd_within_resolved(&root, &dir) && !amd_bytes_eq(amd_pbase(&dir), dir.len, amd_pbase(&base), base.len) && amd_within_resolved(&base, &dir) {
+                    if !amd_paths_has(&cand, &dir) { amd_paths_add(&cand, &dir); };
+                    let parent = AmdPath { bytes: [0u8; 1024], len: 0 };
+                    amd_dirname_into(&dir, &parent);
+                    if amd_bytes_eq(amd_pbase(&parent), parent.len, amd_pbase(&dir), dir.len) { break; };
+                    amd_path_copy(&dir, &parent);
+                }
+            };
+        };
+        ti = ti + 1;
+    }
+    // sort candidates by length descending (insertion sort)
+    let si: u64 = 1;
+    while si < cand.len {
+        let sj: u64 = si;
+        while sj > 0 {
+            let a = &cand.items[sj - 1];
+            let b = &cand.items[sj];
+            if b.len <= a.len { break; };
+            let tmp = AmdPath { bytes: [0u8; 1024], len: 0 };
+            amd_path_copy(&tmp, a);
+            let dst = &cand.items[sj - 1];
+            amd_path_copy(dst, b);
+            let dst2 = &cand.items[sj];
+            amd_path_copy(dst2, &tmp);
+            sj = sj - 1;
+        }
+        si = si + 1;
+    }
+    // delivered set (input keys, lowercased resolved paths, one per line)
+    let delivered = AmdSpans { bytes: [0u8; 65536], offs: [0u64; 40], lens: [0u64; 40], len: 0 };
+    let dp: u64 = 0;
+    while dp < delivered_len {
+        let de: u64 = dp;
+        while de < delivered_len {
+            let v: u8 = 0;
+            PTR_BYTE_AT(v, delivered_ptr, de);
+            if v == 10 { break; };
+            de = de + 1;
+        }
+        if de > dp { amd_spans_add(&delivered, PTR_ADD(delivered_ptr, dp), de - dp); };
+        dp = de + 1;
+    }
+    let fallback: bool = amd_bytes_eq(mode_ptr, mode_len, STR_PTR("fallback"), STR_LEN("fallback"));
+    let files = AmdFiles { items: [AgentsMdFile { path: [0u8; 1024], path_len: 0, scopeDir: [0u8; 1024], scopeDir_len: 0, content: [0u8; 16384], content_len: 0, truncated: false }; 8], len: 0 };
+    let ci: u64 = 0;
+    while ci < cand.len {
+        let dir = &cand.items[ci];
+        let skip_dir: bool = false;
+        if fallback {
+            let native = AmdPath { bytes: [0u8; 1024], len: 0 };
+            amd_join2(dir, STR_PTR("CLAUDE.md"), STR_LEN("CLAUDE.md"), &native);
+            if amd_is_file(amd_pbase(&native), native.len) { skip_dir = true; };
+        };
+        if !skip_dir {
+            let ni: u64 = 0;
+            while ni < 2 {
+                let p = AmdPath { bytes: [0u8; 1024], len: 0 };
+                if ni == 0 {
+                    amd_join2(dir, STR_PTR("AGENTS.md"), STR_LEN("AGENTS.md"), &p);
+                } else {
+                    amd_join2(dir, STR_PTR(".claude/AGENTS.md"), STR_LEN(".claude/AGENTS.md"), &p);
+                };
+                let key = AmdPath { bytes: [0u8; 1024], len: 0 };
+                amd_lower_into(amd_pbase(&p), p.len, &key);
+                if !amd_spans_has(&delivered, amd_pbase(&key), key.len) && amd_is_file(amd_pbase(&p), p.len) {
+                    let f = AgentsMdFile { path: [0u8; 1024], path_len: 0, scopeDir: [0u8; 1024], scopeDir_len: 0, content: [0u8; 16384], content_len: 0, truncated: false };
+                    let isn: bool = true;
+                    amd_read_agents_file(amd_pbase(&p), p.len, amd_pbase(dir), dir.len, &f, &isn);
+                    if !isn {
+                        let so: u64 = 0;
+                        let sl2: u64 = 0;
+                        amd_content_trimmed(&f, &so, &sl2);
+                        if sl2 > 0 {
+                            amd_spans_add(&delivered, amd_pbase(&key), key.len);
+                            amd_files_add(&files, &f);
+                        };
+                    };
+                };
+                ni = ni + 1;
+            }
+        };
+        ci = ci + 1;
+    }
+    amd_first_out(&files, out, out_len);
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// touched-path extraction + display + rendering
+// ---------------------------------------------------------------------------
+
+fn amd_extract_key(root_node: u64, key: ptr, klen: u64, out: &AmdBig, count: &u64) {
+    let sp: ptr = PTR_NULL();
+    let sl: u64 = 0;
+    let st = sa_json_object_get_string(root_node, key, klen, &sp, &sl);
+    if st != 0 { return; };
+    let so: u64 = 0;
+    let tl2: u64 = 0;
+    amd_trim_span(sp, sl, &so, &tl2);
+    if tl2 == 0 { return; };
+    let c0 = *count;
+    if c0 > 0 { amd_big_push_b(out, 10); };
+    amd_big_push(out, PTR_ADD(sp, so), tl2);
+    *count = c0 + 1;
 }
 
 fn extractAgentsMdTouchedPaths(args_json_ptr: ptr, args_json_len: u64, out_ptr: ptr, out_len: &u64, out_count: &u64) -> i32 {
-    // out = []; for (key of ["path","dir","file","directory","cwd"]) { value = args?.[key]; if (typeof value==="string" && value.trim()) out.push(value.trim()) } return out
-    out_count = 0; // DEFECT: dynamic JSON — args: Record<string, any>
+    let out = AmdBig { bytes: [0u8; 32768], len: 0 };
+    let count: u64 = 0;
+    let root_node = sa_json_parse(args_json_ptr, args_json_len);
+    if root_node != 0 && sa_json_kind(root_node) == 7 {
+        amd_extract_key(root_node, STR_PTR("path"), STR_LEN("path"), &out, &count);
+        amd_extract_key(root_node, STR_PTR("dir"), STR_LEN("dir"), &out, &count);
+        amd_extract_key(root_node, STR_PTR("file"), STR_LEN("file"), &out, &count);
+        amd_extract_key(root_node, STR_PTR("directory"), STR_LEN("directory"), &out, &count);
+        amd_extract_key(root_node, STR_PTR("cwd"), STR_LEN("cwd"), &out, &count);
+    };
+    amd_copy_out(out_ptr, amd_bbase(&out), out.len);
+    *out_len = out.len;
+    *out_count = count;
     return 0;
+}
+
+// TS displayRel: relative(process.cwd(), path) with forward slashes.
+fn amd_display_rel(path_ptr: ptr, path_len: u64, out: &AmdPath) {
+    let cwd = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_cwd(&cwd);
+    let tgt = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_push(&tgt, path_ptr, path_len);
+    let rel = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_relative(&cwd, &tgt, &rel);
+    out.len = 0;
+    let i: u64 = 0;
+    let rb = amd_pbase(&rel);
+    while i < rel.len {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, rb, i);
+        if v == 92 {
+            amd_push_b(out, 47);
+        } else {
+            amd_push_b(out, v);
+        };
+        i = i + 1;
+    }
 }
 
 fn displayRel(path_ptr: ptr, path_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
-    // return relative(process.cwd(), path).replace(/\\/g, "/")
-    out_len = path_len;
+    let out = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_display_rel(path_ptr, path_len, &out);
+    amd_copy_out(out_ptr, amd_pbase(&out), out.len);
+    *out_len = out.len;
     return 0;
 }
 
+// AgentsMdFile field offsets under the declared layout (path 1024 +
+// len 8, scopeDir 1024 + len 8, content 16384 + len 8, truncated 1;
+// stride 18464). renderAgentsMdSystemBlock's (files, files_len) ABI
+// is an array of AgentsMdFile; fields are read at these offsets.
+fn amd_read_u64_le(p: ptr, off: u64) -> u64 {
+    let v: u64 = 0;
+    let pow: u64 = 1;
+    let i: u64 = 0;
+    while i < 8 {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, p, off + i);
+        let bv: u64 = b;
+        v = v + bv * pow;
+        pow = pow * 256;
+        i = i + 1;
+    }
+    return v;
+}
+
+fn amd_frame_file(fbase: ptr, out: &AmdBig, total: &u64, parts: &u64) -> bool {
+    // returns false when the caller must stop (budget marker pushed)
+    let path_len = amd_read_u64_le(fbase, 1024);
+    let content_len = amd_read_u64_le(fbase, 18448);
+    let trunc_b: u8 = 0;
+    PTR_BYTE_AT(trunc_b, fbase, 18456);
+    let rel = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_display_rel(fbase, path_len, &rel);
+    let framed = AmdBig { bytes: [0u8; 32768], len: 0 };
+    amd_big_push(&framed, STR_PTR("# Project instructions ("), STR_LEN("# Project instructions ("));
+    amd_big_push(&framed, amd_pbase(&rel), rel.len);
+    amd_big_push(&framed, STR_PTR("):"), STR_LEN("):"));
+    amd_big_push_b(&framed, 10);
+    let cbase = PTR_ADD(fbase, 2064);
+    let so: u64 = 0;
+    let sl: u64 = 0;
+    amd_trim_span(cbase, content_len, &so, &sl);
+    amd_big_push(&framed, PTR_ADD(cbase, so), sl);
+    if trunc_b != 0 {
+        amd_big_push_b(&framed, 10);
+        // U+2026 horizontal ellipsis (E2 80 A6) + "[truncated]"
+        amd_big_push_b(&framed, 226);
+        amd_big_push_b(&framed, 128);
+        amd_big_push_b(&framed, 166);
+        amd_big_push(&framed, STR_PTR("[truncated]"), STR_LEN("[truncated]"));
+    };
+    let t0 = *total;
+    let p0 = *parts;
+    if t0 + framed.len > AGENTS_MD_MAX_TOTAL_CHARS() && p0 > 0 {
+        if p0 > 0 { amd_big_push(out, STR_PTR("\n\n"), STR_LEN("\n\n")); };
+        amd_big_push_b(out, 226);
+        amd_big_push_b(out, 128);
+        amd_big_push_b(out, 166);
+        amd_big_push(out, STR_PTR("[further AGENTS.md files omitted for length]"), STR_LEN("[further AGENTS.md files omitted for length]"));
+        *parts = p0 + 1;
+        return false;
+    };
+    if p0 > 0 { amd_big_push(out, STR_PTR("\n\n"), STR_LEN("\n\n")); };
+    amd_big_push(out, amd_bbase(&framed), framed.len);
+    *total = t0 + framed.len;
+    *parts = p0 + 1;
+    return true;
+}
+
 fn renderAgentsMdSystemBlock(files: &AgentsMdFile, files_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
-    // if (!files.length) return ""; total = 0; parts = []
-    // for (file of files) { rel = displayRel(file.path);
-    //   framed = `# Project instructions (${rel}):\n${file.content.trim()}${file.truncated ? "\n…[truncated]" : ""}`;
-    //   if (total + framed.length > AGENTS_MD_MAX_TOTAL_CHARS && parts.length > 0) { parts.push("…[further AGENTS.md files omitted for length]"); break; }
-    //   total += framed.length; parts.push(framed); }
-    // return parts.join("\n\n")
-    out_len = 0;
+    let out = AmdBig { bytes: [0u8; 32768], len: 0 };
+    let total: u64 = 0;
+    let parts: u64 = 0;
+    if files_len > 0 {
+        let fbase0: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fbase0, &files.path, 0);
+        let i: u64 = 0;
+        while i < files_len {
+            let fb = PTR_ADD(fbase0, i * 18464);
+            if !amd_frame_file(fb, &out, &total, &parts) { break; };
+            i = i + 1;
+        }
+    };
+    amd_copy_out(out_ptr, amd_bbase(&out), out.len);
+    *out_len = out.len;
     return 0;
 }
 
 fn renderAgentsMdNestedBlock(file: &AgentsMdFile, out_ptr: ptr, out_len: &u64) -> i32 {
-    // rel = displayRel(file.path); return `Contents of ${rel}:\n${file.content.trim()}${file.truncated ? "\n…[truncated]" : ""}`
-    out_len = 0;
+    let out = AmdBig { bytes: [0u8; 32768], len: 0 };
+    let pb: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pb, &file.path, 0);
+    let rel = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_display_rel(pb, file.path_len, &rel);
+    amd_big_push(&out, STR_PTR("Contents of "), STR_LEN("Contents of "));
+    amd_big_push(&out, amd_pbase(&rel), rel.len);
+    amd_big_push_b(&out, 58);
+    amd_big_push_b(&out, 10);
+    let cb: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cb, &file.content, 0);
+    let so: u64 = 0;
+    let sl: u64 = 0;
+    amd_trim_span(cb, file.content_len, &so, &sl);
+    amd_big_push(&out, PTR_ADD(cb, so), sl);
+    if file.truncated {
+        amd_big_push_b(&out, 10);
+        amd_big_push_b(&out, 226);
+        amd_big_push_b(&out, 128);
+        amd_big_push_b(&out, 166);
+        amd_big_push(&out, STR_PTR("[truncated]"), STR_LEN("[truncated]"));
+    };
+    amd_copy_out(out_ptr, amd_bbase(&out), out.len);
+    *out_len = out.len;
     return 0;
 }
 
 fn agentsMdDisplayName(path_ptr: ptr, path_len: u64, out_ptr: ptr, out_len: &u64) -> i32 {
-    // return basename(path)
-    out_len = path_len;
+    let p = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_push(&p, path_ptr, path_len);
+    let out = AmdPath { bytes: [0u8; 1024], len: 0 };
+    amd_basename_into(&p, &out);
+    amd_copy_out(out_ptr, amd_pbase(&out), out.len);
+    *out_len = out.len;
     return 0;
 }
