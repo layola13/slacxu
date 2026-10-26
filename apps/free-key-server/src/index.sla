@@ -4,6 +4,8 @@
 @import "sa_std/time.sai"
 @import "sa_std/ptr.sa"
 @import "sa_std/string.sa"
+@import "sa_std/http_server.sai"
+@import "sa_std/globals.sai"
 @import "adminAuth.sla"
 @import "adminCaptcha.sla"
 @import "adminTotp.sla"
@@ -57,6 +59,160 @@ struct ServerState {
     login_attempts_len: u64,
     enrollments: [TotpEnrollment; 256],
     enrollments_len: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Ambient HTTP layer (node:http bridge over the std v2 server,
+// http_server.sai): serve() accepts requests, materializes the
+// converted HttpRequest shape, stashes the raw request handle in a
+// global cell for respond(), and dispatches to handle_request.
+// Header carriage is by probing the names the routes look up
+// (authorization, cookie, x-real-ip, x-signature-ed25519,
+// x-signature-timestamp) into the raw "name: value" block the
+// header scan expects — arbitrary other headers are NOT carried
+// (registered delta). remote_addr has no std accessor and stays
+// empty, so client_address falls back to x-real-ip / "unknown".
+// ---------------------------------------------------------------------------
+
+fn fks_append_header(req: ptr, out: &ByteBuf, name_ptr: ptr, name_len: u64) -> void {
+    let vp: ptr = PTR_NULL();
+    let vl: u64 = 0;
+    if sa_http_server_req_get_header(req, name_ptr, name_len, &vp, &vl) != 0 { return; };
+    buf_append_lit(out, name_ptr, name_len);
+    buf_append_lit(out, STR_PTR(": "), STR_LEN(": "));
+    buf_append_lit(out, vp, vl);
+    buf_append_lit(out, STR_PTR("\r\n"), STR_LEN("\r\n"));
+}
+
+fn sa_http_header_find(hdr_ptr: ptr, hdr_len: u64, name_ptr: ptr, name_len: u64, out: &ByteBuf) -> i32 {
+    let pos: u64 = 0;
+    while pos < hdr_len {
+        let line_end = pos;
+        while line_end < hdr_len {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, hdr_ptr, line_end);
+            if b == 10 { break; };
+            line_end = line_end + 1;
+        }
+        let lend = line_end;
+        if lend > pos {
+            let lb: u8 = 0;
+            PTR_BYTE_AT(lb, hdr_ptr, lend - 1);
+            if lb == 13 { lend = lend - 1; };
+        };
+        let colon: u64 = 0;
+        let has_colon = false;
+        for i in pos..lend {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, hdr_ptr, i);
+            if b == 58 { colon = i; has_colon = true; break; };
+        }
+        if has_colon && colon - pos == name_len {
+            let same = true;
+            for i in 0..name_len {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, hdr_ptr, pos + i);
+                let nb: u8 = 0;
+                PTR_BYTE_AT(nb, name_ptr, i);
+                if byte_lower(b) != byte_lower(nb) { same = false; };
+            }
+            if same {
+                let vs = colon + 1;
+                while vs < lend {
+                    let b: u8 = 0;
+                    PTR_BYTE_AT(b, hdr_ptr, vs);
+                    if b == 32 { vs = vs + 1; } else { break; };
+                }
+                let ve = lend;
+                while ve > vs {
+                    let b: u8 = 0;
+                    PTR_BYTE_AT(b, hdr_ptr, ve - 1);
+                    if b == 32 { ve = ve - 1; } else { break; };
+                }
+                buf_reset(out);
+                let __ap_v: ptr = PTR_NULL();
+                PTR_BYTE_ADD(__ap_v, hdr_ptr, vs);
+                buf_append_lit(out, __ap_v, ve - vs);
+                return 0;
+            };
+        };
+        pos = line_end + 1;
+    }
+    return 1;
+}
+
+fn sa_http_respond(status: u64, ctype_ptr: ptr, ctype_len: u64, has_cookie: bool, cookie_ptr: ptr, cookie_len: u64, body_ptr: ptr, body_len: u64) -> i32 {
+    let req_v: u64 = 0;
+    if sa_global_u64_get(STR_PTR("fks.http.req"), STR_LEN("fks.http.req"), &req_v) != 0 { return 1; };
+    if req_v == 0 { return 1; };
+    let req: ptr = PTR_NULL();
+    PTR_CAST(req, req_v);
+    let resp: ptr = PTR_NULL();
+    if sa_http_server_resp_new_v2(req, status as u16, &resp) != 0 { return 1; };
+    sa_http_server_resp_add_header_v2(resp, STR_PTR("Content-Type"), STR_LEN("Content-Type"), ctype_ptr, ctype_len);
+    sa_http_server_resp_add_header_v2(resp, STR_PTR("Cache-Control"), STR_LEN("Cache-Control"), STR_PTR("no-store"), STR_LEN("no-store"));
+    sa_http_server_resp_add_header_v2(resp, STR_PTR("X-Content-Type-Options"), STR_LEN("X-Content-Type-Options"), STR_PTR("nosniff"), STR_LEN("nosniff"));
+    if has_cookie {
+        sa_http_server_resp_add_header_v2(resp, STR_PTR("Set-Cookie"), STR_LEN("Set-Cookie"), cookie_ptr, cookie_len);
+    };
+    let rc = sa_http_server_resp_send_v2(resp, body_ptr, body_len, 30000);
+    sa_http_server_resp_free_v2(resp);
+    if rc != 0 { return 1; };
+    return 0;
+}
+
+fn sa_http_server_serve(host_ptr: ptr, host_len: u64, port: u64, st: &ServerState) -> i32 {
+    let srv: ptr = PTR_NULL();
+    if sa_http_server_new_v2(&srv) != 0 { return 1; };
+    if sa_http_server_start_v2(srv, host_ptr, host_len, port as u16) != 0 { return 1; };
+    while true {
+        let req: ptr = PTR_NULL();
+        let arc = sa_http_server_accept_v2(srv, 1000, &req);
+        if arc != 0 { continue; };
+        if req == PTR_NULL() { continue; };
+        let req_v: u64 = 0;
+        PTR_ADDR(req_v, req);
+        sa_global_u64_set(STR_PTR("fks.http.req"), STR_LEN("fks.http.req"), req_v);
+        let request = HttpRequest { method: [0u8; 8], method_len: 0, path: StrField { bytes: [0u8; 512], len: 0 }, query: StrField { bytes: [0u8; 512], len: 0 }, headers: ByteBuf { bytes: [0u8; 40960], len: 0 }, body: ByteBuf { bytes: [0u8; 40960], len: 0 }, remote_addr: StrField { bytes: [0u8; 512], len: 0 } };
+        let mp: ptr = PTR_NULL();
+        let ml: u64 = 0;
+        sa_http_server_req_get_method(req, &mp, &ml);
+        let mn = ml;
+        if mn > 8 { mn = 8; };
+        for i in 0..mn {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, mp, i);
+            request.method[i] = b;
+        }
+        request.method_len = mn;
+        let pp: ptr = PTR_NULL();
+        let pl: u64 = 0;
+        sa_http_server_req_get_path(req, &pp, &pl);
+        let qpos = pl;
+        for i in 0..pl {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, pp, i);
+            if b == 63 { qpos = i; break; };
+        }
+        str_field_set(&request.path, pp, qpos);
+        if qpos < pl {
+            let __ap_q: ptr = PTR_NULL();
+            PTR_BYTE_ADD(__ap_q, pp, qpos + 1);
+            str_field_set(&request.query, __ap_q, pl - qpos - 1);
+        };
+        fks_append_header(req, &request.headers, STR_PTR("authorization"), STR_LEN("authorization"));
+        fks_append_header(req, &request.headers, STR_PTR("cookie"), STR_LEN("cookie"));
+        fks_append_header(req, &request.headers, STR_PTR("x-real-ip"), STR_LEN("x-real-ip"));
+        fks_append_header(req, &request.headers, STR_PTR("x-signature-ed25519"), STR_LEN("x-signature-ed25519"));
+        fks_append_header(req, &request.headers, STR_PTR("x-signature-timestamp"), STR_LEN("x-signature-timestamp"));
+        let bp: ptr = PTR_NULL();
+        let bl: u64 = 0;
+        sa_http_server_req_get_body(req, &bp, &bl);
+        if bl > 0 { buf_append_lit(&request.body, bp, bl); };
+        let rc = handle_request(st, &request);
+        sa_http_server_req_free_v2(req);
+    }
+    return 0;
 }
 
 // --- response plumbing (intent extern: sa_http_respond) ---
@@ -117,6 +273,79 @@ fn send_session_cookie(status: u64, cookie_ptr: ptr, cookie_len: u64, max_age: u
     return respond(status, STR_PTR("application/json; charset=utf-8"), STR_LEN("application/json; charset=utf-8"), true, __ap303, hdr.len, __ap302, body.len);
 }
 
+// URLSearchParams.get(name) — local: scans "a=b&c=d" segments and
+// URL-decodes the value (%XX hex via totp_hex_nibble, '+' -> space)
+// into out; returns found.
+fn sa_url_query_param(q_ptr: ptr, q_len: u64, name_ptr: ptr, name_len: u64, out: &ByteBuf) -> bool {
+    buf_reset(out);
+    let pos: u64 = 0;
+    while pos < q_len {
+        let seg_end = pos;
+        while seg_end < q_len {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, q_ptr, seg_end);
+            if b == 38 { break; };
+            seg_end = seg_end + 1;
+        }
+        let eq = pos;
+        while eq < seg_end {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, q_ptr, eq);
+            if b == 61 { break; };
+            eq = eq + 1;
+        }
+        if eq - pos == name_len {
+            let same = true;
+            for i in 0..name_len {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, q_ptr, pos + i);
+                let nb: u8 = 0;
+                PTR_BYTE_AT(nb, name_ptr, i);
+                if b != nb { same = false; };
+            }
+            if same {
+                let vs = eq;
+                if vs < seg_end { vs = vs + 1; };
+                let i = vs;
+                while i < seg_end {
+                    let b: u8 = 0;
+                    PTR_BYTE_AT(b, q_ptr, i);
+                    if b == 37 && i + 2 < seg_end {
+                        let h1: u8 = 0;
+                        PTR_BYTE_AT(h1, q_ptr, i + 1);
+                        let h2: u8 = 0;
+                        PTR_BYTE_AT(h2, q_ptr, i + 2);
+                        buf_append_byte(out, ((totp_hex_nibble(h1) << 4) | totp_hex_nibble(h2)) as u8);
+                        i = i + 3;
+                    } else if b == 43 {
+                        buf_append_byte(out, 32);
+                        i = i + 1;
+                    } else {
+                        buf_append_byte(out, b);
+                        i = i + 1;
+                    };
+                }
+                return true;
+            };
+        };
+        pos = seg_end + 1;
+    }
+    return false;
+}
+
+// Number(text) for the limit parameter — local decimal parse of a
+// ByteBuf; empty or any non-digit yields the fallback (NaN path).
+fn buf_parse_u64(b: &ByteBuf, fallback: u64) -> u64 {
+    if b.len == 0 { return fallback; };
+    let v: u64 = 0;
+    for i in 0..b.len {
+        let c = b.bytes[i];
+        if c < 48 || c > 57 { return fallback; };
+        v = v * 10 + ((c - 48) as u64);
+    }
+    return v;
+}
+
 // --- request helpers ---
 
 // TS: function headerText(request, name): string | undefined
@@ -126,7 +355,9 @@ fn header_text(req: &HttpRequest, out: &ByteBuf, name_ptr: ptr, name_len: u64) -
     // Intent-level scan of the raw header block: "name: value" lines.
     // DEFECT: repeated headers collapse (node joins/arrays) — first wins,
     // except the Array.isArray -> value[0] case which matches first-wins.
-    return sa_http_header_find(&req.headers.bytes, req.headers.len, name_ptr, name_len, out) == 0;
+    let __ap_hb: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_hb, req.headers.bytes, 0);
+    return sa_http_header_find(__ap_hb, req.headers.len, name_ptr, name_len, out) == 0;
 }
 
 // TS: function bearerToken(request): string | undefined
@@ -255,9 +486,10 @@ fn read_session(st: &ServerState, req: &HttpRequest, out: &AdminSession) -> bool
     if !header_text(req, &cookie, STR_PTR("cookie"), STR_LEN("cookie")) { return false; };
     // /(?:^|;\s*)free_key_admin=([^;]+)/ — manual scan for the cookie name.
     // DEFECT: regex match approximated by substring scan + value slice.
-    let name = "free_key_admin=";
     let name_len: u64 = 15;
-    let pos = find_sub_buf(&cookie, STR_PTR(name), name_len);
+    let __ap_ck: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_ck, cookie.bytes, 0);
+    let pos = find_sub_buf(__ap_ck, cookie.len, STR_PTR("free_key_admin="), STR_LEN("free_key_admin="));
     if pos == 4294967295 { return false; };
     let vstart = pos + name_len;
     let vend = vstart;
@@ -265,7 +497,9 @@ fn read_session(st: &ServerState, req: &HttpRequest, out: &AdminSession) -> bool
     if !st.cfg.has_admin_session_secret { return false; };
     let __ap310: ptr = PTR_NULL();
     PTR_BYTE_ADD(__ap310, st.cfg.admin_session_secret.bytes, 0);
-    read_admin_session(out, &cookie.bytes + vstart, vend - vstart, __ap310, st.cfg.admin_session_secret.len, (sa_time_unix_ms() as u64));
+    let __ap_cv: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_cv, cookie.bytes, vstart);
+    read_admin_session(out, __ap_cv, vend - vstart, __ap310, st.cfg.admin_session_secret.len, (sa_time_unix_ms() as u64));
     return out.found;
 }
 
@@ -345,7 +579,8 @@ fn handle_request(st: &ServerState, req: &HttpRequest) -> i32 {
     let __ap317: ptr = PTR_NULL();
     PTR_BYTE_ADD(__ap317, req.method, 0);
     let is_put = req.method_len == 3 && bytes_eq_str(__ap317, req.method_len, STR_PTR("PUT"), STR_LEN("PUT"));
-    let path_ptr: ptr = &req.path.bytes;
+    let path_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(path_ptr, req.path.bytes, 0);
     let path_len = req.path.len;
 
     // GET /health
@@ -552,7 +787,7 @@ fn route_admin_login(st: &ServerState, req: &HttpRequest, err: &ByteBuf) -> i32 
         let secret = ByteBuf { bytes: [0u8; 40960], len: 0 };
         generate_totp_secret(&secret, 20);
         let enrollment_id = ByteBuf { bytes: [0u8; 40960], len: 0 };
-        sa_crypto_random_uuid(&enrollment_id.bytes, &enrollment_id.len);
+        random_uuid_buf(&enrollment_id);
         let expires_at = (sa_time_unix_ms() as u64) + 10 * 60000;
         if st.enrollments_len < 256 {
             let rec = st.enrollments[st.enrollments_len];
@@ -580,7 +815,14 @@ fn route_admin_login(st: &ServerState, req: &HttpRequest, err: &ByteBuf) -> i32 
         PTR_BYTE_ADD(__ap356, username.bytes, 0);
         totp_uri(&uri, __ap357, secret.len, __ap356, username.len, STR_PTR("Codex Ultra"), STR_LEN("Codex Ultra"));
         let qr = ByteBuf { bytes: [0u8; 40960], len: 0 };
-        sa_qr_to_data_url(&qr, &uri.bytes, uri.len, 240, 1);
+        // DEFECT (B-class, four-source verdict): QR code generation
+        // (qrcode package's toDataURL) has NO counterpart in sala
+        // docs, SLA demos/tests, the sa_plugin_sla corpus, or the
+        // sa_std inventory — qrDataUrl stays EMPTY in this build;
+        // the enrollment response still carries the TOTP secret in
+        // plaintext (as the TS does) so manual authenticator entry
+        // works. QR belongs to the qrcode third-party wrapper track
+        // (registered in FIX_OTHER_APPS.md; pilot not started).
         let data = ByteBuf { bytes: [0u8; 40960], len: 0 };
         buf_append_lit(&data, STR_PTR("{\"authenticated\":false,\"requiresTotpSetup\":true,\"enrollmentId\":\""), STR_LEN("{\"authenticated\":false,\"requiresTotpSetup\":true,\"enrollmentId\":\""));
         let __ap358: ptr = PTR_NULL();
@@ -730,16 +972,21 @@ fn route_admin_console(st: &ServerState, req: &HttpRequest, err: &ByteBuf, is_ge
     if !read_session(st, req, &session) {
         return send_error(401, STR_PTR("Unauthorized"), STR_LEN("Unauthorized"));
     };
-    let path_ptr: ptr = &req.path.bytes;
+    let path_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(path_ptr, req.path.bytes, 0);
     let path_len = req.path.len;
     if is_get && path_len == 17 && bytes_eq_str(path_ptr, path_len, STR_PTR("/v1/admin/console"), STR_LEN("/v1/admin/console")) {
         // settings + listLicenses(q, limit) — query params from req.query.
         // DEFECT: URLSearchParams — intent parse of "q"/"limit" pairs.
         let q = ByteBuf { bytes: [0u8; 40960], len: 0 };
-        sa_url_query_param(&req.query.bytes, req.query.len, STR_PTR("q"), STR_LEN("q"), &q);
+        let __ap_qb: ptr = PTR_NULL();
+        PTR_BYTE_ADD(__ap_qb, req.query.bytes, 0);
+        sa_url_query_param(__ap_qb, req.query.len, STR_PTR("q"), STR_LEN("q"), &q);
         let lim = ByteBuf { bytes: [0u8; 40960], len: 0 };
         let limit: u64 = 100;
-        if sa_url_query_param(&req.query.bytes, req.query.len, STR_PTR("limit"), STR_LEN("limit"), &lim) { limit = buf_parse_u64(&lim, 100); };
+        let __ap_qb2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(__ap_qb2, req.query.bytes, 0);
+        if sa_url_query_param(__ap_qb2, req.query.len, STR_PTR("limit"), STR_LEN("limit"), &lim) { limit = buf_parse_u64(&lim, 100); };
         let data = ByteBuf { bytes: [0u8; 40960], len: 0 };
         buf_append_lit(&data, STR_PTR("{\"settings\":"), STR_LEN("{\"settings\":"));
         let settings = ByteBuf { bytes: [0u8; 40960], len: 0 };
@@ -1026,8 +1273,17 @@ fn main() -> i32 {
         return 1;
     };
     if license_store_new(&st.store, &st.cfg) != 0 { return 1; };
-    println("Codex Ultra free-key service listening on http://");
-    // DEFECT: host:port interpolation in the log line + server.listen —
-    // intent extern sa_http_server_serve(host, port, handler).
-    return sa_http_server_serve(&st.cfg.host.bytes, st.cfg.host.len, st.cfg.port, &st);
+    let log_line = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&log_line, STR_PTR("Codex Ultra free-key service listening on http://"), STR_LEN("Codex Ultra free-key service listening on http://"));
+    let __ap_hst: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_hst, st.cfg.host.bytes, 0);
+    buf_append_lit(&log_line, __ap_hst, st.cfg.host.len);
+    buf_append_lit(&log_line, STR_PTR(":"), STR_LEN(":"));
+    buf_append_u64(&log_line, st.cfg.port);
+    buf_append_byte(&log_line, 10);
+    let __ap_ll: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_ll, log_line.bytes, 0);
+    sa_print_bytes(__ap_ll, log_line.len);
+    // server.listen — local sa_http_server_serve (ambient layer).
+    return sa_http_server_serve(__ap_hst, st.cfg.host.len, st.cfg.port, &st);
 }
