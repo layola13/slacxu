@@ -301,3 +301,60 @@ check 为准。）
 - 本提交（70eb30c）cherry-pick 入集成树（基 f89bdc9）时仅 saVmJev.sla 一文件冲突：J1 已把该文件三个重声明结构体改名为 Jev*（JevRunInput / JevRunResult / JevPolicyConfig）——saVmTool.sla 同时 @import sdk 的 saVmTypes.sla（已有 SaVm* 同名类型）与本文件，Jev* 命名是集成树内避免同名碰撞的必要条件，且 saVmTool 的 jev_call 段按 JevRunInput 引用；K 版保留 TS 原名 SaVm*（单文件自洽），整取 K 版会使 saVmTool 在 21763:26 展开失败（实测）。
 - 处置：集成树保留 J1 命名，将 K 版的真实修复回填（json/time 两个 @import、write-through 修复），并按同一缺陷类做全文件扫描（&-参数裸赋值），补齐 K 未及的站点：共 43 处 write-through（str_trim_range、input_dyn_json、shared_field_ptr、jev_parse_env_u64、getJevThrottle、jev_pick_context、jev_parse_response_text、jev_answers_node、input_json_field、jev_marker_literal、jev_find_marker、splitPackedDoneSections）、95 处值位数组字面量 [u8; N]→[0u8; N]（ByteBuf 83、StringMap 3、JevStr/JevCallResult 9）。
 - 集成树复检：saVmPolicy、saVmInterception、agentsMdInventory、omniRouteFree、miniModelHistory 五文件 PASS；apps/server/src/saVmTool.sla PASS（回归门守住）；saVmJev.sla 仍 FAIL，首错与本文 §7 记录一致（str_eq 4 参 InvalidArgsCount），属既有 58 失败集，无新增回归。
+
+## 后续批次（Agent Z，2026-10-27）：余下失败族清扫（新编译器）
+
+### 执行环境注记（必读）
+
+- 本批次原定在 Colab 盒 /content/bulk-be2 执行；盒于 2026-10-27 ~03:5x 不可达，按用户 2026-10-26 23:39 定案（5 次×30s 重试→本机回退）改在本机 VM 重建工具链执行：sci 1ec669ad、sa_plugin_sla 3de91932 本地克隆、插件 dev 安装+confirm、装机 libsla.so 与构建产物 md5 一致（a7bdf25b…）。工作树为 cxu-sla-mirror 的 detached worktree（基点 fd27d69），盒上 bulk-be2 的两笔未推送提交（7a765eb/338e4fd）与未提交残稿已按笔记在本机重演并超越，本地树为超集；若盒恢复以本地为准。
+- 本机执行中另遇一次环境回滚事件（/content 符号链接农场与 /usr/lib/llvm-14 被清）：按既定恢复法（重建 symlink + apt install llvm-14-dev）恢复并复验，工作数据无损。
+- 全部提交只在本机 detached HEAD，未 push、未建任何分支。
+
+### 基线与终态（失败名字集对账）
+
+- 盒基线（新编译器 sla 3de91932 / sci 1ec669ad）：PASS 74/129、FAIL 55 —— 与 K 终态 §7 的 58 名单逐名一致，仅减 saVmJev、relayProtocolGateway、miniServerHooks（三者已在后续批次单独通过）；新编译器自动消除 0 个。
+- 本机基线：PASS 82/129、FAIL 47。历经 sweep1 90 → sweep2 95 → sweep3 103 → 逐族清扫。
+- **终态：PASS 128/129，FAIL 名字集 = { mini/src/runtime/miniBridge.sla }（仅 1 个）**。回归门 apps/server/src/saVmTool.sla 以本树根为 cwd 复检 PASS；终态名单对全部中间基线只缩不增（opencodeBridge 曾因本轮 PM 导入 modelCapabilities 引入 buf_append 闭包碰撞短暂回归，已改 opencodeReview 侧 ocr_ 前缀修复，终态在册外）。
+
+### 逐族处置（摘要，细节见各提交）
+
+- **SQLite DB 层 ×3（agy/muse/opencode SessionStore）**：按 SA_SQLITE 宏面（plugin_sqlite.sa）全量改写；STEP_JSON 行文档以 globals u64 cell 按语句句柄缓存，列按 SELECT * 定义序经 sa_json_object_key_at + get 读取；changes() 走 SELECT changes() 刮擦语句。opencode 另以 oss_ 前缀层实现其调用点固定的 intent-extern 面。
+- **桥声明块族（auggie 模型）**：cline/commandCode 两桥的 body-less 声明块按绑定表补齐——json 面删重复声明改用 json.sai/encoding/json.sai 真 extern；env 4 参 shim（sa_env_get4）回绑 handle 面；fs/io/process/ws/crypto/time/fmt 面逐一回绑。连带补齐被调用但从未定义的函数：cline 的 ClineHubClient_pump/pollEvent、ClineVersionCache 对应物、commandCode 的 join2/read_file_into/deleteTranscript（TS:843 逐后缀 rmSync）/mappingRecord（readMappings 视图重组）、VersionCache 构造器；修复 cline pending 生命周期（答复不再由 handleMessage 就地销毁，改由 hub_pending_take 取走后移除——TS promise resolve 语义）。
+- **claude 单元**：Probe/PM/Runtime/TP 的 arity、capiter 拼接错位（if/else-if 链间插入）、借用比较病（count/pos 裸比较）逐项修复；子进程 stdin 句柄不随 bidi 模型携带——写侧走 hin、关 stdin 为显式 DEFECT 登记（非静默）。
+- **command 三件套**（auggieCommand/clineCommand/commandCodeCommand）：版本探针解引用、扩展 ptr-out 表、run_capture2 解引用修复。
+- **grok binary_expr**：借用比较病同型修复（TP/Runtime）。
+- **muse 顶层 let 残余**：MUSE_SA_VM_DISABLED 改 env 访问器（TS museBridge.ts:187 CODEX_MUSE_DISABLE_SA_VM=="1"）；Runtime 的虚构 2 参 kill(pid,sig) 回绑 `kill` 命令 spawn（POSIX；win32 taskkill 分支在文件内 DEFECT 注明本机不可达）。
+- **跨单元适配器 ×2**：opencode PM → packages/shared modelCapabilities 的 resolveModelContextWindow 跨单元适配（签名对齐 + 记录形态转换）；agy Proxy → sdk openCodeSessionProtocol 的 openCodeThreadHeaders 适配（backend tag 2=agy，记录重组为 "K: V\n" 行）。
+- **mini 四件套**：manifest.sla 按 cline 模型重写（MiniManifest{doc} + mini_manifest_json 逐字 plugin.json）；miniCapabilities/miniInput/miniTurnSafety 的 for 循环变量自增删除（骨架体其余保留，(b) 类登记在原文件）。
+- **mini server（(c) 类）**：全量重译（见下）。
+- **ssh**：splitSshCommand 状态机真实现（长度表 PTR_WRITE_U64 写出参）。
+- **opencode PM/Runtime**：host 接缝真实现（taskkill 树杀同步形、spawn_bidi[_cwd]、就绪行泵 "listening on http"）；sa_json_canonical_stringify 真实现（递归、键字节序排序）。
+
+### (c) 类终态：2 文件 → 1 已重译、1 登记专批
+
+- **mini/src/server.sla —— 已全量重译并 PASS**。按域内既成 server 插件模型（grok/src/server.sla 形态）：EngineStatus/MiniEngine/MiniServerPlugin 结构体 + fn 族；start/stop 的 async 以阻塞形 + 状态码登记；handleRpc 的 throw 以错误码 1 + 错误文本回写表达（TS 原文消息逐字保留）；discovery 双空表、findInstallations 恒空（内置运行时无 CLI 二进制）、skillRoots [".codex/skills"]、manifest 经 mini_manifest_json + MINI_MANIFEST_load 装载。
+- **mini/src/runtime/miniBridge.sla —— 唯一剩余 FAIL，登记为专批重译（relayProtocolGateway/Agent-P 先例）**。定量依据：源 miniBridge.ts 10,282 行、336 个顶层声明 + MiniBridge 类（TS:4639 起、约 5,640 行类体）；批量缺陷日志 _defects/backends-c-mini-bridge.md 合并登记原始命中 3,375 处 / 21 类（JS Array/String 方法 782、typeof 392、模板字面量 352、闭包 336、类型断言 328、异常 276、JS 内建构造 208、?. 205、async/await 108…）。结构性阻塞：类继承 EventEmitter —— CAPABILITY_MAP 已四出处核查定案「确认不支持」（仅 2 项之一），须按回调字段/宿主接缝模型重构而非直译；类实现 CodexRuntimeClient 契约为宿主接线面。本文件为叶子模块（域内无其他 .sla 导入它），其失败不阻塞其余 128 文件。本批次未对其做任何编辑（避免污染专批基线），禁止以桩化/骨架化冒充通过。
+
+### B 类阻塞登记（本轮新增/确认，均为显式 DEFECT、非静默兜底）
+
+1. **spawn env 缺口**（四出处已查：sa_std 无带 env 的 spawn 面）：auggie/cline/command-code 三桥的 spawn_bidi_env 与 opencode PM 的 sa_host_spawn_codex_command 均以父进程 env 继承实现并逐点 DEFECT 注明，env 块不生效。
+2. **进程 exit(code) 缺口**：opencode PM 的 sa_std_process_exit 以 abort 垫片实现，130/143 退出码不保真（文件内 DEFECT）。
+3. **信号钩子缺口**：opencode PM 的 sa_host_install_shutdown_hooks 为文档化 no-op（sa_std 无信号处理注册面）。
+4. **WS 子协议缺口**：cline ws_connect 无法协商 hub 子协议（ws_client.sai connect 无子协议参数）。
+5. **WS 非阻塞 recv 缺口**：ws_client.sai recv 仅阻塞形，cline pump 的轮询语义以阻塞调用近似（文件内注明）。
+6. **JSON 数组元素替换缺口**：json.sai 无 array set/remove 面；agy Proxy 的 sa_json_array_set 以「idx==count 时 push、既有元素为 get-then-mutate 活句柄故成功、null 元素失败」实现并 DEFECT 注明。
+7. **agy Proxy upstream 响应句柄泄漏**：upstream_post 每调用有意泄漏 resp+client 以保 body/ctype 指针有效（文件内 DEFECT 注明，待 std 响应体拷贝面）。
+8. **宿主服务表无类型 fn-ptr**（既有登记延续）：sdk hostServices 的 cli 表已登记实现无法从 SLA 调用；各桥 host_cli_* 垫片按 TS optional-call 回退语义（无偏好→env/PATH 解析）逐点实现并引 TS 出处。
+9. **claude 子进程面**：exec_capture 的 timeout 参数丢弃、ENOENT 以存在性探针判别（sa_std 无 fs errno 面）、bidi 子进程 stdin 关断无面——均逐点 DEFECT。
+10. **date_parse_ms**（commandCode 桥）：恒 false 一行桩，文件内既有登记，本轮未触（无 std 日期解析面；调用点为可选时间戳解析）。
+
+### 普查三账（终态）
+
+- **a/b/c 分类**：(a) 真实现/纯类型 —— 128 个 PASS 文件主体；(b) 注释/空桩与宿主接缝 —— 域内一行桩体函数 37 个（主体为 codex 族 emit_* 事件汇，即 EventEmitter 宿主接缝）+ B 类登记 10 项（见上）+ 既有点名残余（claude Probe dir_next_name、muse HP extractRecordText、museSkillPreload 的 skill_frontmatter_is_sa_vm/path_join4、mini 骨架循环体、cline host_event_log_unknown 文档化 no-op——TS 本就无该 append 点）；(c) 逐字 TS 残段 —— 仅 miniBridge.sla 1 个（专批登记）。K 基线 a=55/b=72/c=2 的口径下，本轮 (c) 2→1、(b) 大量转 (a)（SQLite ×3、桥声明块、泵/事件/转录/mapping 等原 (b) 桩均已真实现）。
+- **fs_exists 极性全域扫**：域内 fs_exists 调用点 19 处。sa_std_fs_exists 为状态码（0=存在/3=不存在）：直用站点全部以 `== 0` 比较（auggie 桥、claude Probe/DesktopInjection、muse Probe 均带 FIX 极性注记）；cline/commandCode 两 Command 单元的裸 `if fs_exists(...)` 调用的是本地 bool 包装（sa_std_fs_len(...) == 0），极性正确。**反转残留 0 处**。
+- **async 账**：`DEFECT: async` 标记终态 334 处 / 53 文件（K 终态口径 412；减少量来自本轮真回绑与重译中按 ASYNC_MODEL 落实的阻塞形 1:1 翻译——控制流逐句对应、await 点以阻塞 extern 直调表达，标记保留在各文件头注/函数注中可审计）。本轮所有 async 触点均显式登记，无静默压平新增。
+
+### 回归门
+
+- apps/server/src/saVmTool.sla（以本树根为 cwd、规范检查口径）：PASS。
+- 终态全域 sweep：PASS 128/129（glob 另含一盒时代遗留未跟踪文件 agy/src/runtime/zz_scan_probe.sla，非 129 在册文件，不在本域范围）。
