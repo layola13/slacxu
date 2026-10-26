@@ -294,6 +294,7 @@ fn mb_floor_f64(v: f64) -> i64 {
     if (v < 0.0) && ((t as f64) != v) { return t - 1; };
     return t;
 }
+fn mb_round_half(v: f64) -> f64 { return mb_floor_f64(v + 0.5) as f64; }
 
 // ---- sa_json helpers (path-addressed doc handles; 0 = no doc) ----
 fn mb_new_obj() -> u64 { return sa_json_parse(STR_PTR("{}"), STR_LEN("{}")); }
@@ -2442,4 +2443,1632 @@ fn miniAnthropicAdaptiveEffort(effort_p: ptr, effort_n: u64, has_effort: bool, o
 }
 fn isAnthropicAdaptiveThinkingRequiredError(msg_p: ptr, msg_n: u64) -> bool {
     return mb_re_test(msg_p, msg_n, STR_PTR("requires adaptive thinking|adaptive.*thinking|output_config.*effort"), STR_LEN("requires adaptive thinking|adaptive.*thinking|output_config.*effort"), true);
+}
+
+// ================= TS 1345-2463: Anthropic family, shrink, tools =================
+const MINI_ANTHROPIC_TRAILING_TEXT = "[Tool results received above; continue with the task.]";
+const MINI_ANTHROPIC_MAX_TOKENS_TRUNCATED = "mini anthropic output truncated at max_tokens";
+fn MINI_CONTEXT_OVERFLOW_MAX_RECOVERIES() -> i64 { return 2; }
+
+fn mb_normalize_model_id(p: ptr, n: u64, out: &MbJson) -> void {
+    let t = MbStr { bytes: [0u8; 8192], len: 0 };
+    mb_trim_to(p, n, &t);
+    let low = MbStr { bytes: [0u8; 8192], len: 0 };
+    mb_lower_into(mb_sp(&t), t.len, &low);
+    out.len = 0;
+    let i: u64 = 0;
+    let in_run: bool = false;
+    while i < low.len {
+        let b: u8 = low.bytes[i];
+        if b == 46 || b == 95 || mb_is_ws(b) { if !in_run { mb_jpush(out, 45); in_run = true; }; } else { mb_jpush(out, b); in_run = false; };
+        i = i + 1;
+    }
+}
+fn isMiniAnthropicPrefillError(msg_p: ptr, msg_n: u64) -> bool {
+    if !mb_re_test(msg_p, msg_n, STR_PTR("^anthropic([^a-z]|$)"), STR_LEN("^anthropic([^a-z]|$)"), true) { return false; };
+    return mb_re_test(msg_p, msg_n, STR_PTR("prefill|must end with a user message"), STR_LEN("prefill|must end with a user message"), true);
+}
+fn isMiniAnthropicEmptyResponseError(msg_p: ptr, msg_n: u64) -> bool {
+    return mb_re_test(msg_p, msg_n, STR_PTR("empty.*anthropic.*response|anthropic.*empty.*response|closed anthropic stream with empty response|anthropic stream ended before a terminal completion marker"), STR_LEN("empty.*anthropic.*response|anthropic.*empty.*response|closed anthropic stream with empty response|anthropic stream ended before a terminal completion marker"), true);
+}
+fn isAnthropicEndpointUnsupportedError(msg_p: ptr, msg_n: u64) -> bool {
+    if mb_re_test(msg_p, msg_n, STR_PTR("^anthropic (404|405)([^0-9]|$)"), STR_LEN("^anthropic (404|405)([^0-9]|$)"), true) { return true; };
+    return isMiniAnthropicEmptyResponseError(msg_p, msg_n);
+}
+fn miniAnthropicOutputCapForModel(model_p: ptr, model_n: u64, has_model: bool) -> i64 {
+    let norm = MbJson { bytes: [0u8; 262144], len: 0 };
+    if has_model { mb_normalize_model_id(model_p, model_n, &norm); };
+    if mb_re_test(mb_jp(&norm), norm.len, STR_PTR("claude-(fable|mythos|opus|sonnet|haiku)-5"), STR_LEN("claude-(fable|mythos|opus|sonnet|haiku)-5"), true)
+        || mb_re_test(mb_jp(&norm), norm.len, STR_PTR("claude-.*5-5"), STR_LEN("claude-.*5-5"), true)
+        || mb_re_test(mb_jp(&norm), norm.len, STR_PTR("claude-(opus|sonnet|haiku)-4-[6-9]"), STR_LEN("claude-(opus|sonnet|haiku)-4-[6-9]"), true) { return 128000; };
+    if mb_re_test(mb_jp(&norm), norm.len, STR_PTR("claude"), STR_LEN("claude"), true) { return 64000; };
+    return 32000;
+}
+fn isMiniContextOverflowError(msg_p: ptr, msg_n: u64) -> bool {
+    if mb_re_test(msg_p, msg_n, STR_PTR("relay unavailable|stall timeout"), STR_LEN("relay unavailable|stall timeout"), true) { return false; };
+    return mb_re_test(msg_p, msg_n, STR_PTR("prompt is too long|prompt too long|context[_ ]length[_ ]exceeded|maximum context length|context window|input is too long|too many (input )?tokens|exceeds? the (maximum|model'?s?|context)|request too large|input length .* exceed"), STR_LEN("prompt is too long|prompt too long|context[_ ]length[_ ]exceeded|maximum context length|context window|input is too long|too many (input )?tokens|exceeds? the (maximum|model'?s?|context)|request too large|input length .* exceed"), true);
+}
+fn isMiniAnthropicCacheControlUnsupportedError(msg_p: ptr, msg_n: u64) -> bool {
+    if !mb_re_test(msg_p, msg_n, STR_PTR("cache_control"), STR_LEN("cache_control"), true) { return false; };
+    return mb_re_test(msg_p, msg_n, STR_PTR("(^|[^a-z])(unknown|unsupported|extra|unexpected|not permitted|forbidden|invalid|not allowed)([^a-z]|$)"), STR_LEN("(^|[^a-z])(unknown|unsupported|extra|unexpected|not permitted|forbidden|invalid|not allowed)([^a-z]|$)"), true);
+}
+fn isMiniAnthropicMaxTokensRejectedError(msg_p: ptr, msg_n: u64) -> bool {
+    if !mb_re_test(msg_p, msg_n, STR_PTR("^anthropic 4[0-9][0-9]([^0-9]|$)"), STR_LEN("^anthropic 4[0-9][0-9]([^0-9]|$)"), true) { return false; };
+    return mb_re_test(msg_p, msg_n, STR_PTR("max_tokens"), STR_LEN("max_tokens"), true);
+}
+fn miniAnthropicMessagesUrl(base_p: ptr, base_n: u64, out: &MbStr) -> void {
+    out.len = 0;
+    let end: u64 = base_n;
+    while end > 0 && mb_byte_at(base_p, end - 1) == 47 { end = end - 1; }
+    if end == 0 { mb_sassign(out, STR_PTR("/messages"), STR_LEN("/messages")); return; };
+    let trimmed = MbStr { bytes: [0u8; 8192], len: 0 };
+    mb_sassign(&trimmed, base_p, end);
+    if mb_re_test(mb_sp(&trimmed), trimmed.len, STR_PTR("/messages$"), STR_LEN("/messages$"), true) { mb_sassign(out, mb_sp(&trimmed), trimmed.len); return; };
+    if mb_re_test(mb_sp(&trimmed), trimmed.len, STR_PTR("/v1$"), STR_LEN("/v1$"), true) {
+        mb_sassign(out, mb_sp(&trimmed), trimmed.len);
+        mb_sappend(out, STR_PTR("/messages"), STR_LEN("/messages"));
+        return;
+    };
+    // URL parse (manual): scheme://host[/path]
+    let scheme: i64 = mb_index_of(mb_sp(&trimmed), trimmed.len, STR_PTR("://"), STR_LEN("://"));
+    if scheme >= 0 {
+        let host_start: u64 = (scheme as u64) + 3;
+        let slash: i64 = -1;
+        let i: u64 = host_start;
+        while i < trimmed.len { if trimmed.bytes[i] == 47 { slash = i as i64; break; }; i = i + 1; }
+        if slash < 0 || (slash as u64) == trimmed.len - 1 {
+            mb_sassign(out, mb_sp(&trimmed), trimmed.len);
+            mb_sappend(out, STR_PTR("/v1/messages"), STR_LEN("/v1/messages"));
+            return;
+        };
+    };
+    mb_sassign(out, mb_sp(&trimmed), trimmed.len);
+    mb_sappend(out, STR_PTR("/messages"), STR_LEN("/messages"));
+}
+fn miniAnthropicTextOf(content: u64, out: &MbJson) -> void {
+    out.len = 0;
+    if content == 0 { return; };
+    if mb_kind(content) == MB_JK_STRING { let ok: bool = mb_n_str_j(content, out); return; };
+    if mb_kind(content) != MB_JK_ARRAY { return; };
+    let count: u64 = mb_n_count(content);
+    let i: u64 = 0;
+    while i < count {
+        let part: u64 = mb_a_at(content, i);
+        i = i + 1;
+        if part == 0 || mb_kind(part) != MB_JK_OBJECT { continue; };
+        let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ok: bool = mb_g_str(part, STR_PTR("type"), STR_LEN("type"), &ty);
+        if mb_s_eq(&ty, STR_PTR("text"), STR_LEN("text")) || mb_s_eq(&ty, STR_PTR("input_text"), STR_LEN("input_text")) {
+            let t = MbJson { bytes: [0u8; 262144], len: 0 };
+            mb_json_scalar_text(mb_g_node(part, STR_PTR("text"), STR_LEN("text")), &t);
+            mb_jappend_j(out, &t);
+        };
+    }
+}
+// Returns an image block doc or 0.
+fn miniAnthropicImageBlock(part: u64) -> u64 {
+    if part == 0 { return 0; };
+    let url = MbJson { bytes: [0u8; 262144], len: 0 };
+    if !mb_g_str_j(part, STR_PTR("url"), STR_LEN("url"), &url) {
+        let nested: u64 = mb_g_node(part, STR_PTR("image_url"), STR_LEN("image_url"));
+        if nested != 0 { let ok: bool = mb_g_str_j(nested, STR_PTR("url"), STR_LEN("url"), &url); };
+    };
+    if url.len == 0 { return 0; };
+    // Manual data-URL parse: ^data:([^;,]+)?(;base64)?,(.*)$
+    if !mb_starts_with(mb_jp(&url), url.len, STR_PTR("data:"), STR_LEN("data:")) { return 0; };
+    let comma: i64 = mb_index_of(mb_jp(&url), url.len, STR_PTR(","), STR_LEN(","));
+    if comma < 0 { return 0; };
+    let header = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_slice_to(mb_jp(&url), url.len, 5, comma, &header);
+    if !mb_contains(mb_jp(&header), header.len, STR_PTR(";base64"), STR_LEN(";base64")) { return 0; };
+    let media = MbJson { bytes: [0u8; 262144], len: 0 };
+    let semi: i64 = mb_index_of(mb_jp(&header), header.len, STR_PTR(";"), STR_LEN(";"));
+    if semi >= 0 { mb_slice_to(mb_jp(&header), header.len, 0, semi, &media); } else { mb_jassign_j(&media, &header); };
+    if media.len == 0 { mb_jassign(&media, STR_PTR("image/png"), STR_LEN("image/png")); };
+    let data = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_slice_to(mb_jp(&url), url.len, comma + 1, url.len as i64, &data);
+    let block: u64 = mb_new_obj();
+    let source: u64 = mb_new_obj();
+    let rc: i32 = mb_s_str(block, STR_PTR("type"), STR_LEN("type"), STR_PTR("image"), STR_LEN("image"));
+    rc = mb_s_str(source, STR_PTR("type"), STR_LEN("type"), STR_PTR("base64"), STR_LEN("base64"));
+    rc = mb_s_str(source, STR_PTR("media_type"), STR_LEN("media_type"), mb_jp(&media), media.len);
+    rc = mb_s_str(source, STR_PTR("data"), STR_LEN("data"), mb_jp(&data), data.len);
+    rc = mb_s_node(block, STR_PTR("source"), STR_LEN("source"), source);
+    return block;
+}
+fn miniAnthropicSafeInput(args_p: ptr, args_n: u64, out: &u64) -> void {
+    let doc: u64 = sa_json_parse(args_p, args_n);
+    if doc != 0 && mb_kind(doc) == MB_JK_OBJECT { *out = doc; return; };
+    if doc != 0 { mb_free_doc(doc); };
+    *out = mb_new_obj();
+}
+fn mb_js_typeof(node: u64, present: bool, out: &MbStr) -> void {
+    if !present { mb_sassign(out, STR_PTR("undefined"), STR_LEN("undefined")); return; };
+    if node == 0 { mb_sassign(out, STR_PTR("undefined"), STR_LEN("undefined")); return; };
+    let k: u64 = mb_kind(node);
+    if k == MB_JK_STRING { mb_sassign(out, STR_PTR("string"), STR_LEN("string")); return; };
+    if k == MB_JK_INT || k == MB_JK_FLOAT { mb_sassign(out, STR_PTR("number"), STR_LEN("number")); return; };
+    if k == MB_JK_BOOL { mb_sassign(out, STR_PTR("boolean"), STR_LEN("boolean")); return; };
+    mb_sassign(out, STR_PTR("object"), STR_LEN("object"));
+}
+// toBlocks for Anthropic shapes: content node -> array doc of block docs.
+fn mb_anth_to_blocks(content: u64, with_text_field: bool, out: &u64) -> void {
+    *out = mb_new_arr();
+    if content == 0 { return; };
+    if mb_kind(content) == MB_JK_STRING {
+        let t = MbJson { bytes: [0u8; 262144], len: 0 };
+        let ok: bool = mb_n_str_j(content, &t);
+        let tt = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_trim_to(mb_jp(&t), t.len, &tt);
+        if tt.len > 0 {
+            let b: u64 = mb_new_obj();
+            let rc: i32 = mb_s_str(b, STR_PTR("type"), STR_LEN("type"), STR_PTR("text"), STR_LEN("text"));
+            if with_text_field { rc = mb_s_str(b, STR_PTR("text"), STR_LEN("text"), mb_jp(&t), t.len); };
+            rc = mb_a_push_node(*out, b);
+        };
+        return;
+    };
+    if mb_kind(content) == MB_JK_ARRAY {
+        let count: u64 = mb_n_count(content);
+        let i: u64 = 0;
+        while i < count {
+            let b: u64 = mb_a_at(content, i);
+            if b != 0 && mb_kind(b) == MB_JK_OBJECT { let rc: i32 = mb_a_push_node(*out, mb_clone_node(b)); };
+            i = i + 1;
+        }
+    };
+}
+// fromBlocks: blocks arr + role -> message doc (0 when empty).
+fn mb_anth_from_blocks(blocks: u64, role_p: ptr, role_n: u64, out: &u64) -> void {
+    *out = 0;
+    if blocks == 0 || mb_n_count(blocks) == 0 { return; };
+    let msg: u64 = mb_new_obj();
+    let rc: i32 = mb_s_str(msg, STR_PTR("role"), STR_LEN("role"), role_p, role_n);
+    if mb_n_count(blocks) == 1 {
+        let b: u64 = mb_a_at(blocks, 0);
+        let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+        if b != 0 && mb_g_str(b, STR_PTR("type"), STR_LEN("type"), &ty) && mb_s_eq(&ty, STR_PTR("text"), STR_LEN("text")) {
+            let t = MbJson { bytes: [0u8; 262144], len: 0 };
+            let ok: bool = mb_g_str_j(b, STR_PTR("text"), STR_LEN("text"), &t);
+            rc = mb_s_str(msg, STR_PTR("content"), STR_LEN("content"), mb_jp(&t), t.len);
+            *out = msg;
+            return;
+        };
+    };
+    rc = mb_s_node(msg, STR_PTR("content"), STR_LEN("content"), mb_clone_node(blocks));
+    *out = msg;
+}
+fn miniAnthropicSkeleton(messages: u64, present: bool, out: &MbJson) -> void {
+    out.len = 0;
+    if !present || messages == 0 || mb_kind(messages) != MB_JK_ARRAY {
+        mb_jappend(out, STR_PTR("<non-array:"), STR_LEN("<non-array:"));
+        let t = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_js_typeof(messages, present, &t);
+        mb_jappend_s(out, &t);
+        mb_jpush(out, 62);
+        return;
+    };
+    let count: u64 = mb_n_count(messages);
+    let i: u64 = 0;
+    while i < count {
+        if i > 0 { mb_jappend(out, STR_PTR(" > "), STR_LEN(" > ")); };
+        let m: u64 = mb_a_at(messages, i);
+        i = i + 1;
+        let role = MbStr { bytes: [0u8; 8192], len: 0 };
+        if m != 0 { let ok: bool = mb_g_str(m, STR_PTR("role"), STR_LEN("role"), &role); };
+        if role.len == 0 { mb_sassign(&role, STR_PTR("?"), STR_LEN("?")); };
+        mb_jappend_s(out, &role);
+        mb_jpush(out, 91);
+        let blocks: u64 = 0;
+        let content: u64 = 0;
+        if m != 0 { content = mb_g_node(m, STR_PTR("content"), STR_LEN("content")); };
+        mb_anth_to_blocks(content, false, &blocks);
+        let texts: u64 = 0;
+        let uses: u64 = 0;
+        let ress: u64 = 0;
+        let imgs: u64 = 0;
+        let bc: u64 = mb_n_count(blocks);
+        let bi: u64 = 0;
+        while bi < bc {
+            let b: u64 = mb_a_at(blocks, bi);
+            bi = bi + 1;
+            let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+            if b != 0 { let ok: bool = mb_g_str(b, STR_PTR("type"), STR_LEN("type"), &ty); };
+            if mb_s_eq(&ty, STR_PTR("text"), STR_LEN("text")) { texts = texts + 1; } else if mb_s_eq(&ty, STR_PTR("tool_use"), STR_LEN("tool_use")) { uses = uses + 1; } else if mb_s_eq(&ty, STR_PTR("tool_result"), STR_LEN("tool_result")) { ress = ress + 1; } else if mb_s_eq(&ty, STR_PTR("image"), STR_LEN("image")) { imgs = imgs + 1; };
+        }
+        let other: u64 = bc - texts - uses - ress - imgs;
+        let first_kind: bool = true;
+        if texts > 0 { mb_anth_skel_kind(out, texts, STR_PTR("txt"), STR_LEN("txt"), &first_kind); };
+        if uses > 0 { mb_anth_skel_kind(out, uses, STR_PTR("use"), STR_LEN("use"), &first_kind); };
+        if ress > 0 { mb_anth_skel_kind(out, ress, STR_PTR("res"), STR_LEN("res"), &first_kind); };
+        if imgs > 0 { mb_anth_skel_kind(out, imgs, STR_PTR("img"), STR_LEN("img"), &first_kind); };
+        if other > 0 { mb_anth_skel_kind(out, other, STR_PTR("other"), STR_LEN("other"), &first_kind); };
+        if bc == 0 { mb_jappend(out, STR_PTR("empty"), STR_LEN("empty")); };
+        mb_jpush(out, 93);
+        mb_free_doc(blocks);
+    }
+}
+fn mb_anth_skel_kind(out: &MbJson, n: u64, name: ptr, name_n: u64, first: &bool) -> void {
+    if !*first { mb_jpush(out, 43); };
+    *first = false;
+    let s = MbStr { bytes: [0u8; 8192], len: 0 };
+    mb_u64_to_s(n, &s);
+    mb_jappend_s(out, &s);
+    mb_jappend(out, name, name_n);
+}
+fn miniAnthropicBodyIssues(body: u64, out: &u64) -> void {
+    *out = mb_new_arr();
+    let messages: u64 = 0;
+    if body != 0 { messages = mb_g_node(body, STR_PTR("messages"), STR_LEN("messages")); };
+    let skel = MbJson { bytes: [0u8; 262144], len: 0 };
+    miniAnthropicSkeleton(messages, messages != 0, &skel);
+    if messages == 0 || mb_kind(messages) != MB_JK_ARRAY || mb_n_count(messages) == 0 {
+        let issue = MbJson { bytes: [0u8; 262144], len: 0 };
+        mb_jappend(&issue, STR_PTR("empty messages (skeleton: "), STR_LEN("empty messages (skeleton: "));
+        mb_jappend_j(&issue, &skel);
+        mb_jpush(&issue, 41);
+        let rc: i32 = mb_a_push_str(*out, mb_jp(&issue), issue.len);
+        return;
+    };
+    let count: u64 = mb_n_count(messages);
+    let first_role = MbStr { bytes: [0u8; 8192], len: 0 };
+    let okf: bool = mb_g_str(mb_a_at(messages, 0), STR_PTR("role"), STR_LEN("role"), &first_role);
+    if !mb_s_eq(&first_role, STR_PTR("user"), STR_LEN("user")) {
+        let issue = MbJson { bytes: [0u8; 262144], len: 0 };
+        mb_jappend(&issue, STR_PTR("first message is "), STR_LEN("first message is "));
+        if first_role.len > 0 { mb_jappend_s(&issue, &first_role); } else { mb_jpush(&issue, 63); };
+        mb_jappend(&issue, STR_PTR(" (skeleton: "), STR_LEN(" (skeleton: "));
+        mb_jappend_j(&issue, &skel);
+        mb_jpush(&issue, 41);
+        let rc: i32 = mb_a_push_str(*out, mb_jp(&issue), issue.len);
+    };
+    let last_role = MbStr { bytes: [0u8; 8192], len: 0 };
+    let okl: bool = mb_g_str(mb_a_at(messages, count - 1), STR_PTR("role"), STR_LEN("role"), &last_role);
+    if !mb_s_eq(&last_role, STR_PTR("user"), STR_LEN("user")) {
+        let issue = MbJson { bytes: [0u8; 262144], len: 0 };
+        mb_jappend(&issue, STR_PTR("last message is "), STR_LEN("last message is "));
+        if last_role.len > 0 { mb_jappend_s(&issue, &last_role); } else { mb_jpush(&issue, 63); };
+        mb_jappend(&issue, STR_PTR(" — prefill rejected (skeleton: "), STR_LEN(" — prefill rejected (skeleton: "));
+        mb_jappend_j(&issue, &skel);
+        mb_jpush(&issue, 41);
+        let rc: i32 = mb_a_push_str(*out, mb_jp(&issue), issue.len);
+    };
+    let prev_use: u64 = mb_new_arr();
+    let i: u64 = 0;
+    while i < count {
+        let m: u64 = mb_a_at(messages, i);
+        let idx: u64 = i;
+        i = i + 1;
+        let role = MbStr { bytes: [0u8; 8192], len: 0 };
+        if m != 0 { let ok: bool = mb_g_str(m, STR_PTR("role"), STR_LEN("role"), &role); };
+        if !mb_s_eq(&role, STR_PTR("user"), STR_LEN("user")) && !mb_s_eq(&role, STR_PTR("assistant"), STR_LEN("assistant")) {
+            let issue = MbJson { bytes: [0u8; 262144], len: 0 };
+            mb_jappend(&issue, STR_PTR("msg"), STR_LEN("msg"));
+            let ns = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_u64_to_s(idx, &ns);
+            mb_jappend_s(&issue, &ns);
+            mb_jappend(&issue, STR_PTR(" has unexpected role "), STR_LEN(" has unexpected role "));
+            mb_jappend_s(&issue, &role);
+            let rc: i32 = mb_a_push_str(*out, mb_jp(&issue), issue.len);
+            mb_free_doc(prev_use);
+            prev_use = mb_new_arr();
+            continue;
+        };
+        if idx > 0 {
+            let prev_role = MbStr { bytes: [0u8; 8192], len: 0 };
+            let okp: bool = mb_g_str(mb_a_at(messages, idx - 1), STR_PTR("role"), STR_LEN("role"), &prev_role);
+            if mb_s_eq_s(&prev_role, &role) {
+                let issue = MbJson { bytes: [0u8; 262144], len: 0 };
+                mb_jappend(&issue, STR_PTR("msg"), STR_LEN("msg"));
+                let ns = MbStr { bytes: [0u8; 8192], len: 0 };
+                mb_u64_to_s(idx, &ns);
+                mb_jappend_s(&issue, &ns);
+                mb_jappend(&issue, STR_PTR(" repeats role "), STR_LEN(" repeats role "));
+                mb_jappend_s(&issue, &role);
+                mb_jappend(&issue, STR_PTR(" (skeleton: "), STR_LEN(" (skeleton: "));
+                mb_jappend_j(&issue, &skel);
+                mb_jpush(&issue, 41);
+                let rc: i32 = mb_a_push_str(*out, mb_jp(&issue), issue.len);
+            };
+        };
+        let blocks: u64 = 0;
+        mb_anth_to_blocks(mb_g_node(m, STR_PTR("content"), STR_LEN("content")), true, &blocks);
+        if mb_n_count(blocks) == 0 {
+            let issue = MbJson { bytes: [0u8; 262144], len: 0 };
+            mb_jappend(&issue, STR_PTR("msg"), STR_LEN("msg"));
+            let ns = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_u64_to_s(idx, &ns);
+            mb_jappend_s(&issue, &ns);
+            mb_jappend(&issue, STR_PTR(" ("), STR_LEN(" ("));
+            mb_jappend_s(&issue, &role);
+            mb_jappend(&issue, STR_PTR(") has empty content"), STR_LEN(") has empty content"));
+            let rc: i32 = mb_a_push_str(*out, mb_jp(&issue), issue.len);
+            mb_free_doc(blocks);
+            mb_free_doc(prev_use);
+            prev_use = mb_new_arr();
+            continue;
+        };
+        if mb_s_eq(&role, STR_PTR("user"), STR_LEN("user")) {
+            let bc: u64 = mb_n_count(blocks);
+            let bi: u64 = 0;
+            while bi < bc {
+                let b: u64 = mb_a_at(blocks, bi);
+                bi = bi + 1;
+                let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+                if b != 0 { let ok: bool = mb_g_str(b, STR_PTR("type"), STR_LEN("type"), &ty); };
+                if mb_s_eq(&ty, STR_PTR("tool_result"), STR_LEN("tool_result")) {
+                    let id = MbStr { bytes: [0u8; 8192], len: 0 };
+                    let has_id: bool = b != 0 && mb_g_str(b, STR_PTR("tool_use_id"), STR_LEN("tool_use_id"), &id);
+                    if !has_id || !mb_str_in_arr(prev_use, mb_sp(&id), id.len, false) {
+                        let issue = MbJson { bytes: [0u8; 262144], len: 0 };
+                        mb_jappend(&issue, STR_PTR("msg"), STR_LEN("msg"));
+                        let ns = MbStr { bytes: [0u8; 8192], len: 0 };
+                        mb_u64_to_s(idx, &ns);
+                        mb_jappend_s(&issue, &ns);
+                        mb_jappend(&issue, STR_PTR(" orphan tool_result "), STR_LEN(" orphan tool_result "));
+                        if has_id && id.len > 0 { mb_jappend_s(&issue, &id); } else { mb_jpush(&issue, 63); };
+                        mb_jappend(&issue, STR_PTR(" (skeleton: "), STR_LEN(" (skeleton: "));
+                        mb_jappend_j(&issue, &skel);
+                        mb_jpush(&issue, 41);
+                        let rc: i32 = mb_a_push_str(*out, mb_jp(&issue), issue.len);
+                    };
+                };
+            }
+            mb_free_doc(blocks);
+            mb_free_doc(prev_use);
+            prev_use = mb_new_arr();
+            continue;
+        };
+        // assistant: prevUse = ids of its tool_use blocks
+        mb_free_doc(prev_use);
+        prev_use = mb_new_arr();
+        let bc: u64 = mb_n_count(blocks);
+        let bi: u64 = 0;
+        while bi < bc {
+            let b: u64 = mb_a_at(blocks, bi);
+            bi = bi + 1;
+            let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+            let id = MbStr { bytes: [0u8; 8192], len: 0 };
+            if b != 0 {
+                let ok: bool = mb_g_str(b, STR_PTR("type"), STR_LEN("type"), &ty);
+                let ok2: bool = mb_g_str(b, STR_PTR("id"), STR_LEN("id"), &id);
+            };
+            if mb_s_eq(&ty, STR_PTR("tool_use"), STR_LEN("tool_use")) && id.len > 0 {
+                let rc: i32 = mb_a_push_str(prev_use, mb_sp(&id), id.len);
+            };
+        }
+        mb_free_doc(blocks);
+    }
+    mb_free_doc(prev_use);
+}
+fn miniAnthropicApplyPromptCache(body: u64, out: &u64) -> void {
+    *out = mb_clone_node(body);
+    if *out == 0 { *out = mb_new_obj(); return; };
+    let cc: u64 = mb_new_obj();
+    let rc0: i32 = mb_s_str(cc, STR_PTR("type"), STR_LEN("type"), STR_PTR("ephemeral"), STR_LEN("ephemeral"));
+    let system: u64 = mb_g_node(*out, STR_PTR("system"), STR_LEN("system"));
+    if system != 0 && mb_kind(system) == MB_JK_STRING {
+        let t = MbJson { bytes: [0u8; 262144], len: 0 };
+        let ok: bool = mb_n_str_j(system, &t);
+        let tt = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_trim_to(mb_jp(&t), t.len, &tt);
+        if tt.len > 0 {
+            let arr: u64 = mb_new_arr();
+            let blk: u64 = mb_new_obj();
+            let rc: i32 = mb_s_str(blk, STR_PTR("type"), STR_LEN("type"), STR_PTR("text"), STR_LEN("text"));
+            rc = mb_s_str(blk, STR_PTR("text"), STR_LEN("text"), mb_jp(&t), t.len);
+            rc = mb_s_node(blk, STR_PTR("cache_control"), STR_LEN("cache_control"), mb_clone_node(cc));
+            rc = mb_a_push_node(arr, blk);
+            rc = mb_s_node(*out, STR_PTR("system"), STR_LEN("system"), arr);
+        };
+    };
+    let tools: u64 = mb_g_node(*out, STR_PTR("tools"), STR_LEN("tools"));
+    if tools != 0 && mb_kind(tools) == MB_JK_ARRAY && mb_n_count(tools) > 0 {
+        let last_tool: u64 = mb_a_at(tools, mb_n_count(tools) - 1);
+        let rc: i32 = mb_s_node(last_tool, STR_PTR("cache_control"), STR_LEN("cache_control"), mb_clone_node(cc));
+    };
+    let messages: u64 = mb_g_node(*out, STR_PTR("messages"), STR_LEN("messages"));
+    if messages != 0 && mb_kind(messages) == MB_JK_ARRAY && mb_n_count(messages) > 0 {
+        let last_msg: u64 = mb_a_at(messages, mb_n_count(messages) - 1);
+        let content: u64 = mb_g_node(last_msg, STR_PTR("content"), STR_LEN("content"));
+        if content != 0 && mb_kind(content) == MB_JK_STRING {
+            let t = MbJson { bytes: [0u8; 262144], len: 0 };
+            let ok: bool = mb_n_str_j(content, &t);
+            let tt = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_trim_to(mb_jp(&t), t.len, &tt);
+            if tt.len > 0 {
+                let arr: u64 = mb_new_arr();
+                let blk: u64 = mb_new_obj();
+                let rc: i32 = mb_s_str(blk, STR_PTR("type"), STR_LEN("type"), STR_PTR("text"), STR_LEN("text"));
+                rc = mb_s_str(blk, STR_PTR("text"), STR_LEN("text"), mb_jp(&t), t.len);
+                rc = mb_s_node(blk, STR_PTR("cache_control"), STR_LEN("cache_control"), mb_clone_node(cc));
+                rc = mb_a_push_node(arr, blk);
+                rc = mb_s_node(last_msg, STR_PTR("content"), STR_LEN("content"), arr);
+            };
+        } else if content != 0 && mb_kind(content) == MB_JK_ARRAY && mb_n_count(content) > 0 {
+            let last_block: u64 = mb_a_at(content, mb_n_count(content) - 1);
+            let rc: i32 = mb_s_node(last_block, STR_PTR("cache_control"), STR_LEN("cache_control"), mb_clone_node(cc));
+        };
+    };
+    mb_free_doc(cc);
+}
+
+// ---- miniChatThreadToAnthropicBody (TS:1675-2010) ----
+fn mb_arr_replace_last(arr: &u64, new_item: u64) -> void {
+    if *arr == 0 || mb_n_count(*arr) == 0 { return; };
+    let next: u64 = mb_new_arr();
+    let count: u64 = mb_n_count(*arr);
+    let i: u64 = 0;
+    while i + 1 < count {
+        let rc: i32 = mb_a_push_node(next, mb_clone_node(mb_a_at(*arr, i)));
+        i = i + 1;
+    }
+    let rc: i32 = mb_a_push_node(next, new_item);
+    mb_free_doc(*arr);
+    *arr = next;
+}
+fn mb_arr_drop_first(arr: &u64) -> void {
+    if *arr == 0 || mb_n_count(*arr) == 0 { return; };
+    let next: u64 = mb_new_arr();
+    let count: u64 = mb_n_count(*arr);
+    let i: u64 = 1;
+    while i < count {
+        let rc: i32 = mb_a_push_node(next, mb_clone_node(mb_a_at(*arr, i)));
+        i = i + 1;
+    }
+    mb_free_doc(*arr);
+    *arr = next;
+}
+fn mb_arr_pop(arr: &u64) -> void {
+    if *arr == 0 || mb_n_count(*arr) == 0 { return; };
+    let next: u64 = mb_new_arr();
+    let count: u64 = mb_n_count(*arr);
+    let i: u64 = 0;
+    while i + 1 < count {
+        let rc: i32 = mb_a_push_node(next, mb_clone_node(mb_a_at(*arr, i)));
+        i = i + 1;
+    }
+    mb_free_doc(*arr);
+    *arr = next;
+}
+fn mb_anth_tool_use_ids(msg: u64, out: &u64) -> void {
+    *out = mb_new_arr();
+    if msg == 0 { return; };
+    let role = MbStr { bytes: [0u8; 8192], len: 0 };
+    let ok: bool = mb_g_str(msg, STR_PTR("role"), STR_LEN("role"), &role);
+    if !mb_s_eq(&role, STR_PTR("assistant"), STR_LEN("assistant")) { return; };
+    let blocks: u64 = 0;
+    mb_anth_to_blocks(mb_g_node(msg, STR_PTR("content"), STR_LEN("content")), true, &blocks);
+    let count: u64 = mb_n_count(blocks);
+    let i: u64 = 0;
+    while i < count {
+        let b: u64 = mb_a_at(blocks, i);
+        i = i + 1;
+        let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+        let id = MbStr { bytes: [0u8; 8192], len: 0 };
+        if b != 0 {
+            let ok1: bool = mb_g_str(b, STR_PTR("type"), STR_LEN("type"), &ty);
+            let ok2: bool = mb_g_str(b, STR_PTR("id"), STR_LEN("id"), &id);
+        };
+        if mb_s_eq(&ty, STR_PTR("tool_use"), STR_LEN("tool_use")) && id.len > 0 {
+            let rc: i32 = mb_a_push_str(*out, mb_sp(&id), id.len);
+        };
+    }
+    mb_free_doc(blocks);
+}
+fn mb_anth_push_tool_results(raw: &u64, open_group: &bool, blocks: u64) -> void {
+    if blocks == 0 || mb_n_count(blocks) == 0 { return; };
+    if *open_group {
+        let count: u64 = mb_n_count(*raw);
+        let last: u64 = mb_a_at(*raw, count - 1);
+        let content: u64 = mb_g_node(last, STR_PTR("content"), STR_LEN("content"));
+        if content != 0 && mb_kind(content) == MB_JK_ARRAY {
+            let bc: u64 = mb_n_count(blocks);
+            let i: u64 = 0;
+            while i < bc {
+                let rc: i32 = mb_a_push_node(content, mb_clone_node(mb_a_at(blocks, i)));
+                i = i + 1;
+            }
+            return;
+        };
+    };
+    let msg: u64 = mb_new_obj();
+    let rc: i32 = mb_s_str(msg, STR_PTR("role"), STR_LEN("role"), STR_PTR("user"), STR_LEN("user"));
+    rc = mb_s_node(msg, STR_PTR("content"), STR_LEN("content"), mb_clone_node(blocks));
+    rc = mb_a_push_node(*raw, msg);
+    *open_group = true;
+}
+fn miniChatThreadToAnthropicBody(thread: u64, opts: u64, out: &u64) -> void {
+    let systems: u64 = mb_new_arr();
+    let raw: u64 = mb_new_arr();
+    let open_group: bool = false;
+    let tcount: u64 = 0;
+    if thread != 0 && mb_kind(thread) == MB_JK_ARRAY { tcount = mb_n_count(thread); };
+    let ti: u64 = 0;
+    while ti < tcount {
+        let item: u64 = mb_a_at(thread, ti);
+        ti = ti + 1;
+        if item == 0 || mb_kind(item) != MB_JK_OBJECT { continue; };
+        let role = MbStr { bytes: [0u8; 8192], len: 0 };
+        let okr: bool = mb_g_str(item, STR_PTR("role"), STR_LEN("role"), &role);
+        let content: u64 = mb_g_node(item, STR_PTR("content"), STR_LEN("content"));
+        if mb_s_eq(&role, STR_PTR("system"), STR_LEN("system")) {
+            let text = MbJson { bytes: [0u8; 262144], len: 0 };
+            miniAnthropicTextOf(content, &text);
+            let tt = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_trim_to(mb_jp(&text), text.len, &tt);
+            if tt.len > 0 { let rc: i32 = mb_a_push_str(systems, mb_jp(&text), text.len); };
+            open_group = false;
+            continue;
+        };
+        if mb_s_eq(&role, STR_PTR("user"), STR_LEN("user")) {
+            open_group = false;
+            if content != 0 && mb_kind(content) == MB_JK_STRING {
+                let t = MbJson { bytes: [0u8; 262144], len: 0 };
+                let ok: bool = mb_n_str_j(content, &t);
+                let tt = MbStr { bytes: [0u8; 8192], len: 0 };
+                mb_trim_to(mb_jp(&t), t.len, &tt);
+                if tt.len > 0 {
+                    let msg: u64 = mb_new_obj();
+                    let rc: i32 = mb_s_str(msg, STR_PTR("role"), STR_LEN("role"), STR_PTR("user"), STR_LEN("user"));
+                    rc = mb_s_str(msg, STR_PTR("content"), STR_LEN("content"), mb_jp(&t), t.len);
+                    rc = mb_a_push_node(raw, msg);
+                };
+                continue;
+            };
+            if content == 0 || mb_kind(content) != MB_JK_ARRAY { continue; };
+            let blocks: u64 = mb_new_arr();
+            let pc: u64 = mb_n_count(content);
+            let pi: u64 = 0;
+            while pi < pc {
+                let part: u64 = mb_a_at(content, pi);
+                pi = pi + 1;
+                if part == 0 || mb_kind(part) != MB_JK_OBJECT { continue; };
+                let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+                let ok: bool = mb_g_str(part, STR_PTR("type"), STR_LEN("type"), &ty);
+                if mb_s_eq(&ty, STR_PTR("text"), STR_LEN("text")) || mb_s_eq(&ty, STR_PTR("input_text"), STR_LEN("input_text")) {
+                    let t = MbJson { bytes: [0u8; 262144], len: 0 };
+                    if mb_g_str_j(part, STR_PTR("text"), STR_LEN("text"), &t) {
+                        let tt = MbStr { bytes: [0u8; 8192], len: 0 };
+                        mb_trim_to(mb_jp(&t), t.len, &tt);
+                        if tt.len > 0 {
+                            let b: u64 = mb_new_obj();
+                            let rc: i32 = mb_s_str(b, STR_PTR("type"), STR_LEN("type"), STR_PTR("text"), STR_LEN("text"));
+                            rc = mb_s_str(b, STR_PTR("text"), STR_LEN("text"), mb_jp(&t), t.len);
+                            rc = mb_a_push_node(blocks, b);
+                        };
+                    };
+                } else if mb_s_eq(&ty, STR_PTR("image_url"), STR_LEN("image_url")) || mb_s_eq(&ty, STR_PTR("input_image"), STR_LEN("input_image")) || mb_s_eq(&ty, STR_PTR("image"), STR_LEN("image")) {
+                    let img: u64 = miniAnthropicImageBlock(part);
+                    if img != 0 { let rc: i32 = mb_a_push_node(blocks, img); };
+                };
+            }
+            if mb_n_count(blocks) == 0 { mb_free_doc(blocks); continue; };
+            let msg: u64 = 0;
+            mb_anth_from_blocks(blocks, STR_PTR("user"), STR_LEN("user"), &msg);
+            mb_free_doc(blocks);
+            if msg != 0 { let rc: i32 = mb_a_push_node(raw, msg); };
+            continue;
+        };
+        if mb_s_eq(&role, STR_PTR("assistant"), STR_LEN("assistant")) {
+            open_group = false;
+            let blocks: u64 = mb_new_arr();
+            let text = MbJson { bytes: [0u8; 262144], len: 0 };
+            miniAnthropicTextOf(content, &text);
+            let tt = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_trim_to(mb_jp(&text), text.len, &tt);
+            if tt.len > 0 {
+                let b: u64 = mb_new_obj();
+                let rc: i32 = mb_s_str(b, STR_PTR("type"), STR_LEN("type"), STR_PTR("text"), STR_LEN("text"));
+                rc = mb_s_str(b, STR_PTR("text"), STR_LEN("text"), mb_jp(&text), text.len);
+                rc = mb_a_push_node(blocks, b);
+            };
+            let calls: u64 = mb_g_node(item, STR_PTR("tool_calls"), STR_LEN("tool_calls"));
+            if calls != 0 && mb_kind(calls) == MB_JK_ARRAY {
+                let cc: u64 = mb_n_count(calls);
+                let ci: u64 = 0;
+                while ci < cc {
+                    let tc: u64 = mb_a_at(calls, ci);
+                    ci = ci + 1;
+                    if tc == 0 { continue; };
+                    let fnn: u64 = mb_g_node(tc, STR_PTR("function"), STR_LEN("function"));
+                    let name = MbStr { bytes: [0u8; 8192], len: 0 };
+                    let args_text = MbJson { bytes: [0u8; 262144], len: 0 };
+                    let args_is_str: bool = false;
+                    if fnn != 0 {
+                        let ok1: bool = mb_g_str(fnn, STR_PTR("name"), STR_LEN("name"), &name);
+                        let anode: u64 = mb_g_node(fnn, STR_PTR("arguments"), STR_LEN("arguments"));
+                        if anode != 0 && mb_kind(anode) == MB_JK_STRING { args_is_str = mb_n_str_j(anode, &args_text); } else if anode == 0 { mb_jassign(&args_text, STR_PTR("{}"), STR_LEN("{}")); args_is_str = true; } else { mb_jassign(&args_text, STR_PTR("[object Object]"), STR_LEN("[object Object]")); args_is_str = true; };
+                    };
+                    let id = MbStr { bytes: [0u8; 8192], len: 0 };
+                    if !mb_g_str(tc, STR_PTR("id"), STR_LEN("id"), &id) { let ok2: bool = mb_g_str(tc, STR_PTR("call_id"), STR_LEN("call_id"), &id); };
+                    // TS String(tc?.id ?? tc?.call_id ?? ""): a non-string id
+                    // stringifies; our scalar fallback mirrors that.
+                    if id.len == 0 {
+                        let idnode: u64 = mb_g_node(tc, STR_PTR("id"), STR_LEN("id"));
+                        if idnode == 0 { idnode = mb_g_node(tc, STR_PTR("call_id"), STR_LEN("call_id")); };
+                        if idnode != 0 && mb_kind(idnode) != MB_JK_STRING {
+                            let t = MbJson { bytes: [0u8; 262144], len: 0 };
+                            mb_json_scalar_text(idnode, &t);
+                            mb_sassign_j(&id, &t);
+                        };
+                    };
+                    if name.len == 0 || id.len == 0 { continue; };
+                    let input: u64 = 0;
+                    miniAnthropicSafeInput(mb_jp(&args_text), args_text.len, &input);
+                    let b: u64 = mb_new_obj();
+                    let rc: i32 = mb_s_str(b, STR_PTR("type"), STR_LEN("type"), STR_PTR("tool_use"), STR_LEN("tool_use"));
+                    rc = mb_s_str(b, STR_PTR("id"), STR_LEN("id"), mb_sp(&id), id.len);
+                    rc = mb_s_str(b, STR_PTR("name"), STR_LEN("name"), mb_sp(&name), name.len);
+                    rc = mb_s_node(b, STR_PTR("input"), STR_LEN("input"), input);
+                    rc = mb_a_push_node(blocks, b);
+                }
+            };
+            if mb_n_count(blocks) == 0 { mb_free_doc(blocks); continue; };
+            let msg: u64 = 0;
+            mb_anth_from_blocks(blocks, STR_PTR("assistant"), STR_LEN("assistant"), &msg);
+            mb_free_doc(blocks);
+            if msg != 0 { let rc: i32 = mb_a_push_node(raw, msg); };
+            continue;
+        };
+        if mb_s_eq(&role, STR_PTR("tool"), STR_LEN("tool")) {
+            let id = MbStr { bytes: [0u8; 8192], len: 0 };
+            if !mb_g_str(item, STR_PTR("tool_call_id"), STR_LEN("tool_call_id"), &id) { let ok: bool = mb_g_str(item, STR_PTR("id"), STR_LEN("id"), &id); };
+            if id.len == 0 {
+                let idnode: u64 = mb_g_node(item, STR_PTR("tool_call_id"), STR_LEN("tool_call_id"));
+                if idnode == 0 { idnode = mb_g_node(item, STR_PTR("id"), STR_LEN("id")); };
+                if idnode != 0 && mb_kind(idnode) != MB_JK_STRING {
+                    let t = MbJson { bytes: [0u8; 262144], len: 0 };
+                    mb_json_scalar_text(idnode, &t);
+                    mb_sassign_j(&id, &t);
+                };
+            };
+            if id.len == 0 { continue; };
+            let result_text = MbJson { bytes: [0u8; 262144], len: 0 };
+            if content != 0 && mb_kind(content) == MB_JK_STRING { let ok: bool = mb_n_str_j(content, &result_text); } else if content != 0 { let ok: bool = mb_stringify_node(content, &result_text); };
+            let tt = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_trim_to(mb_jp(&result_text), result_text.len, &tt);
+            let b: u64 = mb_new_obj();
+            let rc: i32 = mb_s_str(b, STR_PTR("type"), STR_LEN("type"), STR_PTR("tool_result"), STR_LEN("tool_result"));
+            rc = mb_s_str(b, STR_PTR("tool_use_id"), STR_LEN("tool_use_id"), mb_sp(&id), id.len);
+            if tt.len > 0 { rc = mb_s_str(b, STR_PTR("content"), STR_LEN("content"), mb_jp(&result_text), result_text.len); } else { rc = mb_s_str(b, STR_PTR("content"), STR_LEN("content"), STR_PTR("(empty result)"), STR_LEN("(empty result)")); };
+            let one: u64 = mb_new_arr();
+            rc = mb_a_push_node(one, b);
+            mb_anth_push_tool_results(&raw, &open_group, one);
+            mb_free_doc(one);
+            continue;
+        };
+    }
+    // Phase 2: merge consecutive same-role messages.
+    let merged: u64 = mb_new_arr();
+    let rc_count: u64 = mb_n_count(raw);
+    let ri: u64 = 0;
+    while ri < rc_count {
+        let msg: u64 = mb_a_at(raw, ri);
+        ri = ri + 1;
+        let role = MbStr { bytes: [0u8; 8192], len: 0 };
+        if msg != 0 { let ok: bool = mb_g_str(msg, STR_PTR("role"), STR_LEN("role"), &role); };
+        if role.len == 0 { continue; };
+        let blocks: u64 = 0;
+        mb_anth_to_blocks(mb_g_node(msg, STR_PTR("content"), STR_LEN("content")), true, &blocks);
+        if mb_n_count(blocks) == 0 { mb_free_doc(blocks); continue; };
+        let mc: u64 = mb_n_count(merged);
+        if mc > 0 {
+            let prev: u64 = mb_a_at(merged, mc - 1);
+            let prev_role = MbStr { bytes: [0u8; 8192], len: 0 };
+            let okp: bool = mb_g_str(prev, STR_PTR("role"), STR_LEN("role"), &prev_role);
+            if mb_s_eq_s(&prev_role, &role) {
+                let prev_blocks: u64 = 0;
+                mb_anth_to_blocks(mb_g_node(prev, STR_PTR("content"), STR_LEN("content")), true, &prev_blocks);
+                let all: u64 = mb_new_arr();
+                let ac: u64 = mb_n_count(prev_blocks);
+                let ai: u64 = 0;
+                while ai < ac { let rc: i32 = mb_a_push_node(all, mb_clone_node(mb_a_at(prev_blocks, ai))); ai = ai + 1; }
+                let bc: u64 = mb_n_count(blocks);
+                let bi: u64 = 0;
+                while bi < bc { let rc: i32 = mb_a_push_node(all, mb_clone_node(mb_a_at(blocks, bi))); bi = bi + 1; }
+                mb_free_doc(prev_blocks);
+                let next: u64 = 0;
+                mb_anth_from_blocks(all, mb_sp(&role), role.len, &next);
+                mb_free_doc(all);
+                mb_free_doc(blocks);
+                if next != 0 { mb_arr_replace_last(&merged, next); };
+                continue;
+            };
+        };
+        let next: u64 = 0;
+        mb_anth_from_blocks(blocks, mb_sp(&role), role.len, &next);
+        mb_free_doc(blocks);
+        if next != 0 { let rc: i32 = mb_a_push_node(merged, next); };
+    }
+    mb_free_doc(raw);
+    // Phase 3: orphan tool_result filtering.
+    let messages: u64 = mb_new_arr();
+    let mg_count: u64 = mb_n_count(merged);
+    let mi: u64 = 0;
+    while mi < mg_count {
+        let msg: u64 = mb_a_at(merged, mi);
+        mi = mi + 1;
+        let role = MbStr { bytes: [0u8; 8192], len: 0 };
+        if msg != 0 { let ok: bool = mb_g_str(msg, STR_PTR("role"), STR_LEN("role"), &role); };
+        if !mb_s_eq(&role, STR_PTR("user"), STR_LEN("user")) && !mb_s_eq(&role, STR_PTR("assistant"), STR_LEN("assistant")) { continue; };
+        let blocks: u64 = 0;
+        mb_anth_to_blocks(mb_g_node(msg, STR_PTR("content"), STR_LEN("content")), true, &blocks);
+        if mb_s_eq(&role, STR_PTR("assistant"), STR_LEN("assistant")) {
+            let next: u64 = 0;
+            mb_anth_from_blocks(blocks, mb_sp(&role), role.len, &next);
+            mb_free_doc(blocks);
+            if next != 0 { let rc: i32 = mb_a_push_node(messages, next); };
+            continue;
+        };
+        let has_result: bool = false;
+        let bc: u64 = mb_n_count(blocks);
+        let bi: u64 = 0;
+        while bi < bc {
+            let b: u64 = mb_a_at(blocks, bi);
+            bi = bi + 1;
+            let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+            if b != 0 { let ok: bool = mb_g_str(b, STR_PTR("type"), STR_LEN("type"), &ty); };
+            if mb_s_eq(&ty, STR_PTR("tool_result"), STR_LEN("tool_result")) { has_result = true; };
+        }
+        if !has_result {
+            let next: u64 = 0;
+            mb_anth_from_blocks(blocks, mb_sp(&role), role.len, &next);
+            mb_free_doc(blocks);
+            if next != 0 { let rc: i32 = mb_a_push_node(messages, next); };
+            continue;
+        };
+        let valid: u64 = mb_new_arr();
+        let mcount: u64 = mb_n_count(messages);
+        if mcount > 0 { mb_anth_tool_use_ids(mb_a_at(messages, mcount - 1), &valid); };
+        let kept: u64 = mb_new_arr();
+        let bi2: u64 = 0;
+        while bi2 < bc {
+            let b: u64 = mb_a_at(blocks, bi2);
+            bi2 = bi2 + 1;
+            let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+            if b != 0 { let ok: bool = mb_g_str(b, STR_PTR("type"), STR_LEN("type"), &ty); };
+            if !mb_s_eq(&ty, STR_PTR("tool_result"), STR_LEN("tool_result")) {
+                let rc: i32 = mb_a_push_node(kept, mb_clone_node(b));
+            } else {
+                let id = MbStr { bytes: [0u8; 8192], len: 0 };
+                let has_id: bool = b != 0 && mb_g_str(b, STR_PTR("tool_use_id"), STR_LEN("tool_use_id"), &id);
+                if has_id && mb_str_in_arr(valid, mb_sp(&id), id.len, false) {
+                    let rc: i32 = mb_a_push_node(kept, mb_clone_node(b));
+                };
+            };
+        }
+        mb_free_doc(blocks);
+        if mb_n_count(kept) == 0 { mb_free_doc(kept); mb_free_doc(valid); continue; };
+        let only_orphans: bool = true;
+        let kc: u64 = mb_n_count(kept);
+        let ki: u64 = 0;
+        while ki < kc {
+            let b: u64 = mb_a_at(kept, ki);
+            ki = ki + 1;
+            let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+            if b != 0 { let ok: bool = mb_g_str(b, STR_PTR("type"), STR_LEN("type"), &ty); };
+            if mb_s_eq(&ty, STR_PTR("text"), STR_LEN("text")) || mb_s_eq(&ty, STR_PTR("image"), STR_LEN("image")) { only_orphans = false; };
+        }
+        if only_orphans && kc != bc && mb_n_count(valid) == 0 {
+            let non_result: u64 = mb_new_arr();
+            let ki2: u64 = 0;
+            while ki2 < kc {
+                let b: u64 = mb_a_at(kept, ki2);
+                ki2 = ki2 + 1;
+                let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+                if b != 0 { let ok: bool = mb_g_str(b, STR_PTR("type"), STR_LEN("type"), &ty); };
+                if !mb_s_eq(&ty, STR_PTR("tool_result"), STR_LEN("tool_result")) { let rc: i32 = mb_a_push_node(non_result, mb_clone_node(b)); };
+            }
+            mb_free_doc(kept);
+            if mb_n_count(non_result) == 0 { mb_free_doc(non_result); mb_free_doc(valid); continue; };
+            let next: u64 = 0;
+            mb_anth_from_blocks(non_result, STR_PTR("user"), STR_LEN("user"), &next);
+            mb_free_doc(non_result);
+            mb_free_doc(valid);
+            if next != 0 { let rc: i32 = mb_a_push_node(messages, next); };
+            continue;
+        };
+        mb_free_doc(valid);
+        let next: u64 = 0;
+        mb_anth_from_blocks(kept, STR_PTR("user"), STR_LEN("user"), &next);
+        mb_free_doc(kept);
+        if next != 0 { let rc: i32 = mb_a_push_node(messages, next); };
+    }
+    mb_free_doc(merged);
+    // Phase 4: leading assistants dropped.
+    while mb_n_count(messages) > 0 {
+        let role = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ok: bool = mb_g_str(mb_a_at(messages, 0), STR_PTR("role"), STR_LEN("role"), &role);
+        if mb_s_eq(&role, STR_PTR("user"), STR_LEN("user")) { break; };
+        mb_arr_drop_first(&messages);
+    }
+    // Phase 5: trailing assistant handling.
+    let guard: u64 = 0;
+    while mb_n_count(messages) > 0 && guard < 100000 {
+        guard = guard + 1;
+        let count: u64 = mb_n_count(messages);
+        let last: u64 = mb_a_at(messages, count - 1);
+        let role = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ok: bool = mb_g_str(last, STR_PTR("role"), STR_LEN("role"), &role);
+        if !mb_s_eq(&role, STR_PTR("assistant"), STR_LEN("assistant")) { break; };
+        let blocks: u64 = 0;
+        mb_anth_to_blocks(mb_g_node(last, STR_PTR("content"), STR_LEN("content")), true, &blocks);
+        let has_use: bool = false;
+        let bc: u64 = mb_n_count(blocks);
+        let bi: u64 = 0;
+        while bi < bc {
+            let b: u64 = mb_a_at(blocks, bi);
+            bi = bi + 1;
+            let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+            if b != 0 { let ok2: bool = mb_g_str(b, STR_PTR("type"), STR_LEN("type"), &ty); };
+            if mb_s_eq(&ty, STR_PTR("tool_use"), STR_LEN("tool_use")) { has_use = true; };
+        }
+        mb_free_doc(blocks);
+        if has_use || bc == 0 { mb_arr_pop(&messages); continue; };
+        let cont: u64 = mb_new_obj();
+        let rc: i32 = mb_s_str(cont, STR_PTR("role"), STR_LEN("role"), STR_PTR("user"), STR_LEN("user"));
+        rc = mb_s_str(cont, STR_PTR("content"), STR_LEN("content"), STR_PTR("[Continue with the task above.]"), STR_LEN("[Continue with the task above.]"));
+        rc = mb_a_push_node(messages, cont);
+        break;
+    }
+    // Phase 6: trailing-text nudge.
+    let trailing = MbJson { bytes: [0u8; 262144], len: 0 };
+    let has_trailing: bool = opts != 0 && mb_g_str_j(opts, STR_PTR("trailingUserText"), STR_LEN("trailingUserText"), &trailing);
+    if has_trailing {
+        let tt = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_trim_to(mb_jp(&trailing), trailing.len, &tt);
+        if tt.len > 0 && mb_n_count(messages) > 0 {
+            let count: u64 = mb_n_count(messages);
+            let last: u64 = mb_a_at(messages, count - 1);
+            let role = MbStr { bytes: [0u8; 8192], len: 0 };
+            let ok: bool = mb_g_str(last, STR_PTR("role"), STR_LEN("role"), &role);
+            if mb_s_eq(&role, STR_PTR("user"), STR_LEN("user")) {
+                let blocks: u64 = 0;
+                mb_anth_to_blocks(mb_g_node(last, STR_PTR("content"), STR_LEN("content")), true, &blocks);
+                let has_result: bool = false;
+                let has_text_or_img: bool = false;
+                let bc: u64 = mb_n_count(blocks);
+                let bi: u64 = 0;
+                while bi < bc {
+                    let b: u64 = mb_a_at(blocks, bi);
+                    bi = bi + 1;
+                    let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+                    if b != 0 { let ok2: bool = mb_g_str(b, STR_PTR("type"), STR_LEN("type"), &ty); };
+                    if mb_s_eq(&ty, STR_PTR("tool_result"), STR_LEN("tool_result")) { has_result = true; };
+                    if mb_s_eq(&ty, STR_PTR("text"), STR_LEN("text")) || mb_s_eq(&ty, STR_PTR("image"), STR_LEN("image")) { has_text_or_img = true; };
+                }
+                if has_result && !has_text_or_img {
+                    let nb: u64 = mb_new_obj();
+                    let rc: i32 = mb_s_str(nb, STR_PTR("type"), STR_LEN("type"), STR_PTR("text"), STR_LEN("text"));
+                    rc = mb_s_str(nb, STR_PTR("text"), STR_LEN("text"), mb_jp(&trailing), trailing.len);
+                    rc = mb_a_push_node(blocks, nb);
+                    let nudged: u64 = 0;
+                    mb_anth_from_blocks(blocks, STR_PTR("user"), STR_LEN("user"), &nudged);
+                    if nudged != 0 { mb_arr_replace_last(&messages, nudged); };
+                };
+                mb_free_doc(blocks);
+            };
+        };
+    };
+    if mb_n_count(messages) == 0 {
+        let cont: u64 = mb_new_obj();
+        let rc: i32 = mb_s_str(cont, STR_PTR("role"), STR_LEN("role"), STR_PTR("user"), STR_LEN("user"));
+        rc = mb_s_str(cont, STR_PTR("content"), STR_LEN("content"), STR_PTR("[Continue with the task above.]"), STR_LEN("[Continue with the task above.]"));
+        rc = mb_a_push_node(messages, cont);
+    };
+    // Phase 7: thinking + body assembly.
+    let model = MbStr { bytes: [0u8; 8192], len: 0 };
+    if opts != 0 { let ok: bool = mb_g_str(opts, STR_PTR("model"), STR_LEN("model"), &model); };
+    let is_claude: bool = isClaudeModelId(mb_sp(&model), model.len);
+    let effort = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_effort: bool = false;
+    if opts != 0 { normalizeMiniEffort(mb_g_node(opts, STR_PTR("effort"), STR_LEN("effort")), &effort, &has_effort); };
+    if !has_effort && is_claude { mb_sassign(&effort, STR_PTR("medium"), STR_LEN("medium")); has_effort = true; };
+    let is_haiku: bool = mb_re_test(mb_sp(&model), model.len, STR_PTR("haiku"), STR_LEN("haiku"), true);
+    let want_adaptive: bool = requiresAnthropicAdaptiveThinking(mb_sp(&model), model.len);
+    if opts != 0 {
+        let ab: bool = false;
+        if mb_g_bool(opts, STR_PTR("adaptiveThinking"), STR_LEN("adaptiveThinking"), &ab) { want_adaptive = ab; };
+    };
+    let disable_thinking: bool = false;
+    let omit_thinking: bool = false;
+    if opts != 0 {
+        let b1: bool = false;
+        if mb_g_bool(opts, STR_PTR("disableThinking"), STR_LEN("disableThinking"), &b1) { disable_thinking = b1; };
+        let b2: bool = false;
+        if mb_g_bool(opts, STR_PTR("omitThinking"), STR_LEN("omitThinking"), &b2) { omit_thinking = b2; };
+    };
+    let want_disabled: bool = disable_thinking
+        || (has_effort && mb_s_eq(&effort, STR_PTR("none"), STR_LEN("none")))
+        || (!is_claude && has_effort && mb_s_eq(&effort, STR_PTR("low"), STR_LEN("low")))
+        || (is_haiku && !want_adaptive && !(has_effort && (mb_s_eq(&effort, STR_PTR("high"), STR_LEN("high")) || mb_s_eq(&effort, STR_PTR("xhigh"), STR_LEN("xhigh")))));
+    let max_tokens: i64 = 8192;
+    if opts != 0 {
+        let mt: f64 = 0.0;
+        if mb_g_f64(opts, STR_PTR("maxTokens"), STR_LEN("maxTokens"), &mt) { max_tokens = mb_floor_f64(mt); };
+    };
+    let thinking: u64 = 0;
+    let output_config: u64 = 0;
+    if !omit_thinking {
+        if want_adaptive {
+            if !want_disabled {
+                thinking = mb_new_obj();
+                let rc: i32 = mb_s_str(thinking, STR_PTR("type"), STR_LEN("type"), STR_PTR("adaptive"), STR_LEN("adaptive"));
+                let ae = MbStr { bytes: [0u8; 8192], len: 0 };
+                let has_ae: bool = false;
+                if has_effort { miniAnthropicAdaptiveEffort(mb_sp(&effort), effort.len, true, &ae, &has_ae); };
+                if !has_ae { mb_sassign(&ae, STR_PTR("medium"), STR_LEN("medium")); };
+                output_config = mb_new_obj();
+                rc = mb_s_str(output_config, STR_PTR("effort"), STR_LEN("effort"), mb_sp(&ae), ae.len);
+            };
+        } else if want_disabled && (disable_thinking || has_effort || is_haiku) {
+            thinking = mb_new_obj();
+            let rc: i32 = mb_s_str(thinking, STR_PTR("type"), STR_LEN("type"), STR_PTR("disabled"), STR_LEN("disabled"));
+        } else if is_claude && has_effort {
+            let budget: i64 = 2048;
+            if mb_s_eq(&effort, STR_PTR("xhigh"), STR_LEN("xhigh")) || mb_s_eq(&effort, STR_PTR("ultra"), STR_LEN("ultra")) || mb_s_eq(&effort, STR_PTR("max"), STR_LEN("max")) { budget = 8192; } else if mb_s_eq(&effort, STR_PTR("high"), STR_LEN("high")) { budget = 4096; } else if mb_s_eq(&effort, STR_PTR("minimal"), STR_LEN("minimal")) || mb_s_eq(&effort, STR_PTR("low"), STR_LEN("low")) { budget = 1024; };
+            if max_tokens < budget + 2048 { max_tokens = budget + 2048; };
+            thinking = mb_new_obj();
+            let rc: i32 = mb_s_str(thinking, STR_PTR("type"), STR_LEN("type"), STR_PTR("enabled"), STR_LEN("enabled"));
+            rc = mb_s_i64(thinking, STR_PTR("budget_tokens"), STR_LEN("budget_tokens"), budget);
+        } else if !is_claude && has_effort && (mb_s_eq(&effort, STR_PTR("medium"), STR_LEN("medium")) || mb_s_eq(&effort, STR_PTR("high"), STR_LEN("high")) || mb_s_eq(&effort, STR_PTR("xhigh"), STR_LEN("xhigh"))) {
+            let budget: i64 = 2048;
+            if mb_s_eq(&effort, STR_PTR("xhigh"), STR_LEN("xhigh")) { budget = 8192; } else if mb_s_eq(&effort, STR_PTR("high"), STR_LEN("high")) { budget = 4096; };
+            if max_tokens < budget + 2048 { max_tokens = budget + 2048; };
+            thinking = mb_new_obj();
+            let rc: i32 = mb_s_str(thinking, STR_PTR("type"), STR_LEN("type"), STR_PTR("enabled"), STR_LEN("enabled"));
+            rc = mb_s_i64(thinking, STR_PTR("budget_tokens"), STR_LEN("budget_tokens"), budget);
+        };
+    };
+    let body: u64 = mb_new_obj();
+    let rc: i32 = mb_s_str(body, STR_PTR("model"), STR_LEN("model"), mb_sp(&model), model.len);
+    rc = mb_s_i64(body, STR_PTR("max_tokens"), STR_LEN("max_tokens"), max_tokens);
+    rc = mb_s_node(body, STR_PTR("messages"), STR_LEN("messages"), messages);
+    rc = mb_s_bool(body, STR_PTR("stream"), STR_LEN("stream"), true);
+    if thinking != 0 { rc = mb_s_node(body, STR_PTR("thinking"), STR_LEN("thinking"), thinking); };
+    if output_config != 0 { rc = mb_s_node(body, STR_PTR("output_config"), STR_LEN("output_config"), output_config); };
+    if mb_n_count(systems) > 0 {
+        let joined = MbJson { bytes: [0u8; 262144], len: 0 };
+        mb_lines_join(systems, &joined);
+        // systems join with "\n\n": rebuild manually (lines_join uses "\n").
+        let sj = MbJson { bytes: [0u8; 262144], len: 0 };
+        let sc: u64 = mb_n_count(systems);
+        let si: u64 = 0;
+        while si < sc {
+            if si > 0 { mb_jappend(&sj, STR_PTR("\n\n"), STR_LEN("\n\n")); };
+            let s = MbStr { bytes: [0u8; 8192], len: 0 };
+            let oks: bool = mb_n_str(mb_a_at(systems, si), &s);
+            mb_jappend_s(&sj, &s);
+            si = si + 1;
+        }
+        rc = mb_s_str(body, STR_PTR("system"), STR_LEN("system"), mb_jp(&sj), sj.len);
+    };
+    mb_free_doc(systems);
+    let tools: u64 = 0;
+    if opts != 0 { tools = mb_g_node(opts, STR_PTR("tools"), STR_LEN("tools")); };
+    if tools != 0 && mb_kind(tools) == MB_JK_ARRAY && mb_n_count(tools) > 0 {
+        let out_tools: u64 = mb_new_arr();
+        let tc: u64 = mb_n_count(tools);
+        let ti2: u64 = 0;
+        while ti2 < tc {
+            let t: u64 = mb_a_at(tools, ti2);
+            ti2 = ti2 + 1;
+            let entry: u64 = mb_new_obj();
+            let name = MbStr { bytes: [0u8; 8192], len: 0 };
+            let desc = MbStr { bytes: [0u8; 8192], len: 0 };
+            if t != 0 {
+                let ok1: bool = mb_g_str(t, STR_PTR("name"), STR_LEN("name"), &name);
+                let ok2: bool = mb_g_str(t, STR_PTR("description"), STR_LEN("description"), &desc);
+            };
+            let rc2: i32 = mb_s_str(entry, STR_PTR("name"), STR_LEN("name"), mb_sp(&name), name.len);
+            rc2 = mb_s_str(entry, STR_PTR("description"), STR_LEN("description"), mb_sp(&desc), desc.len);
+            let schema: u64 = 0;
+            if t != 0 { schema = mb_g_node(t, STR_PTR("schema"), STR_LEN("schema")); };
+            let input_schema: u64 = mb_new_obj();
+            if schema != 0 && mb_kind(schema) == MB_JK_OBJECT {
+                // copy schema keys; ensure type:"object" when type is not a string
+                let kc: u64 = mb_n_count(schema);
+                let ki: u64 = 0;
+                let type_is_str: bool = false;
+                let tv = MbStr { bytes: [0u8; 8192], len: 0 };
+                if mb_g_str(schema, STR_PTR("type"), STR_LEN("type"), &tv) { type_is_str = true; };
+                if !type_is_str { let rc3: i32 = mb_s_str(input_schema, STR_PTR("type"), STR_LEN("type"), STR_PTR("object"), STR_LEN("object")); };
+                while ki < kc {
+                    let kp: ptr = PTR_NULL();
+                    let kn: u64 = 0;
+                    if mb_key_at(schema, ki, &kp, &kn) {
+                        if type_is_str || !mb_bytes_eq(kp, kn, STR_PTR("type"), STR_LEN("type")) {
+                            let rc3: i32 = mb_s_node(input_schema, kp, kn, mb_clone_node(mb_g_node(schema, kp, kn)));
+                        } else {
+                            let rc3: i32 = mb_s_node(input_schema, kp, kn, mb_clone_node(mb_g_node(schema, kp, kn)));
+                        };
+                    };
+                    ki = ki + 1;
+                }
+            } else {
+                let rc3: i32 = mb_s_str(input_schema, STR_PTR("type"), STR_LEN("type"), STR_PTR("object"), STR_LEN("object"));
+            };
+            rc2 = mb_s_node(entry, STR_PTR("input_schema"), STR_LEN("input_schema"), input_schema);
+            rc2 = mb_a_push_node(out_tools, entry);
+        }
+        rc = mb_s_node(body, STR_PTR("tools"), STR_LEN("tools"), out_tools);
+        let tcobj: u64 = mb_new_obj();
+        let rc4: i32 = mb_s_str(tcobj, STR_PTR("type"), STR_LEN("type"), STR_PTR("auto"), STR_LEN("auto"));
+        rc = mb_s_node(body, STR_PTR("tool_choice"), STR_LEN("tool_choice"), tcobj);
+    };
+    *out = body;
+}
+
+// ---- shrink family (TS:2011-2187) ----
+fn MINI_SHRINK_KEEP_FULL_OUTPUTS() -> u64 { return 3; }
+fn MINI_SHRINK_MAX_OUTPUT_CHARS() -> u64 { return 1000; }
+fn shrinkMiniOutputText(text_p: ptr, text_n: u64, max_chars: u64, out: &MbJson) -> void {
+    out.len = 0;
+    if text_n <= max_chars { mb_jassign(out, text_p, text_n); return; };
+    let tail_chars: u64 = (max_chars * 2) / 5;
+    let head_chars: u64 = max_chars - tail_chars;
+    mb_jappend(out, text_p, head_chars);
+    let omitted: u64 = text_n - max_chars;
+    mb_jappend(out, STR_PTR("\n…[output truncated, "), STR_LEN("\n…[output truncated, "));
+    let num = MbStr { bytes: [0u8; 8192], len: 0 };
+    mb_u64_to_s(omitted, &num);
+    mb_jappend_s(out, &num);
+    mb_jappend(out, STR_PTR(" chars omitted]\n"), STR_LEN(" chars omitted]\n"));
+    mb_jappend(out, mb_ptr_add(text_p, text_n - tail_chars), tail_chars);
+}
+fn isMiniFileLaneArgs(args_text_p: ptr, args_text_n: u64) -> bool {
+    let doc: u64 = mb_parse(args_text_p, args_text_n);
+    if doc == 0 { return false; };
+    if doc == 0 || mb_kind(doc) != MB_JK_OBJECT { mb_free_doc(doc); return false; };
+    let action = MbStr { bytes: [0u8; 8192], len: 0 };
+    let ok: bool = mb_g_str(doc, STR_PTR("action"), STR_LEN("action"), &action);
+    mb_free_doc(doc);
+    if !ok { return false; };
+    return mb_is_file_lane_action(mb_sp(&action), action.len);
+}
+fn shrinkMiniOutputParts(content: u64, max_chars: u64, out: &MbJson) -> void {
+    // (content: string | Array<{text?}>) -> shrunk text.
+    out.len = 0;
+    if content == 0 { return; };
+    if mb_kind(content) == MB_JK_STRING {
+        let t = MbJson { bytes: [0u8; 262144], len: 0 };
+        let ok: bool = mb_n_str_j(content, &t);
+        shrinkMiniOutputText(mb_jp(&t), t.len, max_chars, out);
+        return;
+    };
+    if mb_kind(content) != MB_JK_ARRAY {
+        shrinkMiniOutputText(STR_PTR(""), STR_LEN(""), max_chars, out);
+        return;
+    };
+    let combined = MbJson { bytes: [0u8; 262144], len: 0 };
+    let count: u64 = mb_n_count(content);
+    let i: u64 = 0;
+    let first: bool = true;
+    while i < count {
+        let part: u64 = mb_a_at(content, i);
+        i = i + 1;
+        if part == 0 { continue; };
+        if mb_kind(part) == MB_JK_STRING {
+            if !first { mb_jappend(&combined, STR_PTR("\n"), STR_LEN("\n")); };
+            first = false;
+            let t = MbJson { bytes: [0u8; 262144], len: 0 };
+            let ok: bool = mb_n_str_j(part, &t);
+            mb_jappend(&combined, mb_jp(&t), t.len);
+        } else if mb_kind(part) == MB_JK_OBJECT {
+            let t = MbStr { bytes: [0u8; 8192], len: 0 };
+            let ok: bool = mb_g_str(part, STR_PTR("text"), STR_LEN("text"), &t);
+            if ok {
+                if !first { mb_jappend(&combined, STR_PTR("\n"), STR_LEN("\n")); };
+                first = false;
+                mb_jappend_s(&combined, &t);
+            };
+        };
+    }
+    shrinkMiniOutputText(mb_jp(&combined), combined.len, max_chars, out);
+}
+// In-place thread shrink (TS:2094-2187): `thread` is the array doc, mutated
+// via path-addressed handles; returns shrink stats object.
+fn shrinkMiniThreadOutputs(thread: u64, keep_full: u64, max_chars: u64, out_stats: &u64) -> void {
+    let stats: u64 = mb_new_obj();
+    let rc: i32 = mb_s_i64(stats, STR_PTR("shrunk"), STR_LEN("shrunk"), 0);
+    rc = mb_s_i64(stats, STR_PTR("savedChars"), STR_LEN("savedChars"), 0);
+    *out_stats = stats;
+    if thread == 0 || mb_kind(thread) != MB_JK_ARRAY { return; };
+    // Protected outputs (file-lane sa_vm calls).
+    let protected_ids: u64 = mb_new_arr();
+    let count: u64 = mb_n_count(thread);
+    let i: u64 = 0;
+    while i < count {
+        let item: u64 = mb_a_at(thread, i);
+        i = i + 1;
+        if item == 0 || mb_kind(item) != MB_JK_OBJECT { continue; };
+        let role = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ok: bool = mb_g_str(item, STR_PTR("role"), STR_LEN("role"), &role);
+        if mb_s_eq(&role, STR_PTR("assistant"), STR_LEN("assistant")) {
+            let calls: u64 = mb_g_node(item, STR_PTR("tool_calls"), STR_LEN("tool_calls"));
+            if calls != 0 && mb_kind(calls) == MB_JK_ARRAY {
+                let cc: u64 = mb_n_count(calls);
+                let ci: u64 = 0;
+                while ci < cc {
+                    let tc: u64 = mb_a_at(calls, ci);
+                    ci = ci + 1;
+                    if tc == 0 { continue; };
+                    let fnn: u64 = mb_g_node(tc, STR_PTR("function"), STR_LEN("function"));
+                    let name = MbStr { bytes: [0u8; 8192], len: 0 };
+                    let args = MbJson { bytes: [0u8; 262144], len: 0 };
+                    if fnn != 0 {
+                        let ok1: bool = mb_g_str(fnn, STR_PTR("name"), STR_LEN("name"), &name);
+                        let anode: u64 = mb_g_node(fnn, STR_PTR("arguments"), STR_LEN("arguments"));
+                        if anode != 0 && mb_kind(anode) == MB_JK_STRING { let ok2: bool = mb_n_str_j(anode, &args); };
+                    };
+                    if mb_s_eq(&name, STR_PTR("sa_vm"), STR_LEN("sa_vm")) && isMiniFileLaneArgs(mb_jp(&args), args.len) {
+                        let id = MbStr { bytes: [0u8; 8192], len: 0 };
+                        if !mb_g_str(tc, STR_PTR("id"), STR_LEN("id"), &id) { let ok3: bool = mb_g_str(tc, STR_PTR("call_id"), STR_LEN("call_id"), &id); };
+                        if id.len > 0 { let rc2: i32 = mb_a_push_str(protected_ids, mb_sp(&id), id.len); };
+                    };
+                }
+            };
+            continue;
+        };
+        let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+        let okt: bool = mb_g_str(item, STR_PTR("type"), STR_LEN("type"), &ty);
+        if mb_s_eq(&ty, STR_PTR("function_call"), STR_LEN("function_call")) || mb_s_eq(&ty, STR_PTR("custom_tool_call"), STR_LEN("custom_tool_call")) {
+            let name = MbStr { bytes: [0u8; 8192], len: 0 };
+            let args = MbJson { bytes: [0u8; 262144], len: 0 };
+            let ok1: bool = mb_g_str(item, STR_PTR("name"), STR_LEN("name"), &name);
+            let anode: u64 = mb_g_node(item, STR_PTR("arguments"), STR_LEN("arguments"));
+            if anode == 0 { anode = mb_g_node(item, STR_PTR("input"), STR_LEN("input")); };
+            if anode != 0 && mb_kind(anode) == MB_JK_STRING { let ok2: bool = mb_n_str_j(anode, &args); };
+            if mb_s_eq(&name, STR_PTR("sa_vm"), STR_LEN("sa_vm")) && isMiniFileLaneArgs(mb_jp(&args), args.len) {
+                let id = MbStr { bytes: [0u8; 8192], len: 0 };
+                if !mb_g_str(item, STR_PTR("call_id"), STR_LEN("call_id"), &id) { let ok3: bool = mb_g_str(item, STR_PTR("id"), STR_LEN("id"), &id); };
+                if id.len > 0 { let rc2: i32 = mb_a_push_str(protected_ids, mb_sp(&id), id.len); };
+            };
+        };
+    }
+    // Collect output items (indices).
+    let outputs: u64 = mb_new_arr();
+    let j: u64 = 0;
+    while j < count {
+        let item: u64 = mb_a_at(thread, j);
+        j = j + 1;
+        if item == 0 || mb_kind(item) != MB_JK_OBJECT { continue; };
+        let role = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ok1: bool = mb_g_str(item, STR_PTR("role"), STR_LEN("role"), &role);
+        let ok2: bool = mb_g_str(item, STR_PTR("type"), STR_LEN("type"), &ty);
+        if mb_s_eq(&role, STR_PTR("tool"), STR_LEN("tool")) || mb_s_eq(&ty, STR_PTR("function_call_output"), STR_LEN("function_call_output")) {
+            let idx: u64 = j - 1;
+            let rc2: i32 = mb_a_push_i64(outputs, idx as i64);
+        };
+    }
+    let oc: u64 = mb_n_count(outputs);
+    let shrinkable_count: u64 = 0;
+    if oc > keep_full { shrinkable_count = oc - keep_full; };
+    let shrunk: i64 = 0;
+    let saved: i64 = 0;
+    let k: u64 = 0;
+    while k < shrinkable_count {
+        let idxv: f64 = 0.0;
+        let oki: bool = mb_n_f64(mb_a_at(outputs, k), &idxv);
+        k = k + 1;
+        let item: u64 = mb_a_at(thread, idxv as u64);
+        if item == 0 { continue; };
+        // skip protected
+        let id = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ty = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ok2: bool = mb_g_str(item, STR_PTR("type"), STR_LEN("type"), &ty);
+        if mb_s_eq(&ty, STR_PTR("function_call_output"), STR_LEN("function_call_output")) {
+            if !mb_g_str(item, STR_PTR("call_id"), STR_LEN("call_id"), &id) { let ok3: bool = mb_g_str(item, STR_PTR("id"), STR_LEN("id"), &id); };
+        } else {
+            if !mb_g_str(item, STR_PTR("tool_call_id"), STR_LEN("tool_call_id"), &id) { let ok3: bool = mb_g_str(item, STR_PTR("id"), STR_LEN("id"), &id); };
+        };
+        if id.len > 0 && mb_str_in_arr(protected_ids, mb_sp(&id), id.len, false) { continue; };
+        let is_resp: bool = mb_s_eq(&ty, STR_PTR("function_call_output"), STR_LEN("function_call_output"));
+        let field_ptr: ptr = PTR_NULL();
+        let field_len: u64 = 0;
+        if is_resp { field_ptr = STR_PTR("output"); field_len = STR_LEN("output"); } else { field_ptr = STR_PTR("content"); field_len = STR_LEN("content"); };
+        let content: u64 = mb_g_node(item, field_ptr, field_len);
+        if content == 0 { continue; };
+        if mb_kind(content) == MB_JK_STRING {
+            let t = MbJson { bytes: [0u8; 262144], len: 0 };
+            let ok4: bool = mb_n_str_j(content, &t);
+            if t.len > max_chars {
+                let shrunk_text = MbJson { bytes: [0u8; 262144], len: 0 };
+                shrinkMiniOutputText(mb_jp(&t), t.len, max_chars, &shrunk_text);
+                let rc2: i32 = mb_s_str(item, field_ptr, field_len, mb_jp(&shrunk_text), shrunk_text.len);
+                shrunk = shrunk + 1;
+                saved = saved + (t.len - max_chars) as i64;
+            };
+        } else if mb_kind(content) == MB_JK_ARRAY {
+            let before = MbJson { bytes: [0u8; 262144], len: 0 };
+            let ok4: bool = mb_stringify_node(content, &before);
+            let shrunk_text = MbJson { bytes: [0u8; 262144], len: 0 };
+            shrinkMiniOutputParts(content, max_chars, &shrunk_text);
+            if shrunk_text.len < before.len {
+                let rc2: i32 = mb_s_str(item, field_ptr, field_len, mb_jp(&shrunk_text), shrunk_text.len);
+                shrunk = shrunk + 1;
+                saved = saved + (before.len - shrunk_text.len) as i64;
+            };
+        };
+    }
+    mb_free_doc(protected_ids);
+    mb_free_doc(outputs);
+    rc = mb_s_i64(stats, STR_PTR("shrunk"), STR_LEN("shrunk"), shrunk);
+    rc = mb_s_i64(stats, STR_PTR("savedChars"), STR_LEN("savedChars"), saved);
+}
+// ---- usage build/merge + auto-compact (TS:2188-2328 subset; rest in B5/B7) ----
+fn buildMiniTokenUsage(totals: u64, round: u64, context_window: f64, out: &u64) -> void {
+    let body: u64 = mb_new_obj();
+    let total: u64 = mb_new_obj();
+    let last: u64 = mb_new_obj();
+    let copy_keys: [ptr; 6] = [STR_PTR("inputTokens"), STR_PTR("cachedInputTokens"), STR_PTR("cacheWriteInputTokens"), STR_PTR("outputTokens"), STR_PTR("reasoningOutputTokens"), STR_PTR("totalTokens")];
+    let copy_lens: [u64; 6] = [STR_LEN("inputTokens"), STR_LEN("cachedInputTokens"), STR_LEN("cacheWriteInputTokens"), STR_LEN("outputTokens"), STR_LEN("reasoningOutputTokens"), STR_LEN("totalTokens")];
+    let ki: u64 = 0;
+    while ki < 6 {
+        let v: f64 = 0.0;
+        if totals != 0 && mb_g_f64(totals, copy_keys[ki], copy_lens[ki], &v) { let rc: i32 = mb_s_f64(total, copy_keys[ki], copy_lens[ki], v); };
+        let v2: f64 = 0.0;
+        if round != 0 && mb_g_f64(round, copy_keys[ki], copy_lens[ki], &v2) { let rc: i32 = mb_s_f64(last, copy_keys[ki], copy_lens[ki], v2); };
+        ki = ki + 1;
+    }
+    let rc: i32 = mb_s_bool(total, STR_PTR("reasoningIncludedInOutput"), STR_LEN("reasoningIncludedInOutput"), true);
+    rc = mb_s_bool(last, STR_PTR("reasoningIncludedInOutput"), STR_LEN("reasoningIncludedInOutput"), true);
+    rc = mb_s_node(body, STR_PTR("total"), STR_LEN("total"), total);
+    rc = mb_s_node(body, STR_PTR("last"), STR_LEN("last"), last);
+    let ctx: u64 = mb_new_obj();
+    let rin: f64 = 0.0;
+    if round != 0 { let ok: bool = mb_g_f64(round, STR_PTR("inputTokens"), STR_LEN("inputTokens"), &rin); };
+    rc = mb_s_f64(ctx, STR_PTR("inputTokens"), STR_LEN("inputTokens"), rin);
+    rc = mb_s_f64(ctx, STR_PTR("cachedInputTokens"), STR_LEN("cachedInputTokens"), 0.0);
+    rc = mb_s_f64(ctx, STR_PTR("cacheWriteInputTokens"), STR_LEN("cacheWriteInputTokens"), 0.0);
+    rc = mb_s_f64(ctx, STR_PTR("outputTokens"), STR_LEN("outputTokens"), 0.0);
+    rc = mb_s_f64(ctx, STR_PTR("reasoningOutputTokens"), STR_LEN("reasoningOutputTokens"), 0.0);
+    rc = mb_s_f64(ctx, STR_PTR("totalTokens"), STR_LEN("totalTokens"), rin);
+    rc = mb_s_bool(ctx, STR_PTR("reasoningIncludedInOutput"), STR_LEN("reasoningIncludedInOutput"), true);
+    rc = mb_s_node(body, STR_PTR("contextUsage"), STR_LEN("contextUsage"), ctx);
+    rc = mb_s_f64(body, STR_PTR("modelContextWindow"), STR_LEN("modelContextWindow"), context_window);
+    *out = body;
+}
+fn mergeMiniUsageDelta(base: u64, has_base: bool, next: u64, has_next: bool, out: &u64, out_has: &bool) -> void {
+    *out = 0;
+    *out_has = false;
+    if !has_next { if has_base { *out = mb_clone_node(base); *out_has = true; }; return; };
+    if !has_base { *out = mb_clone_node(next); *out_has = true; return; };
+    let merged: u64 = mb_new_obj();
+    let keys: [ptr; 2] = [STR_PTR("inputTokens"), STR_PTR("outputTokens")];
+    let lens: [u64; 2] = [STR_LEN("inputTokens"), STR_LEN("outputTokens")];
+    let ki: u64 = 0;
+    while ki < 2 {
+        let a: f64 = 0.0;
+        let b: f64 = 0.0;
+        let oka: bool = mb_g_f64(base, keys[ki], lens[ki], &a);
+        let okb: bool = mb_g_f64(next, keys[ki], lens[ki], &b);
+        let rc: i32 = mb_s_f64(merged, keys[ki], lens[ki], a + b);
+        ki = ki + 1;
+    }
+    let opt_keys: [ptr; 4] = [STR_PTR("cachedInputTokens"), STR_PTR("cacheWriteInputTokens"), STR_PTR("reasoningOutputTokens"), STR_PTR("totalTokens")];
+    let opt_lens: [u64; 4] = [STR_LEN("cachedInputTokens"), STR_LEN("cacheWriteInputTokens"), STR_LEN("reasoningOutputTokens"), STR_LEN("totalTokens")];
+    let oi: u64 = 0;
+    while oi < 4 {
+        let a: f64 = 0.0;
+        let b: f64 = 0.0;
+        let oka: bool = mb_g_f64(base, opt_keys[oi], opt_lens[oi], &a);
+        let okb: bool = mb_g_f64(next, opt_keys[oi], opt_lens[oi], &b);
+        if oka || okb { let rc: i32 = mb_s_f64(merged, opt_keys[oi], opt_lens[oi], a + b); };
+        oi = oi + 1;
+    }
+    *out = merged;
+    *out_has = true;
+}
+fn MINI_AUTO_COMPACT_DEFAULT_THRESHOLD() -> f64 { return 80.0; }
+fn MINI_AUTO_COMPACT_MIN_THRESHOLD() -> f64 { return 50.0; }
+fn MINI_AUTO_COMPACT_MAX_THRESHOLD() -> f64 { return 95.0; }
+fn MINI_AUTO_COMPACT_COOLDOWN_MS() -> u64 { return 60000; }
+fn miniAutoCompactThreshold() -> f64 {
+    let raw = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has: bool = mb_env_get(STR_PTR("MINI_AUTO_COMPACT_THRESHOLD"), STR_LEN("MINI_AUTO_COMPACT_THRESHOLD"), &raw);
+    if !has { return MINI_AUTO_COMPACT_DEFAULT_THRESHOLD(); };
+    let parsed: f64 = 0.0;
+    if !mb_parse_f64(mb_sp(&raw), raw.len, &parsed) { return MINI_AUTO_COMPACT_DEFAULT_THRESHOLD(); };
+    if parsed != parsed { return MINI_AUTO_COMPACT_DEFAULT_THRESHOLD(); };
+    let rounded: f64 = mb_round_half(parsed);
+    if rounded < MINI_AUTO_COMPACT_MIN_THRESHOLD() { return MINI_AUTO_COMPACT_MIN_THRESHOLD(); };
+    if rounded > MINI_AUTO_COMPACT_MAX_THRESHOLD() { return MINI_AUTO_COMPACT_MAX_THRESHOLD(); };
+    return rounded;
+}
+fn miniAutoCompactEnabled() -> bool {
+    let raw = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has: bool = mb_env_get(STR_PTR("MINI_AUTO_COMPACT"), STR_LEN("MINI_AUTO_COMPACT"), &raw);
+    if !has { return true; };
+    let low = MbStr { bytes: [0u8; 8192], len: 0 };
+    mb_lower_into(mb_sp(&raw), raw.len, &low);
+    let t = MbStr { bytes: [0u8; 8192], len: 0 };
+    mb_trim_to(mb_sp(&low), low.len, &t);
+    return !(mb_s_eq(&t, STR_PTR("off"), STR_LEN("off")) || mb_s_eq(&t, STR_PTR("false"), STR_LEN("false")) || mb_s_eq(&t, STR_PTR("0"), STR_LEN("0")) || mb_s_eq(&t, STR_PTR("no"), STR_LEN("no")));
+}
+fn shouldMiniAutoCompact(session: u64, now_ms: u64) -> bool {
+    if !miniAutoCompactEnabled() { return false; };
+    if session == 0 { return false; };
+    let messages: u64 = mb_g_node(session, STR_PTR("messages"), STR_LEN("messages"));
+    if messages == 0 || mb_kind(messages) != MB_JK_ARRAY || mb_n_count(messages) <= 2 { return false; };
+    let usage: u64 = mb_g_node(session, STR_PTR("lastUsage"), STR_LEN("lastUsage"));
+    let used: f64 = 0.0;
+    if usage != 0 { let ok: bool = mb_g_f64(usage, STR_PTR("inputTokens"), STR_LEN("inputTokens"), &used); };
+    let window: f64 = 0.0;
+    let okw: bool = mb_g_f64(session, STR_PTR("contextWindow"), STR_LEN("contextWindow"), &window);
+    if !(used > 0.0) || !(window > 0.0) { return false; };
+    let ratio: f64 = used / window;
+    let threshold: f64 = miniAutoCompactThreshold() / 100.0;
+    if ratio < threshold { return false; };
+    let last_at: f64 = 0.0;
+    let okl: bool = mb_g_f64(session, STR_PTR("lastAutoCompactAt"), STR_LEN("lastAutoCompactAt"), &last_at);
+    let elapsed: i64 = now_ms as i64 - last_at as i64;
+    if elapsed < MINI_AUTO_COMPACT_COOLDOWN_MS() as i64 { return false; };
+    return true;
+}
+// ---- tilde family (TS:2330-2380) ----
+fn mb_is_tilde_path(v_p: ptr, v_n: u64) -> bool {
+    if v_n == 1 && mb_byte_at(v_p, 0) == 126 { return true; };
+    if v_n >= 2 && mb_byte_at(v_p, 0) == 126 && (mb_byte_at(v_p, 1) == 47 || mb_byte_at(v_p, 1) == 92) { return true; };
+    return false;
+}
+// Local faithful expandLeadingTilde (TS imageView.ts:6-14). Registered: the
+// sibling imageView.sla expandLeadingTilde is an identity stub (DEFECT-noted
+// there), so the bridge carries its own copy bound to $HOME directly.
+fn mb_expand_leading_tilde(p: ptr, n: u64, out: &MbStr) -> void {
+    out.len = 0;
+    if !mb_is_tilde_path(p, n) { mb_sassign(out, p, n); return; };
+    let home = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_home: bool = mb_env_get(STR_PTR("HOME"), STR_LEN("HOME"), &home);
+    if !has_home || home.len == 0 { mb_sassign(out, p, n); return; };
+    if n == 1 { mb_sassign(out, mb_sp(&home), home.len); return; };
+    // "~/" or "~\\": home + "/" + rest (TS normalizes the separator to "/").
+    mb_sassign(out, mb_sp(&home), home.len);
+    mb_sappend(out, STR_PTR("/"), STR_LEN("/"));
+    mb_sappend(out, mb_ptr_add(p, 2), n - 2);
+}
+fn mb_is_tilde_field(kp: ptr, kn: u64) -> bool {
+    return mb_bytes_eq(kp, kn, STR_PTR("path"), STR_LEN("path"))
+        || mb_bytes_eq(kp, kn, STR_PTR("file"), STR_LEN("file"))
+        || mb_bytes_eq(kp, kn, STR_PTR("target"), STR_LEN("target"))
+        || mb_bytes_eq(kp, kn, STR_PTR("dir"), STR_LEN("dir"))
+        || mb_bytes_eq(kp, kn, STR_PTR("directory"), STR_LEN("directory"))
+        || mb_bytes_eq(kp, kn, STR_PTR("cwd"), STR_LEN("cwd"))
+        || mb_bytes_eq(kp, kn, STR_PTR("from"), STR_LEN("from"))
+        || mb_bytes_eq(kp, kn, STR_PTR("to"), STR_LEN("to"))
+        || mb_bytes_eq(kp, kn, STR_PTR("destination"), STR_LEN("destination"))
+        || mb_bytes_eq(kp, kn, STR_PTR("dest"), STR_LEN("dest"));
+}
+fn mb_expand_tilde_obj(obj: u64, out: &u64) -> void {
+    let next: u64 = mb_new_obj();
+    *out = next;
+    if obj == 0 || mb_kind(obj) != MB_JK_OBJECT { return; };
+    let kc: u64 = mb_n_count(obj);
+    let ki: u64 = 0;
+    while ki < kc {
+        let kp: ptr = PTR_NULL();
+        let kn: u64 = 0;
+        ki = ki + 1;
+        if !mb_key_at(obj, ki - 1, &kp, &kn) { continue; };
+        let value: u64 = mb_g_node(obj, kp, kn);
+        if mb_is_tilde_field(kp, kn) && value != 0 && mb_kind(value) == MB_JK_STRING {
+            let v = MbStr { bytes: [0u8; 8192], len: 0 };
+            let ok: bool = mb_n_str(value, &v);
+            if mb_is_tilde_path(mb_sp(&v), v.len) {
+                let expanded = MbStr { bytes: [0u8; 8192], len: 0 };
+                mb_expand_leading_tilde(mb_sp(&v), v.len, &expanded);
+                let rc: i32 = mb_s_str(next, kp, kn, mb_sp(&expanded), expanded.len);
+                continue;
+            };
+        };
+        if (mb_bytes_eq(kp, kn, STR_PTR("parallel"), STR_LEN("parallel")) || mb_bytes_eq(kp, kn, STR_PTR("tasks"), STR_LEN("tasks"))) && value != 0 && mb_kind(value) == MB_JK_ARRAY {
+            let arr: u64 = mb_new_arr();
+            let ac: u64 = mb_n_count(value);
+            let ai: u64 = 0;
+            while ai < ac {
+                let entry: u64 = mb_a_at(value, ai);
+                ai = ai + 1;
+                if entry != 0 && mb_kind(entry) == MB_JK_OBJECT {
+                    let sub: u64 = 0;
+                    mb_expand_tilde_obj(entry, &sub);
+                    let rc: i32 = mb_a_push_node(arr, sub);
+                } else {
+                    let rc: i32 = mb_a_push_node(arr, mb_clone_node(entry));
+                };
+            }
+            let rc: i32 = mb_s_node(next, kp, kn, arr);
+            continue;
+        };
+        let rc: i32 = mb_s_node(next, kp, kn, mb_clone_node(value));
+    }
+}
+fn expandMiniTildeArgs(args: u64, out: &u64) -> void {
+    if args == 0 || mb_kind(args) != MB_JK_OBJECT { *out = mb_new_obj(); return; };
+    mb_expand_tilde_obj(args, out);
+}
+// ---- subagent consts (TS:2382-2404) ----
+fn MINI_SUBAGENT_MAX_DEPTH() -> u64 { return 1; }
+fn MINI_SUBAGENT_DEFAULT_MAX_CHILDREN() -> u64 { return 5; }
+fn MINI_SUBAGENT_DEFAULT_WAIT_MS() -> u64 { return 60000; }
+fn MINI_SUBAGENT_MIN_WAIT_MS() -> u64 { return 1000; }
+fn MINI_SUBAGENT_MAX_WAIT_MS() -> u64 { return 300000; }
+const MINI_SUBAGENT_MAX_CHILDREN: u64 = 5;
+fn miniSubagentMaxChildren() -> u64 {
+    let raw = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has: bool = mb_env_get(STR_PTR("MINI_SUBAGENT_MAX_CHILDREN"), STR_LEN("MINI_SUBAGENT_MAX_CHILDREN"), &raw);
+    if !has || raw.len == 0 { return MINI_SUBAGENT_DEFAULT_MAX_CHILDREN(); };
+    let parsed: f64 = 0.0;
+    if !mb_parse_f64(mb_sp(&raw), raw.len, &parsed) { return MINI_SUBAGENT_DEFAULT_MAX_CHILDREN(); };
+    let n: i64 = mb_floor_f64(parsed);
+    if n < 1 { return MINI_SUBAGENT_DEFAULT_MAX_CHILDREN(); };
+    if n > 32 { return 32; };
+    return n as u64;
+}
+
+// ---- tool tables (TS:2196-2210, 2259-2269; image_view from imageView.ts:38-55) ----
+// The tables are data: carried as verbatim JSON text (extracted mechanically
+// from the TS literals) and parsed on demand.
+fn mb_mini_tools(out: &u64) -> void {
+    let text: ptr = STR_PTR("[{\"name\":\"sa_vm\",\"description\":\"Ultra workspace tools: {action, ...flat params}, e.g. {action:\\\"read_file\\\",path:\\\"package.json\\\"}; never nest file paths in args. For independent reads/searches, send multiple sa_vm calls in ONE round (native parallel, read-only calls run concurrently). Batch only independent work: never dependent steps, never writes, never the same path twice in one round. sa_vm parallel is temporarily disabled (use native multi-call; batch writes go sequential or apply_patch). Paths are workspace-relative (~ allowed). Actions include read_file/read_lines/read_many/list_dir/find_files/grep_search/write_file/edit_file/apply_patch, split_plan/split_stage/split_refine/split_repair/split_status, run_bun, run_host {command or exe,args[]} (safe git writes go here, e.g. {exe:\\\"git\\\",args:[\\\"checkout\\\",\\\"<branch>\\\"]} or [\\\"switch\\\",\\\"<branch>\\\"] or [\\\"fetch\\\"]; clean/revert/reset --hard stay blocked), git_status/git_diff/git_log {max_count?,revision?} (read-only: status/diff/log only, never for switching branches), session/checkpoint tools (local_checkpoint {message?} snapshots dirty worktree to a git commit; restore_checkpoint {commit} rolls back), and JEV decision actions (jev_done {user_request,actual_work,evidence} for delivery sign-off, jev_choose, jev_checklist, jev_thinking, jev_redteam, jev_rank, jev_scope, jev_dispatch, jev_consistency, jev_diagnose, jev_edge_cases, jev_blast_radius, jev_intent, jev_next, jev_compress, jev_progress). Delivery sign-off: call jev_done with {user_request,actual_work,evidence} before completing implementation work. Writes: write_file needs {path,content} (create/overwrite whole file); edit_file needs {path,old_text,new_text} with old_text copied EXACTLY from a prior read (long unique context, never type definitions as values; set replaceAll:true only to replace every occurrence); apply_patch needs {patch} with *** Begin Patch envelope (NOT a raw unified diff; single-file edits prefer edit_file). NEVER use {input,output} for edits - they are not edit params. Reads: read_many needs {files:[up to 10]} with one shared slice (different slices use parallel). Splits: split_plan {path,task} -> split_stage/split_refine {session_id,module_name,ops:[{path,content|patch}]} (content XOR patch, 1-20 ops, no delete/rename) -> split_repair phase=diff then validate then commit {confirm:true}. read_skill is optional: load a listed skill only when the task needs its specialized guidance.\",\"schema\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"query\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"},\"old_text\":{\"type\":\"string\",\"description\":\"Exact existing text to replace for edit_file (must match file verbatim).\"},\"new_text\":{\"type\":\"string\",\"description\":\"Replacement text for edit_file.\"},\"replaceAll\":{\"type\":\"boolean\",\"description\":\"Replace every occurrence for edit_file (default false, requires unique context otherwise).\"},\"patch\":{\"type\":\"string\",\"description\":\"Patch text with *** Begin Patch envelope (*** Update File: + @@ hunks); raw unified diffs are rejected.\"},\"diff\":{\"type\":\"string\"},\"from\":{\"type\":\"string\"},\"to\":{\"type\":\"string\"},\"source\":{\"type\":\"string\"},\"dest\":{\"type\":\"string\"},\"parallel\":{\"type\":\"array\",\"description\":\"Independent subtasks [{action,...flat params}]; never nest parallel, never repeat same path, never mix writes with reads of same file.\"},\"files\":{\"type\":\"array\"},\"ops\":{\"type\":\"array\"},\"phase\":{\"type\":\"string\"},\"module_name\":{\"type\":\"string\"},\"task\":{\"type\":\"string\"},\"confirm\":{\"type\":\"boolean\"},\"max_tokens\":{\"type\":\"number\"},\"max_tokens_per_file\":{\"type\":\"number\"},\"exe\":{\"type\":\"string\"},\"command\":{\"type\":\"string\",\"description\":\"Command string for run_host, e.g. 'git log --oneline -10'.\"},\"session_id\":{\"type\":\"string\"},\"input\":{\"type\":\"string\"},\"commit\":{\"type\":\"string\"},\"yield_time_ms\":{\"type\":\"number\"},\"start_line\":{\"type\":\"number\"},\"end_line\":{\"type\":\"number\"},\"dir\":{\"type\":\"string\"},\"pattern\":{\"type\":\"string\"},\"depth\":{\"type\":\"number\"},\"max_entries\":{\"type\":\"number\"},\"max_count\":{\"type\":\"number\",\"description\":\"Max commits to display for git_log (default 10).\"},\"revision\":{\"type\":\"string\",\"description\":\"Git revision or range for git_log / git_diff (e.g. 'HEAD~5' or 'main..HEAD').\"},\"args\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"user_request\":{\"type\":\"string\",\"description\":\"Original user request for jev_done delivery review.\"},\"actual_work\":{\"type\":\"string\",\"description\":\"Actual work performed for jev_done.\"},\"evidence\":{\"type\":\"string\",\"description\":\"Verification evidence for jev_done.\"},\"question\":{\"type\":\"string\",\"description\":\"Question or goal for JEV decision actions.\"},\"options\":{\"type\":\"object\",\"description\":\"Options or hypotheses for JEV decision actions.\"},\"checks\":{\"type\":\"object\",\"description\":\"Checklist criteria for JEV decision actions.\"}},\"required\":[\"action\"],\"additionalProperties\":true}},{\"name\":\"read_skill\",\"description\":\"Load a listed SKILL.md by name (e.g. {\\\"name\\\":\\\"sa-vm\\\"}) when the task needs that skill's specialized guidance. Common sa_vm actions are described on the tool itself.\",\"schema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}},{\"name\":\"image_view\",\"description\":\"View a local image file for visual inspection (screenshots, mockups, diagrams, photos). Ask JEV to choose analysisMode when the task is ambiguous: \\\"ui\\\" (screen layout), \\\"ocr\\\" (text), \\\"shape\\\" (contours/geometry/silhouette), \\\"pixel\\\" (transparency/colors), \\\"diagram\\\", or \\\"photo\\\". Args: {path (REQUIRED, workspace-relative, absolute, or ~/ image path; local files only, no URLs), analysisMode (\\\"auto\\\" default, or ui|ocr|shape|pixel|diagram|photo), task (short analysis goal), size (optional override: \\\"720p\\\" or \\\"original\\\"), color (optional override: \\\"rgb\\\", \\\"rgba\\\", or \\\"gray\\\")}. The selected mode controls resize/color/detail to avoid sending unnecessarily expensive pixels.\",\"schema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Local image path (workspace-relative, absolute, or ~/); no URLs.\"},\"analysisMode\":{\"type\":\"string\",\"enum\":[\"auto\",\"ui\",\"ocr\",\"shape\",\"pixel\",\"diagram\",\"photo\"],\"description\":\"JEV-selected visual analysis mode.\"},\"task\":{\"type\":\"string\",\"description\":\"Short visual analysis goal used by auto mode.\"},\"size\":{\"type\":\"string\",\"enum\":[\"original\",\"720p\"],\"description\":\"\\\"720p\\\" (default) or \\\"original\\\".\"},\"color\":{\"type\":\"string\",\"enum\":[\"rgba\",\"rgb\",\"gray\"],\"description\":\"\\\"rgb\\\" (default), \\\"rgba\\\", or \\\"gray\\\".\"}},\"required\":[\"path\"],\"additionalProperties\":false}},{\"name\":\"update_plan\",\"description\":\"Track multi-step work, code modifications, and tasks with a structured todo list. Proactively call update_plan at the start of multi-step or exploratory work to establish your checklist, then update statuses (pending, in_progress, completed) as work completes. Each call replaces the whole list. Args: {todos:[{content,status}]} or {steps:[{step,status}]}; status is pending|in_progress|completed.\",\"schema\":{\"type\":\"object\",\"properties\":{\"todos\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"content\":{\"type\":\"string\"},\"status\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}}}},\"steps\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"step\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"status\":{\"type\":\"string\"}}}},\"explanation\":{\"type\":\"string\"}},\"additionalProperties\":true}},{\"name\":\"request_user_input\",\"description\":\"Ask the user structured clarification questions mid-turn when a blocking requirement, design preference, or ambiguous goal cannot be resolved autonomously. Execution pauses until the user responds in a dialog modal, and returns their structured choices. Args: {questions:[{id?,question,header?,options?,is_multi_select?}]}. Example: {\\\"questions\\\":[{\\\"id\\\":\\\"choice\\\",\\\"question\\\":\\\"Select build target\\\",\\\"options\\\":[\\\"Debug\\\",\\\"Release\\\"]}]}\",\"schema\":{\"type\":\"object\",\"properties\":{\"questions\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"question\":{\"type\":\"string\"},\"header\":{\"type\":\"string\"},\"options\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"is_multi_select\":{\"type\":\"boolean\"}},\"required\":[\"question\"]}}},\"required\":[\"questions\"],\"additionalProperties\":true}},{\"name\":\"web_search\",\"description\":\"Search the web for technical documentation, API specifications, release notes, and error resolution. Args: {query, max_results?}. Returns search results with titles, URLs, and text snippets.\",\"schema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search query or error message\"},\"max_results\":{\"type\":\"number\",\"description\":\"Max results (1-10, default 5)\"}},\"required\":[\"query\"],\"additionalProperties\":false}},{\"name\":\"list_mcp_resources\",\"description\":\"List files/objects exposed by MCP servers (config.toml [mcp_servers.*]). Args: {server?} - omit for all connected servers. Read one with read_mcp_resource.\",\"schema\":{\"type\":\"object\",\"properties\":{\"server\":{\"type\":\"string\"}},\"additionalProperties\":false}},{\"name\":\"read_mcp_resource\",\"description\":\"Read one MCP server resource as text. Args: {server, uri} (both required; discover URIs with list_mcp_resources). Binary content is described, not inlined.\",\"schema\":{\"type\":\"object\",\"properties\":{\"server\":{\"type\":\"string\"},\"uri\":{\"type\":\"string\"}},\"required\":[\"server\",\"uri\"],\"additionalProperties\":false}}]");
+    let n: u64 = STR_LEN("[{\"name\":\"sa_vm\",\"description\":\"Ultra workspace tools: {action, ...flat params}, e.g. {action:\\\"read_file\\\",path:\\\"package.json\\\"}; never nest file paths in args. For independent reads/searches, send multiple sa_vm calls in ONE round (native parallel, read-only calls run concurrently). Batch only independent work: never dependent steps, never writes, never the same path twice in one round. sa_vm parallel is temporarily disabled (use native multi-call; batch writes go sequential or apply_patch). Paths are workspace-relative (~ allowed). Actions include read_file/read_lines/read_many/list_dir/find_files/grep_search/write_file/edit_file/apply_patch, split_plan/split_stage/split_refine/split_repair/split_status, run_bun, run_host {command or exe,args[]} (safe git writes go here, e.g. {exe:\\\"git\\\",args:[\\\"checkout\\\",\\\"<branch>\\\"]} or [\\\"switch\\\",\\\"<branch>\\\"] or [\\\"fetch\\\"]; clean/revert/reset --hard stay blocked), git_status/git_diff/git_log {max_count?,revision?} (read-only: status/diff/log only, never for switching branches), session/checkpoint tools (local_checkpoint {message?} snapshots dirty worktree to a git commit; restore_checkpoint {commit} rolls back), and JEV decision actions (jev_done {user_request,actual_work,evidence} for delivery sign-off, jev_choose, jev_checklist, jev_thinking, jev_redteam, jev_rank, jev_scope, jev_dispatch, jev_consistency, jev_diagnose, jev_edge_cases, jev_blast_radius, jev_intent, jev_next, jev_compress, jev_progress). Delivery sign-off: call jev_done with {user_request,actual_work,evidence} before completing implementation work. Writes: write_file needs {path,content} (create/overwrite whole file); edit_file needs {path,old_text,new_text} with old_text copied EXACTLY from a prior read (long unique context, never type definitions as values; set replaceAll:true only to replace every occurrence); apply_patch needs {patch} with *** Begin Patch envelope (NOT a raw unified diff; single-file edits prefer edit_file). NEVER use {input,output} for edits - they are not edit params. Reads: read_many needs {files:[up to 10]} with one shared slice (different slices use parallel). Splits: split_plan {path,task} -> split_stage/split_refine {session_id,module_name,ops:[{path,content|patch}]} (content XOR patch, 1-20 ops, no delete/rename) -> split_repair phase=diff then validate then commit {confirm:true}. read_skill is optional: load a listed skill only when the task needs its specialized guidance.\",\"schema\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"query\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"},\"old_text\":{\"type\":\"string\",\"description\":\"Exact existing text to replace for edit_file (must match file verbatim).\"},\"new_text\":{\"type\":\"string\",\"description\":\"Replacement text for edit_file.\"},\"replaceAll\":{\"type\":\"boolean\",\"description\":\"Replace every occurrence for edit_file (default false, requires unique context otherwise).\"},\"patch\":{\"type\":\"string\",\"description\":\"Patch text with *** Begin Patch envelope (*** Update File: + @@ hunks); raw unified diffs are rejected.\"},\"diff\":{\"type\":\"string\"},\"from\":{\"type\":\"string\"},\"to\":{\"type\":\"string\"},\"source\":{\"type\":\"string\"},\"dest\":{\"type\":\"string\"},\"parallel\":{\"type\":\"array\",\"description\":\"Independent subtasks [{action,...flat params}]; never nest parallel, never repeat same path, never mix writes with reads of same file.\"},\"files\":{\"type\":\"array\"},\"ops\":{\"type\":\"array\"},\"phase\":{\"type\":\"string\"},\"module_name\":{\"type\":\"string\"},\"task\":{\"type\":\"string\"},\"confirm\":{\"type\":\"boolean\"},\"max_tokens\":{\"type\":\"number\"},\"max_tokens_per_file\":{\"type\":\"number\"},\"exe\":{\"type\":\"string\"},\"command\":{\"type\":\"string\",\"description\":\"Command string for run_host, e.g. 'git log --oneline -10'.\"},\"session_id\":{\"type\":\"string\"},\"input\":{\"type\":\"string\"},\"commit\":{\"type\":\"string\"},\"yield_time_ms\":{\"type\":\"number\"},\"start_line\":{\"type\":\"number\"},\"end_line\":{\"type\":\"number\"},\"dir\":{\"type\":\"string\"},\"pattern\":{\"type\":\"string\"},\"depth\":{\"type\":\"number\"},\"max_entries\":{\"type\":\"number\"},\"max_count\":{\"type\":\"number\",\"description\":\"Max commits to display for git_log (default 10).\"},\"revision\":{\"type\":\"string\",\"description\":\"Git revision or range for git_log / git_diff (e.g. 'HEAD~5' or 'main..HEAD').\"},\"args\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"user_request\":{\"type\":\"string\",\"description\":\"Original user request for jev_done delivery review.\"},\"actual_work\":{\"type\":\"string\",\"description\":\"Actual work performed for jev_done.\"},\"evidence\":{\"type\":\"string\",\"description\":\"Verification evidence for jev_done.\"},\"question\":{\"type\":\"string\",\"description\":\"Question or goal for JEV decision actions.\"},\"options\":{\"type\":\"object\",\"description\":\"Options or hypotheses for JEV decision actions.\"},\"checks\":{\"type\":\"object\",\"description\":\"Checklist criteria for JEV decision actions.\"}},\"required\":[\"action\"],\"additionalProperties\":true}},{\"name\":\"read_skill\",\"description\":\"Load a listed SKILL.md by name (e.g. {\\\"name\\\":\\\"sa-vm\\\"}) when the task needs that skill's specialized guidance. Common sa_vm actions are described on the tool itself.\",\"schema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}},{\"name\":\"image_view\",\"description\":\"View a local image file for visual inspection (screenshots, mockups, diagrams, photos). Ask JEV to choose analysisMode when the task is ambiguous: \\\"ui\\\" (screen layout), \\\"ocr\\\" (text), \\\"shape\\\" (contours/geometry/silhouette), \\\"pixel\\\" (transparency/colors), \\\"diagram\\\", or \\\"photo\\\". Args: {path (REQUIRED, workspace-relative, absolute, or ~/ image path; local files only, no URLs), analysisMode (\\\"auto\\\" default, or ui|ocr|shape|pixel|diagram|photo), task (short analysis goal), size (optional override: \\\"720p\\\" or \\\"original\\\"), color (optional override: \\\"rgb\\\", \\\"rgba\\\", or \\\"gray\\\")}. The selected mode controls resize/color/detail to avoid sending unnecessarily expensive pixels.\",\"schema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Local image path (workspace-relative, absolute, or ~/); no URLs.\"},\"analysisMode\":{\"type\":\"string\",\"enum\":[\"auto\",\"ui\",\"ocr\",\"shape\",\"pixel\",\"diagram\",\"photo\"],\"description\":\"JEV-selected visual analysis mode.\"},\"task\":{\"type\":\"string\",\"description\":\"Short visual analysis goal used by auto mode.\"},\"size\":{\"type\":\"string\",\"enum\":[\"original\",\"720p\"],\"description\":\"\\\"720p\\\" (default) or \\\"original\\\".\"},\"color\":{\"type\":\"string\",\"enum\":[\"rgba\",\"rgb\",\"gray\"],\"description\":\"\\\"rgb\\\" (default), \\\"rgba\\\", or \\\"gray\\\".\"}},\"required\":[\"path\"],\"additionalProperties\":false}},{\"name\":\"update_plan\",\"description\":\"Track multi-step work, code modifications, and tasks with a structured todo list. Proactively call update_plan at the start of multi-step or exploratory work to establish your checklist, then update statuses (pending, in_progress, completed) as work completes. Each call replaces the whole list. Args: {todos:[{content,status}]} or {steps:[{step,status}]}; status is pending|in_progress|completed.\",\"schema\":{\"type\":\"object\",\"properties\":{\"todos\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"content\":{\"type\":\"string\"},\"status\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}}}},\"steps\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"step\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"status\":{\"type\":\"string\"}}}},\"explanation\":{\"type\":\"string\"}},\"additionalProperties\":true}},{\"name\":\"request_user_input\",\"description\":\"Ask the user structured clarification questions mid-turn when a blocking requirement, design preference, or ambiguous goal cannot be resolved autonomously. Execution pauses until the user responds in a dialog modal, and returns their structured choices. Args: {questions:[{id?,question,header?,options?,is_multi_select?}]}. Example: {\\\"questions\\\":[{\\\"id\\\":\\\"choice\\\",\\\"question\\\":\\\"Select build target\\\",\\\"options\\\":[\\\"Debug\\\",\\\"Release\\\"]}]}\",\"schema\":{\"type\":\"object\",\"properties\":{\"questions\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"question\":{\"type\":\"string\"},\"header\":{\"type\":\"string\"},\"options\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"is_multi_select\":{\"type\":\"boolean\"}},\"required\":[\"question\"]}}},\"required\":[\"questions\"],\"additionalProperties\":true}},{\"name\":\"web_search\",\"description\":\"Search the web for technical documentation, API specifications, release notes, and error resolution. Args: {query, max_results?}. Returns search results with titles, URLs, and text snippets.\",\"schema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search query or error message\"},\"max_results\":{\"type\":\"number\",\"description\":\"Max results (1-10, default 5)\"}},\"required\":[\"query\"],\"additionalProperties\":false}},{\"name\":\"list_mcp_resources\",\"description\":\"List files/objects exposed by MCP servers (config.toml [mcp_servers.*]). Args: {server?} - omit for all connected servers. Read one with read_mcp_resource.\",\"schema\":{\"type\":\"object\",\"properties\":{\"server\":{\"type\":\"string\"}},\"additionalProperties\":false}},{\"name\":\"read_mcp_resource\",\"description\":\"Read one MCP server resource as text. Args: {server, uri} (both required; discover URIs with list_mcp_resources). Binary content is described, not inlined.\",\"schema\":{\"type\":\"object\",\"properties\":{\"server\":{\"type\":\"string\"},\"uri\":{\"type\":\"string\"}},\"required\":[\"server\",\"uri\"],\"additionalProperties\":false}}]");
+    *out = mb_parse(text, n);
+}
+fn mb_mini_subagent_tools(out: &u64) -> void {
+    let text: ptr = STR_PTR("[{\"name\":\"spawn_agent\",\"description\":\"Delegate an independent subtask to a sub-agent (child thread with same workspace/relay/model). Args: {task_name,message,agent_type?} - task_name AND message are BOTH required. task_name uses lowercase letters, digits, underscores. message is a plain-text task brief (NEVER todos/steps - use update_plan separately for checklists). Example: {\\\"task_name\\\":\\\"task_a\\\",\\\"message\\\":\\\"Read package.json via sa_vm read_file and report name and version.\\\"}. Returns {agent_id,task_name,nickname,status}. Max 5 live children, depth limit 1 (children cannot spawn).\",\"schema\":{\"type\":\"object\",\"properties\":{\"task_name\":{\"type\":\"string\",\"description\":\"REQUIRED. Canonical task name: lowercase letters, digits, underscores.\"},\"taskName\":{\"type\":\"string\"},\"message\":{\"type\":\"string\",\"description\":\"REQUIRED. Plain-text task brief. Never pass update_plan todos/steps here.\"},\"prompt\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"agent_type\":{\"type\":\"string\"},\"agentType\":{\"type\":\"string\"}},\"required\":[\"task_name\",\"message\"],\"additionalProperties\":false}},{\"name\":\"send_message\",\"description\":\"Queue a message on an existing sub-agent without starting a new turn. Args: {target,message}. target is agent_id (or task_name). The message waits in its inbox; use followup_task to trigger the next turn, interrupt_agent to redirect a running turn. Reuse agents when the follow-up depends on their previous context.\",\"schema\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"target\",\"message\"],\"additionalProperties\":false}},{\"name\":\"followup_task\",\"description\":\"Send a follow-up task to an existing sub-agent and trigger a turn if it is idle. Args: {target,message}. target is agent_id (or task_name). If the agent is already running, the task is queued for its next turn; use interrupt_agent first to redirect the current turn instead.\",\"schema\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"target\",\"message\"],\"additionalProperties\":false}},{\"name\":\"read_agent_report\",\"description\":\"Read a finished sub-agent full final report. Args: {target}. target is agent_id (or task_name). wait_agent returns status only; use this to fetch report content on demand.\",\"schema\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"target\"],\"additionalProperties\":false}},{\"name\":\"interrupt_agent\",\"description\":\"Interrupt a sub-agent's current turn, if any, and return its previous status. Args: {target}. The agent remains available for messages and follow-up tasks.\",\"schema\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"target\"],\"additionalProperties\":false}},{\"name\":\"wait_agent\",\"description\":\"Wait for sub-agent mailbox activity or terminal status. Args: {targets,timeout_ms?}. targets is a list of agent_id (or single target). Returns {agents:[{agent_id,status,has_report,report?}],timedOut}; completed reports are returned inline (capped) and also delivered to the parent live thread, so do NOT call read_agent_report for reports already included here.\",\"schema\":{\"type\":\"object\",\"properties\":{\"targets\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"target\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"number\"},\"timeoutMs\":{\"type\":\"number\"}},\"additionalProperties\":false}},{\"name\":\"close_agent\",\"description\":\"Close a finished sub-agent and free its concurrency slot. Args: {target}. Completed agents count toward the 5-agent limit until closed - do not keep agents open longer than needed. The child rollout is retained and can be reopened with resume_agent.\",\"schema\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"target\"],\"additionalProperties\":false}},{\"name\":\"resume_agent\",\"description\":\"Resume a previously closed sub-agent by id so it can receive follow-up tasks and wait_agent calls. Args: {target}. target is agent_id (or task_name) of a child closed by close_agent. Returns {agent_id,status,resumed}.\",\"schema\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"target\"],\"additionalProperties\":false}},{\"name\":\"list_agents\",\"description\":\"List your live sub-agents with task names and statuses.\",\"schema\":{\"type\":\"object\",\"properties\":{\"path_prefix\":{\"type\":\"string\"}},\"additionalProperties\":false}}]");
+    let n: u64 = STR_LEN("[{\"name\":\"spawn_agent\",\"description\":\"Delegate an independent subtask to a sub-agent (child thread with same workspace/relay/model). Args: {task_name,message,agent_type?} - task_name AND message are BOTH required. task_name uses lowercase letters, digits, underscores. message is a plain-text task brief (NEVER todos/steps - use update_plan separately for checklists). Example: {\\\"task_name\\\":\\\"task_a\\\",\\\"message\\\":\\\"Read package.json via sa_vm read_file and report name and version.\\\"}. Returns {agent_id,task_name,nickname,status}. Max 5 live children, depth limit 1 (children cannot spawn).\",\"schema\":{\"type\":\"object\",\"properties\":{\"task_name\":{\"type\":\"string\",\"description\":\"REQUIRED. Canonical task name: lowercase letters, digits, underscores.\"},\"taskName\":{\"type\":\"string\"},\"message\":{\"type\":\"string\",\"description\":\"REQUIRED. Plain-text task brief. Never pass update_plan todos/steps here.\"},\"prompt\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"agent_type\":{\"type\":\"string\"},\"agentType\":{\"type\":\"string\"}},\"required\":[\"task_name\",\"message\"],\"additionalProperties\":false}},{\"name\":\"send_message\",\"description\":\"Queue a message on an existing sub-agent without starting a new turn. Args: {target,message}. target is agent_id (or task_name). The message waits in its inbox; use followup_task to trigger the next turn, interrupt_agent to redirect a running turn. Reuse agents when the follow-up depends on their previous context.\",\"schema\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"target\",\"message\"],\"additionalProperties\":false}},{\"name\":\"followup_task\",\"description\":\"Send a follow-up task to an existing sub-agent and trigger a turn if it is idle. Args: {target,message}. target is agent_id (or task_name). If the agent is already running, the task is queued for its next turn; use interrupt_agent first to redirect the current turn instead.\",\"schema\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"target\",\"message\"],\"additionalProperties\":false}},{\"name\":\"read_agent_report\",\"description\":\"Read a finished sub-agent full final report. Args: {target}. target is agent_id (or task_name). wait_agent returns status only; use this to fetch report content on demand.\",\"schema\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"target\"],\"additionalProperties\":false}},{\"name\":\"interrupt_agent\",\"description\":\"Interrupt a sub-agent's current turn, if any, and return its previous status. Args: {target}. The agent remains available for messages and follow-up tasks.\",\"schema\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"target\"],\"additionalProperties\":false}},{\"name\":\"wait_agent\",\"description\":\"Wait for sub-agent mailbox activity or terminal status. Args: {targets,timeout_ms?}. targets is a list of agent_id (or single target). Returns {agents:[{agent_id,status,has_report,report?}],timedOut}; completed reports are returned inline (capped) and also delivered to the parent live thread, so do NOT call read_agent_report for reports already included here.\",\"schema\":{\"type\":\"object\",\"properties\":{\"targets\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"target\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"number\"},\"timeoutMs\":{\"type\":\"number\"}},\"additionalProperties\":false}},{\"name\":\"close_agent\",\"description\":\"Close a finished sub-agent and free its concurrency slot. Args: {target}. Completed agents count toward the 5-agent limit until closed - do not keep agents open longer than needed. The child rollout is retained and can be reopened with resume_agent.\",\"schema\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"target\"],\"additionalProperties\":false}},{\"name\":\"resume_agent\",\"description\":\"Resume a previously closed sub-agent by id so it can receive follow-up tasks and wait_agent calls. Args: {target}. target is agent_id (or task_name) of a child closed by close_agent. Returns {agent_id,status,resumed}.\",\"schema\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"target\"],\"additionalProperties\":false}},{\"name\":\"list_agents\",\"description\":\"List your live sub-agents with task names and statuses.\",\"schema\":{\"type\":\"object\",\"properties\":{\"path_prefix\":{\"type\":\"string\"}},\"additionalProperties\":false}}]");
+    *out = mb_parse(text, n);
+}
+fn miniToolsForDepth(depth: i64, out: &u64) -> void {
+    if depth > 0 { mb_mini_tools(out); return; };
+    let base: u64 = 0;
+    mb_mini_tools(&base);
+    let subs: u64 = 0;
+    mb_mini_subagent_tools(&subs);
+    let count: u64 = mb_n_count(subs);
+    let i: u64 = 0;
+    while i < count {
+        let rc: i32 = mb_a_push_node(base, mb_clone_node(mb_a_at(subs, i)));
+        i = i + 1;
+    }
+    mb_free_doc(subs);
+    *out = base;
+}
+
+// ---- subagent/tool-name classification (TS:2211-2395) ----
+const MINI_SUBAGENT_USAGE_HINT: ptr = "Sub-agents: use spawn_agent only for substantial independent work that benefits from parallelism; wait_agent waits and returns completed reports inline (no extra read_agent_report needed for reports already delivered); closed agents stay resumable via resume_agent.";
+fn MINI_CHILD_TURN_CONCURRENCY_DEFAULT() -> u64 { return 3; }
+fn MINI_CHILD_PENDING_INPUTS_DEFAULT() -> u64 { return 8; }
+fn mb_positive_env_int(key_p: ptr, key_n: u64, fallback: u64, min_v: u64, max_v: u64) -> u64 {
+    let raw = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has: bool = mb_env_get(key_p, key_n, &raw);
+    let t = MbStr { bytes: [0u8; 8192], len: 0 };
+    if has { mb_trim_to(mb_sp(&raw), raw.len, &t); };
+    let parsed: f64 = 0.0;
+    if !has || !mb_parse_f64(mb_sp(&t), t.len, &parsed) { return fallback; };
+    if !(parsed > 0.0) { return fallback; };
+    let v: u64 = mb_floor_f64(parsed) as u64;
+    if v < min_v { return min_v; };
+    if v > max_v { return max_v; };
+    return v;
+}
+fn miniChildTurnConcurrency() -> u64 {
+    return mb_positive_env_int(STR_PTR("MINI_MAX_CONCURRENT_CHILD_TURNS"), STR_LEN("MINI_MAX_CONCURRENT_CHILD_TURNS"), MINI_CHILD_TURN_CONCURRENCY_DEFAULT(), 1, MINI_SUBAGENT_MAX_CHILDREN);
+}
+fn miniChildPendingInputLimit() -> u64 {
+    return mb_positive_env_int(STR_PTR("MINI_MAX_PENDING_CHILD_INPUTS"), STR_LEN("MINI_MAX_PENDING_CHILD_INPUTS"), MINI_CHILD_PENDING_INPUTS_DEFAULT(), 1, 64);
+}
+fn mb_mini_subagent_tool_names(out: &u64) -> void {
+    *out = mb_parse(STR_PTR("[\"spawn_agent\",\"send_message\",\"followup_task\",\"read_agent_report\",\"interrupt_agent\",\"wait_agent\",\"close_agent\",\"resume_agent\",\"list_agents\"]"), STR_LEN("[\"spawn_agent\",\"send_message\",\"followup_task\",\"read_agent_report\",\"interrupt_agent\",\"wait_agent\",\"close_agent\",\"resume_agent\",\"list_agents\"]"));
+}
+fn normalizeMiniSubagentToolName(name_p: ptr, name_n: u64, is_str: bool, out: &MbStr) -> void {
+    out.len = 0;
+    if !is_str { return; };
+    if mb_bytes_eq(name_p, name_n, STR_PTR("send_input"), STR_LEN("send_input")) { mb_sassign(out, STR_PTR("send_message"), STR_LEN("send_message")); return; };
+    mb_sassign(out, name_p, name_n);
+}
+fn isMiniSubagentTool(name_p: ptr, name_n: u64, is_str: bool) -> bool {
+    if is_str && mb_bytes_eq(name_p, name_n, STR_PTR("send_input"), STR_LEN("send_input")) { return true; };
+    if !is_str { return false; };
+    let names: u64 = 0;
+    mb_mini_subagent_tool_names(&names);
+    let found: bool = mb_str_in_arr(names, name_p, name_n, false);
+    mb_free_doc(names);
+    return found;
+}
+fn mb_mini_jev_actions(out: &u64) -> void {
+    *out = mb_parse(STR_PTR("[\"jev_choose\",\"jev_checklist\",\"jev_evaluate\",\"jev_thinking\",\"jev_redteam\",\"jev_rank\",\"jev_scope\",\"jev_dispatch\",\"jev_consistency\",\"jev_done\",\"jev_diagnose\",\"jev_edge_cases\",\"jev_blast_radius\",\"jev_intent\",\"jev_next\",\"jev_compress\",\"jev_progress\"]"), STR_LEN("[\"jev_choose\",\"jev_checklist\",\"jev_evaluate\",\"jev_thinking\",\"jev_redteam\",\"jev_rank\",\"jev_scope\",\"jev_dispatch\",\"jev_consistency\",\"jev_done\",\"jev_diagnose\",\"jev_edge_cases\",\"jev_blast_radius\",\"jev_intent\",\"jev_next\",\"jev_compress\",\"jev_progress\"]"));
+}
+fn isMiniSaVmToolName(name_p: ptr, name_n: u64, is_str: bool) -> bool {
+    if !is_str { return false; };
+    let n = MbStr { bytes: [0u8; 8192], len: 0 };
+    mb_trim_to(name_p, name_n, &n);
+    let p: ptr = mb_sp(&n);
+    let len: u64 = n.len;
+    if mb_bytes_eq(p, len, STR_PTR("sa_vm"), STR_LEN("sa_vm")) || mb_bytes_eq(p, len, STR_PTR("sa_vm_run"), STR_LEN("sa_vm_run"))
+        || mb_bytes_eq(p, len, STR_PTR("git_log"), STR_LEN("git_log")) || mb_bytes_eq(p, len, STR_PTR("git-log"), STR_LEN("git-log"))
+        || mb_bytes_eq(p, len, STR_PTR("git_status"), STR_LEN("git_status")) || mb_bytes_eq(p, len, STR_PTR("git-status"), STR_LEN("git-status"))
+        || mb_bytes_eq(p, len, STR_PTR("git_diff"), STR_LEN("git_diff")) || mb_bytes_eq(p, len, STR_PTR("git-diff"), STR_LEN("git-diff"))
+        || mb_bytes_eq(p, len, STR_PTR("run_host"), STR_LEN("run_host")) || mb_bytes_eq(p, len, STR_PTR("exec_host"), STR_LEN("exec_host"))
+        || mb_bytes_eq(p, len, STR_PTR("host"), STR_LEN("host")) || mb_bytes_eq(p, len, STR_PTR("bash"), STR_LEN("bash"))
+        || mb_bytes_eq(p, len, STR_PTR("sh"), STR_LEN("sh")) { return true; };
+    let jev: u64 = 0;
+    mb_mini_jev_actions(&jev);
+    let in_jev: bool = mb_str_in_arr(jev, p, len, false);
+    mb_free_doc(jev);
+    if in_jev { return true; };
+    if mb_starts_with(p, len, STR_PTR("mcp__"), STR_LEN("mcp__")) && (mb_contains(p, len, STR_PTR("sa_vm"), STR_LEN("sa_vm")) || mb_contains(p, len, STR_PTR("sa-vm"), STR_LEN("sa-vm"))) { return true; };
+    return false;
+}
+fn mb_mini_sa_vm_action_names(out: &u64) -> void {
+    *out = mb_parse(STR_PTR("[\"read_file\",\"read_lines\",\"read_many\",\"read_files\",\"read_file_tail\",\"count_lines\",\"file_info\",\"stat\",\"test_path\",\"file_exists\",\"exists\",\"ensure_dir\",\"mkdir\",\"list_dir\",\"find_files\",\"grep_search\",\"grep_search_async\",\"write_file\",\"edit_file\",\"apply_patch\",\"delete_file\",\"safe_delete\",\"move_file\",\"copy_file\",\"move_file_with_imports\",\"find_references\",\"find_implementations\",\"find_definition\",\"file_outline\",\"workspace_outline\",\"rename_symbol\",\"extract_to_file\",\"add_import\",\"get_diagnostics\",\"workspace_diagnostics\",\"organize_imports\",\"verify_loop\",\"verify_changed\",\"analyze_scope\",\"split_plan\",\"split_stage\",\"split_refine\",\"split_repair\",\"split_status\",\"run_bun\",\"run_project_check\",\"run_host\",\"exec_host\",\"host\",\"bash\",\"sh\",\"run_js\",\"run_py\",\"git_status\",\"git-status\",\"git_diff\",\"git-diff\",\"git_log\",\"git-log\",\"save_note\",\"add_memory\",\"edit_memory\",\"save_memory\",\"read_memory\",\"delete_memory\",\"sa_vm_run\"]"), STR_LEN("[\"read_file\",\"read_lines\",\"read_many\",\"read_files\",\"read_file_tail\",\"count_lines\",\"file_info\",\"stat\",\"test_path\",\"file_exists\",\"exists\",\"ensure_dir\",\"mkdir\",\"list_dir\",\"find_files\",\"grep_search\",\"grep_search_async\",\"write_file\",\"edit_file\",\"apply_patch\",\"delete_file\",\"safe_delete\",\"move_file\",\"copy_file\",\"move_file_with_imports\",\"find_references\",\"find_implementations\",\"find_definition\",\"file_outline\",\"workspace_outline\",\"rename_symbol\",\"extract_to_file\",\"add_import\",\"get_diagnostics\",\"workspace_diagnostics\",\"organize_imports\",\"verify_loop\",\"verify_changed\",\"analyze_scope\",\"split_plan\",\"split_stage\",\"split_refine\",\"split_repair\",\"split_status\",\"run_bun\",\"run_project_check\",\"run_host\",\"exec_host\",\"host\",\"bash\",\"sh\",\"run_js\",\"run_py\",\"git_status\",\"git-status\",\"git_diff\",\"git-diff\",\"git_log\",\"git-log\",\"save_note\",\"add_memory\",\"edit_memory\",\"save_memory\",\"read_memory\",\"delete_memory\",\"sa_vm_run\"]"));
+    // TS spreads MINI_JEV_ACTIONS into the set.
+    let jev: u64 = 0;
+    mb_mini_jev_actions(&jev);
+    let count: u64 = mb_n_count(jev);
+    let i: u64 = 0;
+    while i < count {
+        let rc: i32 = mb_a_push_node(*out, mb_clone_node(mb_a_at(jev, i)));
+        i = i + 1;
+    }
+    mb_free_doc(jev);
+}
+fn mb_mini_shell_spellings(out: &u64) -> void {
+    *out = mb_parse(STR_PTR("[\"bash\",\"sh\",\"shell\",\"exec\",\"terminal\",\"cmd\",\"powershell\",\"pwsh\",\"curl\",\"wget\"]"), STR_LEN("[\"bash\",\"sh\",\"shell\",\"exec\",\"terminal\",\"cmd\",\"powershell\",\"pwsh\",\"curl\",\"wget\"]"));
+}
+// Write-redirect table (TS:2233-2257): returns the hint for a lowercased
+// top-level write spelling, or empty.
+fn mb_write_redirect_hint(lower_p: ptr, lower_n: u64, out: &MbJson) -> void {
+    out.len = 0;
+    if mb_bytes_eq(lower_p, lower_n, STR_PTR("edit"), STR_LEN("edit")) || mb_bytes_eq(lower_p, lower_n, STR_PTR("edit_file"), STR_LEN("edit_file")) { mb_jassign(out, STR_PTR("Call sa_vm with {\"action\":\"edit_file\",\"path\":\"<workspace-relative file>\",\"old_text\":\"<exact unique snippet from a prior read>\",\"new_text\":\"<replacement>\"} instead."), STR_LEN("Call sa_vm with {\"action\":\"edit_file\",\"path\":\"<workspace-relative file>\",\"old_text\":\"<exact unique snippet from a prior read>\",\"new_text\":\"<replacement>\"} instead.")); return; };
+    if mb_bytes_eq(lower_p, lower_n, STR_PTR("write"), STR_LEN("write")) || mb_bytes_eq(lower_p, lower_n, STR_PTR("write_file"), STR_LEN("write_file")) { mb_jassign(out, STR_PTR("Call sa_vm with {\"action\":\"write_file\",\"path\":\"<workspace-relative file>\",\"content\":\"<full file text>\"} instead."), STR_LEN("Call sa_vm with {\"action\":\"write_file\",\"path\":\"<workspace-relative file>\",\"content\":\"<full file text>\"} instead.")); return; };
+    if mb_bytes_eq(lower_p, lower_n, STR_PTR("patch"), STR_LEN("patch")) || mb_bytes_eq(lower_p, lower_n, STR_PTR("apply_patch"), STR_LEN("apply_patch")) { mb_jassign(out, STR_PTR("Call sa_vm with {\"action\":\"apply_patch\",\"patch\":\"*** Begin Patch\\n*** Update File: <file>\\n@@\\n-...\\n+...\\n*** End Patch\"} instead (envelope required, not a raw unified diff)."), STR_LEN("Call sa_vm with {\"action\":\"apply_patch\",\"patch\":\"*** Begin Patch\\n*** Update File: <file>\\n@@\\n-...\\n+...\\n*** End Patch\"} instead (envelope required, not a raw unified diff).")); return; };
+    if mb_bytes_eq(lower_p, lower_n, STR_PTR("delete"), STR_LEN("delete")) || mb_bytes_eq(lower_p, lower_n, STR_PTR("delete_file"), STR_LEN("delete_file")) { mb_jassign(out, STR_PTR("Call sa_vm with {\"action\":\"delete_file\",\"path\":\"<workspace-relative file>\"} instead."), STR_LEN("Call sa_vm with {\"action\":\"delete_file\",\"path\":\"<workspace-relative file>\"} instead.")); return; };
+    if mb_bytes_eq(lower_p, lower_n, STR_PTR("move"), STR_LEN("move")) || mb_bytes_eq(lower_p, lower_n, STR_PTR("move_file"), STR_LEN("move_file")) { mb_jassign(out, STR_PTR("Call sa_vm with {\"action\":\"move_file\",\"from\":\"<src>\",\"to\":\"<dst>\"} instead."), STR_LEN("Call sa_vm with {\"action\":\"move_file\",\"from\":\"<src>\",\"to\":\"<dst>\"} instead.")); return; };
+    if mb_bytes_eq(lower_p, lower_n, STR_PTR("copy"), STR_LEN("copy")) || mb_bytes_eq(lower_p, lower_n, STR_PTR("copy_file"), STR_LEN("copy_file")) { mb_jassign(out, STR_PTR("Call sa_vm with {\"action\":\"copy_file\",\"from\":\"<src>\",\"to\":\"<dst>\"} instead."), STR_LEN("Call sa_vm with {\"action\":\"copy_file\",\"from\":\"<src>\",\"to\":\"<dst>\"} instead.")); return; };
+    if mb_bytes_eq(lower_p, lower_n, STR_PTR("read_many"), STR_LEN("read_many")) { mb_jassign(out, STR_PTR("Call sa_vm with {\"action\":\"read_many\",\"files\":[\"<file1>\",\"<file2>\"]} instead (files array, max 10, one shared slice; different slices use parallel)."), STR_LEN("Call sa_vm with {\"action\":\"read_many\",\"files\":[\"<file1>\",\"<file2>\"]} instead (files array, max 10, one shared slice; different slices use parallel).")); return; };
+    if mb_bytes_eq(lower_p, lower_n, STR_PTR("split_plan"), STR_LEN("split_plan")) { mb_jassign(out, STR_PTR("Call sa_vm with {\"action\":\"split_plan\",\"path\":\"<big file>\",\"task\":\"<goal>\"} instead, then split_stage/split_refine with {session_id,module_name,ops:[{path,content|patch}]}, then split_repair phase=diff/validate/commit."), STR_LEN("Call sa_vm with {\"action\":\"split_plan\",\"path\":\"<big file>\",\"task\":\"<goal>\"} instead, then split_stage/split_refine with {session_id,module_name,ops:[{path,content|patch}]}, then split_repair phase=diff/validate/commit.")); return; };
+    if mb_bytes_eq(lower_p, lower_n, STR_PTR("split_stage"), STR_LEN("split_stage")) { mb_jassign(out, STR_PTR("Call sa_vm with {\"action\":\"split_stage\",\"session_id\":\"<id>\",\"module_name\":\"<name>\",\"ops\":[{\"path\":\"<file>\",\"content\":\"...\"}]} instead."), STR_LEN("Call sa_vm with {\"action\":\"split_stage\",\"session_id\":\"<id>\",\"module_name\":\"<name>\",\"ops\":[{\"path\":\"<file>\",\"content\":\"...\"}]} instead.")); return; };
+    if mb_bytes_eq(lower_p, lower_n, STR_PTR("split_refine"), STR_LEN("split_refine")) { mb_jassign(out, STR_PTR("Call sa_vm with {\"action\":\"split_refine\",\"session_id\":\"<id>\",\"module_name\":\"<name>\",\"ops\":[{\"path\":\"<file>\",\"content\":\"...\"}]} instead."), STR_LEN("Call sa_vm with {\"action\":\"split_refine\",\"session_id\":\"<id>\",\"module_name\":\"<name>\",\"ops\":[{\"path\":\"<file>\",\"content\":\"...\"}]} instead.")); return; };
+    if mb_bytes_eq(lower_p, lower_n, STR_PTR("split_repair"), STR_LEN("split_repair")) { mb_jassign(out, STR_PTR("Call sa_vm with {\"action\":\"split_repair\",\"session_id\":\"<id>\",\"phase\":\"diff|validate|commit\",\"confirm\":true} instead (commit needs fresh diff+validate)."), STR_LEN("Call sa_vm with {\"action\":\"split_repair\",\"session_id\":\"<id>\",\"phase\":\"diff|validate|commit\",\"confirm\":true} instead (commit needs fresh diff+validate).")); return; };
+    if mb_bytes_eq(lower_p, lower_n, STR_PTR("split_status"), STR_LEN("split_status")) { mb_jassign(out, STR_PTR("Call sa_vm with {\"action\":\"split_status\",\"session_id\":\"<id>\"} instead."), STR_LEN("Call sa_vm with {\"action\":\"split_status\",\"session_id\":\"<id>\"} instead.")); return; };
+}
+fn miniUnknownToolError(name_p: ptr, name_n: u64, is_str: bool, out: &MbJson) -> void {
+    out.len = 0;
+    let n = MbStr { bytes: [0u8; 8192], len: 0 };
+    if is_str { mb_trim_to(name_p, name_n, &n); };
+    mb_jappend(out, STR_PTR("unknown tool: "), STR_LEN("unknown tool: "));
+    mb_jappend_s(out, &n);
+    if n.len == 0 { return; };
+    let lower = MbStr { bytes: [0u8; 8192], len: 0 };
+    mb_lower_into(mb_sp(&n), n.len, &lower);
+    let shells: u64 = 0;
+    mb_mini_shell_spellings(&shells);
+    let in_shell: bool = mb_str_in_arr(shells, mb_sp(&lower), lower.len, false);
+    mb_free_doc(shells);
+    if in_shell {
+        mb_jappend(out, STR_PTR(". Shell commands run through sa_vm {\"action\":\"run_host\",\"exe\":\"<allowlisted binary>\",\"args\":[...]} (bun/node/python/zig/cargo/go/rustc/git and workspace paths only)."), STR_LEN(". Shell commands run through sa_vm {\"action\":\"run_host\",\"exe\":\"<allowlisted binary>\",\"args\":[...]} (bun/node/python/zig/cargo/go/rustc/git and workspace paths only)."));
+        return;
+    };
+    let hint = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_write_redirect_hint(mb_sp(&lower), lower.len, &hint);
+    if hint.len > 0 {
+        mb_jappend(out, STR_PTR(". "), STR_LEN(". "));
+        mb_jappend(out, mb_jp(&hint), hint.len);
+        return;
+    };
+    let actions: u64 = 0;
+    mb_mini_sa_vm_action_names(&actions);
+    let in_actions: bool = mb_str_in_arr(actions, mb_sp(&lower), lower.len, false);
+    mb_free_doc(actions);
+    if in_actions || isMiniWriteAction(mb_sp(&lower), lower.len) {
+        mb_jappend(out, STR_PTR(". Call sa_vm with {\"action\":\""), STR_LEN(". Call sa_vm with {\"action\":\""));
+        mb_jappend_s(out, &lower);
+        mb_jappend(out, STR_PTR("\", ...} instead (e.g. {\"action\":\""), STR_LEN("\", ...} instead (e.g. {\"action\":\""));
+        mb_jappend_s(out, &lower);
+        mb_jappend(out, STR_PTR("\",\"path\":\"<workspace-relative path>\"})."), STR_LEN("\",\"path\":\"<workspace-relative path>\"})."));
+        return;
+    };
+    mb_jappend(out, STR_PTR(". Workspace operations run through sa_vm, e.g. {\"action\":\"read_file\",\"path\":\"package.json\"}."), STR_LEN(". Workspace operations run through sa_vm, e.g. {\"action\":\"read_file\",\"path\":\"package.json\"}."));
 }
