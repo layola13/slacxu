@@ -11,6 +11,8 @@
 // is added here only when a plugin actually consumes it.
 
 @import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/globals.sai"
 
 // DEFECT: the whole surface is typed contracts over host objects
 // (ChildProcessWithoutNullStreams, fetch Request/Response,
@@ -21,6 +23,14 @@
 // "codex" | "claude" | "agy" | "auggie" | "cline" |
 // "command-code" | "grok" | "pi" | "opencode" | "opencode-v2" |
 // "muse".
+//
+// ASYNC (fix phase, ASYNC_MODEL R1/R2/R7): the five Promise-returning
+// methods are typed fn pointers returning future<i32> (0 = ok, else
+// the domain status code). Callers either `.await` the returned
+// future inside an async fn or drive it with task::new/task::poll
+// at a synchronous boundary. The remaining synchronous methods stay
+// untyped ptr fields with their TS signatures in comments (typing
+// pass for those belongs to the host-implementation phase).
 
 struct PluginHostServicesCli {
     // getPreferredCliBinary(kind): string | null -> fn ptr:
@@ -34,10 +44,17 @@ struct PluginHostServicesCli {
 }
 
 struct PluginHostServicesSaVm {
-    // ensureProjectBundleInstalled(cwd): Promise<{ scriptPath: string; installed: boolean }>  // DEFECT: async
-    ensureProjectBundleInstalled: ptr,
-    // runTool(input: SaVmRunInput, options?, cwdOverride?): Promise<SaVmRunResult>  // DEFECT: async; SaVm types in saVmTypes.sla
-    runTool: ptr,
+    // ensureProjectBundleInstalled(cwd): Promise<{ scriptPath: string; installed: boolean }>
+    // -> (cwd_ptr, cwd_len, out_path_ptr, out_path_cap, &out_path_len,
+    //     &out_installed) -> future<i32>; result path as text +
+    // installed flag (1/0).
+    ensureProjectBundleInstalled: fn(ptr, u64, ptr, u64, &u64, &u64) -> future<i32>,
+    // runTool(input: SaVmRunInput, options?, cwdOverride?): Promise<SaVmRunResult>
+    // SaVm types in saVmTypes.sla; input/result as JSON text.
+    // -> (input_ptr, input_len, cwd_ptr, cwd_len, out_ptr, out_cap,
+    //     &out_len) -> future<i32>; cwd_len 0 = no override, options
+    // ride inside the input JSON.
+    runTool: fn(ptr, u64, ptr, u64, ptr, u64, &u64) -> future<i32>,
 }
 
 struct PluginHostServicesCodeCli {
@@ -47,12 +64,17 @@ struct PluginHostServicesCodeCli {
 }
 
 struct PluginHostServicesRemoteBun {
-    // openTunnel(command, portInput?): Promise<{ tunnelId, localPort, remotePort, baseUrl, token }>  // DEFECT: async
-    openTunnel: ptr,
+    // openTunnel(command, portInput?): Promise<{ tunnelId, localPort, remotePort, baseUrl, token }>
+    // -> (cmd_ptr, cmd_len, port (0 = none), out_ptr, out_cap,
+    //     &out_len) -> future<i32>; result as JSON text.
+    openTunnel: fn(ptr, u64, u64, ptr, u64, &u64) -> future<i32>,
     // closeTunnel(tunnelId): boolean
     closeTunnel: ptr,
-    // request(tunnelId, method, path, body?, apiSession?): Promise<unknown>  // DEFECT: async
-    request: ptr,
+    // request(tunnelId, method, path, body?, apiSession?): Promise<unknown>
+    // -> (id_ptr, id_len, method_ptr, method_len, path_ptr, path_len,
+    //     body_ptr, body_len, out_ptr, out_cap, &out_len)
+    //     -> future<i32>; body/result as JSON text, body_len 0 = none.
+    request: fn(ptr, u64, ptr, u64, ptr, u64, ptr, u64, ptr, u64, &u64) -> future<i32>,
 }
 
 struct PluginHostServicesCodex {
@@ -76,8 +98,11 @@ struct PluginHostServicesMini {
 
 struct PluginHostServicesRelay {
     // runChatRequestWithKeyFailover(input: { request, provider, group, apiKeys, failoverBudgetMs? }): Promise<Response>
-    // DEFECT: async; fetch Request/Response + shared config types -> opaque handles / JSON buffers
-    runChatRequestWithKeyFailover: ptr,
+    // -> (input_ptr, input_len, out_ptr, out_cap, &out_len)
+    //     -> future<i32>; input as one JSON object (fetch Request and
+    // shared config types projected into it), Response projected to
+    // JSON text.
+    runChatRequestWithKeyFailover: fn(ptr, u64, ptr, u64, &u64) -> future<i32>,
     // createDuck2ApiApp(): { request(path, init?): Response | Promise<Response> }
     createDuck2ApiApp: ptr,
 }
@@ -92,17 +117,70 @@ struct PluginHostServices {
     relay: PluginHostServicesRelay,
 }
 
-// let current: PluginHostServices | null = null;
-// DEFECT: module-level mutable singleton -> global + presence flag.
-let current: PluginHostServices;
-let current_set: bool = false;
+// Module singleton (gap 2, closed): SLA has no top-level mutable
+// globals; the registered table lives in sa_std global cells
+// (user ruling 2026-10-26: Rust-style cells, no top-level `let mut`).
+// The table image (17 pointer-width fields = 136 bytes) is stored in
+// a bytes cell; a u64 set_once cell gates registration so the first
+// registration wins, matching the TS contract ("Called once by the
+// host at boot, before any plugin engine runs"). NOTE: the TS
+// assignment itself is unconditional — a second
+// setPluginHostServices call in TS would replace the table; here it
+// is ignored by design of the register-once contract.
+const PLUGIN_HOST_SERVICES_BYTES: u64 = 136;
+
+// Unimplemented stand-ins for the typed async fields of a zero
+// table: awaiting one yields status 4 (not registered), exactly the
+// pluginHostServices() error surface. Real tables overwrite them.
+fn hsUnimplEnsure(cwd_ptr: ptr, cwd_len: u64, out_ptr: ptr, out_cap: u64, out_len: &u64, out_installed: &u64) -> future<i32> {
+    *out_len = 0;
+    *out_installed = 0;
+    return future::ready(4);
+}
+
+fn hsUnimplRunTool(input_ptr: ptr, input_len: u64, cwd_ptr: ptr, cwd_len: u64, out_ptr: ptr, out_cap: u64, out_len: &u64) -> future<i32> {
+    *out_len = 0;
+    return future::ready(4);
+}
+
+fn hsUnimplOpenTunnel(cmd_ptr: ptr, cmd_len: u64, port: u64, out_ptr: ptr, out_cap: u64, out_len: &u64) -> future<i32> {
+    *out_len = 0;
+    return future::ready(4);
+}
+
+fn hsUnimplRequest(id_ptr: ptr, id_len: u64, method_ptr: ptr, method_len: u64, path_ptr: ptr, path_len: u64, body_ptr: ptr, body_len: u64, out_ptr: ptr, out_cap: u64, out_len: &u64) -> future<i32> {
+    *out_len = 0;
+    return future::ready(4);
+}
+
+fn hsUnimplRunChat(input_ptr: ptr, input_len: u64, out_ptr: ptr, out_cap: u64, out_len: &u64) -> future<i32> {
+    *out_len = 0;
+    return future::ready(4);
+}
+
+// The zero table (SLA has no uninitialized locals): every sync
+// field null, every typed async field an unimplemented stand-in.
+// Callers use it as the receptacle for tryPluginHostServices() /
+// pluginHostServices() copy-out.
+fn zeroPluginHostServices() -> PluginHostServices {
+    return PluginHostServices {
+        cli: PluginHostServicesCli { getPreferredCliBinary: PTR_NULL(), getCachedLatestCliPath: PTR_NULL(), enumerateCliCandidates: PTR_NULL() },
+        saVm: PluginHostServicesSaVm { ensureProjectBundleInstalled: hsUnimplEnsure, runTool: hsUnimplRunTool },
+        codeCli: PluginHostServicesCodeCli { createBridge: PTR_NULL() },
+        remoteBun: PluginHostServicesRemoteBun { openTunnel: hsUnimplOpenTunnel, closeTunnel: PTR_NULL(), request: hsUnimplRequest },
+        codex: PluginHostServicesCodex { findCodexBinary: PTR_NULL(), isCodexCliAvailable: PTR_NULL(), codexAppServerArgs: PTR_NULL(), spawnCodexCommand: PTR_NULL(), resolveCodexSpawn: PTR_NULL() },
+        mini: PluginHostServicesMini { createFallbackBridge: PTR_NULL() },
+        relay: PluginHostServicesRelay { runChatRequestWithKeyFailover: hsUnimplRunChat, createDuck2ApiApp: PTR_NULL() },
+    };
+}
 
 // Called once by the host at boot, before any plugin engine runs.
 fn setPluginHostServices(services: &PluginHostServices) -> void {
-    // DEFECT: struct assignment of the full table approximated by
-    // storing through a pointer-sized registry slot in fix phase;
-    // bulk pass records presence only.
-    current_set = true;
+    let already: u64 = 0;
+    let st = sa_global_u64_set_once(STR_PTR("sdk.hostServices.registered"), STR_LEN("sdk.hostServices.registered"), 1, &already);
+    if already == 0 {
+        sa_global_bytes_set(STR_PTR("sdk.hostServices.table"), STR_LEN("sdk.hostServices.table"), services, PLUGIN_HOST_SERVICES_BYTES);
+    };
 }
 
 // The registered host services, or null when no host registered them
@@ -110,9 +188,9 @@ fn setPluginHostServices(services: &PluginHostServices) -> void {
 // capabilities" — e.g. no preferred binary — never as another service.
 // DEFECT: nullable return -> bool + out param.
 fn tryPluginHostServices(out: &PluginHostServices) -> bool {
-    if !current_set { return false; };
-    // DEFECT: table copy-out deferred to fix phase.
-    return true;
+    let n: u64 = 0;
+    let st = sa_global_bytes_get(STR_PTR("sdk.hostServices.table"), STR_LEN("sdk.hostServices.table"), out, PLUGIN_HOST_SERVICES_BYTES, &n);
+    return st == 0;
 }
 
 // The registered host services; throws when the host has not registered them.
@@ -120,6 +198,37 @@ fn tryPluginHostServices(out: &PluginHostServices) -> bool {
 const PLUGIN_HOST_SERVICES_NOT_REGISTERED_ERROR = "plugin host services are not registered (the host must call setPluginHostServices at boot)";
 
 fn pluginHostServices(out: &PluginHostServices) -> i32 {
-    if !current_set { return 4; };
+    let n: u64 = 0;
+    let st = sa_global_bytes_get(STR_PTR("sdk.hostServices.table"), STR_LEN("sdk.hostServices.table"), out, PLUGIN_HOST_SERVICES_BYTES, &n);
+    if st != 0 { return 4; };
     return 0;
+}
+
+// ---- call helpers (see runtimeClient.sla for the probed
+// fn-pointer reference-argument restriction these work around;
+// each forwards its own reference parameters into the table
+// call and returns the future for the caller to await/drive) ----
+fn hsEnsureProjectBundleInstalled(t: &PluginHostServices, cwd_ptr: ptr, cwd_len: u64, out_ptr: ptr, out_cap: u64, out_len: &u64, out_installed: &u64) -> future<i32> {
+    let f = t.saVm.ensureProjectBundleInstalled;
+    return f(cwd_ptr, cwd_len, out_ptr, out_cap, out_len, out_installed);
+}
+
+fn hsRunTool(t: &PluginHostServices, input_ptr: ptr, input_len: u64, cwd_ptr: ptr, cwd_len: u64, out_ptr: ptr, out_cap: u64, out_len: &u64) -> future<i32> {
+    let f = t.saVm.runTool;
+    return f(input_ptr, input_len, cwd_ptr, cwd_len, out_ptr, out_cap, out_len);
+}
+
+fn hsOpenTunnel(t: &PluginHostServices, cmd_ptr: ptr, cmd_len: u64, port: u64, out_ptr: ptr, out_cap: u64, out_len: &u64) -> future<i32> {
+    let f = t.remoteBun.openTunnel;
+    return f(cmd_ptr, cmd_len, port, out_ptr, out_cap, out_len);
+}
+
+fn hsRequest(t: &PluginHostServices, id_ptr: ptr, id_len: u64, m_ptr: ptr, m_len: u64, p_ptr: ptr, p_len: u64, b_ptr: ptr, b_len: u64, out_ptr: ptr, out_cap: u64, out_len: &u64) -> future<i32> {
+    let f = t.remoteBun.request;
+    return f(id_ptr, id_len, m_ptr, m_len, p_ptr, p_len, b_ptr, b_len, out_ptr, out_cap, out_len);
+}
+
+fn hsRunChatRequestWithKeyFailover(t: &PluginHostServices, input_ptr: ptr, input_len: u64, out_ptr: ptr, out_cap: u64, out_len: &u64) -> future<i32> {
+    let f = t.relay.runChatRequestWithKeyFailover;
+    return f(input_ptr, input_len, out_ptr, out_cap, out_len);
 }

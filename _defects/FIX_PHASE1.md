@@ -228,3 +228,118 @@ saVmWorkspaceSkill。分类：
   runtimeClient/service/server 此前记为「通过」，async 审计过关前其
   通过状态带星号；④ 其余域按 server→backends→packages→mini-codex
   顺序在各自修复轮次处理。
+
+## 批次 4：缺口回绑 + async 重译（2026-10-26，sdk-backend 19/26 → 26/26）
+
+验收：26 文件全量复检 PASS=26 FAIL=0；失败名字集合由批次 3 的 7 个
+（bridgeEventLog、codexVirtualConfig、hostServices、imagePersistence、
+index、openCodeSessionProtocol、saVmWorkspaceSkill）变为空集。diff 审计：
+仅 12 个 sdk-backend 文件变更，无范围外改动、无 .sla-cache 入暂存。
+
+### 缺口 2 关闭（cell 回绑）
+- hostServices：模块单例改 cell——表镜像（136 字节 = 17 个 ptr 宽字段）
+  存 bytes cell `sdk.hostServices.table`，注册门用 u64 set_once cell
+  `sdk.hostServices.registered`（首次注册为准，与 TS 文档契约「host 启动
+  时调用一次」一致；TS 原文是无条件赋值，此为有据偏差）。5 个异步字段
+  改类型化 fn 指针（见 async 节）；未注册时调用走 hsUnimpl* 哑函数返回
+  future::ready(4)（= NOT_REGISTERED 状态）。
+- openCodeSessionProtocol：模块缓存改 cell——projectId/sessionId 走
+  bytes cell，createdAt 走 8 字节小端 bytes cell，uuid_counter 走
+  `sa_global_u64_add`（out 为加后值）。cell 无 remove，清缓存 = 存空值
+  （accessor 以非空为存在）。
+- saVmWorkspaceSkill：在途状态改组合键 cell（前缀 + workspaceSkillKey）：
+  `wsk.policy.`（u64 集）、`wsk.inflight.`（u64 标志）、`wsk.fail.`
+  （u64 状态，0 = 无记录；失败只被后来的成功覆写，waitFor 不清除——
+  与 TS 注释一致）、`wsk.boot.inflight.`、`wsk.boot.lastOk.`（epoch ms，
+  冷却 5000ms）。
+
+### 缺口 3 关闭（mkdir -p 回绑）
+- bridgeEventLog：其阻塞根因是传递性导入规则（.sai extern 不经 .sla
+  传递导入），补直接 `@import "sa_std/fs.sai"` 后既有 sa_fs_mkdir_p
+  调用即通；另 sa_fs_append_file（自造）改由 open_options(flags 22) +
+  file_write + close 组合的本地 fs_append_file。
+- codexVirtualConfig：sa_fs_mkdir_p2 → sa_fs_mkdir_p（atomicWrite）。
+- saVmWorkspaceSkill：mkdir_p_ws ×2 → sa_fs_mkdir_p。
+- imagePersistence:308 本已调用真实名，随文件首错消除而通。
+
+### 缺口 4 关闭（排他创建锁）
+- codexVirtualConfig configLockAcquire：sa_fs_open_create_excl →
+  `sa_std_fs_open_create_excl`，竞争状态 17 → 11
+  （SA_STD_ERR_ALREADY_EXISTS）。
+
+### codexVirtualConfig 派发结论
+- 调查：`CodeCliBridgeClient` 类型与 `codeCliBridgeClient_*` 自由函数
+  全树不存在——连同路径 .ts 源里也没有；系转换器虚构。TS 真值
+  （codexVirtualConfig.ts:328-373）：`VirtualConfigCodexRuntimeClient
+  extends EventEmitter implements CodexRuntimeClient`，inner 即
+  CodexRuntimeClient 契约，转发 getStatus/start/stop/restart/request
+  （先 injectThreadConfig）/notify/respond，并回放 inner 事件。
+- 改造：inner 字段改 `CodexRuntimeClient`（runtimeClient.sla 的类型化
+  fn 表）；vcClient_* 改经助手函数派发（见下「fn 指针引用实参」规则）；
+  getStatus 改 JSON 文本出参形态；start/restart/request/notify 改
+  async fn 并 .await inner 的 future；vcClient_request 把注入后的
+  params 文本（或原 node stringify 文本）转发给 inner——原「node
+  重解析跳过」DEFECT 一并关闭。EventEmitter 事件回放保持 DEFECT
+  （CAPABILITY_MAP §2 确认不支持）。TOML 写入/序列化簇保持 DEFECT
+  （CAPABILITY_MAP §12：写侧不支持、读侧无键枚举）。
+
+### async 重译结果（19 标记：18 签名压平 + 3 语义桩）
+- 契约三件套（runtimeClient/service/server）+ hostServices：Promise
+  方法字段由 `ptr` 改类型化 fn 指针（future<i32> 形态、ctx 优先约定、
+  动态值走 JSON 文本缓冲），并在各文件尾部提供调用助手（rc*/hs*/
+  eh*/sp*/relay*/rpcCall）。hostServices 的 hostServices 注释头、
+  runtimeClient 的 EventEmitter 转发保持 DEFECT（能力裁决有据）。
+- imagePersistence：persistImageApiResult、imageBytes 改 async fn
+  （内部 .await）；base64 两站点改 `sa_deno_atob`（补填充感知解码，
+  字节经 fmt buffer 拷出；sa_b64dec_simd 只用于无填充干净流）；
+  fetch 改真实 5 参 `sa_http_fetch_bytes`。DEFECT（保真度）：fetch
+  面不暴露 HTTP 状态码与响应头，TS 的 non-2xx 抛错与声明长度预检
+  无法保留，fetch 路径 mediaType 回退 "image/png"；fetch_fn 注入
+  参数成残留（签名保留、实现直调 std）。
+- saVmWorkspaceSkill 3 语义桩忠实重译（无一保留 return 0 假桩）：
+  ① syncSaVmWorkspaceSkillDirectory：注册 policy 根 → 自旋等待前一
+  在途标志 → 置在途 → await Now → 回写失败 cell（成功写 0）→ 清在途；
+  ② waitForWorkspaceSkillSyncs / waitForProjectSaVmAssets：自旋等待
+  在途（后者先 boot 在途）后返回失败 cell 状态；
+  ③ bootstrapProjectSaVmAssets：保持 sync void——trim/env 禁用/
+  在途去重/5s 冷却（cell）后在同函数内以 task::new + task::poll
+  创建并驱动 bootstrapWorkspaceJob future（R7 规范式），job 内经
+  hsEnsureProjectBundleInstalled 助手 await ensure（错误吞掉）、
+  await waitFor、policy 根或技能文件缺失时 await sync、盖 lastOk。
+  连带：cleanupAllWorkspaceSaVmSkills、forceUpdateWorkspaceSkill、
+  sync…Now、isGenerated*（TS 本就是 async）改 async fn，调用点
+  .await 形态对照 .ts 逐一核过。
+
+### index 桶文件去重（级联外的新阻塞）
+- index.sla 导入集内 4 组同名定义（展开后重声明）：PathBuf
+  （dataDir/memoryFilePaths，形状一致）、path_append（同上，函数体
+  一致）、fs_exists（dataDir/cliSpawn，函数体一致）、str_eq_lower
+  （memoryFilePaths/regressionCases，函数体**不一致**：后者双侧
+  小写化、前者只小写 a 侧——系批量转换的既有差异，本轮不合并、
+  不改语义，仅改名）。处置：memoryFilePaths 删自有 PathBuf +
+  path_append 并 `@import "dataDir.sla"`；cliSpawn 的副本改名
+  cs_fs_exists；regressionCases 的副本改名 rc_str_eq_lower。
+
+### fs_exists 误用扫（批次 4 终扫）
+- sdk-backend 全域 grep `sa_std_fs_exists` / `sa_std_fs_try_exists`：
+  0 处调用，改正数 0。三个本地助手（dataDir.fs_exists、
+  cliSpawn.cs_fs_exists、saVmWorkspaceSkill.ws_exists）均以
+  `sa_std_fs_len(...) == 0` 状态比较实现，语义正确。
+
+### 本轮探针实测的 SLA 检查器规则（修复依据，后续域适用）
+- fn 指针引用实参限制：经 fn 类型值（结构体字段载入本地后）调用时，
+  引用实参必须是调用者自身形参引用、原样转发；`&局部变量`、
+  `&结构体.字段` 均 TypeMismatch。对策 = 助手函数模式（普通 fn 收
+  &出参、转发自身形参进表调用、返回 future 供调用方 await/驱动）。
+- if/else-if 链分支尾类型：else-if 侧（无 else 的 if）为 unit，
+  故链上各分支尾不得是返回值的裸调用（报 if expression branch
+  type mismatch）；if/else 两分支同为 i32 尾则可。修法：尾调用一律
+  绑定到变量。forceUpdate 的 jev 链即此例。
+- `&str` 形参不接受字符串字面量/变量实参（skill_path_for_backend_dir、
+  pol_bool/pol_tools_bool、ws_join2）：一律改 (ptr, len) 惯例。
+- `sa_env_buffer_data` 返回 `&ptr`：无标注 `let vp = ...` 会让 vp
+  成 &ptr，后续作 ptr 实参 TypeMismatch；须写 `let vp: ptr = ...`。
+- `&数组` 只可作 extern/宏的实参，不可作普通 fn 的 ptr 形参实参
+  （wb_append(out, &single, 1) → 先 PTR_BYTE_ADD 绑定 ptr）。
+- pol_bool 原稿 sa_json_object_get 漏 &v 出参（v 恒 0 再 as_bool，
+  语义错误）——已补。

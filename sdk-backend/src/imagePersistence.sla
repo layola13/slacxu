@@ -4,6 +4,9 @@
 @import "sa_std/encoding/json.sai"
 @import "sa_std/fs.sai"
 @import "sa_std/string.sa"
+@import "sa_std/encoding/base64.sai"
+@import "sa_std/fmt.sai"
+@import "sa_std/http_client.sai"
 
 // DEFECT: `unknown` / JsonValue dynamic values -> sa_json node
 // handles (u64) parsed from JSON text. DEFECT: object key
@@ -11,9 +14,20 @@
 // object branch of hasInlineImagePayload inspects the stringified
 // text for the known keys instead of walking entries (semantics
 // preserved for the checks performed, structure differs).
-// DEFECT: async/await + fetch + fs/promises -> synchronous status
-// functions with placeholder externs (sa_base64_decode,
-// sa_http_fetch_bytes, sa_fs_mkdir_p); throw -> status 3.
+// FIX PHASE: the placeholder externs are rebound to real
+// surfaces — sa_fs_mkdir_p (fs.sai), sa_deno_atob
+// (encoding/base64.sai: padding-aware decode into an owned fmt
+// buffer; sa_b64dec_simd stops at '=' and serves only clean
+// unpadded streams, so data-URL payloads must NOT use it),
+// sa_http_fetch_bytes (http_client.sai one-shot GET). The two
+// awaiting entry points are async fns again (ASYNC_MODEL);
+// throw -> status 3.
+// DEFECT (fetch fidelity): sa_http_fetch_bytes exposes neither
+// the HTTP status code nor response headers, so the TS branches
+// throwing on non-2xx and on an oversized declared content-length
+// cannot be preserved, and the content-type mediaType derivation
+// falls back to "image/png". The fetch_fn injection parameter is
+// vestigial (std fetch is called directly).
 // DEFECT: Buffer/Uint8Array -> byte buffers.
 
 const MAX_PERSISTED_IMAGE_BYTES: u64 = 134217728;
@@ -282,7 +296,7 @@ fn buf_append_json_escaped(b: &ByteBuf, src_ptr: ptr, src_len: u64) -> void {
 }
 
 // persistImageApiResult(value, dataDir, fetchImage): Promise<JsonValue>
-// DEFECT: async -> status fn (0 ok + out JSON text, 1 = returned
+// async fn (0 ok + out JSON text, 1 = returned
 // input unchanged signal, 3 = the TS throws). fetchImage (typeof
 // fetch) -> fn pointer handle `fetch_fn`.
 // DEFECT: the TS `{ ...rest, data }` keeps every other top-level
@@ -291,7 +305,7 @@ fn buf_append_json_escaped(b: &ByteBuf, src_ptr: ptr, src_len: u64) -> void {
 // -- logged). Per-entry `{ ...metadata, savedPath, mediaType }`
 // keeps metadata via text-level key stripping of
 // url/b64Json/b64_json.
-fn persistImageApiResult(value: u64, dataDir_ptr: ptr, dataDir_len: u64, fetch_fn: ptr, now_ms: u64, out: &ByteBuf) -> i32 {
+async fn persistImageApiResult(value: u64, dataDir_ptr: ptr, dataDir_len: u64, fetch_fn: ptr, now_ms: u64, out: &ByteBuf) -> i32 {
     let data_node: u64 = 0;
     if sa_json_object_get(value, STR_PTR("data"), STR_LEN("data"), &data_node) != 0 {
         // !Array.isArray(source.data) -> return value unchanged
@@ -321,7 +335,7 @@ fn persistImageApiResult(value: u64, dataDir_ptr: ptr, dataDir_len: u64, fetch_f
         // DEFECT: downloaded bytes can reach 128 MiB; the bulk
         // buffer is 40 KiB (capacity defect, logged).
         let media = ByteBuf { bytes: [0; 40960], len: 0 };
-        let st = imageBytes(entry, fetch_fn, &bytes, &media);
+        let st = imageBytes(entry, fetch_fn, &bytes, &media).await;
         if st == 1 { return 3; };
         if st == 3 { return 3; };
         if bytes.len > MAX_PERSISTED_IMAGE_BYTES { return 3; };
@@ -385,7 +399,7 @@ fn meta_ptr(b: &ByteBuf) -> ptr {
 
 // imageBytes(entry, fetchImage) -> (bytes, mediaType) | null
 // status: 0 ok, 1 null, 3 throw (download failure / oversize).
-fn imageBytes(entry: u64, fetch_fn: ptr, out_bytes: &ByteBuf, out_media: &ByteBuf) -> i32 {
+async fn imageBytes(entry: u64, fetch_fn: ptr, out_bytes: &ByteBuf, out_media: &ByteBuf) -> i32 {
     out_bytes.len = 0;
     out_media.len = 0;
     // b64 = stringValue(entry.b64Json) ?? stringValue(entry.b64_json)
@@ -396,11 +410,16 @@ fn imageBytes(entry: u64, fetch_fn: ptr, out_bytes: &ByteBuf, out_media: &ByteBu
     if !got_b64 && stringValue(entry, STR_PTR("b64_json"), STR_LEN("b64_json"), &b64_ptr, &b64_len) { got_b64 = true; };
     if got_b64 {
         // bytes = Uint8Array.from(Buffer.from(b64, "base64"))
-        // DEFECT: placeholder extern sa_base64_decode.
-        let bp: ptr = PTR_NULL();
-        PTR_BYTE_ADD(bp, &out_bytes.bytes, 0);
-        let n = sa_base64_decode(b64_ptr, b64_len, bp, 40960);
-        out_bytes.len = n;
+        // Padding-aware decode via sa_deno_atob; bytes are copied
+        // out of the owned fmt buffer. Invalid input or a decode
+        // past the ByteBuf capacity -> 3 (throw mapping).
+        let dh = sa_deno_atob(b64_ptr, b64_len);
+        if dh == 0 { return 3; };
+        let dl = sa_fmt_buffer_len(dh);
+        if dl > 40960 { sa_fmt_buffer_free(dh); return 3; };
+        let dp: ptr = sa_fmt_buffer_data(dh);
+        buf_append(out_bytes, dp, dl);
+        sa_fmt_buffer_free(dh);
         let mt_ptr: ptr = PTR_NULL();
         let mt_len: u64 = 0;
         if stringValue(entry, STR_PTR("mediaType"), STR_LEN("mediaType"), &mt_ptr, &mt_len) {
@@ -429,45 +448,31 @@ fn imageBytes(entry: u64, fetch_fn: ptr, out_bytes: &ByteBuf, out_media: &ByteBu
             let payload_off = semi + 8;
             let payload_ptr: ptr = PTR_NULL();
             PTR_BYTE_ADD(payload_ptr, url_ptr, payload_off);
-            let bp2: ptr = PTR_NULL();
-            PTR_BYTE_ADD(bp2, &out_bytes.bytes, 0);
-            let n2 = sa_base64_decode(payload_ptr, url_len - payload_off, bp2, 40960);
-            out_bytes.len = n2;
+            // Data-URL payload: padding-aware decode (atob), NOT
+            // sa_b64dec_simd (stops at the '=' padding).
+            let dh2 = sa_deno_atob(payload_ptr, url_len - payload_off);
+            if dh2 == 0 { return 3; };
+            let dl2 = sa_fmt_buffer_len(dh2);
+            if dl2 > 40960 { sa_fmt_buffer_free(dh2); return 3; };
+            let dp2: ptr = sa_fmt_buffer_data(dh2);
+            buf_append(out_bytes, dp2, dl2);
+            sa_fmt_buffer_free(dh2);
             return 0;
         };
     };
     if !starts_with_ci(url_ptr, url_len, STR_PTR("http://"), STR_LEN("http://")) && !starts_with_ci(url_ptr, url_len, STR_PTR("https://"), STR_LEN("https://")) { return 1; };
     // response = await fetchImage(url, { signal: AbortSignal.timeout(30_000) })
-    // DEFECT: placeholder extern sa_http_fetch_bytes(url, timeout_ms,
-    // out_bytes, out_status, out_content_type, out_declared_len).
-    let status: u64 = 0;
-    let declared: u64 = 0;
+    // Real sa_http_fetch_bytes (one-shot GET). A body past the
+    // buffer reports TRUNCATED (9) -> 3 here.
+    // DEFECT (see header): no status code / headers are exposed,
+    // so the non-2xx throw and declared-length precheck are
+    // dropped and mediaType falls back to "image/png".
     let bp3: ptr = PTR_NULL();
     PTR_BYTE_ADD(bp3, &out_bytes.bytes, 0);
-    let ct = ByteBuf { bytes: [0; 40960], len: 0 };
-    let ctp: ptr = PTR_NULL();
-    PTR_BYTE_ADD(ctp, &ct.bytes, 0);
-    let frc = sa_http_fetch_bytes(url_ptr, url_len, 30000, bp3, 40960, &out_bytes.len, &status, ctp, 40960, &ct.len, &declared);
-    if frc != 0 || status < 200 || status >= 300 { return 3; };
-    if declared > MAX_PERSISTED_IMAGE_BYTES { return 3; };
-    // mediaType = content-type split(";")[0].trim() || "image/png"
-    let cs: u64 = 0;
-    let ce: u64 = ct.len;
-    for i in 0..ct.len {
-        if ct.bytes[i] == 59 { ce = i; break; };
-    }
-    while cs < ce && ct.bytes[cs] == 32 { cs = cs + 1; }
-    while ce > cs && ct.bytes[ce - 1] == 32 { ce = ce - 1; }
-    if ce > cs {
-        for i in cs..ce {
-            if out_media.len < 40960 {
-                out_media.bytes[out_media.len] = ct.bytes[i];
-                out_media.len = out_media.len + 1;
-            };
-        }
-    } else {
-        buf_append(out_media, STR_PTR("image/png"), STR_LEN("image/png"));
-    };
+    let frc = sa_http_fetch_bytes(url_ptr, url_len, bp3, 40960, &out_bytes.len);
+    if frc != 0 { return 3; };
+    if out_bytes.len > MAX_PERSISTED_IMAGE_BYTES { return 3; };
+    buf_append(out_media, STR_PTR("image/png"), STR_LEN("image/png"));
     return 0;
 }
 

@@ -9,6 +9,10 @@
 // The only state is the process-local rotated session cache below.
 
 @import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/env.sai"
+@import "sa_std/net.sai"
+@import "sa_std/globals.sai"
 
 // DEFECT: node:crypto createHash/randomUUID -- sha256 via the
 // sa_std surface (sa_sha256_hex placeholder shape, see
@@ -224,16 +228,47 @@ fn generateOpenCodeUlid(seedTime: u64, has_seed: bool, now_ms: u64, out: &StrBuf
 }
 
 // Process-local rotated session cache (module state in TS).
-let cachedOpenCodeProjectId: StrBuf;
-let cachedOpenCodeProjectId_set: bool = false;
-let cachedOpenCodeSessionId: StrBuf;
-let cachedOpenCodeSessionId_set: bool = false;
-let openCodeSessionCreatedAt: u64 = 0;
+// Gap 2 (closed): SLA has no top-level mutable globals, so the
+// cache lives in sa_std global cells (user ruling 2026-10-26:
+// Rust-style cells). The two ids are bytes cells; createdAt is an
+// 8-byte little-endian bytes cell; the uuid counter is a u64 cell
+// advanced with sa_global_u64_add. Presence reads as a non-empty
+// value (the registry has no remove, so clearing stores empty).
 const OPENCODE_SESSION_TTL_MS: u64 = 2700000;
 
+fn ocCellGetStr(name_ptr: ptr, name_len: u64, out: &StrBuf) -> bool {
+    let got: u64 = 0;
+    let st = sa_global_bytes_get(name_ptr, name_len, out, 512, &got);
+    if st != 0 { return false; };
+    out.len = got;
+    return got > 0;
+}
+
+fn ocCellSetStr(name_ptr: ptr, name_len: u64, sb: &StrBuf) -> void {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &sb.bytes, 0);
+    sa_global_bytes_set(name_ptr, name_len, p, sb.len);
+}
+
+fn ocCellGetCreatedAt() -> u64 {
+    let raw = [0; 8];
+    let got: u64 = 0;
+    let st = sa_global_bytes_get(STR_PTR("opencode.sessionCreatedAt"), STR_LEN("opencode.sessionCreatedAt"), &raw, 8, &got);
+    if st != 0 || got != 8 { return 0; };
+    let v: u64 = 0;
+    for i in 0..8 { v = v | ((raw[i] as u64) << (i * 8)); }
+    return v;
+}
+
+fn ocCellSetCreatedAt(v: u64) -> void {
+    let raw = [0; 8];
+    for i in 0..8 { raw[i] = ((v >> (i * 8)) & 255) as u8; }
+    sa_global_bytes_set(STR_PTR("opencode.sessionCreatedAt"), STR_LEN("opencode.sessionCreatedAt"), &raw, 8);
+}
+
 fn getOpenCodeProjectId(out: &StrBuf) -> void {
-    if !cachedOpenCodeProjectId_set {
-        cachedOpenCodeProjectId.len = 0;
+    if !ocCellGetStr(STR_PTR("opencode.projectId"), STR_LEN("opencode.projectId"), out) {
+        out.len = 0;
         let e_p = sa_env_get(STR_PTR("OPENCODE_PROJECT"), STR_LEN("OPENCODE_PROJECT"));
         let got = false;
         if e_p != 0 {
@@ -257,32 +292,26 @@ fn getOpenCodeProjectId(out: &StrBuf) -> void {
             if e > s {
                 let tp: ptr = PTR_NULL();
                 PTR_BYTE_ADD(tp, vp, s);
-                sb_append(&cachedOpenCodeProjectId, tp, e - s);
+                sb_append(out, tp, e - s);
                 got = true;
             };
         };
         if !got {
-            sb_append(&cachedOpenCodeProjectId, STR_PTR("global"), STR_LEN("global"));
+            sb_append(out, STR_PTR("global"), STR_LEN("global"));
         };
-        cachedOpenCodeProjectId_set = true;
+        ocCellSetStr(STR_PTR("opencode.projectId"), STR_LEN("opencode.projectId"), out);
     };
-    out.len = 0;
-    let cp: ptr = PTR_NULL();
-    PTR_BYTE_ADD(cp, &cachedOpenCodeProjectId.bytes, 0);
-    sb_append(out, cp, cachedOpenCodeProjectId.len);
 }
 
 fn getOpenCodeSessionId(forceNew: bool, now_ms: u64, out: &StrBuf) -> void {
-    if forceNew || !cachedOpenCodeSessionId_set || now_ms - openCodeSessionCreatedAt > OPENCODE_SESSION_TTL_MS {
-        cachedOpenCodeSessionId.len = 0;
-        random_uuid_approx(now_ms, &cachedOpenCodeSessionId);
-        cachedOpenCodeSessionId_set = true;
-        openCodeSessionCreatedAt = now_ms;
+    let created = ocCellGetCreatedAt();
+    let have = ocCellGetStr(STR_PTR("opencode.sessionId"), STR_LEN("opencode.sessionId"), out);
+    if forceNew || !have || now_ms - created > OPENCODE_SESSION_TTL_MS {
+        out.len = 0;
+        random_uuid_approx(now_ms, out);
+        ocCellSetStr(STR_PTR("opencode.sessionId"), STR_LEN("opencode.sessionId"), out);
+        ocCellSetCreatedAt(now_ms);
     };
-    out.len = 0;
-    let cp: ptr = PTR_NULL();
-    PTR_BYTE_ADD(cp, &cachedOpenCodeSessionId.bytes, 0);
-    sb_append(out, cp, cachedOpenCodeSessionId.len);
 }
 
 fn rotateOpenCodeSession(now_ms: u64) -> void {
@@ -291,19 +320,22 @@ fn rotateOpenCodeSession(now_ms: u64) -> void {
 }
 
 fn clearOpenCodeSession() -> void {
-    cachedOpenCodeSessionId_set = false;
-    cachedOpenCodeSessionId.len = 0;
-    cachedOpenCodeProjectId_set = false;
-    cachedOpenCodeProjectId.len = 0;
-    openCodeSessionCreatedAt = 0;
+    // Cells have no remove: clearing stores the empty value, which
+    // the accessors treat as unset (ids are never legitimately
+    // empty; createdAt resets to 0).
+    let empty = StrBuf { bytes: [0; 512], len: 0 };
+    ocCellSetStr(STR_PTR("opencode.sessionId"), STR_LEN("opencode.sessionId"), &empty);
+    ocCellSetStr(STR_PTR("opencode.projectId"), STR_LEN("opencode.projectId"), &empty);
+    ocCellSetCreatedAt(0);
 }
 
 // DEFECT: helper not in TS source. randomUUID() approximation:
 // splitmix64 output formatted 8-4-4-4-12 hex. NOT random.
-let uuid_counter: u64 = 0;
-
+// The counter is a sa_global_u64_add cell (gap 2 mechanism);
+// add returns the post-add value.
 fn random_uuid_approx(now_ms: u64, out: &StrBuf) -> void {
-    uuid_counter = uuid_counter + 1;
+    let uuid_counter: u64 = 0;
+    sa_global_u64_add(STR_PTR("opencode.uuidCounter"), STR_LEN("opencode.uuidCounter"), 1, &uuid_counter);
     let state = now_ms ^ (uuid_counter * ((2654435769 << 32) | 2135587861));
     let hex = [0; 64];
     let seedbuf = [0; 8];

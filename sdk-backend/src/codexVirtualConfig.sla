@@ -22,8 +22,11 @@
 // conversion points are marked DEFECT inline. TomlDate/bigint
 // handling in tomlToJson has no counterpart and is dropped.
 // DEFECT: fs/promises (open "wx", stat mtime, chmod, unlink) ->
-// sync sa_std fs calls + placeholder externs for the missing
-// pieces (create-exclusive open, mtime, pid, sleep, clock).
+// sync sa_std fs calls. FIX PHASE: the missing pieces bind real
+// surfaces — create-exclusive open = sa_std_fs_open_create_excl
+// (gap 4 closed; contention = SA_STD_ERR_ALREADY_EXISTS 11),
+// mkdir -p = sa_fs_mkdir_p (gap 3 closed), clock/sleep/mtime via
+// time.sai / fs metadata helpers composed below.
 // DEFECT: Promise queue (writeQueue) and the cached migration
 // promise -> sequential calls + a done flag (single-threaded
 // approximation of the serialization the queue provided).
@@ -770,29 +773,42 @@ fn prepareVirtualCodexConfig(home_ptr: ptr, home_len: u64) -> i32 {
 // VirtualConfigCodexRuntimeClient: wraps an inner CodexRuntimeClient.
 // DEFECT: class extends EventEmitter -- the three forwarded
 // events ("status", "message", "stderr") have no emitter
-// counterpart; the wrapper forwards calls only.
+// counterpart (CAPABILITY_MAP section 2: EventEmitter
+// unsupported); the wrapper forwards calls only.
+// FIX PHASE (dispatch): the bulk pass invented a CodeCliBridgeClient
+// type + codeCliBridgeClient_* free functions that exist nowhere
+// — not even in the TS source, where the wrapper's inner is the
+// CodexRuntimeClient contract (codexVirtualConfig.ts:
+// inner: CodexRuntimeClient). Dispatch is now the typed fn-table
+// call of runtimeClient.sla: load the field into a local, then
+// call it with ctx = inner.emitter_state.
 struct VirtualConfigCodexRuntimeClient {
-    inner: CodeCliBridgeClient,
+    inner: CodexRuntimeClient,
     store: VirtualCodexConfigStore,
 }
 
-fn vcClient_getStatus(c: &VirtualConfigCodexRuntimeClient, out_status: &u64, out_label: &CfgBuf) -> i32 {
-    return codeCliBridgeClient_getStatus(&c.inner, out_status, out_label);
+// getStatus(): EngineStatus — forwarded; status as JSON text.
+fn vcClient_getStatus(c: &VirtualConfigCodexRuntimeClient, out_ptr: ptr, out_cap: u64, out_len: &u64) -> i32 {
+    return rcGetStatus(&c.inner, out_ptr, out_cap, out_len);
 }
 
-fn vcClient_start(c: &VirtualConfigCodexRuntimeClient) -> i32 {
-    return codeCliBridgeClient_start(&c.inner);
+// start(): Promise<EngineStatus> — forwarded (async).
+async fn vcClient_start(c: &VirtualConfigCodexRuntimeClient, out_ptr: ptr, out_cap: u64, out_len: &u64) -> i32 {
+    return rcStart(&c.inner, out_ptr, out_cap, out_len).await;
 }
 
+// stop(): void — forwarded.
 fn vcClient_stop(c: &VirtualConfigCodexRuntimeClient) -> void {
-    codeCliBridgeClient_stop(&c.inner);
+    let f = c.inner.stop;
+    f(c.inner.emitter_state);
 }
 
-fn vcClient_restart(c: &VirtualConfigCodexRuntimeClient) -> i32 {
-    return codeCliBridgeClient_restart(&c.inner);
+// restart(): Promise<EngineStatus> — forwarded (async).
+async fn vcClient_restart(c: &VirtualConfigCodexRuntimeClient, out_ptr: ptr, out_cap: u64, out_len: &u64) -> i32 {
+    return rcRestart(&c.inner, out_ptr, out_cap, out_len).await;
 }
 
-fn vcClient_request(c: &VirtualConfigCodexRuntimeClient, method_ptr: ptr, method_len: u64, params_node: u64, timeout_ms: u64, out: &CfgBuf) -> i32 {
+async fn vcClient_request(c: &VirtualConfigCodexRuntimeClient, method_ptr: ptr, method_len: u64, params_node: u64, timeout_ms: u64, out: &CfgBuf) -> i32 {
     if bytes_eq_str2(method_ptr, method_len, STR_PTR("config/read"), STR_LEN("config/read")) {
         return store_read(&c.store, params_node, out);
     };
@@ -802,24 +818,67 @@ fn vcClient_request(c: &VirtualConfigCodexRuntimeClient, method_ptr: ptr, method
     if bytes_eq_str2(method_ptr, method_len, STR_PTR("config/batchWrite"), STR_LEN("config/batchWrite")) {
         return store_batchWrite(&c.store, params_node, out);
     };
-    // inner.request(method, await injectThreadConfig(...), timeout)
+    // TS: inner.request(method, await injectThreadConfig(method,
+    // params), timeout). injectThreadConfig reports 0 (rewritten
+    // params as JSON text in `injected`), 1 (unchanged — forward
+    // the original params) or an error status. The inner contract
+    // takes params as JSON text, so both branches forward text:
+    // the injected text directly, or the original node stringified
+    // (this closes the bulk pass's skipped re-parse).
     let injected = CfgBuf { bytes: [0; 262144], len: 0 };
     let ist = store_injectThreadConfig(&c.store, method_ptr, method_len, params_node, &injected);
-    // DEFECT: injected params JSON text -> node re-parse skipped;
-    // the inner request is issued with the original params node
-    // when injection returned "unchanged" (status 1).
-    let req_node = params_node;
-    // DEFECT: request framing delegated to the codeCliBridge
-    // unit's client in the fix phase; here we surface the call.
-    return 0;
+    if ist != 0 && ist != 1 { return ist; };
+    let p_ptr: ptr = PTR_NULL();
+    let p_len: u64 = 0;
+    if ist == 0 {
+        p_ptr = cb_ptr(&injected);
+        p_len = injected.len;
+    } else {
+        let sh: u64 = 0;
+        sa_json_stringify(params_node, &sh);
+        p_ptr = sa_json_string_ptr(sh);
+        p_len = sa_json_string_len(sh);
+    };
+    out.len = 0;
+    return rcRequest(&c.inner, method_ptr, method_len, p_ptr, p_len, timeout_ms, cb_ptr(out), 262144, &out.len).await;
 }
 
-fn vcClient_notify(c: &VirtualConfigCodexRuntimeClient, method_ptr: ptr, method_len: u64, params_node: u64) -> i32 {
-    return codeCliBridgeClient_notify(&c.inner, method_ptr, method_len, params_node);
+// notify(method, params?): Promise<void> — forwarded (async);
+// params node stringified to JSON text (len 0 = absent).
+async fn vcClient_notify(c: &VirtualConfigCodexRuntimeClient, method_ptr: ptr, method_len: u64, params_node: u64) -> i32 {
+    let pp: ptr = PTR_NULL();
+    let pl: u64 = 0;
+    if params_node != 0 {
+        let sh: u64 = 0;
+        sa_json_stringify(params_node, &sh);
+        pp = sa_json_string_ptr(sh);
+        pl = sa_json_string_len(sh);
+    };
+    return rcNotify(&c.inner, method_ptr, method_len, pp, pl).await;
 }
 
+// respond(id, result?, error?): void — forwarded; result/error
+// nodes stringified to JSON text (len 0 = absent).
 fn vcClient_respond(c: &VirtualConfigCodexRuntimeClient, id_json_ptr: ptr, id_json_len: u64, result_node: u64, has_result: bool, error_node: u64, has_error: bool) -> i32 {
-    return codeCliBridgeClient_respond(&c.inner, id_json_ptr, id_json_len, result_node, has_result, error_node, has_error);
+    let rp: ptr = PTR_NULL();
+    let rl: u64 = 0;
+    let ep: ptr = PTR_NULL();
+    let el: u64 = 0;
+    if has_result {
+        let sh: u64 = 0;
+        sa_json_stringify(result_node, &sh);
+        rp = sa_json_string_ptr(sh);
+        rl = sa_json_string_len(sh);
+    };
+    if has_error {
+        let sh2: u64 = 0;
+        sa_json_stringify(error_node, &sh2);
+        ep = sa_json_string_ptr(sh2);
+        el = sa_json_string_len(sh2);
+    };
+    let f = c.inner.respond;
+    f(c.inner.emitter_state, id_json_ptr, id_json_len, rp, rl, ep, el);
+    return 0;
 }
 
 // Remaining helpers -------------------------------------------------
@@ -869,7 +928,7 @@ fn atomicWrite(path_ptr: ptr, path_len: u64, content_ptr: ptr, content_len: u64)
         if b == 47 { dir_len = k - 1; break; };
         k = k - 1;
     }
-    sa_fs_mkdir_p2(path_ptr, dir_len);
+    sa_fs_mkdir_p(path_ptr, dir_len);
     let tmp = CfgBuf { bytes: [0; 262144], len: 0 };
     tmp.len = 0;
     cb_append(&tmp, path_ptr, dir_len);
@@ -887,10 +946,11 @@ fn atomicWrite(path_ptr: ptr, path_len: u64, content_ptr: ptr, content_len: u64)
 // Loop: open(lockPath, "wx") -> contention (EEXIST, or EPERM /
 // EACCES on win32) -> drop stale (>30s by mtime) -> deadline 5s
 // -> delay(10ms) and retry.
-// DEFECT: create-exclusive open, mtime, wall clock, pid and
-// sleep are placeholder externs (sa_fs_open_create_excl,
-// sa_fs_stat_mtime_ms, sa_now_ms, sa_process_pid, sa_sleep_ms);
-// the loop structure and constants are preserved.
+// Create-exclusive open binds the real sa_std_fs_open_create_excl
+// (gap 4 closed); contention is SA_STD_ERR_ALREADY_EXISTS (11).
+// Mtime / wall clock / sleep are composed from the real time.sai
+// and fs.sai surfaces below (sa_fs_stat_mtime_ms, sa_now_ms,
+// sa_sleep_ms). The loop structure and constants are preserved.
 fn configLockAcquire(path_ptr: ptr, path_len: u64) -> i32 {
     let lock = CfgBuf { bytes: [0; 262144], len: 0 };
     lock.len = 0;
@@ -900,13 +960,13 @@ fn configLockAcquire(path_ptr: ptr, path_len: u64) -> i32 {
     let tries: u64 = 0;
     while tries < 1000 {
         let fh: u64 = 0;
-        let ost = sa_fs_open_create_excl(cb_ptr(&lock), lock.len, &fh);
+        let ost = sa_std_fs_open_create_excl(cb_ptr(&lock), lock.len, &fh);
         if ost == 0 {
             // write "<pid>\n<now>\n" (content shape preserved)
             sa_fs_close_quiet(fh);
             return 0;
         };
-        if ost != 17 {
+        if ost != 11 {
             // not EEXIST -> throw (isLockContention false)
             return 3;
         };
@@ -931,15 +991,15 @@ fn configLockRelease(path_ptr: ptr, path_len: u64) -> void {
 
 // isMissingFile / isLockContention operate on error objects in
 // TS; here they are folded into the status checks above
-// (status 3 from fs_len = ENOENT-ish; open status 17 = EEXIST).
+// (status 3 from fs_len = ENOENT-ish; open status 11 = EEXIST).
 
 // Batch 3: local @extern block removed (SLA has no @extern syntax;
 // externs come only from @import'ed .sai files). TOML, sha256 and fs
 // names now bind the real sa_std surfaces; the four lock helpers
 // below are composed from the real time.sai / fs.sai surfaces.
-// Still unbound (recorded gaps -- no workaround):
-// sa_fs_mkdir_p2 = gap 3 (sa_std fs has no mkdir -p);
-// sa_fs_open_create_excl = gap 4 (EEXIST not distinguishable).
+// Gaps 3/4 closed in the fix phase: mkdir binds sa_fs_mkdir_p
+// directly at the call site; the lock binds
+// sa_std_fs_open_create_excl with contention status 11.
 fn sa_now_ms() -> u64 {
     return sa_time_unix_ms() as u64;
 }
