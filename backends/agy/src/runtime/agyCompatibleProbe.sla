@@ -21,6 +21,7 @@
 @import "sa_std/encoding/json.sai"
 @import "sa_std/env.sai"
 @import "sa_std/fs.sai"
+@import "sa_std/process.sai"
 
 // FIX (host services): the bulk pass called a free function
 // host_cli_getPreferredCliBinary that no unit defines. The real
@@ -303,7 +304,14 @@ fn nvmAgyBinDirs_first(home: ptr, home_len: u64, out: ptr, out_cap: u64, out_len
     let json = [0u8; 16384];
     let json_p: ptr = PTR_NULL(); PTR_BYTE_ADD(json_p, &json, 0);
     let json_len: u64 = 0;
-    if sa_std_fs_read_dir_json(root_p, root_len, json_p, 16384, &json_len) != 0 { return false; };
+    // FIX(be2): the 5-arg buffer form of sa_std_fs_read_dir_json was
+    // fabricated; the real extern is (path, len, max_entries, &out_handle)
+    // and the listing bytes come from sa_fs_dir_buffer_data/len (fs.sai:36,55).
+    let dh: u64 = 0;
+    if sa_std_fs_read_dir_json(root_p, root_len, 65536, &dh) != 0 { return false; };
+    let dsrc: ptr = sa_fs_dir_buffer_data(dh);
+    let dlen: u64 = sa_fs_dir_buffer_len(dh);
+    json_len = buf_copy(json_p, 16384, dsrc, dlen);
     // DEFECT: dir-entry iteration over the JSON listing —
     // entries are scanned textually for "name" fields in this
     // pass (repair: sa_fs_dir_buffer surface).
@@ -372,6 +380,7 @@ fn findAgyLaunchBin(out: ptr, out_cap: u64, out_len: &u64, out_found: &bool) -> 
         let sp: ptr = PTR_NULL();
         PTR_BYTE_ADD(sp, tails_p, offs[s]);
         let cand = [0u8; 2048];
+        let cand_p: ptr = PTR_NULL(); PTR_BYTE_ADD(cand_p, &cand, 0);
         let cl = join2(cand_p, 2048, cwd_p, cwd_len, sp, lens[s]);
         if isLaunchable(cand_p, cl, env_platform_is_win32()) {
             *out_len = buf_copy(out, out_cap, cand_p, cl);
@@ -545,12 +554,12 @@ fn buildAgySpawnArgs(opts: &AgySpawnOptions, out: ptr, out_cap: u64, out_len: &u
     let dir_count: u64 = 0;
     // DEFECT: addDirs arrives as JSON text (Record/array
     // stand-in); string elements are scanned out of it.
-    dir_count = dirs_collect(opts.addDirs_json_ptr, opts.addDirs_json_len, dirs_p, 8192, dir_off_p, dir_len_p, dir_count);
+    dir_count = dirs_collect(opts.addDirs_json_ptr, opts.addDirs_json_len, dirs_p, 8192, &dir_off, &dir_len, dir_count);
     if opts.has_cwd {
         let tp: ptr = PTR_NULL();
         let tl: u64 = 0;
         trim_span(opts.cwd_ptr, opts.cwd_len, &tp, &tl);
-        if tl > 0 { dir_count = dirs_add(dirs_p, 8192, dir_off_p, dir_len_p, dir_count, tp, tl); };
+        if tl > 0 { dir_count = dirs_add(dirs_p, 8192, &dir_off, &dir_len, dir_count, tp, tl); };
     };
     for d in 0..dir_count {
         n = n + arg_put(out, out_cap, n, STR_PTR("--add-dir"), STR_LEN("--add-dir"));
@@ -733,13 +742,13 @@ fn env_first2(k1: ptr, k1_len: u64, k2: ptr, k2_len: u64, out_ptr: &ptr, out_len
     if h != 0 {
         *out_ptr = sa_env_buffer_data(h);
         *out_len = sa_env_buffer_len(h);
-        if out_len > 0 { return true; };
+        if *out_len > 0 { return true; };
     };
     h = sa_env_get(k2, k2_len);
     if h != 0 {
         *out_ptr = sa_env_buffer_data(h);
         *out_len = sa_env_buffer_len(h);
-        if out_len > 0 { return true; };
+        if *out_len > 0 { return true; };
     };
     return false;
 }
@@ -901,11 +910,11 @@ fn arg_put(out: ptr, cap: u64, at: u64, arg: ptr, arg_len: u64) -> u64 {
 // array text, trim, skip empties, dedup into the table.
 // DEFECT: JSON array traversal via the parsed doc in repair;
 // this pass scans quoted strings textually.
-fn dirs_collect(json_ptr: ptr, json_len: u64, dirs: ptr, dirs_cap: u64, dir_off: &u64, dir_len: &u64, count: u64) -> u64 {
+fn dirs_collect(json_ptr: ptr, json_len: u64, dirs: ptr, dirs_cap: u64, dir_off: &[u64], dir_len: &[u64], count: u64) -> u64 {
     let used: u64 = 0;
     // recover already-used bytes from prior adds via dir table
     if count > 0 {
-        used = dir_off[count - 1] + *dir_len[count - 1];
+        used = dir_off[count - 1] + dir_len[count - 1];
     };
     let i: u64 = 0;
     while i < json_len {
@@ -938,7 +947,7 @@ fn dirs_collect(json_ptr: ptr, json_len: u64, dirs: ptr, dirs_cap: u64, dir_off:
     return count;
 }
 
-fn dirs_register(dir_off: &u64, dir_len: &u64, count: u64, dirs: ptr, off: u64, len: u64) -> u64 {
+fn dirs_register(dir_off: &[u64], dir_len: &[u64], count: u64, dirs: ptr, off: u64, len: u64) -> u64 {
     for d in 0..count {
         if dir_len[d] == len {
             let dp: ptr = PTR_NULL();
@@ -956,9 +965,9 @@ fn dirs_register(dir_off: &u64, dir_len: &u64, count: u64, dirs: ptr, off: u64, 
     return count;
 }
 
-fn dirs_add(dirs: ptr, dirs_cap: u64, dir_off: &u64, dir_len: &u64, count: u64, p: ptr, n: u64) -> u64 {
+fn dirs_add(dirs: ptr, dirs_cap: u64, dir_off: &[u64], dir_len: &[u64], count: u64, p: ptr, n: u64) -> u64 {
     let used: u64 = 0;
-    if count > 0 { used = dir_off[count - 1] + *dir_len[count - 1]; };
+    if count > 0 { used = dir_off[count - 1] + dir_len[count - 1]; };
     let w: u64 = 0;
     for k in 0..n {
         if used + w < dirs_cap {
@@ -998,8 +1007,8 @@ fn run_capture_status(bin_ptr: ptr, bin_len: u64, arg_ptr: ptr, arg_len: u64, bu
         if sa_io_read(hout, chunk_p, 512, &rd) != 0 { break; };
         if rd == 0 { break; };
         for i in 0..rd {
-            if out_len < cap {
-                let __pbs4: ptr = PTR_NULL(); PTR_BYTE_ADD(__pbs4, buf, out_len); PTR_WRITE_U8(__pbs4, chunk[i]);
+            if *out_len < cap {
+                let __pbs4: ptr = PTR_NULL(); PTR_BYTE_ADD(__pbs4, buf, *out_len); PTR_WRITE_U8(__pbs4, chunk[i]);
                 *out_len = (*out_len) + 1;
             };
         }
@@ -1009,8 +1018,8 @@ fn run_capture_status(bin_ptr: ptr, bin_len: u64, arg_ptr: ptr, arg_len: u64, bu
         if sa_io_read(herr, chunk_p, 512, &rd) != 0 { break; };
         if rd == 0 { break; };
         for i in 0..rd {
-            if out_len < cap {
-                let __pbs5: ptr = PTR_NULL(); PTR_BYTE_ADD(__pbs5, buf, out_len); PTR_WRITE_U8(__pbs5, chunk[i]);
+            if *out_len < cap {
+                let __pbs5: ptr = PTR_NULL(); PTR_BYTE_ADD(__pbs5, buf, *out_len); PTR_WRITE_U8(__pbs5, chunk[i]);
                 *out_len = (*out_len) + 1;
             };
         }
