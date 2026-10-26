@@ -1,6 +1,8 @@
 // Converted 1:1 from frontends/jev/src/jev/jevClient.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
 @import "./jevConfig.sla"
-@import "sa_std/json.sai"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/http_client.sai"
+@import "sa_std/string.sa"
 
 // TS: export type JevQuestionMap = Record<string, unknown>;
 // DEFECT: dynamic object — carried as raw JSON text.
@@ -78,11 +80,18 @@ fn jb_append_escaped(buf: &JsonBuf, src_ptr: ptr, src_len: u64) -> void {
         } else if b < 32 {
             if buf.len < 32768 { buf.bytes[buf.len] = 92; buf.len = buf.len + 1; };
             if buf.len < 32768 { buf.bytes[buf.len] = 117; buf.len = buf.len + 1; };
-            // DEFECT: \u00XX hex digits are appended as "00" + two
-            // placeholder digits; exact control-char escaping is a
-            // fix-phase detail (payload values are URLs/keys/ids).
+            // \u00XX with the byte's real hex digits (the bulk
+            // pass emitted placeholder zeros; fixed in fix phase).
             if buf.len < 32768 { buf.bytes[buf.len] = 48; buf.len = buf.len + 1; };
             if buf.len < 32768 { buf.bytes[buf.len] = 48; buf.len = buf.len + 1; };
+            let hi = b / 16;
+            let lo = b % 16;
+            let hd: u8 = 48;
+            if hi < 10 { hd = 48 + hi; } else { hd = 87 + hi; };
+            if buf.len < 32768 { buf.bytes[buf.len] = hd; buf.len = buf.len + 1; };
+            let ld: u8 = 48;
+            if lo < 10 { ld = 48 + lo; } else { ld = 87 + lo; };
+            if buf.len < 32768 { buf.bytes[buf.len] = ld; buf.len = buf.len + 1; };
         } else {
             if buf.len < 32768 { buf.bytes[buf.len] = b; buf.len = buf.len + 1; };
         };
@@ -110,12 +119,96 @@ fn trim_view(src_ptr: ptr, src_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
     *out_len = end - start;
 }
 
-// DEFECT: fetch() (browser/Node HTTP) has no counterpart in the
-// known sa_std surface (only the SSE turn client exists). Declared
-// here in the shape the fix phase needs: synchronous POST with a
-// JSON body and header text, filling out_status + out_body.
-// Returns 0 on transport success.
-extern fn cxu_http_post_json(url_ptr: ptr, url_len: u64, headers_ptr: ptr, headers_len: u64, body_ptr: ptr, body_len: u64, out_status: &u64, out_body: &JsonBuf) -> i32;
+// TS: fetch(path, { method: "POST", headers, body }) — the fix
+// phase binds this to the real sa_std stateful HTTP client
+// (http_client.sai, v2 surface): real transport, real status
+// code, real body. Two registered boundary differences from the
+// browser fetch it replaces:
+// - fetch resolved the relative `path` against the page origin;
+//   native SLA has no origin, so the caller-supplied url_ptr must
+//   be an absolute URL (call sites pass the TS path parameter
+//   through; a host embedding supplies the server base).
+// - Headers arrive as "Key: Value\n" text (the shape the
+//   converted caller builds) and are split into per-header
+//   req_add_header_v2 calls here.
+// Returns 0 on transport success (any HTTP status); 1 on
+// transport failure.
+fn cxu_http_post_json(url_ptr: ptr, url_len: u64, headers_ptr: ptr, headers_len: u64, body_ptr: ptr, body_len: u64, out_status: &u64, out_body: &JsonBuf) -> i32 {
+    let use_tls: u8 = 0;
+    if url_len >= 6 {
+        let c0: u8 = 0;
+        PTR_BYTE_AT(c0, url_ptr, 0);
+        let c4: u8 = 0;
+        PTR_BYTE_AT(c4, url_ptr, 4);
+        let c5: u8 = 0;
+        PTR_BYTE_AT(c5, url_ptr, 5);
+        if c0 == 104 && c4 == 115 && c5 == 58 { use_tls = 1; };
+    };
+    let client: ptr = PTR_NULL();
+    if sa_http_client_new_v2(use_tls, PTR_NULL(), 0, &client) != 0 || client == PTR_NULL() { return 1; };
+    let req: ptr = PTR_NULL();
+    if sa_http_client_req_new_v2(client, 2, url_ptr, url_len, &req) != 0 || req == PTR_NULL() {
+        let cf0: u32 = sa_http_client_free(client);
+        return 1;
+    };
+    // Split the header text into lines and add each "Key: Value".
+    let pos: u64 = 0;
+    while pos < headers_len {
+        let eol = pos;
+        while eol < headers_len {
+            let hb: u8 = 0;
+            PTR_BYTE_AT(hb, headers_ptr, eol);
+            if hb == 10 { break; };
+            eol = eol + 1;
+        }
+        // find ':' within [pos, eol)
+        let colon = eol;
+        let scan = pos;
+        while scan < eol {
+            let cb: u8 = 0;
+            PTR_BYTE_AT(cb, headers_ptr, scan);
+            if cb == 58 { colon = scan; break; };
+            scan = scan + 1;
+        }
+        if colon < eol && colon > pos {
+            let vstart = colon + 1;
+            while vstart < eol {
+                let vb: u8 = 0;
+                PTR_BYTE_AT(vb, headers_ptr, vstart);
+                if vb == 32 { vstart = vstart + 1; } else { break; };
+            }
+            let vend = eol;
+            if vend > vstart {
+                let lb: u8 = 0;
+                PTR_BYTE_AT(lb, headers_ptr, vend - 1);
+                if lb == 13 { vend = vend - 1; };
+            };
+            let kp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(kp, headers_ptr, pos);
+            let vp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(vp, headers_ptr, vstart);
+            let hst: u32 = sa_http_client_req_add_header_v2(req, kp, colon - pos, vp, vend - vstart);
+        };
+        pos = eol + 1;
+    }
+    let bst: u32 = sa_http_client_req_set_body_v2(req, body_ptr, body_len);
+    let resp: ptr = PTR_NULL();
+    let sst: u32 = sa_http_client_req_send_v2(req, &resp);
+    if sst != 0 || resp == PTR_NULL() {
+        let rf0: u32 = sa_http_client_req_free(req);
+        let cf1: u32 = sa_http_client_free(client);
+        return 1;
+    };
+    *out_status = sa_http_client_resp_status(resp) as u64;
+    out_body.len = 0;
+    let bp: ptr = sa_http_client_resp_body_ptr(resp);
+    let bl: u64 = sa_http_client_resp_body_len(resp);
+    if bp != PTR_NULL() && bl > 0 { jb_append(out_body, bp, bl); };
+    let pf: u32 = sa_http_client_resp_free(resp);
+    let rf1: u32 = sa_http_client_req_free(req);
+    let cf2: u32 = sa_http_client_free(client);
+    return 0;
+}
 
 // TS: async function postJevProxy(path, sessionToken, payload): Promise<JevProxySuccess>
 // DEFECT: async/Promise — synchronous + status code. `throw new
@@ -130,7 +223,11 @@ fn postJevProxy(path_ptr: ptr, path_len: u64, session_token_ptr: ptr, session_to
     };
     let body = JsonBuf { bytes: [0u8; 32768], len: 0 };
     let status: u64 = 0;
-    let trc = cxu_http_post_json(path_ptr, path_len, &headers.bytes, headers.len, &payload.bytes, payload.len, &status, &body);
+    let __hp1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__hp1, &headers.bytes, 0);
+    let __hp2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__hp2, &payload.bytes, 0);
+    let trc = cxu_http_post_json(path_ptr, path_len, __hp1, headers.len, __hp2, payload.len, &status, &body);
     if trc != 0 { return 41; };
     // TS: const body = await response.json().catch(() => ({}));
     let doc = sa_json_parse(&body.bytes, body.len);
@@ -250,7 +347,9 @@ fn build_jev_payload(params: &JevEvaluateParams, with_state: u64, out_payload: &
         jb_append_lit(out_payload, STR_PTR(",\"state\":\""), STR_LEN(",\"state\":\""));
         jb_append_escaped(out_payload, params.state_ptr, params.state_len);
         jb_append_lit(out_payload, STR_PTR("\",\"questions\":"), STR_LEN("\",\"questions\":"));
-        jb_append(out_payload, &params.questions.json_bytes, params.questions.json_len);
+        let __hp1: ptr = PTR_NULL();
+        PTR_BYTE_ADD(__hp1, &params.questions.json_bytes, 0);
+        jb_append(out_payload, __hp1, params.questions.json_len);
     };
     jb_append_lit(out_payload, STR_PTR("}"), STR_LEN("}"));
 }
