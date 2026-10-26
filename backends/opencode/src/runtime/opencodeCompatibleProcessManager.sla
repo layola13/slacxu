@@ -5,7 +5,13 @@
 @import "sa_std/string.sa"
 @import "sa_std/encoding/json.sai"
 @import "sa_std/fs.sai"
+@import "sa_std/env.sai"
+@import "sa_std/crypto.sai"
+@import "sa_std/fmt.sai"
+@import "sa_std/process.sai"
+@import "sa_std/io.sai"
 @import "sa_std/time.sai"
+@import "../../../../packages/shared/src/modelCapabilities.sla"
 @import "sa_std/net.sai"
 
 // TS imports:
@@ -490,6 +496,306 @@ fn inferOpencodeOutputLimit(model_ptr: ptr, model_len: u64, has_model: bool) -> 
 }
 
 // TS: export function inferOpencodeModelLimits(modelId?, explicitContextWindow?, modelCapability?): OpencodeModelLimit
+
+// FIX(be2): sa_shared_resolve_model_context_window bound to
+// packages/shared resolveModelContextWindow
+// (modelCapabilities.sla:608). The explicit capability arrives
+// as JSON text (PmModelCapability.json); the descriptor is
+// rebuilt from its numeric fields (contextWindow /
+// maxOutputTokens — the fields the resolver consults). No group
+// context window exists at this call site (has_group=false).
+
+// FIX(be2): sa_std_os_tmpdir bound to sa_env_temp_dir (env.sai:9).
+
+// FIX(be2): sa_std_process_pid bound to sa_std_process_id
+// (process.sai:28).
+
+// FIX(be2): mkdir/write-with-mode bound to the fs.sai faces
+// (sa_fs_mkdir_p + sa_fs_set_permissions; sa_fs_write_file +
+// sa_fs_set_permissions).
+
+// FIX(be2): sa_net_try_bind bound to sa_std_net_tcp_listen
+// (net.sai:16) + close; returns 1 when the bind succeeds (the
+// call site's `!= 0` availability contract), 0 when it fails.
+
+// FIX(be2): sa_std_platform_is_win32 bound to the Probe unit's
+// platform_is_win32 (OS env face; see its four-source note).
+fn sa_std_platform_is_win32() -> i32 {
+    return platform_is_win32();
+}
+
+fn sa_net_try_bind(host_ptr: ptr, host_len: u64, port: u64) -> i32 {
+    let h: u64 = 0;
+    let bound: u32 = 0;
+    let rc = sa_std_net_tcp_listen(host_ptr, host_len, port as u32, &h, &bound);
+    if rc != 0 { return 0; };
+    sa_std_close(h);
+    return 1;
+}
+
+fn sa_std_fs_mkdir_mode(path_ptr: ptr, path_len: u64, mode: u32) -> i32 {
+    let rc = sa_fs_mkdir_p(path_ptr, path_len);
+    if rc != 0 { return rc; };
+    return sa_fs_set_permissions(path_ptr, path_len, mode);
+}
+
+fn sa_std_fs_write_file_mode(path_ptr: ptr, path_len: u64, data_ptr: ptr, data_len: u64, mode: u32) -> i32 {
+    let rc = sa_fs_write_file(path_ptr, path_len, data_ptr, data_len);
+    if rc != 0 { return rc; };
+    return sa_fs_set_permissions(path_ptr, path_len, mode);
+}
+
+fn sa_std_process_pid() -> u64 {
+    return sa_std_process_id() as u64;
+}
+
+// DEFECT(B-class, std gap): process.exit(code) has no sa_std
+// face — four-source checked (sa_std .sai/.sa/sa_std.h expose
+// only sa_std_process_abort and child exit-status accessors;
+// sala docs + sla demos/tests have no exit-with-code). The
+// shim terminates via abort after the caller's pool shutdown;
+// the 130/143 exit codes are NOT honored (abort status instead).
+fn sa_std_process_exit(code: i32) -> void {
+    sa_std_process_abort();
+}
+
+fn sa_std_os_tmpdir(out_ptr: &ptr, out_len: &u64) -> void {
+    *out_ptr = PTR_NULL();
+    *out_len = 0;
+    let h = sa_env_temp_dir();
+    if h == 0 { return; };
+    *out_ptr = sa_env_buffer_data(h);
+    *out_len = sa_env_buffer_len(h);
+}
+
+
+// ---- host seam (pluginHostServices codex faces) ----
+// FIX(be2): the sa_host_* intent externs are implemented here
+// over the sa_std process faces where they exist.
+// DEFECT(B-class, std gap): no env-carrying spawn face exists
+// in sa_std (four-source checked), so spawn does not apply the
+// env list / envOverrides — the child inherits the parent
+// environment; same registration as the other backends.
+
+
+// FIX(be2): sa_uuid_random bound to sa_deno_random_uuid
+// (crypto.sai:32, fmt handle readback).
+fn sa_uuid_random(out: &ProbePath) -> void {
+    let h = sa_deno_random_uuid();
+    out.len = 0;
+    if h == 0 { return; };
+    let dp: ptr = PTR_NULL();
+    dp = sa_fmt_buffer_data(h);
+    let dl = sa_fmt_buffer_len(h);
+    let pp: ptr = PTR_NULL(); PTR_BYTE_ADD(pp, &out.bytes, 0);
+    out.len = pm_copy(pp, 1024, dp, dl);
+    sa_fmt_buffer_free(h);
+}
+
+fn sa_host_taskkill_tree_sync(pid: u64) -> void {
+    let tb = PmBuf { bytes: [0u8; 65536], len: 0 };
+    pm_buf_lit(&tb, STR_PTR("taskkill\n/pid\n"), STR_LEN("taskkill\n/pid\n"));
+    pm_buf_u64(&tb, pid);
+    pm_buf_lit(&tb, STR_PTR("\n/T\n/F"), STR_LEN("\n/T\n/F"));
+    let tp: ptr = PTR_NULL(); PTR_BYTE_ADD(tp, &tb.bytes, 0);
+    let proc: u64 = 0;
+    let hin: u64 = 0;
+    let hout: u64 = 0;
+    let herr: u64 = 0;
+    if sa_std_process_spawn_bidi(tp, tb.len, &proc, &hin, &hout, &herr) != 0 { return; };
+    sa_std_close(hin);
+    sa_std_close(hout);
+    sa_std_close(herr);
+    let code: i32 = 0;
+    sa_std_process_wait(proc, &code);
+}
+
+fn sa_host_child_kill(child: u64, sig_ptr: ptr, sig_len: u64) -> void {
+    // std has a single forceful kill face; the TS signal name
+    // (SIGKILL at the call sites) collapses onto it.
+    if child != 0 { sa_std_process_kill(child); };
+}
+
+fn sa_host_spawn_codex_command(bin_ptr: ptr, bin_len: u64, args: &PmStringList, env_list: &PmEnvList, env_json: &[u8; 8192], env_json_len: u64, has_env: bool, cwd_ptr: ptr, cwd_len: u64, has_cwd: bool, out_child: &u64, out_pid: &u64, out_has_pid: &bool) -> i32 {
+    *out_child = 0;
+    *out_pid = 0;
+    *out_has_pid = false;
+    let tb = PmBuf { bytes: [0u8; 65536], len: 0 };
+    pm_buf_append(&tb, bin_ptr, bin_len);
+    let i: u64 = 0;
+    while i < args.len {
+        pm_buf_lit(&tb, STR_PTR("\n"), 1);
+        let ap: ptr = PTR_NULL(); PTR_BYTE_ADD(ap, &args.items[i].bytes, 0);
+        pm_buf_append(&tb, ap, args.items[i].len);
+        i = i + 1;
+    }
+    let tp: ptr = PTR_NULL(); PTR_BYTE_ADD(tp, &tb.bytes, 0);
+    let hin: u64 = 0;
+    let hout: u64 = 0;
+    let herr: u64 = 0;
+    let rc: i32 = 0;
+    if has_cwd {
+        rc = sa_std_process_spawn_bidi_cwd(tp, tb.len, cwd_ptr, cwd_len, out_child, &hin, &hout, &herr);
+    } else {
+        rc = sa_std_process_spawn_bidi(tp, tb.len, out_child, &hin, &hout, &herr);
+    };
+    if rc != 0 { return rc; };
+    let pidv: u64 = 0;
+    if sa_std_process_child_id(*out_child, &pidv) == 0 {
+        *out_pid = pidv;
+        *out_has_pid = true;
+    };
+    return 0;
+}
+
+// Readiness pump: drain stdout into lines; a line containing
+// "listening on http" (TS regexes, case-insensitive) is the
+// ready line. stderr chunks are line-split into the tail list.
+// Outcomes: 0 ready, 1 timeout, 2 exit, 3 read error.
+fn sa_host_child_wait_ready(child: u64, timeout_ms: u64, line: &ProbePath, tail: &PmStringList, max_lines: u64, exit_code: &i32) -> i32 {
+    *exit_code = 0;
+    line.len = 0;
+    let deadline = (sa_time_unix_ms() as u64) + timeout_ms;
+    let acc = PmBuf { bytes: [0u8; 65536], len: 0 };
+    let eacc = PmBuf { bytes: [0u8; 65536], len: 0 };
+    let chunk = [0u8; 4096];
+    let chunk_p: ptr = PTR_NULL(); PTR_BYTE_ADD(chunk_p, &chunk, 0);
+    while (sa_time_unix_ms() as u64) < deadline {
+        let ready: u8 = 0;
+        let code: i32 = 0;
+        let wrc = sa_std_process_try_wait_raw(child, &ready, &code);
+        if wrc == 0 && ready != 0 {
+            *exit_code = code;
+            return 2;
+        };
+        let n: u64 = 0;
+        let rrc = sa_std_process_read_stdout(child, chunk_p, 4096, &n);
+        if rrc != 0 { return 3; };
+        if n > 0 {
+            let base = acc.len;
+            pm_buf_append(&acc, chunk_p, n);
+            // scan complete lines in acc
+            let start: u64 = 0;
+            let j: u64 = 0;
+            let acc_p: ptr = PTR_NULL(); PTR_BYTE_ADD(acc_p, &acc.bytes, 0);
+            while j < acc.len {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, acc_p, j);
+                if b == 10 {
+                    let lp2: ptr = PTR_NULL(); PTR_BYTE_ADD(lp2, acc_p, start);
+                    if pm_contains_ci(lp2, j - start, STR_PTR("listening on http"), STR_LEN("listening on http")) {
+                        let dp: ptr = PTR_NULL(); PTR_BYTE_ADD(dp, &line.bytes, 0);
+                        line.len = pm_copy(dp, 1024, lp2, j - start);
+                        return 0;
+                    };
+                    start = j + 1;
+                };
+                j = j + 1;
+            }
+            if start > 0 {
+                // drop consumed lines
+                let rest = PmBuf { bytes: [0u8; 65536], len: 0 };
+                let rp: ptr = PTR_NULL(); PTR_BYTE_ADD(rp, acc_p, start);
+                pm_buf_append(&rest, rp, acc.len - start);
+                acc.len = 0;
+                let rp2: ptr = PTR_NULL(); PTR_BYTE_ADD(rp2, &rest.bytes, 0);
+                pm_buf_append(&acc, rp2, rest.len);
+            };
+        };
+        let en: u64 = 0;
+        let erc = sa_std_process_read_stderr(child, chunk_p, 4096, &en);
+        if erc == 0 && en > 0 {
+            pm_buf_append(&eacc, chunk_p, en);
+            let e_p: ptr = PTR_NULL(); PTR_BYTE_ADD(e_p, &eacc.bytes, 0);
+            let start: u64 = 0;
+            let j: u64 = 0;
+            while j < eacc.len {
+                let b: u8 = 0;
+                PTR_BYTE_AT(b, e_p, j);
+                if b == 10 {
+                    if tail.len >= 32 {
+                        let k: u64 = 0;
+                        while k + 1 < tail.len { tail.items[k] = tail.items[k + 1]; k = k + 1; }
+                        tail.len = tail.len - 1;
+                    };
+                    let sp: ptr = PTR_NULL(); PTR_BYTE_ADD(sp, e_p, start);
+                    let dp: ptr = PTR_NULL(); PTR_BYTE_ADD(dp, &tail.items[tail.len].bytes, 0);
+                    tail.items[tail.len].len = pm_copy(dp, 1024, sp, j - start);
+                    tail.len = tail.len + 1;
+                    start = j + 1;
+                };
+                j = j + 1;
+            }
+            if start > 0 {
+                let rest = PmBuf { bytes: [0u8; 65536], len: 0 };
+                let rp: ptr = PTR_NULL(); PTR_BYTE_ADD(rp, e_p, start);
+                pm_buf_append(&rest, rp, eacc.len - start);
+                eacc.len = 0;
+                let rp2: ptr = PTR_NULL(); PTR_BYTE_ADD(rp2, &rest.bytes, 0);
+                pm_buf_append(&eacc, rp2, rest.len);
+            };
+        };
+        if n == 0 && en == 0 { sa_time_sleep_ms(10); };
+    }
+    return 1;
+}
+
+fn sa_host_child_stop(child: u64, pid: u64, has_pid: bool, is_win32: bool, grace_ms: u64) -> void {
+    if is_win32 && has_pid {
+        sa_host_taskkill_tree_sync(pid);
+        return;
+    };
+    if child == 0 { return; };
+    // SIGTERM stage collapses to the poll-then-kill discipline:
+    // give the child the grace window to exit on its own after
+    // the host's polite close, then force-kill.
+    let deadline = (sa_time_unix_ms() as u64) + grace_ms;
+    while (sa_time_unix_ms() as u64) < deadline {
+        let ready: u8 = 0;
+        let code: i32 = 0;
+        if sa_std_process_try_wait_raw(child, &ready, &code) == 0 && ready != 0 { return; };
+        sa_time_sleep_ms(10);
+    }
+    sa_std_process_kill(child);
+}
+
+// DEFECT(host seam): TS registers process exit/SIGINT/SIGTERM
+// handlers that run killTreeSync; sa_std has no signal-handler
+// registration face (four-source checked), so installation is
+// a no-op here — host-wiring phase item.
+fn sa_host_install_shutdown_hooks() -> void {
+}
+
+fn sa_shared_resolve_model_context_window(model_ptr: ptr, model_len: u64, cap_ptr: ptr, cap_len: u64, present: bool, out_resolved: &u64, out_has: &bool) -> void {
+    *out_resolved = 0;
+    *out_has = false;
+    let desc = ModelCapabilityDescriptor { reasoningEfforts: StrList { items: [StrRef { ptr: PTR_NULL(), len: 0 }; 32], len: 0 }, reasoningEfforts_present: false, contextWindow: 0.0, contextWindow_present: false, maxOutputTokens: 0.0, maxOutputTokens_present: false, verbosity: 0, verbosity_present: false, supportsVerbosity: false, supportsVerbosity_present: false, source: 0, source_present: false };
+    descriptor_empty(&desc);
+    if present && cap_len > 0 {
+        let doc = sa_json_parse(cap_ptr, cap_len);
+        if doc != 0 {
+            let cw: f64 = 0.0;
+            if sa_json_object_get_f64(doc, STR_PTR("contextWindow"), STR_LEN("contextWindow"), &cw) == 0 {
+                desc.contextWindow = cw;
+                desc.contextWindow_present = true;
+            };
+            let mo: f64 = 0.0;
+            if sa_json_object_get_f64(doc, STR_PTR("maxOutputTokens"), STR_LEN("maxOutputTokens"), &mo) == 0 {
+                desc.maxOutputTokens = mo;
+                desc.maxOutputTokens_present = true;
+            };
+            sa_json_free(doc);
+        };
+    };
+    let v: f64 = 0.0;
+    if resolveModelContextWindow(model_ptr, model_len, &desc, present, 0.0, false, &v) {
+        if v > 0.0 {
+            *out_resolved = v as u64;
+            *out_has = true;
+        };
+    };
+}
+
 fn inferOpencodeModelLimits(model_ptr: ptr, model_len: u64, has_model: bool, explicit_ctx: u64, has_explicit_ctx: bool, cap: &PmModelCapability, out: &OpencodeModelLimit) -> void {
     // if (typeof explicitContextWindow === "number" && explicitContextWindow > 0)
     if has_explicit_ctx && explicit_ctx > 0 {
@@ -1272,7 +1578,7 @@ fn OpencodeCompatibleProcessManager_start(self_m: &OpencodeCompatibleProcessMana
             // const actualPort = Number(parsed.port || port);
             if aport == 0 { aport = port; };
             // url: `http://${actualHostname}:${actualPort}`
-            let info = OpencodeServerInfo { url: [0u8; 1024], url_len: 0, hostname: [0u8; 256], hostname_len: 0, port: 0, password: [u8; 128], password_len: 0 };
+            let info = OpencodeServerInfo { url: [0u8; 1024], url_len: 0, hostname: [0u8; 256], hostname_len: 0, port: 0, password: [0u8; 128], password_len: 0 };
             let ub = PmBuf { bytes: [0u8; 65536], len: 0 };
             pm_buf_lit(&ub, STR_PTR("http://"), STR_LEN("http://"));
             let ahp: ptr = PTR_NULL();
@@ -1292,7 +1598,7 @@ fn OpencodeCompatibleProcessManager_start(self_m: &OpencodeCompatibleProcessMana
             info.password_len = pm_copy(id2, 128, pw_ptr, password.len);
             self_m.server_info = info;
             self_m.has_server_info = true;
-            *out = info;
+            *out = self_m.server_info;
             return 0;
         };
         // A ready outcome without a parseable line cannot happen with the
@@ -1355,6 +1661,128 @@ fn pm_console_warn(text: &PmBuf) -> void {
 // DEFECT: recursion over a dynamic value -> intent extern
 // sa_json_canonical_stringify(jsonText) (MISSING) operating on the JSON
 // text form of the value.
+
+// FIX(be2): sa_json_canonical_stringify implemented for real
+// over the json.sai node API: scalars via node stringify,
+// arrays in order, object keys sorted bytewise (JS default
+// sort is UTF-16 code-unit order — identical for the ASCII
+// config keys fingerprinted here).
+fn pm_canon_write(node: u64, out: &PmBuf) -> void {
+    let kind = sa_json_kind(node);
+    if kind == 6 {
+        pm_buf_lit(out, STR_PTR("["), STR_LEN("["));
+        let cnt: u64 = 0;
+        sa_json_value_count(node, &cnt);
+        let i: u64 = 0;
+        while i < cnt {
+            if i > 0 { pm_buf_lit(out, STR_PTR(","), STR_LEN(",")); };
+            let item: u64 = 0;
+            sa_json_array_get(node, i, &item);
+            pm_canon_write(item, out);
+            i = i + 1;
+        }
+        pm_buf_lit(out, STR_PTR("]"), STR_LEN("]"));
+        return;
+    };
+    if kind == 7 {
+        let cnt: u64 = 0;
+        sa_json_value_count(node, &cnt);
+        if cnt > 256 { cnt = 256; };
+        let kptrs: [ptr; 256] = [PTR_NULL(); 256];
+        let klens: [u64; 256] = [0u64; 256];
+        let i: u64 = 0;
+        while i < cnt {
+            sa_json_object_key_at(node, i, &kptrs[i], &klens[i]);
+            i = i + 1;
+        }
+        // insertion sort, bytewise lexicographic
+        let a: u64 = 1;
+        while a < cnt {
+            let tp = kptrs[a];
+            let tl = klens[a];
+            let b = a;
+            while b > 0 {
+                let cmp = pm_key_cmp(kptrs[b - 1], klens[b - 1], tp, tl);
+                if cmp <= 0 { break; };
+                kptrs[b] = kptrs[b - 1];
+                klens[b] = klens[b - 1];
+                b = b - 1;
+            }
+            kptrs[b] = tp;
+            klens[b] = tl;
+            a = a + 1;
+        }
+        pm_buf_lit(out, STR_PTR("{"), STR_LEN("{"));
+        let j: u64 = 0;
+        while j < cnt {
+            if j > 0 { pm_buf_lit(out, STR_PTR(","), STR_LEN(",")); };
+            pm_buf_json_string(out, kptrs[j], klens[j]);
+            pm_buf_lit(out, STR_PTR(":"), STR_LEN(":"));
+            let v: u64 = 0;
+            sa_json_object_get(node, kptrs[j], klens[j], &v);
+            pm_canon_write(v, out);
+            j = j + 1;
+        }
+        pm_buf_lit(out, STR_PTR("}"), STR_LEN("}"));
+        return;
+    };
+    let h: u64 = 0;
+    if sa_json_stringify(node, &h) == 0 {
+        let bp: ptr = PTR_NULL();
+        bp = sa_json_buffer_data(h);
+        let bl = sa_json_buffer_len(h);
+        pm_buf_append(out, bp, bl);
+        sa_json_buffer_free(h);
+    };
+}
+
+fn pm_key_cmp(a: ptr, alen: u64, b: ptr, blen: u64) -> i32 {
+    let n = alen;
+    if blen < n { n = blen; };
+    let i: u64 = 0;
+    while i < n {
+        let x: u8 = 0;
+        PTR_BYTE_AT(x, a, i);
+        let y: u8 = 0;
+        PTR_BYTE_AT(y, b, i);
+        if x != y {
+            if x < y { return -1; };
+            return 1;
+        };
+        i = i + 1;
+    }
+    if alen == blen { return 0; };
+    if alen < blen { return -1; };
+    return 1;
+}
+
+
+// FIX(be2): sa_std_env_get bound to the sa_env faces (env.sai).
+
+// FIX(be2): sa_time_now_ms bound to sa_time_unix_ms (time.sai:5).
+fn sa_time_now_ms() -> u64 {
+    return sa_time_unix_ms() as u64;
+}
+
+fn sa_std_env_get(key_ptr: ptr, key_len: u64, out_ptr: &ptr, out_len: &u64, out_has: &bool) -> void {
+    *out_has = false;
+    *out_ptr = PTR_NULL();
+    *out_len = 0;
+    let h = sa_env_get(key_ptr, key_len);
+    if h == 0 { return; };
+    *out_ptr = sa_env_buffer_data(h);
+    *out_len = sa_env_buffer_len(h);
+    *out_has = true;
+}
+
+fn sa_json_canonical_stringify(json_ptr: ptr, json_len: u64, out: &PmBuf) -> void {
+    out.len = 0;
+    let doc = sa_json_parse(json_ptr, json_len);
+    if doc == 0 { return; };
+    pm_canon_write(doc, out);
+    sa_json_free(doc);
+}
+
 fn stableStringify(json_ptr: ptr, json_len: u64, has_value: bool, out: &PmBuf) -> void {
     out.len = 0;
     if !has_value {
@@ -1703,11 +2131,11 @@ fn acquireSharedOpencodeServer(state: &PmPoolState, config: &OpencodeProcessConf
         state.inflight_keys[state.inflight_len].len = pm_copy(d, 1024, key_ptr, keybuf.len);
         state.inflight_len = state.inflight_len + 1;
     };
-    let manager = OpencodeCompatibleProcessManager { self_id: 0, config: OpencodeProcessConfig { binPath: [0u8; 1024], binPath_len: 0, has_binPath: false, apiVersion: 1, has_apiVersion: false, serverEntryArgs: PmStringList { items: [ProbePath { bytes: [0u8; 1024], len: 0 }; 32], len: 0 }, has_serverEntryArgs: false, cwd: [0u8; 1024], cwd_len: 0, has_cwd: false, hostname: [0u8; 256], hostname_len: 0, has_hostname: false, port: 0, has_port: false, dangerous: false, has_dangerous: false, readyTimeoutMs: 0, has_readyTimeoutMs: false, envOverrides_json: [0u8; 8192], envOverrides_json_len: 0, has_envOverrides: false, relayProvider: OpencodeRelayProviderConfig { providerId: [0u8; 512], providerId_len: 0, baseURL: [0u8; 1024], baseURL_len: 0, apiKey: [u8; 512], apiKey_len: 0, models: PmStringList { items: [ProbePath { bytes: [0u8; 1024], len: 0 }; 32], len: 0 }, has_contextWindow: false, contextWindow: 0, modelCapability: PmModelCapability { json: [0u8; 8192], json_len: 0, present: false } }, has_relayProvider: false, saVmMcp: OpencodeSaVmMcpConfig { scriptPath: [0u8; 1024], scriptPath_len: 0, enabled: false, has_enabled: false }, has_saVmMcp: false, isolateThirdParty: false, has_isolateThirdParty: false }, child: 0, child_pid: 0, has_child_pid: false, server_info: OpencodeServerInfo { url: [0u8; 1024], url_len: 0, hostname: [0u8; 256], hostname_len: 0, port: 0, password: [u8; 128], password_len: 0 }, has_server_info: false, stopping: false, stderr_tail: PmStringList { items: [ProbePath { bytes: [0u8; 1024], len: 0 }; 32], len: 0 }, max_stderr_lines: 100 };
+    let manager = OpencodeCompatibleProcessManager { self_id: 0, config: OpencodeProcessConfig { binPath: [0u8; 1024], binPath_len: 0, has_binPath: false, apiVersion: 1, has_apiVersion: false, serverEntryArgs: PmStringList { items: [ProbePath { bytes: [0u8; 1024], len: 0 }; 32], len: 0 }, has_serverEntryArgs: false, cwd: [0u8; 1024], cwd_len: 0, has_cwd: false, hostname: [0u8; 256], hostname_len: 0, has_hostname: false, port: 0, has_port: false, dangerous: false, has_dangerous: false, readyTimeoutMs: 0, has_readyTimeoutMs: false, envOverrides_json: [0u8; 8192], envOverrides_json_len: 0, has_envOverrides: false, relayProvider: OpencodeRelayProviderConfig { providerId: [0u8; 512], providerId_len: 0, baseURL: [0u8; 1024], baseURL_len: 0, apiKey: [0u8; 512], apiKey_len: 0, models: PmStringList { items: [ProbePath { bytes: [0u8; 1024], len: 0 }; 32], len: 0 }, has_contextWindow: false, contextWindow: 0, modelCapability: PmModelCapability { json: [0u8; 8192], json_len: 0, present: false } }, has_relayProvider: false, saVmMcp: OpencodeSaVmMcpConfig { scriptPath: [0u8; 1024], scriptPath_len: 0, enabled: false, has_enabled: false }, has_saVmMcp: false, isolateThirdParty: false, has_isolateThirdParty: false }, child: 0, child_pid: 0, has_child_pid: false, server_info: OpencodeServerInfo { url: [0u8; 1024], url_len: 0, hostname: [0u8; 256], hostname_len: 0, port: 0, password: [0u8; 128], password_len: 0 }, has_server_info: false, stopping: false, stderr_tail: PmStringList { items: [ProbePath { bytes: [0u8; 1024], len: 0 }; 32], len: 0 }, max_stderr_lines: 100 };
     OpencodeCompatibleProcessManager_new(&manager, config, true);
     state.next_manager_id = state.next_manager_id + 1;
     manager.self_id = state.next_manager_id;
-    let info = OpencodeServerInfo { url: [0u8; 1024], url_len: 0, hostname: [0u8; 256], hostname_len: 0, port: 0, password: [u8; 128], password_len: 0 };
+    let info = OpencodeServerInfo { url: [0u8; 1024], url_len: 0, hostname: [0u8; 256], hostname_len: 0, port: 0, password: [0u8; 128], password_len: 0 };
     let rc = OpencodeCompatibleProcessManager_start(&manager, &info);
     // finally { if (pooledInflight.get(key) === starter) pooledInflight.delete(key); }
     pm_pool_inflight_remove(state, key_ptr, keybuf.len);
@@ -1728,7 +2156,7 @@ fn acquireSharedOpencodeServer(state: &PmPoolState, config: &OpencodeProcessConf
         e2.has_idle_deadline = false;
         *idx_out = state.servers_len;
         state.servers_len = state.servers_len + 1;
-        *info_out = info;
+        *info_out = e2.info;
         return 0;
     };
     return 5;
