@@ -105,6 +105,12 @@ slacxu main 手写区）。环境：sci 6bc56b29、sa_plugin_sla b228d0d2；
 - 下游阻塞：hostServices 本体、index.sla（聚合导入）、saVmWorkspaceSkill
   （PluginHostServices 字面量因导入失败 SyntaxError）。
 - 需要：顶层可变全局（零初始化 + 读写语义）或官方 global-cell 机制。
+- **裁决（用户 2026-10-26 08:33）：走 Rust 式 cell，否决顶层 `let mut`。**
+  SLA 顶层保持只许不可变；sa_std 提供官方具名 global cell：注册表按名字
+  索引、内部带锁，含 u64 与 bytes 两型、set_once（写一次）与原子 add
+  语义；产物把模块状态回绑为 cell get/set。依据：Rust 的 static mut
+  已被封存（2024 起取引用报错）、正道是 OnceLock/Mutex 式内部可变；
+  且 SLA 无 unsafe 标记（语料+探针已核），cell 路线零新语法。
 
 ### 缺口 3：sa_std fs 缺 mkdir -p（递归建目录）【高】
 - 复现：bridgeEventLog.sla 的 `sa_fs_mkdir_p` 调用（无声明、std 无导出）；
