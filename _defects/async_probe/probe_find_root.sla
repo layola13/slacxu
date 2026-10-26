@@ -1,0 +1,175 @@
+// async probe: faithful SLA translation of the findAgentsMdProjectRoot
+// pattern (backends/mini agentsMdInventory): starting at cwd, walk up
+// parent-by-parent; at each level await an existence check for ".git";
+// return the first ancestor containing ".git", or cwd itself when the
+// filesystem root is reached without a hit.
+//
+// Structure under test (the exact shapes bulk conversion flattened away):
+//   - async fn with a while loop whose locals (dir) mutate across .await
+//   - nested await: async fn awaiting another async fn's future
+//   - future::defer_ready(raw).await forces a real Pending suspension
+//     at every level (first poll Pending, second poll Ready)
+//   - blocking fs extern (sa_std_fs_exists) called directly in async fn
+//   - sync entry drives the future with task::poll in a loop (block_on
+//     form proven by test_unit_async_nested_pending_resume_state_machine
+//     and demos/rosetta/314, where future+task are created in the same
+//     function that drives them)
+@import "sa_std/fs.sai"
+@import "sa_std/future.sa"
+@import "sa_std/core/task.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/time.sla"
+@import "sa_std/thread.sa"
+@import "sa_std/fmt.sai"
+
+struct PathBuf {
+    bytes: [u8; 512], len: u64,
+}
+
+fn pb_base(p: &PathBuf) -> ptr {
+    let q: ptr = PTR_NULL();
+    PTR_BYTE_ADD(q, &p.bytes, 0);
+    return q;
+}
+
+fn pb_push_byte(p: &PathBuf, b: u8) {
+    if p.len < 512 {
+        p.bytes[p.len] = b;
+        p.len = p.len + 1;
+    };
+}
+
+fn pb_push(p: &PathBuf, src: ptr, src_len: u64) {
+    let i: u64 = 0;
+    while i < src_len {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, src, i);
+        pb_push_byte(p, b);
+        i = i + 1;
+    }
+}
+
+fn pb_set(p: &PathBuf, src: ptr, src_len: u64) {
+    p.len = 0;
+    pb_push(p, src, src_len);
+}
+
+fn pb_eq(a: &PathBuf, b: &PathBuf) -> bool {
+    if a.len != b.len { return false; };
+    let ap = pb_base(a);
+    let bp = pb_base(b);
+    let i: u64 = 0;
+    while i < a.len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, ap, i);
+        PTR_BYTE_AT(y, bp, i);
+        if x != y { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// Length of dirname(path); unchanged when path is already "/".
+fn dirname_len(p: &PathBuf) -> u64 {
+    if p.len <= 1 { return p.len; };
+    let base = pb_base(p);
+    let i = p.len - 1;
+    while i > 0 {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, base, i);
+        if b == 47 { return i; };
+        i = i - 1;
+    }
+    return 1;
+}
+
+// One level's check: build "<dir>/.git" and ask the fs. The blocking
+// extern runs synchronously; defer_ready turns its result into a future
+// that suspends once, so every level exercises a real state-machine
+// suspension/resume before the walk continues.
+async fn git_exists(dir: &PathBuf) -> bool {
+    let probe = PathBuf { bytes: [0; 512], len: 0 };
+    pb_push(&probe, pb_base(dir), dir.len);
+    if probe.len > 1 { pb_push_byte(&probe, 47); };
+    pb_push(&probe, STR_PTR(".git"), STR_LEN(".git"));
+    let raw = sa_std_fs_exists(pb_base(&probe), probe.len);
+    let hit = future::defer_ready(raw).await;
+    // NOTE: sa_std_fs_exists returns a STATUS code, not a boolean:
+    // SA_STD_OK (0) when the path exists, an error code (3 =
+    // FileNotFound) otherwise -- measured by this probe and read in
+    // sci/src/runtime/sa_std.zig (access() + finish/finishErr).
+    return hit == 0;
+}
+
+async fn find_root_async(cwd: &PathBuf, out: &PathBuf) -> i32 {
+    let dir = PathBuf { bytes: [0; 512], len: 0 };
+    pb_push(&dir, pb_base(cwd), cwd.len);
+    while true {
+        let hit = git_exists(&dir).await;
+        if hit {
+            pb_set(out, pb_base(&dir), dir.len);
+            return 0;
+        };
+        let plen = dirname_len(&dir);
+        if plen == dir.len {
+            pb_set(out, pb_base(cwd), cwd.len);
+            return 0;
+        };
+        dir.len = plen;
+    }
+    return 1;
+}
+
+fn now_ns() -> u64 {
+    let t = Instant::now();
+    return t.raw_ns();
+}
+
+// Drive one case end-to-end. Returns 0 when the async walk produced
+// exactly `expect`; 2 on mismatch; 3 on poll deadline.
+fn drive_case(cwd_ptr: ptr, cwd_len: u64, expect_ptr: ptr, expect_len: u64, outfile_ptr: ptr, outfile_len: u64) -> i32 {
+    let cwd = PathBuf { bytes: [0; 512], len: 0 };
+    pb_push(&cwd, cwd_ptr, cwd_len);
+    let expect = PathBuf { bytes: [0; 512], len: 0 };
+    pb_push(&expect, expect_ptr, expect_len);
+    let out = PathBuf { bytes: [0; 512], len: 0 };
+    let t = task::new(find_root_async(&cwd, &out));
+    let deadline = now_ns() + 5000000000;
+    while now_ns() < deadline {
+        if task::poll(t) == true {
+            let st = task::result(t);
+            if st != 0 { return 4; };
+            let wr = sa_fs_write_file(outfile_ptr, outfile_len, pb_base(&out), out.len);
+            if wr != 0 { return 5; };
+            if pb_eq(&out, &expect) { return 0; };
+            return 2;
+        };
+        THREAD_SLEEP_MS(1);
+    }
+    return 3;
+}
+
+fn main() -> i32 {
+    // Document the raw exists-extern contract on known paths first.
+    let raw_yes = sa_std_fs_exists(STR_PTR("/tmp/async_probe_t1/repo/.git"), STR_LEN("/tmp/async_probe_t1/repo/.git"));
+    let raw_no = sa_std_fs_exists(STR_PTR("/tmp/async_probe_t1/repo/deep/.git"), STR_LEN("/tmp/async_probe_t1/repo/deep/.git"));
+    println("exists_raw_yes={}", raw_yes);
+    println("exists_raw_no={}", raw_no);
+
+    let c1 = drive_case(STR_PTR("/tmp/async_probe_t1/repo/deep/deeper"), STR_LEN("/tmp/async_probe_t1/repo/deep/deeper"),
+                        STR_PTR("/tmp/async_probe_t1/repo"), STR_LEN("/tmp/async_probe_t1/repo"),
+                        STR_PTR("/tmp/async_probe_out1.txt"), STR_LEN("/tmp/async_probe_out1.txt"));
+    println("case1_rc={}", c1);
+    let c2 = drive_case(STR_PTR("/tmp/async_probe_t2/x/y"), STR_LEN("/tmp/async_probe_t2/x/y"),
+                        STR_PTR("/tmp/async_probe_t2/x/y"), STR_LEN("/tmp/async_probe_t2/x/y"),
+                        STR_PTR("/tmp/async_probe_out2.txt"), STR_LEN("/tmp/async_probe_out2.txt"));
+    println("case2_rc={}", c2);
+    if c1 == 0 && c2 == 0 {
+        println("PROBE_PASS");
+        return 0;
+    };
+    println("PROBE_FAIL");
+    return 1;
+}
