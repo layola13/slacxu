@@ -33,8 +33,13 @@
   `if {}` 块后**要加** `};`。字符串字面量经 `STR_PTR("...")`/`STR_LEN("...")`
   传给 extern；extern 风格见 sa_std 的 .sai（sa_json_*、sa_std_fs_*、
   sa_http_client_sse_turn_ex、sa_std_process_spawn_bidi 等）。
-- async 函数 → 同步函数 + 返回状态码，签名处 `// DEFECT: async`；
-  回调/Promise 链 → 顺序调用近似 + DEFECT。
+- ~~async 函数 → 同步函数 + 返回状态码~~ **【2026-10-26 撤销，用户指出】**：
+  SLA 原生支持 async/await（`async fn`、`.await`、future<T>、block_on，
+  编译器测试族 test_unit_async_* 与 sa_std/async.sla 执行器为证）。
+  async 函数必须按 async 忠实转换：控制流、await 顺序、循环体全部保留；
+  同步入口用 block_on 驱动；回调/Promise 链先查 ASYNC_MODEL.md 的映射规则，
+  禁止压平为同步桩。已压平的 185 文件 / 1181 处 `// DEFECT: async`
+  按 _defects/ASYNC_AUDIT.md 分阶段重译。
 - 每个 .sla 文件头注释：`// Converted 1:1 from <相对路径>.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.`
 
 ## SAX（.tsx → .sax）

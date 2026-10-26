@@ -201,3 +201,24 @@ saVmWorkspaceSkill。分类：
   sa_b64dec_simd 实现但无 .sai 声明，402）、sa_http_fetch_bytes
   （无 one-shot fetch 面；http_client.sai 是有状态 client API，
   组合实现非机械回绑，450）。
+
+## 方法论修正：async 压平误判（2026-10-26，用户指出）
+
+- 事实：SLA 原生支持 async/await——编译器测试族 test_unit_async_await /
+  test_unit_async_block_on_direct / test_unit_async_defer_ready_*
+  （async fn、.await、block_on、状态机 codegen）；sa_std 有 async.sla
+  （多线程执行器 + future<T> 可跨函数/线程）与 future.sa。转换简报的
+  「async→同步+状态码」规则系误判（且与简报自身列出的 async 面自相
+  矛盾），已撤销改写。
+- 影响面：`// DEFECT: async` 共 1181 处 / 185 文件（apps 100、backends 54、
+  mini-codex 12、packages 11、sdk-backend 6、frontends 2；其中 apps/server
+  单域 44 文件）。一部分是语义桩：如 backends/mini/src/runtime/
+  agentsMdInventory.sla:47 findAgentsMdProjectRoot——向上逐级找 .git 的
+  循环被整体丢弃、直接返回 cwd：能编译、行为错误，属明令禁止的静默降级。
+- 处置：① 简报规则已改；② 专项审计产出 ASYNC_MODEL.md（映射规则 +
+  探针实证）与 ASYNC_AUDIT.md（逐文件分类：签名压平 / 语义桩）；
+  ③ sdk-backend 6 文件（runtimeClient、service、server、hostServices、
+  imagePersistence、saVmWorkspaceSkill）随缺口回绑一并重译——其中
+  runtimeClient/service/server 此前记为「通过」，async 审计过关前其
+  通过状态带星号；④ 其余域按 server→backends→packages→mini-codex
+  顺序在各自修复轮次处理。
