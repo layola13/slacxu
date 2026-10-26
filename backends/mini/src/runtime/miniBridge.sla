@@ -7753,3 +7753,477 @@ fn sanitizeMiniChatMessages(msgs: u64, out: &u64) -> void {
     mb_free_doc(seen_output);
     *out = filtered;
 }
+
+// ---- B6: SSE frames, user-input answer, web search, AGENTS.md active (TS:4461-4638) ----
+// readSseStream landing: the streaming reader + onEvent callback dispatch is
+// a host seam; the frame semantics are ported whole-text here — the host
+// feeds accumulated body text and dispatches the returned frame list in
+// order (same queue/drain model as MiniBridge_emit). Abort polling maps to
+// the caller's deadline checks between chunks (registered async seam).
+fn mb_trim_start_to(p: ptr, n: u64, out: &MbStr) -> void {
+    out.len = 0;
+    let i: u64 = 0;
+    while i < n {
+        let c: u8 = mb_byte_at(p, i);
+        if c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12 { i = i + 1; } else { break; };
+    }
+    mb_slice_to_s(p, n, i, n, out);
+}
+fn mb_sse_frame_emit(lines: u64, from: u64, to: u64, out_events: u64) -> void {
+    let event_name = MbStr { bytes: [0u8; 8192], len: 0 };
+    let has_event: bool = false;
+    let data_parts: u64 = mb_new_arr();
+    let i: u64 = from;
+    while i < to {
+        let line = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ok: bool = mb_n_str(mb_a_at(lines, i), &line);
+        i = i + 1;
+        let body = MbStr { bytes: [0u8; 8192], len: 0 };
+        if line.len > 0 && mb_byte_at(mb_sp(&line), line.len - 1) == 13 { mb_slice_to_s(mb_sp(&line), line.len, 0, line.len - 1, &body); } else { mb_sassign_s2(&body, &line); };
+        if mb_starts_with(mb_sp(&body), body.len, STR_PTR("event:"), STR_LEN("event:")) {
+            let rest = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_slice_to_s(mb_sp(&body), body.len, 6, body.len, &rest);
+            mb_trim_to(mb_sp(&rest), rest.len, &event_name);
+            has_event = true;
+        } else if mb_starts_with(mb_sp(&body), body.len, STR_PTR("data:"), STR_LEN("data:")) {
+            let rest = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_slice_to_s(mb_sp(&body), body.len, 5, body.len, &rest);
+            let trimmed = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_trim_start_to(mb_sp(&rest), rest.len, &trimmed);
+            let rc: i32 = mb_a_push_str(data_parts, mb_sp(&trimmed), trimmed.len);
+        };
+    }
+    if mb_n_count(data_parts) == 0 { mb_free_doc(data_parts); return; };
+    let joined = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_lines_join(data_parts, &joined);
+    mb_free_doc(data_parts);
+    let ev: u64 = mb_new_obj();
+    if has_event { let rc: i32 = mb_s_str(ev, STR_PTR("event"), STR_LEN("event"), mb_sp(&event_name), event_name.len); } else { let rc: i32 = mb_s_null(ev, STR_PTR("event"), STR_LEN("event")); };
+    let rc: i32 = mb_s_str(ev, STR_PTR("data"), STR_LEN("data"), mb_jp(&joined), joined.len);
+    rc = mb_a_push_node(out_events, ev);
+}
+fn readSseFrames(body_p: ptr, body_n: u64, out: &u64) -> void {
+    let events: u64 = mb_new_arr();
+    *out = events;
+    let lines_text = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_split_on(body_p, body_n, STR_PTR("\n"), STR_LEN("\n"), &lines_text);
+    let lines: u64 = mb_parse(mb_jp(&lines_text), lines_text.len);
+    if lines == 0 { return; };
+    let count: u64 = mb_n_count(lines);
+    let frame_start: u64 = 0;
+    let i: u64 = 0;
+    while i < count {
+        let line = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ok: bool = mb_n_str(mb_a_at(lines, i), &line);
+        let is_blank: bool = line.len == 0 || (line.len == 1 && mb_byte_at(mb_sp(&line), 0) == 13);
+        if is_blank {
+            if i > frame_start { mb_sse_frame_emit(lines, frame_start, i, events); };
+            frame_start = i + 1;
+        };
+        i = i + 1;
+    }
+    // Trailing partial frame: TS flushes only when buf.trim() is non-empty.
+    if frame_start < count {
+        let any: bool = false;
+        let j: u64 = frame_start;
+        while j < count {
+            let line = MbStr { bytes: [0u8; 8192], len: 0 };
+            let ok: bool = mb_n_str(mb_a_at(lines, j), &line);
+            let t = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_trim_to(mb_sp(&line), line.len, &t);
+            if t.len > 0 { any = true; };
+            j = j + 1;
+        }
+        if any { mb_sse_frame_emit(lines, frame_start, count, events); };
+    };
+    mb_free_doc(lines);
+}
+fn extractUserInputAnswer(result: u64, out: &MbJson) -> void {
+    out.len = 0;
+    if result == 0 || mb_kind(result) != MB_JK_OBJECT { return; };
+    let answers: u64 = mb_g_node(result, STR_PTR("answers"), STR_LEN("answers"));
+    if answers != 0 && mb_kind(answers) == MB_JK_OBJECT {
+        let selected: u64 = mb_new_arr();
+        let key_count: u64 = mb_n_count(answers);
+        let ki: u64 = 0;
+        while ki < key_count {
+            let kp: ptr = PTR_NULL();
+            let kn: u64 = 0;
+            let has_key: bool = mb_key_at(answers, ki, &kp, &kn);
+            ki = ki + 1;
+            if !has_key { continue; };
+            let entry: u64 = mb_g_node(answers, kp, kn);
+            if entry == 0 || mb_kind(entry) != MB_JK_OBJECT { continue; };
+            let arr: u64 = mb_g_node(entry, STR_PTR("answers"), STR_LEN("answers"));
+            if arr == 0 || mb_kind(arr) != MB_JK_ARRAY { continue; };
+            let ac: u64 = mb_n_count(arr);
+            let ai: u64 = 0;
+            while ai < ac {
+                let raw = MbJson { bytes: [0u8; 262144], len: 0 };
+                mb_str_of_node(mb_a_at(arr, ai), &raw);
+                ai = ai + 1;
+                let str = MbStr { bytes: [0u8; 8192], len: 0 };
+                mb_trim_to(mb_jp(&raw), raw.len, &str);
+                if mb_starts_with(mb_sp(&str), str.len, STR_PTR("user_note:"), STR_LEN("user_note:")) {
+                    // str.replace(/^user_note:\s*/, "")
+                    let rest = MbStr { bytes: [0u8; 8192], len: 0 };
+                    mb_slice_to_s(mb_sp(&str), str.len, 10, str.len, &rest);
+                    let stripped = MbStr { bytes: [0u8; 8192], len: 0 };
+                    mb_trim_start_to(mb_sp(&rest), rest.len, &stripped);
+                    let rc: i32 = mb_a_push_str(selected, mb_sp(&stripped), stripped.len);
+                } else if str.len > 0 {
+                    let rc: i32 = mb_a_push_str(selected, mb_sp(&str), str.len);
+                };
+            }
+        }
+        if mb_n_count(selected) > 0 {
+            let parts: u64 = mb_n_count(selected);
+            let pi: u64 = 0;
+            while pi < parts {
+                if pi > 0 { mb_jappend(out, STR_PTR(", "), STR_LEN(", ")); };
+                let s = MbStr { bytes: [0u8; 8192], len: 0 };
+                let ok: bool = mb_n_str(mb_a_at(selected, pi), &s);
+                mb_jappend_s(out, &s);
+                pi = pi + 1;
+            }
+            mb_free_doc(selected);
+            return;
+        };
+        mb_free_doc(selected);
+    };
+    let decision: u64 = mb_g_node(result, STR_PTR("decision"), STR_LEN("decision"));
+    if decision != 0 && mb_kind(decision) == MB_JK_STRING { let ok: bool = mb_n_str_j(decision, out); return; };
+    let response: u64 = mb_g_node(result, STR_PTR("response"), STR_LEN("response"));
+    if response != 0 && mb_kind(response) == MB_JK_STRING { let ok: bool = mb_n_str_j(response, out); return; };
+}
+// ---- web search (TS:4531-4623) ----
+// ASYNC landing: blocking via sa_http_fetch_bytes (one-shot composed client).
+// DEFECT(std): fetch_bytes exposes neither status codes nor request headers
+// — the !res.ok note branch and the UA/Accept headers + 12s AbortController
+// timeout cannot be honored; a transport failure lands in the catch-shaped
+// error JSON, and any completed exchange is parsed (a provider error page
+// yields the "No web results found." note). JSON.stringify(..., null, 2)
+// pretty-printing is rendered compact (JSON carriers in this port are
+// compact; consumers parse).
+fn mb_uri_encode(p: ptr, n: u64, out: &MbJson) -> void {
+    out.len = 0;
+    let hexd: ptr = "0123456789ABCDEF";
+    let i: u64 = 0;
+    while i < n {
+        let c: u8 = mb_byte_at(p, i);
+        i = i + 1;
+        let unreserved: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 95 || c == 46 || c == 33 || c == 126 || c == 42 || c == 39 || c == 40 || c == 41;
+        if unreserved {
+            mb_jpush(out, c);
+        } else {
+            mb_jpush(out, 37);
+            mb_jpush(out, mb_byte_at(hexd, (c >> 4) as u64));
+            mb_jpush(out, mb_byte_at(hexd, (c & 15) as u64));
+        };
+    }
+}
+fn mb_hex_val(c: u8, out: &u64) -> bool {
+    if c >= 48 && c <= 57 { *out = (c - 48) as u64; return true; };
+    if c >= 65 && c <= 70 { *out = (c - 55) as u64; return true; };
+    if c >= 97 && c <= 102 { *out = (c - 87) as u64; return true; };
+    return false;
+}
+fn mb_pct_decode(p: ptr, n: u64, out: &MbStr) -> void {
+    // URLSearchParams value decoding: '+' -> space, %XX -> byte.
+    out.len = 0;
+    let i: u64 = 0;
+    while i < n {
+        let c: u8 = mb_byte_at(p, i);
+        if c == 37 && i + 2 < n {
+            let hi: u64 = 0;
+            let lo: u64 = 0;
+            if mb_hex_val(mb_byte_at(p, i + 1), &hi) && mb_hex_val(mb_byte_at(p, i + 2), &lo) {
+                mb_spush(out, ((hi * 16 + lo) & 255) as u8);
+                i = i + 3;
+                continue;
+            };
+        };
+        if c == 43 { mb_spush(out, 32); i = i + 1; continue; };
+        mb_spush(out, c);
+        i = i + 1;
+    }
+}
+fn mb_strip_tags(p: ptr, n: u64, out: &MbJson) -> void {
+    out.len = 0;
+    let i: u64 = 0;
+    let in_tag: bool = false;
+    while i < n {
+        let c: u8 = mb_byte_at(p, i);
+        i = i + 1;
+        if in_tag { if c == 62 { in_tag = false; }; continue; };
+        if c == 60 { in_tag = true; continue; };
+        mb_jpush(out, c);
+    }
+}
+fn mb_ws_collapse(p: ptr, n: u64, out: &MbStr) -> void {
+    out.len = 0;
+    let pending_space: bool = false;
+    let i: u64 = 0;
+    while i < n {
+        let c: u8 = mb_byte_at(p, i);
+        i = i + 1;
+        if c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12 { if out.len > 0 { pending_space = true; }; continue; };
+        if pending_space { mb_spush(out, 32); pending_space = false; };
+        mb_spush(out, c);
+    }
+}
+fn mb_ddg_clean_text(p: ptr, n: u64, out: &MbStr) -> void {
+    let stripped = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_strip_tags(p, n, &stripped);
+    let step = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_replace_all(mb_jp(&stripped), stripped.len, STR_PTR("&quot;"), STR_LEN("&quot;"), STR_PTR("\""), STR_LEN("\""), &step);
+    mb_replace_all(mb_jp(&step), step.len, STR_PTR("&amp;"), STR_LEN("&amp;"), STR_PTR("&"), STR_LEN("&"), &stripped);
+    mb_replace_all(mb_jp(&stripped), stripped.len, STR_PTR("&lt;"), STR_LEN("&lt;"), STR_PTR("<"), STR_LEN("<"), &step);
+    mb_replace_all(mb_jp(&step), step.len, STR_PTR("&gt;"), STR_LEN("&gt;"), STR_PTR(">"), STR_LEN(">"), &stripped);
+    mb_replace_all(mb_jp(&stripped), stripped.len, STR_PTR("&#39;"), STR_LEN("&#39;"), STR_PTR("'"), STR_LEN("'"), &step);
+    mb_ws_collapse(mb_jp(&step), step.len, out);
+}
+fn mb_ddg_block_match(block_p: ptr, block_n: u64, out_url: &MbStr, out_title: &MbStr, out_snippet: &MbStr) -> void {
+    out_url.len = 0;
+    out_title.len = 0;
+    out_snippet.len = 0;
+    // titleMatch chain (ERE forms of the TS alternation; non-greedy *? is not
+    // expressible in POSIX ERE — greedy span to the last </a> in the block is
+    // the registered engine-limit divergence, cf. regex.sai header).
+    let tm_url = MbStr { bytes: [0u8; 8192], len: 0 };
+    let tm_title = MbStr { bytes: [0u8; 8192], len: 0 };
+    let m1: u64 = mb_re_match(block_p, block_n, STR_PTR("<a[^>]+class=\"result__snippet[^>]*href=\"([^\"]+)\"[^>]*>(.*)</a>"), STR_LEN("<a[^>]+class=\"result__snippet[^>]*href=\"([^\"]+)\"[^>]*>(.*)</a>"), true);
+    if m1 != 0 {
+        let ok1: bool = mb_re_group(m1, 1, &tm_url);
+        let ok2: bool = mb_re_group(m1, 2, &tm_title);
+        mb_re_free_match(m1);
+    } else {
+        let m2: u64 = mb_re_match(block_p, block_n, STR_PTR("<a[^>]+class=\"result__url[^>]*href=\"([^\"]+)\"[^>]*>(.*)</a>"), STR_LEN("<a[^>]+class=\"result__url[^>]*href=\"([^\"]+)\"[^>]*>(.*)</a>"), true);
+        if m2 != 0 {
+            let ok1: bool = mb_re_group(m2, 1, &tm_url);
+            let ok2: bool = mb_re_group(m2, 2, &tm_title);
+            mb_re_free_match(m2);
+        } else {
+            let m3: u64 = mb_re_match(block_p, block_n, STR_PTR("<a[^>]+href=\"([^\"]+)\"[^>]*class=\"result__url\"[^>]*>(.*)</a>"), STR_LEN("<a[^>]+href=\"([^\"]+)\"[^>]*class=\"result__url\"[^>]*>(.*)</a>"), true);
+            if m3 != 0 {
+                let ok1: bool = mb_re_group(m3, 1, &tm_url);
+                let ok2: bool = mb_re_group(m3, 2, &tm_title);
+                mb_re_free_match(m3);
+            };
+        };
+    };
+    let lm_url = MbStr { bytes: [0u8; 8192], len: 0 };
+    let lm_title = MbStr { bytes: [0u8; 8192], len: 0 };
+    let lm: u64 = mb_re_match(block_p, block_n, STR_PTR("<a[^>]+class=\"result__a\"[^>]*href=\"([^\"]+)\"[^>]*>(.*)</a>"), STR_LEN("<a[^>]+class=\"result__a\"[^>]*href=\"([^\"]+)\"[^>]*>(.*)</a>"), true);
+    if lm != 0 {
+        let ok1: bool = mb_re_group(lm, 1, &lm_url);
+        let ok2: bool = mb_re_group(lm, 2, &lm_title);
+        mb_re_free_match(lm);
+    };
+    let sm = MbStr { bytes: [0u8; 8192], len: 0 };
+    let sm_match: u64 = mb_re_match(block_p, block_n, STR_PTR("<a[^>]+class=\"result__snippet\"[^>]*>(.*)</a>"), STR_LEN("<a[^>]+class=\"result__snippet\"[^>]*>(.*)</a>"), true);
+    if sm_match != 0 {
+        let ok: bool = mb_re_group(sm_match, 1, &sm);
+        mb_re_free_match(sm_match);
+    } else {
+        // alt: class="result__snippet">CAPTURE</ — capture up to the first "</"
+        let marker: ptr = "class=\"result__snippet\">";
+        let marker_len: u64 = 24;
+        let pos_i: i64 = mb_index_of(block_p, block_n, marker, marker_len);
+        if pos_i >= 0 {
+            let pos: u64 = pos_i as u64;
+            let start: u64 = pos + marker_len;
+            let end: u64 = start;
+            while end + 1 < block_n {
+                if mb_byte_at(block_p, end) == 60 && mb_byte_at(block_p, end + 1) == 47 { break; };
+                end = end + 1;
+            }
+            mb_slice_to_s(block_p, block_n, start, end, &sm);
+        };
+    };
+    if lm_url.len > 0 { mb_sassign_s2(out_url, &lm_url); } else { mb_sassign_s2(out_url, &tm_url); };
+    if lm_title.len > 0 { mb_sassign_s2(out_title, &lm_title); } else { mb_sassign_s2(out_title, &tm_title); };
+    mb_sassign_s2(out_snippet, &sm);
+}
+fn runMiniWebSearch(query_p: ptr, query_n: u64, max_results: u64, out: &MbJson) -> void {
+    out.len = 0;
+    let clean = MbStr { bytes: [0u8; 8192], len: 0 };
+    mb_trim_to(query_p, query_n, &clean);
+    if clean.len == 0 {
+        let obj: u64 = mb_new_obj();
+        let rc: i32 = mb_s_str(obj, STR_PTR("query"), STR_LEN("query"), query_p, query_n);
+        let empty_arr: u64 = mb_new_arr();
+        rc = mb_s_node(obj, STR_PTR("results"), STR_LEN("results"), empty_arr);
+        rc = mb_s_str(obj, STR_PTR("error"), STR_LEN("error"), STR_PTR("Empty query"), STR_LEN("Empty query"));
+        let ok: bool = mb_stringify_node(obj, out);
+        mb_free_doc(obj);
+        return;
+    };
+    let count: u64 = max_results;
+    if count < 1 { count = 1; };
+    if count > 10 { count = 10; };
+    let encoded = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_uri_encode(mb_sp(&clean), clean.len, &encoded);
+    let url = MbJson { bytes: [0u8; 262144], len: 0 };
+    mb_jappend(&url, STR_PTR("https://html.duckduckgo.com/html/?q="), STR_LEN("https://html.duckduckgo.com/html/?q="));
+    mb_jappend(&url, mb_jp(&encoded), encoded.len);
+    let html = MbBig { bytes: [0u8; 1048576], len: 0 };
+    let got: u64 = 0;
+    let status: i32 = sa_http_fetch_bytes(mb_jp(&url), url.len, mb_bp(&html), 1048576, &got);
+    if status != 0 {
+        let obj: u64 = mb_new_obj();
+        let rc: i32 = mb_s_str(obj, STR_PTR("query"), STR_LEN("query"), mb_sp(&clean), clean.len);
+        let empty_arr: u64 = mb_new_arr();
+        rc = mb_s_node(obj, STR_PTR("results"), STR_LEN("results"), empty_arr);
+        rc = mb_s_str(obj, STR_PTR("error"), STR_LEN("error"), STR_PTR("fetch failed"), STR_LEN("fetch failed"));
+        let ok: bool = mb_stringify_node(obj, out);
+        mb_free_doc(obj);
+        return;
+    };
+    html.len = got;
+    // Split into result blocks on class="result\s+results_links (icase).
+    let lower = MbBig { bytes: [0u8; 1048576], len: 0 };
+    let li: u64 = 0;
+    while li < html.len {
+        let c: u8 = mb_byte_at(mb_bp(&html), li);
+        lower.bytes[li] = mb_lower_byte(c);
+        li = li + 1;
+    }
+    lower.len = html.len;
+    let starts: u64 = mb_new_arr();
+    let scan: u64 = 0;
+    while scan < lower.len {
+        let pos_i: i64 = mb_index_of(mb_ptr_add(mb_bp(&lower), scan), lower.len - scan, STR_PTR("class=\"result"), STR_LEN("class=\"result"));
+        if pos_i < 0 { break; };
+        let pos: u64 = pos_i as u64;
+        let at: u64 = scan + pos + 13;
+        // \s+ then results_links
+        let j: u64 = at;
+        let ws: u64 = 0;
+        while j < lower.len {
+            let c: u8 = mb_byte_at(mb_bp(&lower), j);
+            if c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12 { j = j + 1; ws = ws + 1; } else { break; };
+        }
+        if ws > 0 && mb_starts_with(mb_ptr_add(mb_bp(&lower), j), lower.len - j, STR_PTR("results_links"), STR_LEN("results_links")) {
+            let rc: i32 = mb_a_push_i64(starts, (j + 13) as i64);
+            scan = j + 13;
+        } else { scan = at; };
+    }
+    let results: u64 = mb_new_arr();
+    let sc: u64 = mb_n_count(starts);
+    let bi: u64 = 0;
+    while bi < sc {
+        if mb_n_count(results) >= count { break; };
+        let bstart_v: i64 = 0;
+        let ok_bs: bool = mb_n_i64(mb_a_at(starts, bi), &bstart_v);
+        let bstart: u64 = bstart_v as u64;
+        let bend: u64 = lower.len;
+        if bi + 1 < sc { let bend_v: i64 = 0; let ok_be: bool = mb_n_i64(mb_a_at(starts, bi + 1), &bend_v); bend = bend_v as u64; };
+        bi = bi + 1;
+        if bend > bstart + 13 { bend = bend - 13; };
+        let block_len: u64 = 0;
+        if bend > bstart { block_len = bend - bstart; };
+        let raw_url = MbStr { bytes: [0u8; 8192], len: 0 };
+        let raw_title = MbStr { bytes: [0u8; 8192], len: 0 };
+        let raw_snippet = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_ddg_block_match(mb_ptr_add(mb_bp(&html), bstart), block_len, &raw_url, &raw_title, &raw_snippet);
+        let target = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_sassign_s2(&target, &raw_url);
+        let uddg_i: i64 = mb_index_of(mb_sp(&target), target.len, STR_PTR("uddg="), STR_LEN("uddg="));
+        if uddg_i >= 0 {
+            let uddg_pos: u64 = uddg_i as u64;
+            let vstart: u64 = uddg_pos + 5;
+            let vend: u64 = vstart;
+            while vend < target.len && mb_byte_at(mb_sp(&target), vend) != 38 { vend = vend + 1; }
+            let raw_v = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_slice_to_s(mb_sp(&target), target.len, vstart, vend, &raw_v);
+            let decoded = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_pct_decode(mb_sp(&raw_v), raw_v.len, &decoded);
+            if decoded.len > 0 { mb_sassign_s2(&target, &decoded); };
+        };
+        let title = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_ddg_clean_text(mb_sp(&raw_title), raw_title.len, &title);
+        let snippet = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_ddg_clean_text(mb_sp(&raw_snippet), raw_snippet.len, &snippet);
+        if title.len > 0 && (mb_starts_with(mb_sp(&target), target.len, STR_PTR("http://"), STR_LEN("http://")) || mb_starts_with(mb_sp(&target), target.len, STR_PTR("https://"), STR_LEN("https://"))) {
+            let item: u64 = mb_new_obj();
+            let rc: i32 = mb_s_str(item, STR_PTR("title"), STR_LEN("title"), mb_sp(&title), title.len);
+            rc = mb_s_str(item, STR_PTR("url"), STR_LEN("url"), mb_sp(&target), target.len);
+            rc = mb_s_str(item, STR_PTR("snippet"), STR_LEN("snippet"), mb_sp(&snippet), snippet.len);
+            rc = mb_a_push_node(results, item);
+        };
+    }
+    mb_free_doc(starts);
+    if mb_n_count(results) == 0 {
+        mb_free_doc(results);
+        let obj: u64 = mb_new_obj();
+        let rc: i32 = mb_s_str(obj, STR_PTR("query"), STR_LEN("query"), mb_sp(&clean), clean.len);
+        let empty_arr: u64 = mb_new_arr();
+        rc = mb_s_node(obj, STR_PTR("results"), STR_LEN("results"), empty_arr);
+        rc = mb_s_str(obj, STR_PTR("note"), STR_LEN("note"), STR_PTR("No web results found."), STR_LEN("No web results found."));
+        let ok: bool = mb_stringify_node(obj, out);
+        mb_free_doc(obj);
+        return;
+    };
+    mb_jappend(out, STR_PTR("Web Search Results for \""), STR_LEN("Web Search Results for \""));
+    mb_jappend_s(out, &clean);
+    mb_jappend(out, STR_PTR("\":\n"), STR_LEN("\":\n"));
+    let rc_count: u64 = mb_n_count(results);
+    let ri: u64 = 0;
+    while ri < rc_count {
+        let r: u64 = mb_a_at(results, ri);
+        ri = ri + 1;
+        mb_jappend(out, STR_PTR("\n"), STR_LEN("\n"));
+        let num = MbStr { bytes: [0u8; 8192], len: 0 };
+        mb_u64_to_s(ri, &num);
+        mb_jappend_s(out, &num);
+        mb_jappend(out, STR_PTR(". **"), STR_LEN(". **"));
+        let t = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ok1: bool = mb_g_str(r, STR_PTR("title"), STR_LEN("title"), &t);
+        mb_jappend_s(out, &t);
+        mb_jappend(out, STR_PTR("**\n   URL: "), STR_LEN("**\n   URL: "));
+        let u = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ok2: bool = mb_g_str(r, STR_PTR("url"), STR_LEN("url"), &u);
+        mb_jappend_s(out, &u);
+        mb_jappend(out, STR_PTR("\n   Snippet: "), STR_LEN("\n   Snippet: "));
+        let sn = MbStr { bytes: [0u8; 8192], len: 0 };
+        let ok3: bool = mb_g_str(r, STR_PTR("snippet"), STR_LEN("snippet"), &sn);
+        mb_jappend_s(out, &sn);
+        mb_jappend(out, STR_PTR("\n"), STR_LEN("\n"));
+    }
+    mb_free_doc(results);
+}
+fn trackAgentsMdActive(session: u64, path_p: ptr, path_n: u64) -> void {
+    if session == 0 { return; };
+    let list: u64 = mb_g_node(session, STR_PTR("agentsMdActive"), STR_LEN("agentsMdActive"));
+    if list == 0 || mb_kind(list) != MB_JK_ARRAY {
+        list = mb_new_arr();
+        let rc: i32 = mb_s_node(session, STR_PTR("agentsMdActive"), STR_LEN("agentsMdActive"), list);
+    };
+    if mb_str_in_arr(list, path_p, path_n, false) { return; };
+    let rc: i32 = mb_a_push_str(list, path_p, path_n);
+    while mb_n_count(list) > 20 { mb_arr_remove_at(&list, 0); }
+}
+fn restoreAgentsMdActive(value: u64, out: &u64, out_has: &bool) -> void {
+    *out_has = false;
+    *out = 0;
+    if value == 0 || mb_kind(value) != MB_JK_ARRAY { return; };
+    let list: u64 = mb_new_arr();
+    let count: u64 = mb_n_count(value);
+    let i: u64 = 0;
+    while i < count {
+        let v: u64 = mb_a_at(value, i);
+        i = i + 1;
+        if v != 0 && mb_kind(v) == MB_JK_STRING {
+            let s = MbStr { bytes: [0u8; 8192], len: 0 };
+            let ok: bool = mb_n_str(v, &s);
+            let t = MbStr { bytes: [0u8; 8192], len: 0 };
+            mb_trim_to(mb_sp(&s), s.len, &t);
+            if t.len > 0 { let rc: i32 = mb_a_push_str(list, mb_sp(&s), s.len); };
+        };
+    }
+    if mb_n_count(list) == 0 { mb_free_doc(list); return; };
+    while mb_n_count(list) > 20 { let last: u64 = mb_n_count(list) - 1; mb_arr_remove_at(&list, last); }
+    *out = list;
+    *out_has = true;
+}
