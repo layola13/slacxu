@@ -3,6 +3,7 @@
 @import "sa_std/ptr.sa"
 @import "sa_std/encoding/json.sai"
 @import "sa_std/process.sai"
+@import "sa_std/io.sai"
 @import "claudeCompatibleProbe.sla"
 @import "claudeCompatibleProtocol.sla"
 @import "sa_std/time.sai"
@@ -132,7 +133,8 @@ fn logManagerEvent(level: u64, event_ptr: ptr, event_len: u64, details_json_ptr:
     if n > 4000 { n = 4000; };
     let cap_p49: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p49, &redacted.bytes, 0);
     buf_append_bytes(&line, cap_p49, n);
-    if level == MGR_LOG_ERROR { sa_print_stderr(&line.bytes, line.len); } else { println_buf(&line); };
+    let cap_p20132: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20132, &line.bytes, 0);
+    if level == MGR_LOG_ERROR { print_stderr_probe( cap_p20132, line.len); } else { println_buf(&line); };
     return;
 }
 
@@ -187,13 +189,91 @@ fn mgr_emit(mgr: &ClaudeCompatibleProcessManager, kind: u64, text_ptr: ptr, text
 
 // Consumer side of the queue: returns event kind (MGR_EVENT_NONE when empty)
 // and copies the payload text out.
+
+// FIX(be2): buf_append_u64 was called but never defined in this
+// unit (the claude TP/CR units carry their own twins); local
+// implementation over buf_append_byte.
+fn buf_append_u64(b: &ByteBuf, v: u64) -> void {
+    if v >= 10 { buf_append_u64(b, v / 10); };
+    buf_append_byte(b, 48 + ((v % 10) as u8));
+    return;
+}
+
+
+// FIX(be2): sa_std_process_killed was fictional. Node's
+// child.killed means "a kill signal was sent"; the gates here use
+// it as "do not signal a dead child", so the observable proxy is
+// process liveness via try_wait_raw (process.sai:37): returns 0
+// while the child is still running, 1 once it has exited.
+fn pm_process_killed(handle: u64) -> i32 {
+    if handle == 0 { return 1; };
+    let ready: u32 = 0;
+    let raw: i32 = 0;
+    let rc = sa_std_process_try_wait_raw(handle, &ready, &raw);
+    if rc != 0 { return 0; };
+    if ready == 0 { return 0; };
+    return 1;
+}
+
+// FIX(be2): same stdin-handle registration as claudeCompactionRunner
+// — ClaudeChildProcess carries no stdin handle; the write goes
+// through sa_io_write_all on the child handle.
+fn pm_write_child_stdin(handle: u64, buf_ptr: ptr, buf_len: u64) -> void {
+    let ig = sa_io_write_all(handle, buf_ptr, buf_len);
+    return;
+}
+
+
+// FIX(be2): sa_std_process_poll was fictional. Poll over
+// try_wait_raw (process.sai:39) with exit_status code/signal
+// decoding: 0 = still running, 1 = exited (outs filled),
+// 2 = poll error. Twin of claudeCompactionRunner's cr_poll_child.
+fn pm_poll_child(handle: u64, out_code: &i64, out_signal: &i64) -> i32 {
+    *out_code = -1;
+    *out_signal = -1;
+    if handle == 0 { return 2; };
+    let ready: u32 = 0;
+    let raw: i32 = 0;
+    if sa_std_process_try_wait_raw(handle, &ready, &raw) != 0 { return 2; };
+    if ready == 0 { return 0; };
+    *out_code = sa_std_process_exit_status_code(raw) as i64;
+    *out_signal = sa_std_process_exit_status_signal(raw) as i64;
+    return 1;
+}
+
+
+// FIX(be2): buf_append_i64 twin (compaction runner carries its own).
+fn buf_append_i64(b: &ByteBuf, v: i64) -> void {
+    if v < 0 {
+        buf_append_byte(b, 45);
+        buf_append_u64(b, (0 - v) as u64);
+    } else {
+        buf_append_u64(b, v as u64);
+    };
+    return;
+}
+
+
+// DEFECT(host seam): TS stop() begins with child.stdin.end().
+// sa_std has no per-stream close for the process-handle model and
+// ClaudeChildProcess carries no stdin handle (see the stdin
+// registration at pm_write_child_stdin), so ending stdin cannot
+// be expressed; the escalation stages after this point (SIGTERM
+// then SIGKILL via pm_process_killed gates) are real. This shim
+// is intentionally a no-op rather than closing the process
+// handle, which would kill the child at stage 0.
+fn pm_close_child_stdin(handle: u64) -> i32 {
+    return 0;
+}
+
 fn ClaudeCompatibleProcessManager_drainEvent(mgr: &ClaudeCompatibleProcessManager, out: &ByteBuf) -> u64 {
     let q = &mgr.queue;
     if q.head >= q.tail { return MGR_EVENT_NONE; };
     let off: u64 = 0;
     let i: u64 = 0;
     while i < q.head { off = off + q.lens[i]; i = i + 1; }
-    buf_append_bytes(out, q.events + off, q.lens[q.head]);
+    let cap_ev: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_ev, &q.events, off);
+    buf_append_bytes(out, cap_ev, q.lens[q.head]);
     let kind: u64 = q.kinds[q.head];
     q.head = q.head + 1;
     return kind;
@@ -207,8 +287,10 @@ fn ClaudeCompatibleProcessManager_start(mgr: &ClaudeCompatibleProcessManager, ba
     // try { this.config.cwd = ensureClaudeSpawnCwd(this.config.cwd); } catch (error) { log; throw }
     let ensured = ByteBuf { bytes: [0u8; 65536], len: 0 };
     let ensure_err = ByteBuf { bytes: [0u8; 65536], len: 0 };
-    if ensureClaudeSpawnCwd(&mgr.config.cwd, mgr.config.cwd_len, &ensured, &ensure_err) != 0 {
-        logManagerEvent(MGR_LOG_ERROR, STR_PTR("start-ensure-cwd-failed"), STR_LEN("start-ensure-cwd-failed"), &ensure_err.bytes, ensure_err.len);
+    let cap_p20186: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20186, &mgr.config.cwd, 0);
+    if ensureClaudeSpawnCwd( cap_p20186, mgr.config.cwd_len, &ensured, &ensure_err) != 0 {
+        let cap_p20187: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20187, &ensure_err.bytes, 0);
+        logManagerEvent(MGR_LOG_ERROR, STR_PTR("start-ensure-cwd-failed"), STR_LEN("start-ensure-cwd-failed"), cap_p20187, ensure_err.len);
         let cap_p50: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p50, &ensure_err.bytes, 0);
         buf_append_bytes(err, cap_p50, ensure_err.len);
         return 1;
@@ -222,24 +304,31 @@ fn ClaudeCompatibleProcessManager_start(mgr: &ClaudeCompatibleProcessManager, ba
     let permissionMode = ByteBuf { bytes: [0u8; 65536], len: 0 };
     if mgr.config.has_sandbox {
         if mgr.config.has_approvalPolicy {
-            mapPermissionMode(&mgr.config.sandbox, mgr.config.sandbox_len, &mgr.config.approvalPolicy, mgr.config.approvalPolicy_len, &permissionMode);
+            let cap_p20192: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20192, &mgr.config.sandbox, 0);
+            let cap_p20194: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20194, &mgr.config.approvalPolicy, 0);
+            mapPermissionMode( cap_p20192, mgr.config.sandbox_len, cap_p20194, mgr.config.approvalPolicy_len, &permissionMode);
         } else {
-            mapPermissionMode(&mgr.config.sandbox, mgr.config.sandbox_len, STR_PTR("on-request"), STR_LEN("on-request"), &permissionMode);
+            let cap_p20193: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20193, &mgr.config.sandbox, 0);
+            mapPermissionMode( cap_p20193, mgr.config.sandbox_len, STR_PTR("on-request"), STR_LEN("on-request"), &permissionMode);
         };
     } else {
         if mgr.config.has_approvalPolicy {
-            mapPermissionMode(STR_PTR("default"), STR_LEN("default"), &mgr.config.approvalPolicy, mgr.config.approvalPolicy_len, &permissionMode);
+            let cap_p20195: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20195, &mgr.config.approvalPolicy, 0);
+            mapPermissionMode(STR_PTR("default"), STR_LEN("default"), cap_p20195, mgr.config.approvalPolicy_len, &permissionMode);
         } else {
             mapPermissionMode(STR_PTR("default"), STR_LEN("default"), STR_PTR("on-request"), STR_LEN("on-request"), &permissionMode);
         };
     };
     // const args = buildClaudeSpawnArgs(this.config.model, permissionMode);
     let args = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
-    buildClaudeSpawnArgs(mgr.config.has_model, &mgr.config.model, mgr.config.model_len, true, &permissionMode.bytes, permissionMode.len, false, STR_PTR(""), 0, false, STR_PTR(""), 0, &args);
+    let cap_p20196: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20196, &mgr.config.model, 0);
+    let cap_p20197: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20197, &permissionMode.bytes, 0);
+    buildClaudeSpawnArgs(mgr.config.has_model, cap_p20196, mgr.config.model_len, true, cap_p20197, permissionMode.len, false, STR_PTR(""), 0, false, STR_PTR(""), 0, &args);
     // const env = buildSafeClaudeEnv(baseEnv, this.config.envOverrides);
     let env = ByteBuf { bytes: [0u8; 65536], len: 0 };
     if mgr.config.has_envOverrides {
-        buildSafeClaudeEnv(baseEnv_ptr, baseEnv_len, &mgr.config.envOverrides, mgr.config.envOverrides_len, &env);
+        let cap_p20198: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20198, &mgr.config.envOverrides, 0);
+        buildSafeClaudeEnv(baseEnv_ptr, baseEnv_len, cap_p20198, mgr.config.envOverrides_len, &env);
     } else {
         buildSafeClaudeEnv(baseEnv_ptr, baseEnv_len, STR_PTR(""), 0, &env);
     };
@@ -251,17 +340,24 @@ fn ClaudeCompatibleProcessManager_start(mgr: &ClaudeCompatibleProcessManager, ba
     buf_append_lit(&det, STR_PTR("\",\"argCount\":"), STR_LEN("\",\"argCount\":"));
     buf_append_u64(&det, args.count);
     buf_append_lit(&det, STR_PTR("}"), STR_LEN("}"));
-    logManagerEvent(MGR_LOG_LOG, STR_PTR("start-attempt"), STR_LEN("start-attempt"), &det.bytes, det.len);
+    let cap_p20188: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20188, &det.bytes, 0);
+    logManagerEvent(MGR_LOG_LOG, STR_PTR("start-attempt"), STR_LEN("start-attempt"), cap_p20188, det.len);
     // let child; try { child = spawnClaudeCommand(bin, args, { cwd, env, stdio: pipe, windowsHide }) } catch { log; throw }
     let options = ClaudeSpawnOptions { has_cwd: true, cwd: [0u8; 1024], cwd_len: mgr.config.cwd_len, has_env: true, env: [0u8; 65536], env_len: env.len };
-    buf_copy_to(&mgr.config.cwd, &options.cwd);
+    // FIX(be2): Probe's buf_copy_to takes a &ByteBuf source; both
+    // cwd fields here are raw [u8; 1024] arrays — copy cwd_len
+    // bytes explicitly.
+    let cwi: u64 = 0;
+    while cwi < mgr.config.cwd_len { options.cwd[cwi] = mgr.config.cwd[cwi]; cwi = cwi + 1; }
     // DEFECT: options env field fixed 64KB copy of the built env buffer.
     let ei: u64 = 0;
     while ei < env.len { options.env[ei] = env.bytes[ei]; ei = ei + 1; }
     let child = ClaudeChildProcess { handle: 0, pid: -1, has_pid: false };
     let spawn_err = ByteBuf { bytes: [0u8; 65536], len: 0 };
-    if spawnClaudeCommand(&bin.bytes, bin.len, &args, &options, baseEnv_ptr, baseEnv_len, &child, &spawn_err) != 0 {
-        logManagerEvent(MGR_LOG_ERROR, STR_PTR("start-spawn-sync-failed"), STR_LEN("start-spawn-sync-failed"), &spawn_err.bytes, spawn_err.len);
+    let cap_bin: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_bin, &bin.bytes, 0);
+    if spawnClaudeCommand(cap_bin, bin.len, &args, &options, baseEnv_ptr, baseEnv_len, &child, &spawn_err) != 0 {
+        let cap_p20189: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20189, &spawn_err.bytes, 0);
+        logManagerEvent(MGR_LOG_ERROR, STR_PTR("start-spawn-sync-failed"), STR_LEN("start-spawn-sync-failed"), cap_p20189, spawn_err.len);
         let cap_p52: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p52, &spawn_err.bytes, 0);
         buf_append_bytes(err, cap_p52, spawn_err.len);
         return 1;
@@ -273,7 +369,8 @@ fn ClaudeCompatibleProcessManager_start(mgr: &ClaudeCompatibleProcessManager, ba
         return 1;
     };
     // logManagerEvent("log", "start-ok", { bin, cwd, pid: child.pid });
-    logManagerEvent(MGR_LOG_LOG, STR_PTR("start-ok"), STR_LEN("start-ok"), &det.bytes, det.len);
+    let cap_p20190: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20190, &det.bytes, 0);
+    logManagerEvent(MGR_LOG_LOG, STR_PTR("start-ok"), STR_LEN("start-ok"), cap_p20190, det.len);
     mgr.child = child;
     mgr.has_child = true;
     // child.once("exit"/"error") + readline stdout + stderr "data" handlers are
@@ -291,7 +388,9 @@ fn ClaudeCompatibleProcessManager_pump(mgr: &ClaudeCompatibleProcessManager) -> 
     ClaudeCompatibleProcessManager_checkStopTimers(mgr);
     // stdout: readline "line" events
     let chunk = ByteBuf { bytes: [0u8; 65536], len: 0 };
-    let n = sa_std_process_read_stdout(mgr.child.handle, &chunk.bytes, 65536);
+    let cap_rd0: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_rd0, &chunk.bytes, 0);
+    let n: u64 = 0;
+    let rd_rc = sa_std_process_read_stdout(mgr.child.handle, cap_rd0, 65536, &n);
     if n > 0 {
         chunk.len = n;
         // append to partial-line buffer, split complete lines
@@ -305,11 +404,12 @@ fn ClaudeCompatibleProcessManager_pump(mgr: &ClaudeCompatibleProcessManager) -> 
                 let line_len: u64 = j - line_start;
                 if line_len > 0 && mgr.stdoutBuffer[j - 1] == 13 { line_len = line_len - 1; };
                 // this.emit("line", line);
-                mgr_emit(mgr, MGR_EVENT_LINE, mgr.stdoutBuffer + line_start, line_len);
+                let cap_ls: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_ls, &mgr.stdoutBuffer, line_start);
+                mgr_emit(mgr, MGR_EVENT_LINE, cap_ls, line_len);
                 // const message = parseClaudeMessage(line); if (message) this.emit("message", message as Record<string, JsonValue>);
-                let parsed = ClaudeMessage { kind: 0, type: [0u8; 64], type_len: 0, has_session_id: false, session_id: [0u8; 128], session_id_len: 0, json: [0u8; 262144], json_len: 0 };
-                if parseClaudeMessage(mgr.stdoutBuffer + line_start, line_len, &parsed) == 0 {
-                    mgr_emit(mgr, MGR_EVENT_MESSAGE, mgr.stdoutBuffer + line_start, line_len);
+                let parsed = ClaudeMessage { kind: 0, type_: [0u8; 64], type_len: 0, has_session_id: false, session_id: [0u8; 128], session_id_len: 0, json: [0u8; 262144], json_len: 0 };
+                if parseClaudeMessage(cap_ls, line_len, &parsed) == 0 {
+                    mgr_emit(mgr, MGR_EVENT_MESSAGE, cap_ls, line_len);
                 };
                 line_start = j + 1;
             };
@@ -323,7 +423,9 @@ fn ClaudeCompatibleProcessManager_pump(mgr: &ClaudeCompatibleProcessManager) -> 
     };
     // stderr: child.stderr.on("data", chunk => { const text = chunk.toString("utf8").trim(); ... })
     let echunk = ByteBuf { bytes: [0u8; 65536], len: 0 };
-    let en = sa_std_process_read_stderr(mgr.child.handle, &echunk.bytes, 65536);
+    let cap_rd1: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_rd1, &echunk.bytes, 0);
+    let en: u64 = 0;
+    let re_rc = sa_std_process_read_stderr(mgr.child.handle, cap_rd1, 65536, &en);
     if en > 0 {
         echunk.len = en;
         buf_trim_in_place(&echunk);
@@ -332,15 +434,19 @@ fn ClaudeCompatibleProcessManager_pump(mgr: &ClaudeCompatibleProcessManager) -> 
             if mgr.stderrLineCount <= MAX_STDERR_LINES {
                 // if (count === 1 || /error|enoent|uv_spawn|fail/i.test(text)) log warn "child-stderr"
                 // DEFECT: regex test approximated by case-insensitive substring search.
-                let interesting: bool = mgr.stderrLineCount == 1 || buf_contains_ci(&echunk.bytes, echunk.len, STR_PTR("error"), STR_LEN("error")) || buf_contains_ci(&echunk.bytes, echunk.len, STR_PTR("enoent"), STR_LEN("enoent")) || buf_contains_ci(&echunk.bytes, echunk.len, STR_PTR("uv_spawn"), STR_LEN("uv_spawn")) || buf_contains_ci(&echunk.bytes, echunk.len, STR_PTR("fail"), STR_LEN("fail"));
+                let cap_p20349: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20349, &echunk.bytes, 0);
+                let interesting: bool = mgr.stderrLineCount == 1 || buf_contains_ci( cap_p20349, echunk.len, STR_PTR("error"), STR_LEN("error")) || buf_contains_ci(cap_p20349, echunk.len, STR_PTR("enoent"), STR_LEN("enoent")) || buf_contains_ci(cap_p20349, echunk.len, STR_PTR("uv_spawn"), STR_LEN("uv_spawn")) || buf_contains_ci(cap_p20349, echunk.len, STR_PTR("fail"), STR_LEN("fail"));
                 if interesting {
                     let red = ByteBuf { bytes: [0u8; 65536], len: 0 };
-                    redactManagerLogText(&echunk.bytes, echunk.len, &red);
+                    let cap_p20371: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20371, &echunk.bytes, 0);
+                    redactManagerLogText( cap_p20371, echunk.len, &red);
                     if red.len > 2000 { red.len = 2000; };
-                    logManagerEvent(MGR_LOG_WARN, STR_PTR("child-stderr"), STR_LEN("child-stderr"), &red.bytes, red.len);
+                    let cap_p20191: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20191, &red.bytes, 0);
+                    logManagerEvent(MGR_LOG_WARN, STR_PTR("child-stderr"), STR_LEN("child-stderr"), cap_p20191, red.len);
                 };
                 // this.emit("stderr", text);
-                mgr_emit(mgr, MGR_EVENT_STDERR, &echunk.bytes, echunk.len);
+                let cap_p20372: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20372, &echunk.bytes, 0);
+                mgr_emit(mgr, MGR_EVENT_STDERR, cap_p20372, echunk.len);
             } else if mgr.stderrLineCount == MAX_STDERR_LINES + 1 {
                 logManagerEvent(MGR_LOG_WARN, STR_PTR("child-stderr-truncated"), STR_LEN("child-stderr-truncated"), STR_PTR("{}"), STR_LEN("{}"));
             };
@@ -349,7 +455,7 @@ fn ClaudeCompatibleProcessManager_pump(mgr: &ClaudeCompatibleProcessManager) -> 
     // exit / error realization
     let exit_code: i64 = -1;
     let exit_signal: i64 = -1;
-    let poll = sa_std_process_poll(mgr.child.handle, &exit_code, &exit_signal);
+    let poll = pm_poll_child(mgr.child.handle, &exit_code, &exit_signal);
     if poll == 2 {
         // child.once("error", error => { log; this.emit("error", error); this.child = null; })
         logManagerEvent(MGR_LOG_ERROR, STR_PTR("child-error"), STR_LEN("child-error"), STR_PTR("{}"), STR_LEN("{}"));
@@ -366,7 +472,8 @@ fn ClaudeCompatibleProcessManager_pump(mgr: &ClaudeCompatibleProcessManager) -> 
         buf_append_lit(&payload, STR_PTR("{\"code\":"), STR_LEN("{\"code\":"));
         buf_append_i64(&payload, exit_code);
         buf_append_lit(&payload, STR_PTR(",\"signal\":null}"), STR_LEN(",\"signal\":null}"));
-        mgr_emit(mgr, MGR_EVENT_EXIT, &payload.bytes, payload.len);
+        let cap_p20373: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p20373, &payload.bytes, 0);
+        mgr_emit(mgr, MGR_EVENT_EXIT, cap_p20373, payload.len);
         mgr.has_child = false;
     };
     return;
@@ -399,7 +506,10 @@ fn buf_contains_ci(hay_ptr: ptr, hay_len: u64, needle_ptr: ptr, needle_len: u64)
 // Returns 0 ok, 1 on throw (TS throws Error when not running / stdin not writable).
 fn ClaudeCompatibleProcessManager_writeStdin(mgr: &ClaudeCompatibleProcessManager, message_json_ptr: ptr, message_json_len: u64, err: &ByteBuf) -> i32 {
     // if (!this.child || !this.child.stdin.writable) { log "stdin-not-writable"; throw }
-    let writable: bool = mgr.has_child && sa_std_process_stdin_writable(mgr.child.handle) != 0;
+    // FIX(be2): sa_std_process_stdin_writable was fictional; with
+    // the process-handle stream model the writable proxy is child
+    // liveness (same stdin registration as pm_write_child_stdin).
+    let writable: bool = mgr.has_child && pm_process_killed(mgr.child.handle) == 0;
     if !(writable) {
         logManagerEvent(MGR_LOG_ERROR, STR_PTR("stdin-not-writable"), STR_LEN("stdin-not-writable"), STR_PTR("{}"), STR_LEN("{}"));
         buf_append_lit(err, STR_PTR("Claude CLI process is not running or stdin is not writable"), STR_LEN("Claude CLI process is not running or stdin is not writable"));
@@ -409,7 +519,8 @@ fn ClaudeCompatibleProcessManager_writeStdin(mgr: &ClaudeCompatibleProcessManage
     let line = ByteBuf { bytes: [0u8; 65536], len: 0 };
     buf_append_bytes(&line, message_json_ptr, message_json_len);
     buf_append_lit(&line, STR_PTR("\n"), STR_LEN("\n"));
-    sa_std_process_write_stdin(mgr.child.handle, &line.bytes, line.len);
+    let cap_ws: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_ws, &line.bytes, 0);
+    pm_write_child_stdin(mgr.child.handle, cap_ws, line.len);
     return 0;
 }
 
@@ -427,18 +538,18 @@ fn ClaudeCompatibleProcessManager_stop(mgr: &ClaudeCompatibleProcessManager, tim
         return;
     };
     // try { child.stdin.end(); } catch { /* stdin already closed */ }
-    let ignored = sa_std_process_close_stdin(mgr.child.handle);
+    let ignored = pm_close_child_stdin(mgr.child.handle);
     mgr.stop_stage = 1;
-    mgr.stop_deadline_ms = sa_time_now_ms() + timeoutMs;
+    mgr.stop_deadline_ms = (sa_time_unix_ms() as u64) + timeoutMs;
     return;
 }
 
 fn ClaudeCompatibleProcessManager_checkStopTimers(mgr: &ClaudeCompatibleProcessManager) -> void {
     if mgr.stop_stage == 0 || !(mgr.has_child) { return; };
-    let now: u64 = sa_time_now_ms();
+    let now: u64 = (sa_time_unix_ms() as u64);
     if mgr.stop_stage == 1 && now >= mgr.stop_deadline_ms {
         // const timer = setTimeout(() => { if (this.child === child && !child.killed) { win32 ? taskkill : child.kill("SIGTERM"); setTimeout(SIGKILL, 1000) } }, timeoutMs)
-        if sa_std_process_killed(mgr.child.handle) == 0 {
+        if pm_process_killed(mgr.child.handle) == 0 {
             if host_platform_is_win32() && mgr.child.has_pid {
                 // spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true }); on error -> child.kill("SIGTERM")
                 let tk_args = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
@@ -451,11 +562,31 @@ fn ClaudeCompatibleProcessManager_checkStopTimers(mgr: &ClaudeCompatibleProcessM
                 let killer = ClaudeChildProcess { handle: 0, pid: -1, has_pid: false };
                 let tk = ByteBuf { bytes: [0u8; 65536], len: 0 };
                 let env_empty = ByteBuf { bytes: [0u8; 65536], len: 0 };
-                if sa_std_process_spawn_bidi(STR_PTR("taskkill"), STR_LEN("taskkill"), &tk_args, STR_PTR(""), 0, &env_empty.bytes, 0, &killer) != 0 {
-                    let ig = sa_std_process_kill(mgr.child.handle, 15); // SIGTERM fallback
+                // FIX(be2): real spawn over the newline-joined argv
+                // text face (process.sai:10); env face n/a (B-class gap).
+                let tk_argv = ByteBuf { bytes: [0u8; 65536], len: 0 };
+                buf_append_lit(&tk_argv, STR_PTR("taskkill"), STR_LEN("taskkill"));
+                let tk_off: u64 = 0;
+                let tk_i: u64 = 0;
+                while tk_i < tk_args.count {
+                    buf_append_lit(&tk_argv, STR_PTR("\n"), STR_LEN("\n"));
+                    let cap_tk: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_tk, &tk_args.items, tk_off);
+                    buf_append_bytes(&tk_argv, cap_tk, tk_args.lens[tk_i]);
+                    tk_off = tk_off + tk_args.lens[tk_i];
+                    tk_i = tk_i + 1;
+                }
+                let tk_proc: u64 = 0;
+                let tk_hin: u64 = 0;
+                let tk_hout: u64 = 0;
+                let tk_herr: u64 = 0;
+                let cap_ta: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_ta, &tk_argv.bytes, 0);
+                if sa_std_process_spawn_bidi(cap_ta, tk_argv.len, &tk_proc, &tk_hin, &tk_hout, &tk_herr) != 0 {
+                    let ig = sa_std_process_kill(mgr.child.handle); // SIGTERM fallback (std kill takes no signal arg)
+                } else {
+                    killer.handle = tk_proc;
                 };
             } else {
-                let ig = sa_std_process_kill(mgr.child.handle, 15); // child.kill("SIGTERM")
+                let ig = sa_std_process_kill(mgr.child.handle); // child.kill("SIGTERM") — std kill takes no signal arg
             };
             mgr.stop_stage = 2;
             mgr.kill_deadline_ms = now + 1000;
@@ -463,8 +594,8 @@ fn ClaudeCompatibleProcessManager_checkStopTimers(mgr: &ClaudeCompatibleProcessM
     };
     if mgr.stop_stage == 2 && now >= mgr.kill_deadline_ms {
         // killTimer: if (this.child === child && !child.killed) child.kill("SIGKILL")
-        if sa_std_process_killed(mgr.child.handle) == 0 {
-            let ig2 = sa_std_process_kill(mgr.child.handle, 9); // SIGKILL
+        if pm_process_killed(mgr.child.handle) == 0 {
+            let ig2 = sa_std_process_kill(mgr.child.handle); // SIGKILL — std kill takes no signal arg
         };
         mgr.stop_stage = 0;
     };
@@ -474,7 +605,7 @@ fn ClaudeCompatibleProcessManager_checkStopTimers(mgr: &ClaudeCompatibleProcessM
 // Check if the process is alive.
 fn ClaudeCompatibleProcessManager_isRunning(mgr: &ClaudeCompatibleProcessManager) -> bool {
     // return this.child !== null && !this.child.killed;
-    return mgr.has_child && sa_std_process_killed(mgr.child.handle) == 0;
+    return mgr.has_child && pm_process_killed(mgr.child.handle) == 0;
 }
 
 // get pid(): number | null — returns pid, or -1 for TS null (has_pid flag distinguishes).
