@@ -2,6 +2,7 @@
 @import "sa_std/string.sa"
 @import "sa_std/ptr.sa"
 @import "sa_std/fs.sai"
+@import "sa_std/fmt.sai"
 @import "sa_std/process.sai"
 @import "sa_std/env.sai"
 @import "sa_std/encoding/json.sai"
@@ -13,6 +14,7 @@
 // untyped ptr at this phase; report "no cached path" so callers
 // fall through to their normal resolution.
 @import "../../../../sdk-backend/src/hostServices.sla"
+@import "../../../../sdk-backend/src/cliSpawn.sla"
 @import "sa_std/io.sai"
 @import "../../../../sdk-backend/src/openCodeSessionProtocol.sla"
 
@@ -715,6 +717,167 @@ fn wellKnownClaudeCandidates(env_ptr: ptr, env_len: u64, out: &StrList) -> void 
 
 // DEFECT: node:path join approximated — joins base + "/" + rel (platform separator
 // handling and normalization not reproduced).
+// FIX(be2): sa_std_fs_list_dir was fictional. The real face is
+// sa_std_fs_read_dir_json (fs.sai:36) returning a handle whose bytes
+// come from sa_fs_dir_buffer_data/len (fs.sai:55-56); the listing is
+// a JSON array of entry objects with "name" fields. Fills `out`
+// with the entry names; returns 0 on success.
+// FIX(be2): sa_std_fs_is_dir exists nowhere; the real face is
+// sa_fs_metadata + sa_fs_metadata_is_directory (fs.sai:69-72).
+// Returns 1 when the path is a directory, else 0.
+// FIX(be2): host_exec_path was an undeclared host shim for
+// process.execPath; the real face is sa_env_current_exe (env.sai:10)
+// whose handle bytes come from sa_env_buffer_data/len.
+fn probe_exec_path(out: &ByteBuf) -> void {
+    out.len = 0;
+    let h = sa_env_current_exe();
+    if h == 0 { return; };
+    let dp: ptr = PTR_NULL();
+    dp = sa_env_buffer_data(h);
+    let dl = sa_env_buffer_len(h);
+    let n = dl;
+    if n > 65536 { n = 65536; };
+    let i: u64 = 0;
+    while i < n {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, dp, i);
+        out.bytes[i] = v;
+        i = i + 1;
+    }
+    out.len = n;
+    return;
+}
+
+// FIX(be2): host_codex_resolveCodexSpawn was an undeclared host
+// shim for pluginHostServices().codex.resolveCodexSpawn (TS:
+// apps/server/src/pluginHostServices.ts:51 forwards to sdk-backend
+// resolveCliSpawn, sdk-backend/src/cliSpawn.ts:21). The host fn-ptr
+// table itself stays a host-wiring item, but the sdk SLA twin
+// resolveCliSpawn (sdk-backend/src/cliSpawn.sla:117) is a real
+// implementation, so the shim is bound to it through a
+// StrList<->ArgvBuf adapter. Deviation: the TS takes an env param
+// (used only for ComSpec/PowerShell resolution); the sdk SLA twin
+// reads the process env itself, so env_ptr/env_len are unused here.
+fn host_codex_resolveCodexSpawn(cmd_ptr: ptr, cmd_len: u64, args: &StrList, env_ptr: ptr, env_len: u64, out: &ResolvedSpawn) -> void {
+    let av = ArgvBuf { items: [ArgBuf { bytes: [0; 4096], len: 0 }; 64], count: 0 };
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < args.count {
+        let cap_av: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_av, &args.items, off);
+        argv_push(&av, cap_av, args.lens[i]);
+        off = off + args.lens[i];
+        i = i + 1;
+    }
+    let cres = CliSpawnResolved { command: ArgBuf { bytes: [0; 4096], len: 0 }, args: ArgvBuf { items: [ArgBuf { bytes: [0; 4096], len: 0 }; 64], count: 0 }, usesCommandShim: false };
+    resolveCliSpawn(cmd_ptr, cmd_len, &av, host_platform_is_win32(), &cres);
+    out.command_len = cres.command.len;
+    if out.command_len > 1024 { out.command_len = 1024; };
+    let ci: u64 = 0;
+    while ci < out.command_len {
+        out.command[ci] = cres.command.bytes[ci];
+        ci = ci + 1;
+    }
+    out.args = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
+    let ai: u64 = 0;
+    while ai < cres.args.count {
+        let cap_ai: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_ai, &cres.args.items[ai].bytes, 0);
+        strlist_push(&out.args, cap_ai, cres.args.items[ai].len);
+        ai = ai + 1;
+    }
+    out.usesCommandShim = cres.usesCommandShim;
+    return;
+}
+
+struct ProbeExecArg {
+    data: ptr,
+    len: u64,
+}
+
+// FIX(be2): process_exec_capture was a placeholder extern for
+// execFileSync-style capture. Bound to sa_std_process_exec_capture
+// (process.sai:57): argv is an array of {data, len} pairs; stdout /
+// stderr come back as fmt buffer handles. Returns 0 on success
+// (exit code 0, stdout copied into out), the spawn status or the
+// child exit code otherwise. DEFECT: timeout_ms has no std face and
+// is dropped (opencode probe precedent); env is not applied (the
+// B-class no-env-spawn gap).
+fn process_exec_capture(cmd_ptr: ptr, cmd_len: u64, args: &StrList, env_ptr: ptr, env_len: u64, timeout_ms: u64, out: &ByteBuf) -> i32 {
+    out.len = 0;
+    let argv: [ProbeExecArg; 66] = [ProbeExecArg { data: PTR_NULL(), len: 0 }; 66];
+    argv[0].data = cmd_ptr;
+    argv[0].len = cmd_len;
+    let argc: u64 = 1;
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < args.count && argc < 66 {
+        let cap_ea: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_ea, &args.items, off);
+        argv[argc].data = cap_ea;
+        argv[argc].len = args.lens[i];
+        argc = argc + 1;
+        off = off + args.lens[i];
+        i = i + 1;
+    }
+    let argv_p: ptr = PTR_NULL(); PTR_BYTE_ADD(argv_p, &argv, 0);
+    let code: u32 = 0;
+    let so: u64 = 0;
+    let se: u64 = 0;
+    let st = sa_std_process_exec_capture(argv_p, argc, &code, &so, &se);
+    if st != 0 { return st; };
+    if so != 0 {
+        let dp: ptr = PTR_NULL();
+        dp = sa_fmt_buffer_data(so);
+        let dl = sa_fmt_buffer_len(so);
+        let n = dl;
+        if n > 65536 { n = 65536; };
+        let bi: u64 = 0;
+        while bi < n {
+            let v: u8 = 0;
+            PTR_BYTE_AT(v, dp, bi);
+            out.bytes[bi] = v;
+            bi = bi + 1;
+        }
+        out.len = n;
+    };
+    if code != 0 { return code as i32; };
+    return 0;
+}
+
+fn probe_fs_is_dir(path_ptr: ptr, path_len: u64) -> i32 {
+    let md = sa_fs_metadata(path_ptr, path_len);
+    if md == 0 { return 0; };
+    if sa_fs_metadata_is_directory(md) == 1 { return 1; };
+    return 0;
+}
+
+fn probe_list_dir_names(path_ptr: ptr, path_len: u64, out: &StrList) -> i32 {
+    let dh: u64 = 0;
+    if sa_std_fs_read_dir_json(path_ptr, path_len, 65536, &dh) != 0 { return 1; };
+    let dsrc: ptr = PTR_NULL();
+    dsrc = sa_fs_dir_buffer_data(dh);
+    let dlen = sa_fs_dir_buffer_len(dh);
+    let doc = sa_json_parse(dsrc, dlen);
+    if doc == 0 { let frc = sa_fs_dir_buffer_free(dh); return 1; };
+    if sa_json_kind(doc) == 6 {
+        let cnt: u64 = 0;
+        if sa_json_value_count(doc, &cnt) == 0 {
+            let ei: u64 = 0;
+            while ei < cnt {
+                let entry: u64 = 0;
+                if sa_json_array_get(doc, ei, &entry) == 0 && entry != 0 {
+                    let nb = ByteBuf { bytes: [0u8; 65536], len: 0 };
+                    let cap_nb: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_nb, &nb.bytes, 0);
+                    let nl = json_get_string_copy(entry, STR_PTR("name"), STR_LEN("name"), cap_nb, 65536);
+                    if nl > 0 { strlist_push_buf(out, &nb.bytes, nl); };
+                };
+                ei = ei + 1;
+            }
+        };
+    };
+    sa_json_free(doc);
+    let frc2 = sa_fs_dir_buffer_free(dh);
+    return 0;
+}
+
 fn path_join_push(out: &StrList, base: &ByteBuf, rel_ptr: ptr, rel_len: u64) -> void {
     let joined = ByteBuf { bytes: [0u8; 65536], len: 0 };
     let cap_p14: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p14, &base.bytes, 0);
@@ -931,12 +1094,10 @@ fn pathEnvCandidates(env_ptr: ptr, env_len: u64, names: &StrList, out: &StrList)
                     dir.len = dir.len - 1;
                 };
                 if dir.len > 0 {
-                    let ni: u64 = 0;
-                    while ni < names.count {
-                        path_join_push(out, &dir, names.items, 0);
-                        // DEFECT: per-name join approximated below by direct rebuild.
-                        ni = ni + 1;
-                    }
+                    // FIX(be2): the bulk pass first pushed join(dir, <whole
+                    // items buffer>, 0) per name — a wrong approximation
+                    // with no TS counterpart; the loop below is the real
+                    // per-name join (TS: for (name of names) push(join)).
                     // Rebuild properly: for each name push join(dir, name).
                     let base_count: u64 = out.count;
                     let nj: u64 = 0;
@@ -1001,7 +1162,8 @@ fn wellKnownJavaScriptRuntimeCandidates(env_ptr: ptr, env_len: u64, out: &StrLis
             // try { for (entry of readdirSync(nvmHome, {withFileTypes:true})) if (entry.isDirectory()) push(join(nvmHome, entry.name, "node.exe")) } catch {}
             // DEFECT: readdirSync with Dirent approximated by sa_std_fs_list_dir names + is_dir probes.
             let entries = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
-            if sa_std_fs_list_dir(&nvmHome.bytes, nvmHome.len, &entries) == 0 {
+            let cap_ld1: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_ld1, &nvmHome.bytes, 0);
+            if probe_list_dir_names(cap_ld1, nvmHome.len, &entries) == 0 {
                 let ei: u64 = 0;
                 let off: u64 = 0;
                 while ei < entries.count {
@@ -1011,7 +1173,8 @@ fn wellKnownJavaScriptRuntimeCandidates(env_ptr: ptr, env_len: u64, out: &StrLis
                     buf_append_lit(&full, STR_PTR("/"), STR_LEN("/"));
                     let ah_p6: ptr = PTR_NULL(); PTR_BYTE_ADD(ah_p6, &entries.items, off);
                     buf_append_bytes(&full, ah_p6, entries.lens[ei]);
-                    if sa_std_fs_is_dir(&full.bytes, full.len) != 0 {
+                    let cap_id1: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_id1, &full.bytes, 0);
+                    if probe_fs_is_dir(cap_id1, full.len) != 0 {
                         buf_append_lit(&full, STR_PTR("/node.exe"), STR_LEN("/node.exe"));
                         strlist_push_buf(out, &full.bytes, full.len);
                     };
@@ -1111,7 +1274,8 @@ fn resolveJavaScriptRuntime(env_ptr: ptr, env_len: u64, hostExecPath_ptr: ptr, h
     let cap_p23: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p23, &base.bytes, 0);
     buf_append_bytes(&details, cap_p23, base.len);
     buf_append_lit(&details, STR_PTR("\"}"), STR_LEN("\"}"));
-    logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("js-runtime-unresolved"), STR_LEN("js-runtime-unresolved"), &details.bytes, details.len);
+    let cap_p28615: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28615, &details.bytes, 0);
+    logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("js-runtime-unresolved"), STR_LEN("js-runtime-unresolved"), cap_p28615, details.len);
     // Let PATH/cmd resolution surface the failure with its own diagnostic.
     out.command_len = STR_LEN("node");
     buf_copy_lit_to(STR_PTR("node"), STR_LEN("node"), &out.command);
@@ -1147,8 +1311,9 @@ fn resolveClaudeLaunch(command_ptr: ptr, command_len: u64, args: &StrList, env_p
     if bytes_eq_buf(cap_p24, ext.len, STR_PTR(".mjs"), STR_LEN(".mjs")) || bytes_eq_buf(cap_p25, ext.len, STR_PTR(".js"), STR_LEN(".js")) || bytes_eq_buf(cap_p26, ext.len, STR_PTR(".cjs"), STR_LEN(".cjs")) {
         // const runtime = resolveJavaScriptRuntime(env); — hostExecPath defaults to process.execPath
         let host = ByteBuf { bytes: [0u8; 65536], len: 0 };
-        host_exec_path(&host);
-        resolveJavaScriptRuntime(env_ptr, env_len, &host.bytes, host.len, out);
+        probe_exec_path(&host);
+        let cap_p28660: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28660, &host.bytes, 0);
+        resolveJavaScriptRuntime(env_ptr, env_len, cap_p28660, host.len, out);
         // return { command: runtime.command, args: [command, ...args], env: runtime.env };
         let new_args = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
         strlist_push(&new_args, command_ptr, command_len);
@@ -1218,7 +1383,8 @@ fn spawnClaudeCommand(command_ptr: ptr, command_len: u64, args: &StrList, option
     let cap_p27: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p27, &options.cwd, 0);
     if options.has_cwd { buf_append_bytes(&cwd, cap_p27, options.cwd_len); };
     let env = ByteBuf { bytes: [0u8; 65536], len: 0 };
-    if options.has_env { buf_append_bytes(&env, &options.env, options.env_len); } else { buf_append_bytes(&env, process_env_ptr, process_env_len); };
+    let cap_p28661: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28661, &options.env, 0);
+    if options.has_env { buf_append_bytes(&env, cap_p28661, options.env_len); } else { buf_append_bytes(&env, process_env_ptr, process_env_len); };
     let has_env: bool = true;
     // if (typeof options.cwd === "string" && options.cwd.trim().length > 0) { try { ensureClaudeSpawnCwd } catch { log; throw } }
     if options.has_cwd {
@@ -1229,8 +1395,10 @@ fn spawnClaudeCommand(command_ptr: ptr, command_len: u64, args: &StrList, option
         if probe_cwd.len > 0 {
             let ensured = ByteBuf { bytes: [0u8; 65536], len: 0 };
             let ensure_err = ByteBuf { bytes: [0u8; 65536], len: 0 };
-            if ensureClaudeSpawnCwd(&options.cwd, options.cwd_len, &ensured, &ensure_err) != 0 {
-                logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_ERROR, STR_PTR("ensure-cwd-failed"), STR_LEN("ensure-cwd-failed"), &ensure_err.bytes, ensure_err.len);
+            let cap_p28666: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28666, &options.cwd, 0);
+            if ensureClaudeSpawnCwd( cap_p28666, options.cwd_len, &ensured, &ensure_err) != 0 {
+                let cap_p28616: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28616, &ensure_err.bytes, 0);
+                logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_ERROR, STR_PTR("ensure-cwd-failed"), STR_LEN("ensure-cwd-failed"), cap_p28616, ensure_err.len);
                 let cap_p29: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p29, &ensure_err.bytes, 0);
                 buf_append_bytes(err, cap_p29, ensure_err.len);
                 return 1;
@@ -1243,36 +1411,46 @@ fn spawnClaudeCommand(command_ptr: ptr, command_len: u64, args: &StrList, option
     // if (process.platform === "win32") { inject ComSpec / SystemRoot into child env }
     if host_platform_is_win32() {
         let comspec = ByteBuf { bytes: [0u8; 65536], len: 0 };
-        let has_comspec: bool = env_get(&env.bytes, env.len, STR_PTR("ComSpec"), STR_LEN("ComSpec"), &comspec) || env_get(&env.bytes, env.len, STR_PTR("COMSPEC"), STR_LEN("COMSPEC"), &comspec);
+        let cap_p28667: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28667, &env.bytes, 0);
+        let has_comspec: bool = env_get( cap_p28667, env.len, STR_PTR("ComSpec"), STR_LEN("ComSpec"), &comspec) || env_get(cap_p28667, env.len, STR_PTR("COMSPEC"), STR_LEN("COMSPEC"), &comspec);
         if !(has_comspec) {
             let pcomspec = ByteBuf { bytes: [0u8; 65536], len: 0 };
             let has_p: bool = env_get(process_env_ptr, process_env_len, STR_PTR("ComSpec"), STR_LEN("ComSpec"), &pcomspec) || env_get(process_env_ptr, process_env_len, STR_PTR("COMSPEC"), STR_LEN("COMSPEC"), &pcomspec);
             if !(has_p) { buf_append_lit(&pcomspec, STR_PTR("C:\\Windows\\System32\\cmd.exe"), STR_LEN("C:\\Windows\\System32\\cmd.exe")); };
-            env_set(&env, STR_PTR("ComSpec"), STR_LEN("ComSpec"), &pcomspec.bytes, pcomspec.len);
-            logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("comspec-injected"), STR_LEN("comspec-injected"), &pcomspec.bytes, pcomspec.len);
+            let cap_p28694: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28694, &pcomspec.bytes, 0);
+            env_set(&env, STR_PTR("ComSpec"), STR_LEN("ComSpec"), cap_p28694, pcomspec.len);
+            let cap_p28617: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28617, &pcomspec.bytes, 0);
+            logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("comspec-injected"), STR_LEN("comspec-injected"), cap_p28617, pcomspec.len);
         };
         let sysroot = ByteBuf { bytes: [0u8; 65536], len: 0 };
-        let has_sysroot: bool = env_get(&env.bytes, env.len, STR_PTR("SystemRoot"), STR_LEN("SystemRoot"), &sysroot) || env_get(&env.bytes, env.len, STR_PTR("SYSTEMROOT"), STR_LEN("SYSTEMROOT"), &sysroot);
+        let cap_p28668: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28668, &env.bytes, 0);
+        let has_sysroot: bool = env_get( cap_p28668, env.len, STR_PTR("SystemRoot"), STR_LEN("SystemRoot"), &sysroot) || env_get(cap_p28668, env.len, STR_PTR("SYSTEMROOT"), STR_LEN("SYSTEMROOT"), &sysroot);
         if !(has_sysroot) {
             let psysroot = ByteBuf { bytes: [0u8; 65536], len: 0 };
             if env_get(process_env_ptr, process_env_len, STR_PTR("SystemRoot"), STR_LEN("SystemRoot"), &psysroot) {
-                env_set(&env, STR_PTR("SystemRoot"), STR_LEN("SystemRoot"), &psysroot.bytes, psysroot.len);
+                let cap_p28695: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28695, &psysroot.bytes, 0);
+                env_set(&env, STR_PTR("SystemRoot"), STR_LEN("SystemRoot"), cap_p28695, psysroot.len);
             };
         };
     };
     // const launch = resolveClaudeLaunch(command, args, spawnOptions.env ?? process.env);
     let launch = ClaudeLaunchSpec { command: [0u8; 1024], command_len: 0, args: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, env: [0u8; 4096], env_len: 0 };
-    resolveClaudeLaunch(command_ptr, command_len, args, &env.bytes, env.len, &launch);
+    let cap_p28696: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28696, &env.bytes, 0);
+    resolveClaudeLaunch(command_ptr, command_len, args, cap_p28696, env.len, &launch);
     // if (Object.keys(launch.env).length > 0) merge launch.env into child env
     if launch.env_len > 0 {
-        buf_append_bytes(&env, &launch.env, launch.env_len);
+        let cap_p28662: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28662, &launch.env, 0);
+        buf_append_bytes(&env, cap_p28662, launch.env_len);
     };
     // const resolved = pluginHostServices().codex.resolveCodexSpawn(launch.command, launch.args, process.platform, env);
     let resolved = ResolvedSpawn { command: [0u8; 1024], command_len: 0, args: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, usesCommandShim: false };
-    host_codex_resolveCodexSpawn(&launch.command, launch.command_len, &launch.args, &env.bytes, env.len, &resolved);
+    let cap_p28797: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28797, &launch.command, 0);
+    let cap_p28800: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28800, &env.bytes, 0);
+    host_codex_resolveCodexSpawn( cap_p28797, launch.command_len, &launch.args, cap_p28800, env.len, &resolved);
     // spawn-attempt diagnostics block: stat cwd, binExists, log "spawn-attempt"
     if cwd.len > 0 {
-        let is_dir: bool = sa_std_fs_is_dir(&cwd.bytes, cwd.len) != 0;
+        let cap_id2: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_id2, &cwd.bytes, 0);
+        let is_dir: bool = probe_fs_is_dir(cap_id2, cwd.len) != 0;
         let exists: bool = existsSyncBuf(&cwd);
         let det = ByteBuf { bytes: [0u8; 65536], len: 0 };
         buf_append_lit(&det, STR_PTR("{\"event\":\"spawn-attempt\",\"cwdExists\":"), STR_LEN("{\"event\":\"spawn-attempt\",\"cwdExists\":"));
@@ -1280,13 +1458,47 @@ fn spawnClaudeCommand(command_ptr: ptr, command_len: u64, args: &StrList, option
         buf_append_lit(&det, STR_PTR("}"), STR_LEN("}"));
         if !(exists) || !(is_dir) {
             // TS logs cwd-stat-failed only on stat throw; approximated here.
-            logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_LOG, STR_PTR("spawn-attempt"), STR_LEN("spawn-attempt"), &det.bytes, det.len);
+            let cap_p28618: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28618, &det.bytes, 0);
+            logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_LOG, STR_PTR("spawn-attempt"), STR_LEN("spawn-attempt"), cap_p28618, det.len);
         } else {
-            logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_LOG, STR_PTR("spawn-attempt"), STR_LEN("spawn-attempt"), &det.bytes, det.len);
+            let cap_p28619: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28619, &det.bytes, 0);
+            logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_LOG, STR_PTR("spawn-attempt"), STR_LEN("spawn-attempt"), cap_p28619, det.len);
         };
     };
     // try { const child = spawn(resolved.command, resolved.args, { ...spawnOptions, stdio: pipe x3, windowsHide, windowsVerbatimArguments? }) }
-    let spawn_rc = sa_std_process_spawn_bidi(&resolved.command, resolved.command_len, &resolved.args, &cwd.bytes, cwd.len, &env.bytes, env.len, out);
+    // FIX(be2): the 8-arg sa_std_process_spawn_bidi form was
+    // fictional; the real faces take a newline-joined argv text
+    // (argv[0] = command) plus out handles (process.sai:10-11).
+    // DEFECT(B-class, std gap): no env-carrying spawn face exists —
+    // the merged env built above is not applied (child inherits the
+    // parent environment); same registration as auggieAgentBridge.
+    // DEFECT: ClaudeChildProcess carries only the process handle;
+    // the bidi stream handles are left open for the child's
+    // lifetime (std reads/writes go through the process handle).
+    let argv_text = ByteBuf { bytes: [0u8; 65536], len: 0 };
+    let cap_sp1: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_sp1, &resolved.command, 0);
+    buf_append_bytes(&argv_text, cap_sp1, resolved.command_len);
+    let aoff2: u64 = 0;
+    let ai2: u64 = 0;
+    while ai2 < resolved.args.count {
+        buf_append_lit(&argv_text, STR_PTR("\n"), STR_LEN("\n"));
+        let cap_sp2: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_sp2, &resolved.args.items, aoff2);
+        buf_append_bytes(&argv_text, cap_sp2, resolved.args.lens[ai2]);
+        aoff2 = aoff2 + resolved.args.lens[ai2];
+        ai2 = ai2 + 1;
+    }
+    let proc_h: u64 = 0;
+    let hin_h: u64 = 0;
+    let hout_h: u64 = 0;
+    let herr_h: u64 = 0;
+    let cap_sp3: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_sp3, &argv_text.bytes, 0);
+    let cap_sp4: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_sp4, &cwd.bytes, 0);
+    let spawn_rc = if cwd.len > 0 { sa_std_process_spawn_bidi_cwd(cap_sp3, argv_text.len, cap_sp4, cwd.len, &proc_h, &hin_h, &hout_h, &herr_h) } else { sa_std_process_spawn_bidi(cap_sp3, argv_text.len, &proc_h, &hin_h, &hout_h, &herr_h) };
+    if spawn_rc == 0 {
+        out.handle = proc_h;
+        let pidv: u64 = 0;
+        if sa_std_process_child_id(proc_h, &pidv) == 0 { out.pid = pidv as i64; out.has_pid = true; };
+    };
     if spawn_rc != 0 {
         // catch: log "spawn-sync-throw"; throw new Error(`Failed to spawn Claude CLI (bin="${command}"${detail}): ${message}`)
         logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_ERROR, STR_PTR("spawn-sync-throw"), STR_LEN("spawn-sync-throw"), STR_PTR("{}"), STR_LEN("{}"));
@@ -1312,7 +1524,8 @@ fn spawnClaudeCommand(command_ptr: ptr, command_len: u64, args: &StrList, option
 fn probeClaudeCli(env_ptr: ptr, env_len: u64, out: &ClaudeCliProbeResult) -> void {
     let bin = ByteBuf { bytes: [0u8; 65536], len: 0 };
     findClaudeBin(env_ptr, env_len, &bin);
-    probeClaudeCliCommand(&bin.bytes, bin.len, env_ptr, env_len, out);
+    let cap_p28842: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28842, &bin.bytes, 0);
+    probeClaudeCliCommand( cap_p28842, bin.len, env_ptr, env_len, out);
     return;
 }
 
@@ -1335,13 +1548,17 @@ fn probeClaudeCliCommand(bin_ptr: ptr, bin_len: u64, env_ptr: ptr, env_len: u64,
     let launch = ClaudeLaunchSpec { command: [0u8; 1024], command_len: 0, args: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, env: [0u8; 4096], env_len: 0 };
     resolveClaudeLaunch(bin_ptr, bin_len, &version_args, env_ptr, env_len, &launch);
     let resolved = ResolvedSpawn { command: [0u8; 1024], command_len: 0, args: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, usesCommandShim: false };
-    host_codex_resolveCodexSpawn(&launch.command, launch.command_len, &launch.args, env_ptr, env_len, &resolved);
+    let cap_p28798: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28798, &launch.command, 0);
+    host_codex_resolveCodexSpawn( cap_p28798, launch.command_len, &launch.args, env_ptr, env_len, &resolved);
     // env: { ...env, ...launch.env }
     let merged_env = ByteBuf { bytes: [0u8; 65536], len: 0 };
     buf_append_bytes(&merged_env, env_ptr, env_len);
-    if launch.env_len > 0 { buf_append_bytes(&merged_env, &launch.env, launch.env_len); };
+    let cap_p28663: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28663, &launch.env, 0);
+    if launch.env_len > 0 { buf_append_bytes(&merged_env, cap_p28663, launch.env_len); };
     let output = ByteBuf { bytes: [0u8; 65536], len: 0 };
-    let rc = process_exec_capture(&resolved.command, resolved.command_len, &resolved.args, &merged_env.bytes, merged_env.len, 10000, &output);
+    let cap_p28894: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28894, &resolved.command, 0);
+    let cap_p28896: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28896, &merged_env.bytes, 0);
+    let rc = process_exec_capture( cap_p28894, resolved.command_len, &resolved.args, cap_p28896, merged_env.len, 10000, &output);
     if rc != 0 {
         // catch (error) { logClaudeSpawnEvent("warn", "probe-failed", {...}); return { available: false, binPath: bin, error: message }; }
         logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("probe-failed"), STR_LEN("probe-failed"), STR_PTR("{}"), STR_LEN("{}"));
@@ -1529,9 +1746,14 @@ fn ensureClaudeSpawnCwd(cwd_ptr: ptr, cwd_len: u64, out: &ByteBuf, err: &ByteBuf
         return 1;
     };
     // try { const stats = statSync(trimmed); if (!stats.isDirectory()) { log; throw } return trimmed; }
-    let stat_rc = sa_std_fs_stat(&trimmed.bytes, trimmed.len);
+    // FIX(be2): sa_std_fs_stat was fictional; stat success is
+    // sa_fs_metadata returning a nonzero handle (fs.sai:69).
+    let cap_st: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_st, &trimmed.bytes, 0);
+    let md_st = sa_fs_metadata(cap_st, trimmed.len);
+    let stat_rc = if md_st != 0 { 0 } else { 1 };
     if stat_rc == 0 {
-        if sa_std_fs_is_dir(&trimmed.bytes, trimmed.len) == 0 {
+        let cap_id3: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_id3, &trimmed.bytes, 0);
+        if probe_fs_is_dir(cap_id3, trimmed.len) == 0 {
             logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_ERROR, STR_PTR("ensure-cwd-not-directory"), STR_LEN("ensure-cwd-not-directory"), STR_PTR("{}"), STR_LEN("{}"));
             buf_append_lit(err, STR_PTR("Claude workspace is not a directory: "), STR_LEN("Claude workspace is not a directory: "));
             let cap_p34: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p34, &trimmed.bytes, 0);
@@ -1543,9 +1765,12 @@ fn ensureClaudeSpawnCwd(cwd_ptr: ptr, cwd_len: u64, out: &ByteBuf, err: &ByteBuf
         return 0;
     };
     // catch (error) { if (code !== "ENOENT") { log "ensure-cwd-stat-failed"; throw } ... mkdir }
-    // DEFECT: errno code inspection (NodeJS.ErrnoException.code) approximated by
-    // sa_std_fs_last_errno() == ENOENT(2) check.
-    if sa_std_fs_last_errno() != 2 {
+    // FIX(be2): sa_std_fs_last_errno was fictional and sa_std has no
+    // fs errno surface; the ENOENT case is discriminated by an
+    // existence probe instead (stat failed + path exists => throw;
+    // path missing => fall through to mkdir, matching TS).
+    let cap_en: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_en, &trimmed.bytes, 0);
+    if sa_std_fs_exists(cap_en, trimmed.len) == 0 {
         logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_ERROR, STR_PTR("ensure-cwd-stat-failed"), STR_LEN("ensure-cwd-stat-failed"), STR_PTR("{}"), STR_LEN("{}"));
         buf_append_lit(err, STR_PTR("Cannot use Claude workspace "), STR_LEN("Cannot use Claude workspace "));
         let cap_p36: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p36, &trimmed.bytes, 0);
@@ -1553,7 +1778,8 @@ fn ensureClaudeSpawnCwd(cwd_ptr: ptr, cwd_len: u64, out: &ByteBuf, err: &ByteBuf
         return 1;
     };
     // try { mkdirSync(trimmed, { recursive: true }); log warn "ensure-cwd-created"; return trimmed; }
-    if sa_std_fs_mkdir_recursive(&trimmed.bytes, trimmed.len) == 0 {
+    let cap_mk: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_mk, &trimmed.bytes, 0);
+    if sa_fs_mkdir_p(cap_mk, trimmed.len) == 0 {
         logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("ensure-cwd-created"), STR_LEN("ensure-cwd-created"), STR_PTR("{}"), STR_LEN("{}"));
         let cap_p37: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p37, &trimmed.bytes, 0);
         buf_append_bytes(out, cap_p37, trimmed.len);
@@ -1590,7 +1816,8 @@ fn prepareClaudeThreadCwd(has_cwd: bool, cwd_ptr: ptr, cwd_len: u64, is_ssh: boo
     // if (/not a directory/i.test(check.error ?? "")) throw new Error(check.error);
     // DEFECT: regex test approximated by substring search for "not a directory" (case-sensitive).
     if check.has_error && buf_contains(&check.error, check.error_len, STR_PTR("not a directory"), STR_LEN("not a directory")) {
-        buf_append_bytes(err, &check.error, check.error_len);
+        let cap_p28664: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28664, &check.error, 0);
+        buf_append_bytes(err, cap_p28664, check.error_len);
         return 1;
     };
     // return ensureClaudeSpawnCwd(cwd);
@@ -1690,7 +1917,7 @@ fn claudeCliSupportsEffort(cache: &EffortSupportCache, bin_ptr: ptr, bin_len: u6
     // const cached = effortSupportCache.get(bin); if (cached && Date.now() - cached.at < TTL) return cached.ok;
     let cached_at: u64 = 0;
     let cached_ok: bool = false;
-    let now: u64 = sa_time_now_ms();
+    let now: u64 = (sa_time_unix_ms() as u64);
     if effort_cache_get(cache, bin_ptr, bin_len, &cached_at, &cached_ok) && now - cached_at < EFFORT_SUPPORT_CACHE_TTL_MS {
         return cached_ok;
     };
@@ -1701,17 +1928,22 @@ fn claudeCliSupportsEffort(cache: &EffortSupportCache, bin_ptr: ptr, bin_len: u6
     let launch = ClaudeLaunchSpec { command: [0u8; 1024], command_len: 0, args: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, env: [0u8; 4096], env_len: 0 };
     resolveClaudeLaunch(bin_ptr, bin_len, &help_args, env_ptr, env_len, &launch);
     let resolved = ResolvedSpawn { command: [0u8; 1024], command_len: 0, args: StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 }, usesCommandShim: false };
-    host_codex_resolveCodexSpawn(&launch.command, launch.command_len, &launch.args, env_ptr, env_len, &resolved);
+    let cap_p28799: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28799, &launch.command, 0);
+    host_codex_resolveCodexSpawn( cap_p28799, launch.command_len, &launch.args, env_ptr, env_len, &resolved);
     let merged_env = ByteBuf { bytes: [0u8; 65536], len: 0 };
     buf_append_bytes(&merged_env, env_ptr, env_len);
-    if launch.env_len > 0 { buf_append_bytes(&merged_env, &launch.env, launch.env_len); };
+    let cap_p28665: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28665, &launch.env, 0);
+    if launch.env_len > 0 { buf_append_bytes(&merged_env, cap_p28665, launch.env_len); };
     let output = ByteBuf { bytes: [0u8; 65536], len: 0 };
-    let rc = process_exec_capture(&resolved.command, resolved.command_len, &resolved.args, &merged_env.bytes, merged_env.len, 10000, &output);
+    let cap_p28895: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28895, &resolved.command, 0);
+    let cap_p28897: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28897, &merged_env.bytes, 0);
+    let rc = process_exec_capture( cap_p28895, resolved.command_len, &resolved.args, cap_p28897, merged_env.len, 10000, &output);
     if rc != 0 {
         logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("effort-probe-failed"), STR_LEN("effort-probe-failed"), STR_PTR("{}"), STR_LEN("{}"));
         ok = false;
     } else {
-        ok = output_has_effort_flag(&output.bytes, output.len);
+        let cap_p28977: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28977, &output.bytes, 0);
+        ok = output_has_effort_flag( cap_p28977, output.len);
     };
     effort_cache_set(cache, bin_ptr, bin_len, now, ok);
     if !(ok) { logClaudeSpawnEvent(CLAUDE_LOG_LEVEL_WARN, STR_PTR("effort-unsupported"), STR_LEN("effort-unsupported"), STR_PTR("{}"), STR_LEN("{}")); };
@@ -1728,7 +1960,7 @@ fn warmClaudeEffortSupport(cache: &EffortSupportCache, bin_ptr: ptr, bin_len: u6
     if probe_bin.len == 0 { return; };
     let cached_at: u64 = 0;
     let cached_ok: bool = false;
-    let now: u64 = sa_time_now_ms();
+    let now: u64 = (sa_time_unix_ms() as u64);
     if effort_cache_get(cache, bin_ptr, bin_len, &cached_at, &cached_ok) && now - cached_at < EFFORT_SUPPORT_CACHE_TTL_MS { return; };
     // try { execFile(..., callback sets cache) } catch { /* fire-and-forget */ }
     let ignored: bool = claudeCliSupportsEffort(cache, bin_ptr, bin_len, env_ptr, env_len);
@@ -1743,7 +1975,7 @@ fn resolveClaudeEffortForCli(cache: &EffortSupportCache, bin_ptr: ptr, bin_len: 
     if !(sanitizeClaudeCliEffort(has_effort, effort_ptr, effort_len, &normalized)) { return false; };
     let cached_at: u64 = 0;
     let cached_ok: bool = false;
-    let now: u64 = sa_time_now_ms();
+    let now: u64 = (sa_time_unix_ms() as u64);
     if effort_cache_get(cache, bin_ptr, bin_len, &cached_at, &cached_ok) && now - cached_at < EFFORT_SUPPORT_CACHE_TTL_MS {
         if cached_ok {
             let cap_p39: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p39, &normalized.bytes, 0);
@@ -1822,7 +2054,8 @@ fn sanitizeClaudeCliEffort(has_value: bool, value_ptr: ptr, value_len: u64, out:
         buf_append_bytes(&level, cap_p44, normalized.len);
     };
     // return CLAUDE_CLI_EFFORT_LEVELS.has(level) ? level : undefined;
-    if is_claude_cli_effort_level(&level.bytes, level.len) {
+    let cap_p28978: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p28978, &level.bytes, 0);
+    if is_claude_cli_effort_level( cap_p28978, level.len) {
         let cap_p45: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_p45, &level.bytes, 0);
         buf_append_bytes(out, cap_p45, level.len);
         return true;
@@ -1913,7 +2146,8 @@ fn claudeTranscriptExists(has_configDir: bool, configDir_ptr: ptr, configDir_len
     // try { return readdirSync(projectsDir, {withFileTypes:true}).some(entry => entry.isDirectory() && existsSync(join(projectsDir, entry.name, sessionId + ".jsonl"))) }
     // catch { return existsSync(projectsDir) ? undefined : false; }
     let entries = StrList { items: [0u8; 16384], items_len: 0, lens: [0u64; 64], count: 0 };
-    if sa_std_fs_list_dir(&projectsDir.bytes, projectsDir.len, &entries) != 0 {
+    let cap_ld2: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_ld2, &projectsDir.bytes, 0);
+    if probe_list_dir_names(cap_ld2, projectsDir.len, &entries) != 0 {
         if existsSyncBuf(&projectsDir) { return -1; };
         return 0;
     };
@@ -1926,7 +2160,8 @@ fn claudeTranscriptExists(has_configDir: bool, configDir_ptr: ptr, configDir_len
         buf_append_lit(&full, STR_PTR("/"), STR_LEN("/"));
         let ah_p8: ptr = PTR_NULL(); PTR_BYTE_ADD(ah_p8, &entries.items, off);
         buf_append_bytes(&full, ah_p8, entries.lens[ei]);
-        if sa_std_fs_is_dir(&full.bytes, full.len) != 0 {
+        let cap_id4: ptr = PTR_NULL(); PTR_BYTE_ADD(cap_id4, &full.bytes, 0);
+        if probe_fs_is_dir(cap_id4, full.len) != 0 {
             buf_append_lit(&full, STR_PTR("/"), STR_LEN("/"));
             buf_append_bytes(&full, sessionId_ptr, sessionId_len);
             buf_append_lit(&full, STR_PTR(".jsonl"), STR_LEN(".jsonl"));
