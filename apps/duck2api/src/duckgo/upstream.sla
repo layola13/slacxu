@@ -5,6 +5,9 @@
 @import "sa_std/ts_math.sa"
 @import "sa_std/crypto.sai"
 @import "sa_std/env.sai"
+@import "sa_std/http_client.sai"
+@import "sa_std/globals.sai"
+@import "sa_std/math.sai"
 @import "sa_std/fmt.sai"
 @import "convert.sla"
 @import "vqd.sla"
@@ -21,7 +24,7 @@
 // import("fetch-impersonate") / setTimeout sleeps / a promise-chain mutex
 // (waitSlot). SLA has no async runtime in this conversion: every step is a
 // synchronous fn, sleeps and the serialized queue collapse into intent
-// externs (sa_sleep_ms, sa_http_fetch_*), and the TLS-impersonation fetch
+// externs (sa_time_sleep_ms, sa_http_fetch_*), and the TLS-impersonation fetch
 // (fetch-impersonate chrome146 preset) is an intent extern
 // sa_http_fetch_impersonated — sa_std has no TLS-fingerprint client.
 // DEFECT: module-level mutable state (fetchImpl, duckFetchDegraded,
@@ -215,7 +218,9 @@ fn get_fetch(state: &UpstreamState) -> void {
         let preset = ByteBuf { bytes: [0u8; 40960], len: 0 };
         env_read_buf(&preset, STR_PTR("DUCK_IMPERSONATE_TARGET"), STR_LEN("DUCK_IMPERSONATE_TARGET"));
         if preset.len == 0 { buf_append_lit(&preset, STR_PTR("chrome146"), STR_LEN("chrome146")); };
-        if sa_http_impersonate_available(&preset.bytes, preset.len) != 0 {
+        let __ap_avail: ptr = PTR_NULL();
+        PTR_BYTE_ADD(__ap_avail, preset.bytes, 0);
+        if sa_http_impersonate_available(__ap_avail, preset.len) != 0 {
             state.fetch_degraded = true;
             // DEFECT: console.warn(...) diagnostic has no SLA equivalent;
             // the degraded flag is the only observable (same as TS callers
@@ -223,6 +228,166 @@ fn get_fetch(state: &UpstreamState) -> void {
         };
     };
     state.fetch_ready = true;
+}
+
+// --- fetch family: local implementation over the std stateful HTTP
+// client (http_client.sai). The converter's intent externs
+// (sa_http_fetch_get/post, sa_http_response_*) do not exist; the res
+// handle here is the std response pointer as u64 (PTR_ADDR), with the
+// matching request/client pointers kept in u64 cells keyed by the
+// handle ("up.req.<h>" / "up.client.<h>") so release frees all three.
+//
+// Impersonation: the TS resolves an impersonating fetch (TLS
+// fingerprint preset, e.g. chrome146) and degrades to native when the
+// module cannot load. sa_std has shaped-TLS primitives
+// (sa_std_tls_shaped_*) but no preset fetch client is bound in this
+// file, so the probe honestly reports unavailable: get_fetch marks
+// fetch_degraded and every fetch below takes the native path — the
+// same observable state as the TS module-load-failure path.
+// DEFECT: response headers are readable only BY NAME through the std
+// client; repeated Set-Cookie values cannot be enumerated, so
+// collect_cookies sees at most the single by-name value (count 0/1).
+fn sa_http_impersonate_available(preset_ptr: ptr, preset_len: u64) -> i32 {
+    return 1;
+}
+
+fn http_fetch_send(method: u8, url_ptr: ptr, url_len: u64, h: &HeaderList, body_ptr: ptr, body_len: u64, has_body: bool, out_res: &u64) -> i32 {
+    *out_res = 0;
+    let use_tls: u8 = 0;
+    if starts_with(url_ptr, url_len, STR_PTR("https://"), STR_LEN("https://")) { use_tls = 1; };
+    let client: ptr = PTR_NULL();
+    if sa_http_client_new(use_tls, &client) != 0 || client == PTR_NULL() { return 1; };
+    let req: ptr = PTR_NULL();
+    if sa_http_client_req_new(client, method, url_ptr, url_len, &req) != 0 || req == PTR_NULL() {
+        sa_http_client_free(client);
+        return 1;
+    };
+    for i in 0..h.len {
+        let __apf1: ptr = PTR_NULL();
+        PTR_BYTE_ADD(__apf1, h.names[i].bytes, 0);
+        let __apf2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(__apf2, h.values[i].bytes, 0);
+        sa_http_client_req_add_header(req, __apf1, h.names[i].len, __apf2, h.values[i].len);
+    }
+    if has_body { sa_http_client_req_set_body(req, body_ptr, body_len); };
+    let resp: ptr = PTR_NULL();
+    if sa_http_client_req_send(req, &resp) != 0 || resp == PTR_NULL() {
+        sa_http_client_req_free(req);
+        sa_http_client_free(client);
+        return 1;
+    };
+    let handle: u64 = 0;
+    PTR_ADDR(handle, resp);
+    let req_v: u64 = 0;
+    PTR_ADDR(req_v, req);
+    let cli_v: u64 = 0;
+    PTR_ADDR(cli_v, client);
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&nm, STR_PTR("up.req."), STR_LEN("up.req."));
+    buf_append_u64(&nm, handle);
+    let __apf3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__apf3, nm.bytes, 0);
+    sa_global_u64_set(__apf3, nm.len, req_v);
+    buf_reset(&nm);
+    buf_append_lit(&nm, STR_PTR("up.client."), STR_LEN("up.client."));
+    buf_append_u64(&nm, handle);
+    let __apf4: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__apf4, nm.bytes, 0);
+    sa_global_u64_set(__apf4, nm.len, cli_v);
+    *out_res = handle;
+    return 0;
+}
+
+fn sa_http_fetch_get(state: &UpstreamState, url_ptr: ptr, url_len: u64, h: &HeaderList, out_res: &u64) -> i32 {
+    return http_fetch_send(1, url_ptr, url_len, h, PTR_NULL(), 0, false, out_res);
+}
+
+fn sa_http_fetch_post(state: &UpstreamState, url_ptr: ptr, url_len: u64, h: &HeaderList, body_ptr: ptr, body_len: u64, out_res: &u64) -> i32 {
+    return http_fetch_send(2, url_ptr, url_len, h, body_ptr, body_len, true, out_res);
+}
+
+fn sa_http_response_status(res: u64) -> u64 {
+    if res == 0 { return 0; };
+    let resp: ptr = PTR_NULL();
+    PTR_CAST(resp, res);
+    return sa_http_client_resp_status(resp) as u64;
+}
+
+fn sa_http_response_header(res: u64, name_ptr: ptr, name_len: u64, out_ptr: &ptr, out_len: &u64) -> i32 {
+    *out_ptr = PTR_NULL();
+    *out_len = 0;
+    if res == 0 { return 1; };
+    let resp: ptr = PTR_NULL();
+    PTR_CAST(resp, res);
+    if sa_http_client_resp_get_header(resp, name_ptr, name_len, out_ptr, out_len) != 0 {
+        *out_ptr = PTR_NULL();
+        *out_len = 0;
+        return 1;
+    };
+    return 0;
+}
+
+fn sa_http_response_text(res: u64, out: &ByteBuf) -> void {
+    buf_reset(out);
+    if res == 0 { return; };
+    let resp: ptr = PTR_NULL();
+    PTR_CAST(resp, res);
+    let bp = sa_http_client_resp_body_ptr(resp);
+    let bl = sa_http_client_resp_body_len(resp);
+    if bp != PTR_NULL() && bl > 0 { buf_append_lit(out, bp, bl); };
+}
+
+fn sa_http_response_set_cookie_count(res: u64) -> u64 {
+    let vp: ptr = PTR_NULL();
+    let vl: u64 = 0;
+    if sa_http_response_header(res, STR_PTR("set-cookie"), STR_LEN("set-cookie"), &vp, &vl) != 0 || vl == 0 { return 0; };
+    return 1;
+}
+
+fn sa_http_response_set_cookie(res: u64, idx: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    *out_ptr = PTR_NULL();
+    *out_len = 0;
+    if idx != 0 { return; };
+    sa_http_response_header(res, STR_PTR("set-cookie"), STR_LEN("set-cookie"), out_ptr, out_len);
+}
+
+fn sa_http_response_release(res: u64) -> void {
+    if res == 0 { return; };
+    let resp: ptr = PTR_NULL();
+    PTR_CAST(resp, res);
+    sa_http_client_resp_free(resp);
+    let nm = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    buf_append_lit(&nm, STR_PTR("up.req."), STR_LEN("up.req."));
+    buf_append_u64(&nm, res);
+    let __apf5: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__apf5, nm.bytes, 0);
+    let v: u64 = 0;
+    if sa_global_u64_get(__apf5, nm.len, &v) == 0 && v != 0 {
+        let rp: ptr = PTR_NULL();
+        PTR_CAST(rp, v);
+        sa_http_client_req_free(rp);
+        sa_global_u64_set(__apf5, nm.len, 0);
+    };
+    buf_reset(&nm);
+    buf_append_lit(&nm, STR_PTR("up.client."), STR_LEN("up.client."));
+    buf_append_u64(&nm, res);
+    let __apf6: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__apf6, nm.bytes, 0);
+    if sa_global_u64_get(__apf6, nm.len, &v) == 0 && v != 0 {
+        let cp: ptr = PTR_NULL();
+        PTR_CAST(cp, v);
+        sa_http_client_free(cp);
+        sa_global_u64_set(__apf6, nm.len, 0);
+    };
+}
+
+// TS: Math.random()-based randBelow for FE signal jitter (upstream.ts
+// randBelow). The converter bound it to a "crypto-random" intent
+// extern; the TS source is Math.random, so the faithful surface is
+// sa_math_random (math.sai).
+fn math_random_below(n: u64) -> u64 {
+    if n == 0 { return 0; };
+    return (sa_math_random() * (n as f64)) as u64;
 }
 
 // TS: function sessionFor(proxyUrl: string): Session
@@ -324,11 +489,11 @@ fn collect_cookies(state: &UpstreamState, session_idx: u64, response: u64) -> vo
 // TS: export function createFESignals(nowMs = Date.now()): string
 // Math.random() maps to the crypto-random intent extern (uniform u64).
 fn create_fe_signals(out: &ByteBuf, now_ms: u64) -> void {
-    let impression = 50 + sa_crypto_random_below(100);
-    let action = impression + 5000 + sa_crypto_random_below(25000);
-    let finish = action + 1000 + sa_crypto_random_below(9000);
-    let start_chat = finish + 10 + sa_crypto_random_below(90);
-    let end = start_chat + sa_crypto_random_below(10);
+    let impression = 50 + math_random_below(100);
+    let action = impression + 5000 + math_random_below(25000);
+    let finish = action + 1000 + math_random_below(9000);
+    let start_chat = finish + 10 + math_random_below(90);
+    let end = start_chat + math_random_below(10);
     let payload = ByteBuf { bytes: [0u8; 40960], len: 0 };
     buf_append_lit(&payload, STR_PTR("{\"start\":"), STR_LEN("{\"start\":"));
     buf_append_u64(&payload, now_ms - end);
@@ -443,7 +608,14 @@ fn fetch_xvqd(state: &UpstreamState, session_idx: u64, out_token: &ByteBuf, out_
     if hl == 0 { return 2; };
     let hash = ByteBuf { bytes: [0u8; 40960], len: 0 };
     buf_append_lit(&hash, hp, hl);
-    generate_vqd_hash(out_token, &hash.bytes, hash.len);
+    // TS: token = await generateVQDHash(hash) — a rejection
+    // propagates as this fn's error. The converted call dropped the
+    // err out-param AND the result; restored: failure returns 3 (the
+    // fn's other failure codes are 1 = bad status, 2 = no hash).
+    let herr = ByteBuf { bytes: [0u8; 40960], len: 0 };
+    let __ap_hash: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_hash, hash.bytes, 0);
+    if generate_vqd_hash(out_token, &herr, __ap_hash, hash.len) != 0 { return 3; };
     return 0;
 }
 
@@ -488,7 +660,7 @@ fn wait_slot(state: &UpstreamState) -> void {
         let w2 = state.rate_limit_until - now;
         if w2 > wait { wait = w2; };
     };
-    if wait > 0 { sa_sleep_ms(wait); };
+    if wait > 0 { sa_time_sleep_ms(wait); };
 }
 
 // TS: function cooldownResult(): ConversationResult
@@ -499,7 +671,7 @@ fn cooldown_result(out: &ConversationResult, state: &UpstreamState) -> void {
     // @ts_math_rounding (op 1 = ceil) / @ts_math_minmax (sa_std ts_math.sa).
     // DEFECT: the TS delta can be negative (Math.ceil of a negative);
     // the u64 delta here covers the reachable positive path only.
-    let seconds = ts_math_minmax(ts_math_rounding(remaining / 1000.0, 1) + 1, 1, 1);
+    let seconds = ts_math_minmax(ts_math_rounding((remaining as f64) / 1000.0, 1) + 1, 1, 1);
     out.ok = false;
     out.status = 503;
     headers_set(&out.headers, STR_PTR("content-type"), STR_LEN("content-type"), STR_PTR("application/json"), STR_LEN("application/json"));
@@ -555,7 +727,9 @@ fn post_once(state: &UpstreamState, session_idx: u64, request: &DuckApiRequest, 
     let wire = ByteBuf { bytes: [0u8; 40960], len: 0 };
     duck_api_request_to_json(&wire, request);
     let res: u64 = 0;
-    sa_http_fetch_post(state, duck_chat_url(), duck_chat_url_len(), &h, &wire.bytes, wire.len, &res);
+    let __ap_wire: ptr = PTR_NULL();
+    PTR_BYTE_ADD(__ap_wire, wire.bytes, 0);
+    sa_http_fetch_post(state, duck_chat_url(), duck_chat_url_len(), &h, __ap_wire, wire.len, &res);
     if res != 0 { collect_cookies(state, session_idx, res); };
     return res;
 }
@@ -571,7 +745,7 @@ fn rate_limited(state: &UpstreamState, out: &ConversationResult, proxy_ptr: ptr,
     if res != 0 { sa_http_response_release(res); };
     // Math.max(1, Math.ceil(waitMs / 1000)) — @ts_math_rounding (ceil)
     // + @ts_math_minmax (sa_std ts_math.sa).
-    let seconds = ts_math_minmax(ts_math_rounding(wait_ms / 1000.0, 1), 1, 1);
+    let seconds = ts_math_minmax(ts_math_rounding((wait_ms as f64) / 1000.0, 1), 1, 1);
     conversation_result_clear(out);
     out.ok = false;
     out.status = 503;
@@ -725,7 +899,7 @@ fn post_conversation(state: &UpstreamState, out: &ConversationResult, request: &
         sa_http_response_text(res, &sink);
         sa_http_response_release(res);
         res = 0;
-        sa_sleep_ms(backoff_ms(1));
+        sa_time_sleep_ms(backoff_ms(1));
         reset_session(state, proxy_ptr, proxy_len);
         let retry_idx = session_for(state, proxy_ptr, proxy_len);
         let uuid_ha = sa_deno_random_uuid();
