@@ -50,6 +50,9 @@
 @import "sa_std/encoding/json.sai"
 @import "sa_std/fs.sai"
 @import "sa_std/process.sai"
+@import "sa_std/ws_client.sai"
+@import "sa_std/crypto.sai"
+@import "sa_std/time.sai"
 
 fn chc_ts_str_trim(out_ptr: &ptr, out_len: &u64, p: ptr, n: u64) -> void {
     // Local replica of the SA-layer @ts_str_trim view semantics
@@ -435,7 +438,12 @@ fn ClineHubClient_handleMessage(self: &ClineHubClient, text_ptr: ptr, text_len: 
             };
             self.pending[idx].status = 2;
         };
-        pending_remove(self, idx);
+        // FIX(be2): the bulk pass removed the entry here,
+        // destroying the result before the owner's
+        // hub_pending_take could read it (the TS design
+        // resolves the awaiting command's promise with this
+        // entry). The entry now persists until taken;
+        // hub_pending_take performs the removal.
         return;
     };
     if chc_str_is(kind_ptr, kind_len, STR_PTR("event"), STR_LEN("event")) {
@@ -790,10 +798,17 @@ fn parse_int_span(p: ptr, n: u64) -> i64 {
 }
 
 // ---- ws shims ----
-// DEFECT: WebSocket client surface (ws npm package in TS).
+// FIX(be2): bound to the sa_std WebSocket client
+// (ws_client.sai, RFC 6455). DEFECT: the TS `ws` package
+// negotiates the hub subprotocol at connect; the std
+// connect face has no subprotocol parameter, so none is
+// negotiated here.
 fn ws_connect(url_ptr: ptr, url_len: u64, subprotocol_ptr: ptr, subprotocol_len: u64, out_ws: &u64) -> i32 {
     *out_ws = 0;
-    return 1;
+    let h: u64 = 0;
+    if sa_std_ws_client_connect(url_ptr, url_len, &h) != 0 || h == 0 { return 1; };
+    *out_ws = h;
+    return 0;
 }
 
 fn ws_is_open(ws: u64) -> bool {
@@ -801,27 +816,132 @@ fn ws_is_open(ws: u64) -> bool {
 }
 
 fn ws_send(ws: u64, data: ptr, data_len: u64) -> void {
+    if ws == 0 { return; };
+    let ig = sa_std_ws_client_send_text(ws, data, data_len);
 }
 
 fn ws_close(ws: u64) -> void {
+    if ws == 0 { return; };
+    let ig = sa_std_ws_client_close(ws, 1000, STR_PTR(""), 0);
+}
+
+// ws_recv_msg: one blocking recv (the std client has no
+// nonblocking/poll face — pump semantics note in the
+// bridge). Returns 0 with a text message copied out, 2 on
+// a close frame, 1 on error/no message.
+fn ws_recv_msg(ws: u64, out: ptr, out_cap: u64, out_len: &u64, out_opcode: &u64) -> i32 {
+    *out_len = 0;
+    *out_opcode = 0;
+    if ws == 0 { return 1; };
+    let opcode: u64 = 0;
+    let bh: u64 = 0;
+    if sa_std_ws_client_recv(ws, &opcode, &bh) != 0 { return 1; };
+    *out_opcode = opcode;
+    if opcode == 8 { return 2; };
+    if bh == 0 { return 1; };
+    let dp: ptr = PTR_NULL();
+    dp = sa_std_ws_client_buffer_data(bh);
+    let dl = sa_std_ws_client_buffer_len(bh);
+    let n = dl;
+    if n > out_cap { n = out_cap; };
+    let k: u64 = 0;
+    while k < n {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, dp, k);
+        let wp: ptr = PTR_NULL(); PTR_BYTE_ADD(wp, out, k);
+        PTR_WRITE_U8(wp, v);
+        k = k + 1;
+    }
+    *out_len = n;
+    let ig = sa_std_ws_client_buffer_free(bh);
+    return 0;
 }
 
 // process_pid / process_alive / random_base36 / now_ms shims.
 // DEFECT: no verified std counterparts in this pass.
+// FIX(be2): process/entropy/clock shims bound to sa_std.
 fn process_pid() -> i64 {
-    return 0;
+    return (sa_std_process_id() as i64);
 }
 
+// kill -0 probe via the process face (POSIX liveness).
 fn process_alive(pid: i64) -> bool {
-    return false;
+    if pid <= 0 { return false; };
+    let argv = [0u8; 64];
+    let ap: ptr = PTR_NULL(); PTR_BYTE_ADD(ap, &argv, 0);
+    let n: u64 = 0;
+    let lit = "kill\n-0\n";
+    let i: u64 = 0;
+    while i < 8 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, STR_PTR("kill\n-0\n"), i);
+        let wp: ptr = PTR_NULL(); PTR_BYTE_ADD(wp, ap, n);
+        PTR_WRITE_U8(wp, v);
+        n = n + 1;
+        i = i + 1;
+    }
+    let v2 = pid;
+    let digs = [0u8; 20];
+    let dp: ptr = PTR_NULL(); PTR_BYTE_ADD(dp, &digs, 0);
+    let dn: u64 = 0;
+    if v2 == 0 {
+        let wp: ptr = PTR_NULL(); PTR_BYTE_ADD(wp, dp, 0);
+        PTR_WRITE_U8(wp, 48);
+        dn = 1;
+    };
+    while v2 > 0 {
+        let wp: ptr = PTR_NULL(); PTR_BYTE_ADD(wp, dp, dn);
+        PTR_WRITE_U8(wp, 48 + ((v2 % 10) as u8));
+        dn = dn + 1;
+        v2 = v2 / 10;
+    }
+    let j: u64 = 0;
+    while j < dn {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, dp, dn - 1 - j);
+        let wp: ptr = PTR_NULL(); PTR_BYTE_ADD(wp, ap, n);
+        PTR_WRITE_U8(wp, v);
+        n = n + 1;
+        j = j + 1;
+    }
+    let proc: u64 = 0;
+    let hin: u64 = 0;
+    let hout: u64 = 0;
+    let herr: u64 = 0;
+    if sa_std_process_spawn_bidi(ap, n, &proc, &hin, &hout, &herr) != 0 { return false; };
+    sa_std_close(hin);
+    sa_std_close(hout);
+    sa_std_close(herr);
+    let code: i32 = 0;
+    sa_std_process_wait(proc, &code);
+    return code == 0;
 }
 
+// Math.random().toString(36) replacement: CSPRNG bytes
+// mapped mod 36 onto the base36 alphabet.
 fn random_base36(out: ptr, out_cap: u64, out_len: &u64) -> void {
     *out_len = 0;
+    let raw = [0u8; 64];
+    let rp: ptr = PTR_NULL(); PTR_BYTE_ADD(rp, &raw, 0);
+    let want = out_cap;
+    if want > 64 { want = 64; };
+    if sa_crypto_random_bytes(rp, want) != 0 { return; };
+    let alpha = "0123456789abcdefghijklmnopqrstuvwxyz";
+    let i: u64 = 0;
+    while i < want {
+        let b: u8 = 0;
+        PTR_BYTE_AT(b, rp, i);
+        let ch: u8 = 0;
+        PTR_BYTE_AT(ch, STR_PTR("0123456789abcdefghijklmnopqrstuvwxyz"), (b % 36) as u64);
+        let wp: ptr = PTR_NULL(); PTR_BYTE_ADD(wp, out, i);
+        PTR_WRITE_U8(wp, ch);
+        i = i + 1;
+    }
+    *out_len = want;
 }
 
 fn chc_now_ms() -> u64 {
-    return 0;
+    return (sa_time_unix_ms() as u64);
 }
 
 fn drain_handle(handle: u64, out: ptr, cap: u64) -> u64 {
