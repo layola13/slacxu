@@ -294,3 +294,10 @@ check 为准。）
 | opencode/src/runtime/opencodeSessionStore.sla | Type Check Error: failed to verify types: Undefined call: sa_sqlite_column_is_null (error.UndefinedV |
 | relay-config/src/relay/relayProtocolGateway.sla | Syntax Error: failed to parse backends/relay-config/src/relay/relayProtocolGateway.sla:332:1: error. |
 
+
+
+## 集成注记（主会话，2026-10-26）
+
+- 本提交（70eb30c）cherry-pick 入集成树（基 f89bdc9）时仅 saVmJev.sla 一文件冲突：J1 已把该文件三个重声明结构体改名为 Jev*（JevRunInput / JevRunResult / JevPolicyConfig）——saVmTool.sla 同时 @import sdk 的 saVmTypes.sla（已有 SaVm* 同名类型）与本文件，Jev* 命名是集成树内避免同名碰撞的必要条件，且 saVmTool 的 jev_call 段按 JevRunInput 引用；K 版保留 TS 原名 SaVm*（单文件自洽），整取 K 版会使 saVmTool 在 21763:26 展开失败（实测）。
+- 处置：集成树保留 J1 命名，将 K 版的真实修复回填（json/time 两个 @import、write-through 修复），并按同一缺陷类做全文件扫描（&-参数裸赋值），补齐 K 未及的站点：共 43 处 write-through（str_trim_range、input_dyn_json、shared_field_ptr、jev_parse_env_u64、getJevThrottle、jev_pick_context、jev_parse_response_text、jev_answers_node、input_json_field、jev_marker_literal、jev_find_marker、splitPackedDoneSections）、95 处值位数组字面量 [u8; N]→[0u8; N]（ByteBuf 83、StringMap 3、JevStr/JevCallResult 9）。
+- 集成树复检：saVmPolicy、saVmInterception、agentsMdInventory、omniRouteFree、miniModelHistory 五文件 PASS；apps/server/src/saVmTool.sla PASS（回归门守住）；saVmJev.sla 仍 FAIL，首错与本文 §7 记录一致（str_eq 4 参 InvalidArgsCount），属既有 58 失败集，无新增回归。
