@@ -71,8 +71,8 @@ TS 真值中 fs 存在性判断点（译时逐点核极性，落点一律 `== 0`
 | B3 | 1345-2404 | Anthropic 族、chat→anthropic、输出收缩、auto-compact、tilde、工具表 | PASS | 5cadf66 |
 | B4 | 2405-2920 | 工具+MCP、子代理名、参数校验、normalizeSaVmArgs、steer 族 | PASS | 1acc1f9 |
 | B5 | 3183-4638 | history 文本、图片剥离、计划族、echo 门、收件箱、紧凑/锚点、上游错误、评审族、patch 校验、去重/sanitize | PASS | de895c9 |
-| B6 | 4560-4638 余 + 类前自由函数 | readSseStream、extractUserInputAnswer、runMiniWebSearch、AGENTS.md active 追踪 | 待 | — |
-| B7 | 4639-5430 | 类状态/构造/emit 模型、respond/pending、会话恢复、resolveTarget、摘要请求、usage/retry 通知、fetch 上游、exec 会话族 | 待 | — |
+| B6 | 4560-4638 余 + 类前自由函数 | readSseStream、extractUserInputAnswer、runMiniWebSearch、AGENTS.md active 追踪 | PASS | 440df75 |
+| B7 | 4639-5430 | 类状态/构造/emit 队列模型、respond/pending、会话恢复、resolveTarget、摘要请求、usage/retry 通知、fetch 上游、exec 会话族 | PASS | cdee17d |
 | B8 | 5431-7630 | request 分发、子代理调用族、排队/等待/收尾 | 待 | — |
 | B9 | 7631-10282 | runMiniTurn/Once 主循环 | 待 | — |
 
