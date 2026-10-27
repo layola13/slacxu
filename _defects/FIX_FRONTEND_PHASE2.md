@@ -107,7 +107,7 @@
 - `sa_plugin_mui/mui/material.sax`：153 个 MUI 组件 / 3138 行，试件用到的 6 个组件**全部在内**（盒上 grep 逐个复核：Box@1732、Stack@2609、Typography@3123、Switch@349、TextField@549、Alert@2064）。
 - 消费方式（sa_plugin_react demos + README）：`sa react build|check <file> --include mui/material.sax`；用户组件以大写标签组合，props 降为同名子 `<state>` 槽赋值（数值/字符串/布尔/对象即 JSON），子内容经 `<Slot/>` 投影，处理器为组件内 Sla `fn`/SA 标签，合成事件桥提供 checked/current_value 一族读取器。产物同为 app.wasm + airlock.js + index.html + app.sa。
 - 本线已在盒上构建并 dev-install 两插件（react libreact.so 25,226,456 B；mui libmui.so 17,696 B；installed 目录现含 http-client/http-server/mui/node/react/sax/sla）。
-- 对照实验：react_counter.sax → 全链路 PASS（app.wasm + airlock.js + index.html + app.sa）。mui 全组件 demo（mui_all_components_from_library.sax，153 组件单文件）→ app.sa 已生成（984 KB）但在后续阶段 **SIGABRT（exit 134）**——单文件全组件规模的上限，登记为阶段 2 规模风险（§5），不影响小文件路径成立。
+- 对照实验：react_counter.sax → 全链路 PASS（app.wasm + airlock.js + index.html + app.sa）。mui 全组件 demo（mui_all_components_from_library.sax，153 组件单文件）→ app.sa 完整生成（7,943,594 B）后在 FFI 包装阶段以 **trap UnknownRegister（trap_code 1007）** 终止：生成 app.sa 第 9070 行 `@ffi_wrapper sax_muiallcomponents_init_ffi()` 内 `node_282 = call @sax_searchicon_mount(slot_281)` 的 callee 未声明——mui 库在全组件规模下 SearchIcon 图标挂载符号缺失，属库侧符号声明完整性问题，不是规模/内存上限（本条为构建最终输出的更正，取代中途半成品 app.sa 得出的 SIGABRT 形态），不影响小文件路径成立。
 - 试件原稿 FAIL（钉死）：`sa react check` 同报 UnexpectedToken——与路线一同因：定义式根节点不是 `<Component name="…">` 形，解析期即止步，尚未及 MUI 解析。
 
 ### 3.3 适配探针：同一文件的 react 形态重写（/tmp 留存，未动 bulk 原稿）
@@ -146,7 +146,7 @@
 4. **嵌套配置对象状态约定**：以 JSON 对象 state + 补丁函数的标准形承接 TSX 的 `useState(对象)` + 不可变更新（CXU 前端通式，非本文件独有）。
 5. **state 释放行生成**：转换器机械 emit（纪律已实测，非桥面缺口，但工具必须做）。
 6. **airlock 流式负载验证**：就绪度页原判保留——ChatPanel 级流式转录渲染在 wasm/airlock 下的吞吐与增量更新行为未验，阶段 2 早期必须做负载探针（本线未做）。
-7. **规模上限排查**：mui 全组件 demo 在 app.sa 生成后 SIGABRT 的定位（153 组件单文件）——真实文件达不到此规模，但需确认上限与文件大小的关系。
+7. **mui 库图标挂载符号声明完整性排查**：mui_all_components 对照的最终失败形态为 app.sa 完整生成（7,943,594 B）后 FFI 包装阶段 trap UnknownRegister（1007）、`@sax_searchicon_mount` 未声明（生成 app.sa 第 9070 行，源出 demo 的 SearchIcon 用法）——需排查 mui 库图标挂载符号哪些有 mount 声明、哪些缺失。
 8. （宿主侧，已知接缝）sax sap.json 补 kind/language_extensions 使 `sa check` 可按扩展名分发——属插件清单修订，非本线改动范围。
 
 ---
