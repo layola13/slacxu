@@ -8,6 +8,16 @@
 // as a hand matcher over bytes, in source order, with the source's
 // guidance literals preserved verbatim. Approximations are noted
 // per rule where a pattern has no exact hand form.
+//
+// Audit fixes (2026-10-27, see _defects/FIX_INTERCEPTION_AUDIT.md):
+// truncation on the inspection path is now fail-closed (the StrOut
+// overflow flag below; build_full_cmd / interceptSaVmRequest), the
+// whitespace helpers share one ASCII \s set (intc_is_space), and
+// several matchers were tightened to the source forms (rules 2, 3,
+// 4, 5, 6, 13, 14, 18, 19). One deliberate deviation from the
+// source: a command longer than the inspection buffer is denied
+// with an explicit reason instead of being inspected partially
+// (the source uses unbounded strings and has no such case).
 
 @import "saVmPolicy.sla"
 @import "sa_std/string.sa"
@@ -20,6 +30,10 @@ struct StrOut {
     bytes: [u8; 2048],
     len: u64,
     has: bool,
+    // Set when a write had to drop bytes at the 2048 cap. Callers
+    // on judgment paths must treat overflow as fail-closed (see
+    // interceptSaVmRequest's direct-command branch).
+    overflow: bool,
 }
 
 // SaVmScriptLanguage = "python" | "javascript" | "bun" — string union
@@ -73,6 +87,7 @@ fn intc_out_lit(out: &StrOut, lit_ptr: ptr, lit_len: u64) -> void {
     PTR_BYTE_ADD(dst, &out.bytes, 0);
     let n = lit_len;
     if n > 2048 { n = 2048; };
+    out.overflow = lit_len > 2048;
     let i: u64 = 0;
     while i < n {
         let wp: ptr = PTR_NULL();
@@ -88,7 +103,7 @@ fn intc_out_append(out: &StrOut, src: ptr, n: u64) -> void {
     PTR_BYTE_ADD(dst, &out.bytes, 0);
     let i: u64 = 0;
     while i < n {
-        if out.len >= 2048 { return; };
+        if out.len >= 2048 { out.overflow = true; return; };
         let wp: ptr = PTR_NULL();
         PTR_BYTE_ADD(wp, dst, out.len);
         PTR_WRITE_U8(wp, intc_byte(src, i));
@@ -157,10 +172,17 @@ fn intc_word_ci(p: ptr, n: u64, w_ptr: ptr, w_len: u64) -> bool {
     return false;
 }
 
+// The ASCII \s set of the source patterns (JS \s also covers
+// unicode spaces; this byte-level matcher covers the ASCII subset,
+// the same documented limitation as the rest of this unit).
+fn intc_is_space(b: u8) -> bool {
+    return b == 32 || b == 9 || b == 10 || b == 11 || b == 12 || b == 13;
+}
+
 // The (?:^|["'\s;&|()]) prefix class of the source patterns: start of
 // text or one of " ' whitespace ; & | ( ) before the token.
 fn intc_prefix_class(b: u8) -> bool {
-    return b == 34 || b == 39 || b == 32 || b == 9 || b == 10 || b == 13 || b == 59 || b == 38 || b == 124 || b == 40 || b == 41;
+    return b == 34 || b == 39 || intc_is_space(b) || b == 59 || b == 38 || b == 124 || b == 40 || b == 41;
 }
 
 // Prefix-boundary word find: (?:^|["'\s;&|()])\bWORD\b (ci).
@@ -207,7 +229,7 @@ fn intc_pword_term_ci(p: ptr, n: u64, w_ptr: ptr, w_len: u64) -> bool {
             if ok {
                 if i + w_len >= n { return true; };
                 let t = intc_byte(p, i + w_len);
-                if t == 32 || t == 9 || t == 10 || t == 13 || t == 59 || t == 38 || t == 124 || t == 40 || t == 41 { return true; };
+                if intc_is_space(t) || t == 59 || t == 38 || t == 124 || t == 40 || t == 41 { return true; };
             };
         };
         i = i + 1;
@@ -323,6 +345,34 @@ fn raw_cmd_node(record: u64) -> u64 {
     if n2 != 0 && sa_json_kind(n2) != 0 { return n2; };
     let n3 = rec_node(record, STR_PTR("argv"), STR_LEN("argv"));
     if n3 != 0 && sa_json_kind(n3) != 0 { return n3; };
+    return 0;
+}
+
+// Node-returning twin of rec_str (string fields only), so callers
+// can measure the FULL string length behind a possibly truncated
+// node_str copy.
+fn rec_str_node(doc: u64, key_ptr: ptr, key_len: u64) -> u64 {
+    let node = rec_node(doc, key_ptr, key_len);
+    if node == 0 { return 0; };
+    if sa_json_kind(node) != 5 { return 0; };
+    return node;
+}
+
+// The same candidate order as classify's rec_str chain:
+// tool / toolName / name / item.tool / item.name.
+fn tool_candidate_node(doc: u64) -> u64 {
+    let n1 = rec_str_node(doc, STR_PTR("tool"), STR_LEN("tool"));
+    if n1 != 0 { return n1; };
+    let n2 = rec_str_node(doc, STR_PTR("toolName"), STR_LEN("toolName"));
+    if n2 != 0 { return n2; };
+    let n3 = rec_str_node(doc, STR_PTR("name"), STR_LEN("name"));
+    if n3 != 0 { return n3; };
+    let item_node = rec_node(doc, STR_PTR("item"), STR_LEN("item"));
+    if item_node != 0 && sa_json_kind(item_node) == 7 {
+        let n4 = rec_str_node(item_node, STR_PTR("tool"), STR_LEN("tool"));
+        if n4 != 0 { return n4; };
+        return rec_str_node(item_node, STR_PTR("name"), STR_LEN("name"));
+    };
     return 0;
 }
 
@@ -479,7 +529,14 @@ fn classifySaVmScriptToolRequest(method_ptr: ptr, method_len: u64, params_doc: u
                 };
                 if is_shell_executable(ep, argv.executable_len) {
                     // fullArgs = parsed.args.join(" ")
-                    let joined = StrOut { bytes: [0u8; 2048], len: 0, has: false };
+                    // (joined is capped at 2048 bytes and records
+                    // the loss in joined.overflow; a script name
+                    // past the cap would be missed here. In
+                    // interceptSaVmRequest every direct command is
+                    // denied anyway, so this cannot become an
+                    // allow there; direct classify consumers
+                    // inherit the caveat — see the audit register.)
+                    let joined = StrOut { bytes: [0u8; 2048], len: 0, has: false, overflow: false };
                     let j: u64 = 0;
                     while j < argv.args.len {
                         if j > 0 { intc_out_append(&joined, STR_PTR(" "), STR_LEN(" ")); };
@@ -516,6 +573,34 @@ fn classifySaVmScriptToolRequest(method_ptr: ptr, method_len: u64, params_doc: u
     if !found { return; };
     let cp: ptr = pol_item_ptr(&cand);
     let lang2 = saVmScriptLanguage(cp, cand.len);
+    if lang2 < 0 {
+        // node_str capped the candidate copy at 1024 bytes; if the
+        // real string is longer, its tail (where the basename of a
+        // path-like tool name lives) was invisible to the check
+        // above. Test the basename slice of the FULL string
+        // instead (saVmScriptLanguage's own normalization caps at
+        // 1024 too, so passing the whole string would still hide a
+        // basename past the cap). Fail-closed for classification;
+        // the executable copied into the request stays the capped
+        // copy — output-side, see the audit register.
+        let cand_node = tool_candidate_node(params_doc);
+        if cand_node != 0 {
+            let csp: ptr = sa_json_string_ptr(cand_node);
+            let csl: u64 = sa_json_string_len(cand_node);
+            if csl > 1024 {
+                let bs: u64 = 0;
+                let bi: u64 = 0;
+                while bi < csl {
+                    let bc = intc_byte(csp, bi);
+                    if bc == 47 || bc == 92 { bs = bi + 1; };
+                    bi = bi + 1;
+                }
+                let bp2: ptr = PTR_NULL();
+                PTR_BYTE_ADD(bp2, csp, bs);
+                lang2 = saVmScriptLanguage(bp2, csl - bs);
+            };
+        };
+    };
     if lang2 >= 0 {
         req_set_executable(out, cp, cand.len);
         out.args_len = 0;
@@ -589,6 +674,281 @@ fn intc_chain3(p: ptr, n: u64, a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64, w
     return intc_word_ci(rest2, n - from2, w_ptr, w_len);
 }
 
+// Prefix test (case-insensitive) without a right boundary: the
+// counterpart of intc_starts_word_ci for source positions that
+// have no \b after the literal (e.g. the .git/<part> names).
+fn intc_starts_ci(p: ptr, n: u64, w_ptr: ptr, w_len: u64) -> bool {
+    if n < w_len { return false; };
+    return intc_eq_ci(p, w_len, w_ptr, w_len);
+}
+
+// Rule 2 helper: token (ci substring, as in the source), then \s*,
+// then '(', then \bgit\b anywhere after. Returns true on a hit.
+fn ap_token_call_git(p: ptr, n: u64, t_ptr: ptr, t_len: u64) -> bool {
+    if t_len == 0 { return false; };
+    let from: u64 = 0;
+    while from + t_len <= n {
+        let rest: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rest, p, from);
+        let at = intc_find_ci(rest, n - from, t_ptr, t_len);
+        if at < 0 { return false; };
+        let i: u64 = from + (at as u64) + t_len;
+        while i < n && intc_is_space(intc_byte(p, i)) { i = i + 1; }
+        if i < n && intc_byte(p, i) == 40 && i + 1 < n {
+            let tail: ptr = PTR_NULL();
+            PTR_BYTE_ADD(tail, p, i + 1);
+            if intc_word_ci(tail, n - i - 1, STR_PTR("git"), STR_LEN("git")) { return true; };
+        };
+        from = from + (at as u64) + 1;
+    }
+    return false;
+}
+
+// Rule 2, python form: python(?:\.exe)?\s+-c[\s\S]*?\bgit\b
+// (the source has no \b before "python").
+fn ap_python_c_git(p: ptr, n: u64) -> bool {
+    let t_len: u64 = STR_LEN("python");
+    let from: u64 = 0;
+    while from + t_len <= n {
+        let rest: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rest, p, from);
+        let at = intc_find_ci(rest, n - from, STR_PTR("python"), STR_LEN("python"));
+        if at < 0 { return false; };
+        let i: u64 = from + (at as u64) + t_len;
+        if i + 4 <= n {
+            let ext: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ext, p, i);
+            if intc_eq_ci(ext, 4, STR_PTR(".exe"), STR_LEN(".exe")) { i = i + 4; };
+        };
+        let spaced: bool = false;
+        while i < n && intc_is_space(intc_byte(p, i)) { i = i + 1; spaced = true; }
+        if spaced && i + 2 <= n && intc_byte(p, i) == 45 && intc_byte(p, i + 1) == 99 && i + 2 < n {
+            let tail: ptr = PTR_NULL();
+            PTR_BYTE_ADD(tail, p, i + 2);
+            if intc_word_ci(tail, n - i - 2, STR_PTR("git"), STR_LEN("git")) { return true; };
+        };
+        from = from + (at as u64) + 1;
+    }
+    return false;
+}
+
+// Rule 2, bun form: \bbun\s+-e[\s\S]*?\bgit\b (no .exe in source).
+fn ap_bun_e_git(p: ptr, n: u64) -> bool {
+    let t_len: u64 = STR_LEN("bun");
+    let from: u64 = 0;
+    while from + t_len <= n {
+        let rest: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rest, p, from);
+        let at = intc_find_ci(rest, n - from, STR_PTR("bun"), STR_LEN("bun"));
+        if at < 0 { return false; };
+        let pos: u64 = from + (at as u64);
+        let left_ok: bool = true;
+        if pos > 0 && intc_is_word(intc_byte(p, pos - 1)) { left_ok = false; };
+        if left_ok {
+            let i: u64 = pos + t_len;
+            let spaced: bool = false;
+            while i < n && intc_is_space(intc_byte(p, i)) { i = i + 1; spaced = true; }
+            if spaced && i + 2 <= n && intc_byte(p, i) == 45 && intc_byte(p, i + 1) == 101 && i + 2 < n {
+                let tail: ptr = PTR_NULL();
+                PTR_BYTE_ADD(tail, p, i + 2);
+                if intc_word_ci(tail, n - i - 2, STR_PTR("git"), STR_LEN("git")) { return true; };
+            };
+        };
+        from = pos + 1;
+    }
+    return false;
+}
+
+// Rule 2 (git repository bypass via code runners / process APIs).
+// The source alternatives all require the call shape: a known
+// process API token immediately (modulo whitespace) followed by
+// '(', or python -c / bun -e, with \bgit\b later. The earlier
+// two_part/chain3 form dropped the '(' and the \s+ requirements
+// and so over-matched (e.g. plain prose mentioning both tokens).
+fn ap_git_bypass(p: ptr, n: u64) -> bool {
+    if ap_token_call_git(p, n, STR_PTR("subprocess"), STR_LEN("subprocess")) { return true; };
+    if ap_token_call_git(p, n, STR_PTR("child_process"), STR_LEN("child_process")) { return true; };
+    if ap_token_call_git(p, n, STR_PTR("execSync"), STR_LEN("execSync")) { return true; };
+    if ap_token_call_git(p, n, STR_PTR("spawnSync"), STR_LEN("spawnSync")) { return true; };
+    if ap_token_call_git(p, n, STR_PTR("Bun.spawnSync"), STR_LEN("Bun.spawnSync")) { return true; };
+    if ap_token_call_git(p, n, STR_PTR("Bun.spawn"), STR_LEN("Bun.spawn")) { return true; };
+    if ap_python_c_git(p, n) { return true; };
+    if ap_bun_e_git(p, n) { return true; };
+    return false;
+}
+
+// Rule 3 (.git internals): the source form is
+// \.git\s*/\s*(HEAD|config|index|refs|objects|FETCH_HEAD) with NO
+// word boundary after the part name. Implemented directly here
+// (the earlier two_part form both over-matched — part word
+// anywhere later — and under-matched — it required a right word
+// boundary the source does not have).
+fn ap_git_internals(p: ptr, n: u64) -> bool {
+    let t_len: u64 = STR_LEN(".git");
+    let from: u64 = 0;
+    while from + t_len <= n {
+        let rest: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rest, p, from);
+        let at = intc_find_ci(rest, n - from, STR_PTR(".git"), STR_LEN(".git"));
+        if at < 0 { return false; };
+        let i: u64 = from + (at as u64) + t_len;
+        while i < n && intc_is_space(intc_byte(p, i)) { i = i + 1; }
+        if i < n && intc_byte(p, i) == 47 {
+            i = i + 1;
+            while i < n && intc_is_space(intc_byte(p, i)) { i = i + 1; }
+            if i < n {
+                let tail: ptr = PTR_NULL();
+                PTR_BYTE_ADD(tail, p, i);
+                let tn: u64 = n - i;
+                if intc_starts_ci(tail, tn, STR_PTR("HEAD"), STR_LEN("HEAD")) { return true; };
+                if intc_starts_ci(tail, tn, STR_PTR("config"), STR_LEN("config")) { return true; };
+                if intc_starts_ci(tail, tn, STR_PTR("index"), STR_LEN("index")) { return true; };
+                if intc_starts_ci(tail, tn, STR_PTR("refs"), STR_LEN("refs")) { return true; };
+                if intc_starts_ci(tail, tn, STR_PTR("objects"), STR_LEN("objects")) { return true; };
+                if intc_starts_ci(tail, tn, STR_PTR("FETCH_HEAD"), STR_LEN("FETCH_HEAD")) { return true; };
+            };
+        };
+        from = from + (at as u64) + 1;
+    }
+    return false;
+}
+
+// Rule 4, shell for-in: \bfor\s+\$?[A-Za-z_][A-Za-z0-9_]*\s+in\b
+// (occurrence test with i at the 'f' of a left-bounded "for").
+fn ap_for_in_at(p: ptr, n: u64, i: u64) -> bool {
+    let k: u64 = i + 3;
+    let spaced: bool = false;
+    while k < n && intc_is_space(intc_byte(p, k)) { k = k + 1; spaced = true; }
+    if !spaced || k >= n { return false; };
+    if intc_byte(p, k) == 36 { k = k + 1; };
+    if k >= n { return false; };
+    let c0 = intc_byte(p, k);
+    let ident_start: bool = (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122) || c0 == 95;
+    if !ident_start { return false; };
+    while k < n && intc_is_word(intc_byte(p, k)) { k = k + 1; }
+    let spaced2: bool = false;
+    while k < n && intc_is_space(intc_byte(p, k)) { k = k + 1; spaced2 = true; }
+    if !spaced2 || k + 2 > n { return false; };
+    let rest: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rest, p, k);
+    if !intc_eq_ci(rest, 2, STR_PTR("in"), STR_LEN("in")) { return false; };
+    if k + 2 < n && intc_is_word(intc_byte(p, k + 2)) { return false; };
+    return true;
+}
+
+fn ap_for_in(p: ptr, n: u64) -> bool {
+    if n < 3 { return false; };
+    let i: u64 = 0;
+    while i + 3 <= n {
+        let rest: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rest, p, i);
+        if intc_eq_ci(rest, 3, STR_PTR("for"), STR_LEN("for")) {
+            let left_ok: bool = true;
+            if i > 0 && intc_is_word(intc_byte(p, i - 1)) { left_ok = false; };
+            if left_ok && ap_for_in_at(p, n, i) { return true; };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// Rule 4, pipe-% ForEach alias: \|\s*%[\s{]
+fn ap_pipe_pct(p: ptr, n: u64) -> bool {
+    let i: u64 = 0;
+    while i < n {
+        if intc_byte(p, i) == 124 {
+            let k: u64 = i + 1;
+            while k < n && intc_is_space(intc_byte(p, k)) { k = k + 1; }
+            if k < n && intc_byte(p, k) == 37 && k + 1 < n {
+                let c = intc_byte(p, k + 1);
+                if intc_is_space(c) || c == 123 { return true; };
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// Rule 6 (cmd wrapper): the source form is the anchored
+// prefix-class form cmd(?:\.exe)?\s+\/[ck]\b — not the plain \b
+// adjacency the earlier word_ws_lit call tested.
+fn ap_cmd_wrapper(p: ptr, n: u64) -> bool {
+    let e = intc_pword_end(p, n, STR_PTR("cmd"), STR_LEN("cmd"), true);
+    if e < 0 { return false; };
+    let i: u64 = e as u64;
+    let spaced: bool = false;
+    while i < n && intc_is_space(intc_byte(p, i)) { i = i + 1; spaced = true; }
+    if !spaced || i + 1 >= n { return false; };
+    if intc_byte(p, i) != 47 { return false; };
+    let c = intc_lower(intc_byte(p, i + 1));
+    if c != 99 && c != 107 { return false; };
+    if i + 2 < n && intc_is_word(intc_byte(p, i + 2)) { return false; };
+    return true;
+}
+
+// Rule 13, pipe-? : \|\s*\?(?:\s*\{|\s+(?![\w\$\.]+\s*:)[\$\w\-])
+// A bare "|?" followed by a non-word char is NOT a hit in the
+// source; the ternary-shaped "| ? b :" is excluded by the
+// lookahead. (The earlier pipe_then_word("?") fired on both.)
+fn ap_pipe_question(p: ptr, n: u64) -> bool {
+    let i: u64 = 0;
+    while i < n {
+        if intc_byte(p, i) == 124 {
+            let k: u64 = i + 1;
+            while k < n && intc_is_space(intc_byte(p, k)) { k = k + 1; }
+            if k < n && intc_byte(p, k) == 63 {
+                let m: u64 = k + 1;
+                while m < n && intc_is_space(intc_byte(p, m)) { m = m + 1; }
+                if m < n && intc_byte(p, m) == 123 { return true; };
+                let m2: u64 = k + 1;
+                let spaced: bool = false;
+                while m2 < n && intc_is_space(intc_byte(p, m2)) { m2 = m2 + 1; spaced = true; }
+                if spaced && m2 < n {
+                    let c = intc_byte(p, m2);
+                    if c == 36 || c == 45 || intc_is_word(c) {
+                        let t: u64 = m2;
+                        while t < n {
+                            let tc = intc_byte(p, t);
+                            if !(intc_is_word(tc) || tc == 36 || tc == 46) { break; };
+                            t = t + 1;
+                        }
+                        while t < n && intc_is_space(intc_byte(p, t)) { t = t + 1; }
+                        if t >= n || intc_byte(p, t) != 58 { return true; };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// Rule 13, command-position Where-block:
+// (?:^|["'\s;&|()])\bWhere\s*\{ — covers a leading "Where { ... }"
+// with no pipe and no Where-Object (the source's 4th alternative).
+fn ap_where_brace(p: ptr, n: u64) -> bool {
+    if n < 5 { return false; };
+    let i: u64 = 0;
+    while i + 5 <= n {
+        let pre_ok: bool = false;
+        if i == 0 { pre_ok = true; };
+        if i > 0 && intc_prefix_class(intc_byte(p, i - 1)) { pre_ok = true; };
+        if pre_ok {
+            let rest: ptr = PTR_NULL();
+            PTR_BYTE_ADD(rest, p, i);
+            if intc_eq_ci(rest, 5, STR_PTR("Where"), STR_LEN("Where")) {
+                let k: u64 = i + 5;
+                if k >= n || !intc_is_word(intc_byte(p, k)) {
+                    while k < n && intc_is_space(intc_byte(p, k)) { k = k + 1; }
+                    if k < n && intc_byte(p, k) == 123 { return true; };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
 // After a word occurrence of W (ci, \b), the next non-space char is
 // one of the given set — for `for [%/(]` shapes.
 fn intc_word_then_char(p: ptr, n: u64, w_ptr: ptr, w_len: u64, c1: u8, c2: u8, c3: u8) -> bool {
@@ -608,7 +968,7 @@ fn intc_word_then_char(p: ptr, n: u64, w_ptr: ptr, w_len: u64, c1: u8, c2: u8, c
             if i + w_len < n && intc_is_word(intc_byte(p, i + w_len)) { right_ok = false; };
             if left_ok && right_ok {
                 let k: u64 = i + w_len;
-                while k < n && (intc_byte(p, k) == 32 || intc_byte(p, k) == 9) { k = k + 1; }
+                while k < n && intc_is_space(intc_byte(p, k)) { k = k + 1; }
                 if k < n {
                     let c = intc_byte(p, k);
                     if c == c1 || c == c2 || c == c3 { return true; };
@@ -626,7 +986,7 @@ fn intc_semi_then_word(p: ptr, n: u64) -> bool {
     while i < n {
         if intc_byte(p, i) == 59 {
             let k: u64 = i + 1;
-            while k < n && (intc_byte(p, k) == 32 || intc_byte(p, k) == 9) { k = k + 1; }
+            while k < n && intc_is_space(intc_byte(p, k)) { k = k + 1; }
             if k < n {
                 let rest: ptr = PTR_NULL();
                 PTR_BYTE_ADD(rest, p, k);
@@ -649,7 +1009,7 @@ fn intc_pipe_then_word(p: ptr, n: u64, w_ptr: ptr, w_len: u64) -> bool {
     while i < n {
         if intc_byte(p, i) == 124 {
             let k: u64 = i + 1;
-            while k < n && (intc_byte(p, k) == 32 || intc_byte(p, k) == 9) { k = k + 1; }
+            while k < n && intc_is_space(intc_byte(p, k)) { k = k + 1; }
             if k + w_len <= n {
                 let rest: ptr = PTR_NULL();
                 PTR_BYTE_ADD(rest, p, k);
@@ -683,7 +1043,7 @@ fn intc_word_ws_lit(p: ptr, n: u64, w_ptr: ptr, w_len: u64, lit_ptr: ptr, lit_le
             if left_ok {
                 let k: u64 = i + w_len;
                 let spaced: bool = false;
-                while k < n && (intc_byte(p, k) == 32 || intc_byte(p, k) == 9) { k = k + 1; spaced = true; }
+                while k < n && intc_is_space(intc_byte(p, k)) { k = k + 1; spaced = true; }
                 if spaced && k + lit_len <= n {
                     let rest: ptr = PTR_NULL();
                     PTR_BYTE_ADD(rest, p, k);
@@ -709,30 +1069,21 @@ fn detectPowerShellAntiPattern(cmd_ptr: ptr, cmd_len: u64, out: &StrOut) -> void
         if ap_hit(out, STR_PTR("Tool 'vm-read' does not exist; use sa_vm_run({ action: 'read_lines', path: '...' }) for line ranges or sa_vm_run({ action: 'read_file', path: '...' }) for complete files."), STR_LEN("Tool 'vm-read' does not exist; use sa_vm_run({ action: 'read_lines', path: '...' }) for line ranges or sa_vm_run({ action: 'read_file', path: '...' }) for complete files.")) { return; };
     };
     // 2. git via subprocess / child_process / Bun.spawn / python -c / bun -e
-    if intc_two_part(cmd_ptr, cmd_len, STR_PTR("subprocess"), STR_LEN("subprocess"), STR_PTR("git"), STR_LEN("git"))
-        || intc_two_part(cmd_ptr, cmd_len, STR_PTR("child_process"), STR_LEN("child_process"), STR_PTR("git"), STR_LEN("git"))
-        || intc_two_part(cmd_ptr, cmd_len, STR_PTR("execSync"), STR_LEN("execSync"), STR_PTR("git"), STR_LEN("git"))
-        || intc_two_part(cmd_ptr, cmd_len, STR_PTR("spawnSync"), STR_LEN("spawnSync"), STR_PTR("git"), STR_LEN("git"))
-        || intc_two_part(cmd_ptr, cmd_len, STR_PTR("Bun.spawn"), STR_LEN("Bun.spawn"), STR_PTR("git"), STR_LEN("git"))
-        || intc_chain3(cmd_ptr, cmd_len, STR_PTR("python"), STR_LEN("python"), STR_PTR("-c"), STR_LEN("-c"), STR_PTR("git"), STR_LEN("git"))
-        || intc_chain3(cmd_ptr, cmd_len, STR_PTR("bun"), STR_LEN("bun"), STR_PTR("-e"), STR_LEN("-e"), STR_PTR("git"), STR_LEN("git")) {
+    if ap_git_bypass(cmd_ptr, cmd_len) {
         if ap_hit(out, STR_PTR("Bypassing git via 'python -c subprocess(git)' / 'bun -e Bun.spawnSync(git)' / temp scripts is prohibited; call sa_vm_run({ action: 'git_status' }) or sa_vm_run({ action: 'git_diff' }) instead."), STR_LEN("Bypassing git via 'python -c subprocess(git)' / 'bun -e Bun.spawnSync(git)' / temp scripts is prohibited; call sa_vm_run({ action: 'git_status' }) or sa_vm_run({ action: 'git_diff' }) instead.")) { return; };
     };
     // 3. .git/<part> internals
-    if intc_two_part(cmd_ptr, cmd_len, STR_PTR(".git"), STR_LEN(".git"), STR_PTR("HEAD"), STR_LEN("HEAD"))
-        || intc_two_part(cmd_ptr, cmd_len, STR_PTR(".git"), STR_LEN(".git"), STR_PTR("config"), STR_LEN("config"))
-        || intc_two_part(cmd_ptr, cmd_len, STR_PTR(".git"), STR_LEN(".git"), STR_PTR("index"), STR_LEN("index"))
-        || intc_two_part(cmd_ptr, cmd_len, STR_PTR(".git"), STR_LEN(".git"), STR_PTR("refs"), STR_LEN("refs"))
-        || intc_two_part(cmd_ptr, cmd_len, STR_PTR(".git"), STR_LEN(".git"), STR_PTR("objects"), STR_LEN("objects"))
-        || intc_two_part(cmd_ptr, cmd_len, STR_PTR(".git"), STR_LEN(".git"), STR_PTR("FETCH_HEAD"), STR_LEN("FETCH_HEAD")) {
-        // Note: the source pattern requires .git\s*/\s*<part>; two_part
-        // is the documented approximation (any later word occurrence).
+    if ap_git_internals(cmd_ptr, cmd_len) {
+        // ap_git_internals implements the source form
+        // .git\s*/\s*<part> directly (see its comment).
         if ap_hit(out, STR_PTR("Reading '.git/*' internals directly is prohibited; use sa_vm_run({ action: 'git_status' }) for branch/state or sa_vm_run({ action: 'git_diff' }) for changes."), STR_LEN("Reading '.git/*' internals directly is prohibited; use sa_vm_run({ action: 'git_status' }) for branch/state or sa_vm_run({ action: 'git_diff' }) for changes.")) { return; };
     };
     // 4. for / foreach loops
     if intc_word_then_char(cmd_ptr, cmd_len, STR_PTR("for"), STR_LEN("for"), 37, 47, 40)
+        || ap_for_in(cmd_ptr, cmd_len)
         || intc_word_ci(cmd_ptr, cmd_len, STR_PTR("foreach"), STR_LEN("foreach"))
-        || intc_word_ci(cmd_ptr, cmd_len, STR_PTR("ForEach-Object"), STR_LEN("ForEach-Object")) {
+        || intc_word_ci(cmd_ptr, cmd_len, STR_PTR("ForEach-Object"), STR_LEN("ForEach-Object"))
+        || ap_pipe_pct(cmd_ptr, cmd_len) {
         if ap_hit(out, STR_PTR("Batch loops via 'for / foreach / ForEach-Object' are prohibited in the shell: loop pipelines cause quoting collapse and encoding damage. For batch search use sa_vm_run({ action: 'grep_search', pattern: '*.ext', query: '...' }) or sa_vm_run({ action: 'grep_search_async', queries: [...] }); for batch writes use parallel: [{ action: 'edit_file', ... }]."), STR_LEN("Batch loops via 'for / foreach / ForEach-Object' are prohibited in the shell: loop pipelines cause quoting collapse and encoding damage. For batch search use sa_vm_run({ action: 'grep_search', pattern: '*.ext', query: '...' }) or sa_vm_run({ action: 'grep_search_async', queries: [...] }); for batch writes use parallel: [{ action: 'edit_file', ... }].")) { return; };
     };
     // 5. ';'-chained file ops
@@ -742,10 +1093,7 @@ fn detectPowerShellAntiPattern(cmd_ptr: ptr, cmd_len: u64, out: &StrOut) -> void
         if ap_hit(out, STR_PTR("Chaining multiple commands with ';' combining file operations and execution is prohibited. Follow the 3-step recipe: 1. sa_vm_run write_file -> 2. single host compile/test command -> 3. sa_vm_run read_lines/read_file_tail."), STR_LEN("Chaining multiple commands with ';' combining file operations and execution is prohibited. Follow the 3-step recipe: 1. sa_vm_run write_file -> 2. single host compile/test command -> 3. sa_vm_run read_lines/read_file_tail.")) { return; };
     };
     // 6. cmd /c wrapper
-    if intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("cmd"), STR_LEN("cmd"), STR_PTR("/c"), STR_LEN("/c"))
-        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("cmd"), STR_LEN("cmd"), STR_PTR("/k"), STR_LEN("/k"))
-        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("cmd.exe"), STR_LEN("cmd.exe"), STR_PTR("/c"), STR_LEN("/c"))
-        || intc_word_ws_lit(cmd_ptr, cmd_len, STR_PTR("cmd.exe"), STR_LEN("cmd.exe"), STR_PTR("/k"), STR_LEN("/k")) {
+    if ap_cmd_wrapper(cmd_ptr, cmd_len) {
         if ap_hit(out, STR_PTR("Wrapping commands with 'cmd /c' is prohibited. Direct binary invocation must use sa_vm_run({ action: 'run_host', exe: '...', args: [...] }); execute binaries directly without shell wrappers."), STR_LEN("Wrapping commands with 'cmd /c' is prohibited. Direct binary invocation must use sa_vm_run({ action: 'run_host', exe: '...', args: [...] }); execute binaries directly without shell wrappers.")) { return; };
     };
     // 7. cd / Set-Location / pushd / chdir
@@ -799,7 +1147,8 @@ fn detectPowerShellAntiPattern(cmd_ptr: ptr, cmd_len: u64, out: &StrOut) -> void
     if !(intc_word_ci(cmd_ptr, cmd_len, STR_PTR("Get-ChildItem"), STR_LEN("Get-ChildItem")) || intc_word_ci(cmd_ptr, cmd_len, STR_PTR("gci"), STR_LEN("gci"))) {
         if intc_word_ci(cmd_ptr, cmd_len, STR_PTR("Where-Object"), STR_LEN("Where-Object"))
             || intc_pipe_then_word(cmd_ptr, cmd_len, STR_PTR("Where"), STR_LEN("Where"))
-            || intc_pipe_then_word(cmd_ptr, cmd_len, STR_PTR("?"), STR_LEN("?")) {
+            || ap_pipe_question(cmd_ptr, cmd_len)
+            || ap_where_brace(cmd_ptr, cmd_len) {
             if ap_hit(out, STR_PTR("Pipeline filtering via 'Where-Object / Where / ?' is prohibited; use sa_vm_run({ action: 'find_files', pattern: '*xyz*', path_pattern: '...' }) for name filtering or sa_vm_run({ action: 'grep_search', query: '...' }) for content filtering."), STR_LEN("Pipeline filtering via 'Where-Object / Where / ?' is prohibited; use sa_vm_run({ action: 'find_files', pattern: '*xyz*', path_pattern: '...' }) for name filtering or sa_vm_run({ action: 'grep_search', query: '...' }) for content filtering.")) { return; };
         };
     };
@@ -935,88 +1284,27 @@ fn intc_pword_end(p: ptr, n: u64, w_ptr: ptr, w_len: u64, allow_exe: bool) -> i6
     return -1;
 }
 
+// \b<word>\b followed (anywhere later) by ';'. Every bounded
+// occurrence is tried: the source needs only one such pair, so
+// stopping at the first occurrence (as the earlier version did)
+// missed commands whose first mention is not the ';'-chained one.
 fn ap_word_then_semi(p: ptr, n: u64, w_ptr: ptr, w_len: u64) -> bool {
-    let at = intc_find_ci(p, n, w_ptr, w_len);
-    if at < 0 { return false; };
-    let from: u64 = (at as u64) + w_len;
-    let i: u64 = from;
-    while i < n {
-        if intc_byte(p, i) == 59 { return true; };
-        i = i + 1;
-    }
-    return false;
-}
-
-fn ap_where_with_arg(p: ptr, n: u64) -> bool {
-    let end = intc_pword_end(p, n, STR_PTR("where"), STR_LEN("where"), false);
-    if end < 0 { return false; };
-    let i: u64 = end as u64;
-    let spaced: bool = false;
-    while i < n && (intc_byte(p, i) == 32 || intc_byte(p, i) == 9) { i = i + 1; spaced = true; }
-    if !spaced || i >= n { return false; };
-    let c0 = intc_byte(p, i);
-    if c0 == 123 || c0 == 36 { return false; };
-    // token = run of non-space chars, compared lowercased to the
-    // source's negative lookahead list.
-    let tok = StrItem { bytes: [0u8; 1024], len: 0 };
-    let tp: ptr = pol_item_ptr(&tok);
-    while i < n {
-        let c = intc_byte(p, i);
-        if c == 32 || c == 9 || c == 10 || c == 13 { break; };
-        if tok.len < 1024 {
-            let wp: ptr = PTR_NULL();
-            PTR_BYTE_ADD(wp, tp, tok.len);
-            PTR_WRITE_U8(wp, intc_lower(c));
-            tok.len = tok.len + 1;
-        };
-        i = i + 1;
-    }
-    if tok.len == 0 { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("is"), STR_LEN("is")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("are"), STR_LEN("are")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("was"), STR_LEN("was")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("were"), STR_LEN("were")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("the"), STR_LEN("the")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("do"), STR_LEN("do")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("does"), STR_LEN("does")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("did"), STR_LEN("did")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("can"), STR_LEN("can")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("could"), STR_LEN("could")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("should"), STR_LEN("should")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("would"), STR_LEN("would")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("to"), STR_LEN("to")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("from"), STR_LEN("from")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("in"), STR_LEN("in")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("at"), STR_LEN("at")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("for"), STR_LEN("for")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("with"), STR_LEN("with")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("about"), STR_LEN("about")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("and"), STR_LEN("and")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("or"), STR_LEN("or")) { return false; };
-    if intc_eq_ci(tp, tok.len, STR_PTR("not"), STR_LEN("not")) { return false; };
-    return true;
-}
-
-fn ap_find_with_flags(p: ptr, n: u64) -> bool {
-    let end = intc_pword_end(p, n, STR_PTR("find"), STR_LEN("find"), true);
-    if end < 0 { return false; };
-    let i: u64 = end as u64;
-    while i < n {
-        let c = intc_byte(p, i);
-        if c == 59 || c == 38 || c == 124 || c == 10 { return false; };
-        if c == 32 || c == 9 {
-            // look for -name/-iname/-path/-type/-not/-exec
-            let k: u64 = i + 1;
-            if k < n && intc_byte(p, k) == 45 {
-                let rest: ptr = PTR_NULL();
-                PTR_BYTE_ADD(rest, p, k + 1);
-                let rn: u64 = n - k - 1;
-                if intc_starts_word_ci(rest, rn, STR_PTR("name"), STR_LEN("name")) { return true; };
-                if intc_starts_word_ci(rest, rn, STR_PTR("iname"), STR_LEN("iname")) { return true; };
-                if intc_starts_word_ci(rest, rn, STR_PTR("path"), STR_LEN("path")) { return true; };
-                if intc_starts_word_ci(rest, rn, STR_PTR("type"), STR_LEN("type")) { return true; };
-                if intc_starts_word_ci(rest, rn, STR_PTR("not"), STR_LEN("not")) { return true; };
-                if intc_starts_word_ci(rest, rn, STR_PTR("exec"), STR_LEN("exec")) { return true; };
+    if w_len == 0 || n < w_len { return false; };
+    let i: u64 = 0;
+    while i + w_len <= n {
+        let rest: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rest, p, i);
+        if intc_eq_ci(rest, w_len, w_ptr, w_len) {
+            let left_ok: bool = true;
+            if i > 0 && intc_is_word(intc_byte(p, i - 1)) { left_ok = false; };
+            let right_ok: bool = true;
+            if i + w_len < n && intc_is_word(intc_byte(p, i + w_len)) { right_ok = false; };
+            if left_ok && right_ok {
+                let k: u64 = i + w_len;
+                while k < n {
+                    if intc_byte(p, k) == 59 { return true; };
+                    k = k + 1;
+                }
             };
         };
         i = i + 1;
@@ -1024,24 +1312,138 @@ fn ap_find_with_flags(p: ptr, n: u64) -> bool {
     return false;
 }
 
+
+fn ap_where_with_arg(p: ptr, n: u64) -> bool {
+    let end = intc_pword_end(p, n, STR_PTR("where"), STR_LEN("where"), false);
+    if end < 0 { return false; };
+    let i: u64 = end as u64;
+    let spaced: bool = false;
+    while i < n && intc_is_space(intc_byte(p, i)) { i = i + 1; spaced = true; }
+    if !spaced || i >= n { return false; };
+    let c0 = intc_byte(p, i);
+    if c0 == 123 || c0 == 36 { return false; };
+    // The source's negative lookahead is
+    //   (?!(?:is|are|...|not)\b|\{|\$)
+    // i.e. the following argument is excluded when its LEADING WORD
+    // is a stop word followed by a word boundary. Compare the
+    // leading [A-Za-z0-9_] run, lowercased, against the list (the
+    // list itself is complete vs the source — all 21 words). The
+    // earlier version compared the whole whitespace-delimited
+    // token, so "where is, the file" (token "is,") wrongly fired;
+    // the run form also matches the source for "isx" (run "isx"
+    // is not a stop word, so it still fires).
+    let run = StrItem { bytes: [0u8; 1024], len: 0 };
+    let rp: ptr = pol_item_ptr(&run);
+    let k: u64 = i;
+    while k < n && intc_is_word(intc_byte(p, k)) {
+        if run.len < 1024 {
+            let wp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(wp, rp, run.len);
+            PTR_WRITE_U8(wp, intc_lower(intc_byte(p, k)));
+            run.len = run.len + 1;
+        };
+        k = k + 1;
+    }
+    if run.len == 0 { return true; };
+    if intc_eq_ci(rp, run.len, STR_PTR("is"), STR_LEN("is")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("are"), STR_LEN("are")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("was"), STR_LEN("was")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("were"), STR_LEN("were")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("the"), STR_LEN("the")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("do"), STR_LEN("do")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("does"), STR_LEN("does")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("did"), STR_LEN("did")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("can"), STR_LEN("can")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("could"), STR_LEN("could")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("should"), STR_LEN("should")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("would"), STR_LEN("would")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("to"), STR_LEN("to")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("from"), STR_LEN("from")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("in"), STR_LEN("in")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("at"), STR_LEN("at")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("for"), STR_LEN("for")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("with"), STR_LEN("with")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("about"), STR_LEN("about")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("and"), STR_LEN("and")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("or"), STR_LEN("or")) { return false; };
+    if intc_eq_ci(rp, run.len, STR_PTR("not"), STR_LEN("not")) { return false; };
+    return true;
+}
+
+
+// Flag word test for the find rule: one of
+// name|iname|path|type|not|exec at off, with the source's \b.
+fn ap_find_flag_at(p: ptr, n: u64, off: u64) -> bool {
+    if off >= n { return false; };
+    let rest: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rest, p, off);
+    let rn: u64 = n - off;
+    if intc_starts_word_ci(rest, rn, STR_PTR("name"), STR_LEN("name")) { return true; };
+    if intc_starts_word_ci(rest, rn, STR_PTR("iname"), STR_LEN("iname")) { return true; };
+    if intc_starts_word_ci(rest, rn, STR_PTR("path"), STR_LEN("path")) { return true; };
+    if intc_starts_word_ci(rest, rn, STR_PTR("type"), STR_LEN("type")) { return true; };
+    if intc_starts_word_ci(rest, rn, STR_PTR("not"), STR_LEN("not")) { return true; };
+    if intc_starts_word_ci(rest, rn, STR_PTR("exec"), STR_LEN("exec")) { return true; };
+    return false;
+}
+
+// Source: find(?:\.exe)?\s+[^;&|\r\n]*\s-(name|iname|path|type|not|exec)\b
+// The \s+ after find is consumed first (it may itself contain
+// \r\n); the segment scan that follows excludes ; & | \r \n, and
+// the flag's '-' needs its own preceding whitespace inside (or
+// right after) the segment. A single whitespace straight before
+// '-' ("find -name") does NOT match in the source: the \s+ and
+// the \s- cannot share one char; with a run of >= 2 the last
+// whitespace serves as the \s- (backtrack case below).
+fn ap_find_with_flags(p: ptr, n: u64) -> bool {
+    let end = intc_pword_end(p, n, STR_PTR("find"), STR_LEN("find"), true);
+    if end < 0 { return false; };
+    let i: u64 = end as u64;
+    let run_end: u64 = i;
+    while run_end < n && intc_is_space(intc_byte(p, run_end)) { run_end = run_end + 1; }
+    if run_end == i { return false; };
+    if run_end - i >= 2 && run_end < n && intc_byte(p, run_end) == 45 {
+        if ap_find_flag_at(p, n, run_end + 1) { return true; };
+    };
+    let k: u64 = run_end;
+    while k < n {
+        let c = intc_byte(p, k);
+        if c == 59 || c == 38 || c == 124 || c == 10 || c == 13 { return false; };
+        if c == 45 && k > run_end && intc_is_space(intc_byte(p, k - 1)) {
+            if ap_find_flag_at(p, n, k + 1) { return true; };
+        };
+        k = k + 1;
+    }
+    return false;
+}
+
 fn ap_head_tail(p: ptr, n: u64) -> bool {
     if intc_pipe_then_word(p, n, STR_PTR("head"), STR_LEN("head")) { return true; };
     if intc_pipe_then_word(p, n, STR_PTR("tail"), STR_LEN("tail")) { return true; };
-    // prefix form: word + \s+ (the source's third alternative), or
-    // the -N / --lines forms — all begin with whitespace after the
-    // word (and optional .exe), which the \s+ alternative subsumes.
+    if intc_pipe_then_word(p, n, STR_PTR("head.exe"), STR_LEN("head.exe")) { return true; };
+    if intc_pipe_then_word(p, n, STR_PTR("tail.exe"), STR_LEN("tail.exe")) { return true; };
+    // Prefix form. The source alternative is
+    //   prefix (head|tail)(?:\.exe)? \b
+    //     (?:\s+-[A-Za-z]*\d+ | \s+--(?:lines|bytes)(?:=|\s+) | \s+)
+    // Its third branch is a bare \s+, so EVERY whitespace-followed
+    // form fires: `head -5`, `head -n 5`, `head --lines=5` and
+    // `head file` are indistinguishable to the detector, exactly
+    // as in the source, which never parses the numeric argument.
+    // This is detection-level equivalence only — the matcher
+    // checks "word followed by whitespace", nothing more; it is
+    // not an argument-level equivalence. A bare `head`/`tail` at
+    // end of input fires in neither implementation.
     let e1 = intc_pword_end(p, n, STR_PTR("head"), STR_LEN("head"), true);
     if e1 >= 0 && (e1 as u64) < n {
-        let c = intc_byte(p, e1 as u64);
-        if c == 32 || c == 9 { return true; };
+        if intc_is_space(intc_byte(p, e1 as u64)) { return true; };
     };
     let e2 = intc_pword_end(p, n, STR_PTR("tail"), STR_LEN("tail"), true);
     if e2 >= 0 && (e2 as u64) < n {
-        let c = intc_byte(p, e2 as u64);
-        if c == 32 || c == 9 { return true; };
+        if intc_is_space(intc_byte(p, e2 as u64)) { return true; };
     };
     return false;
 }
+
 
 fn ap_select_first_last(p: ptr, n: u64) -> bool {
     let e1 = intc_pword_end(p, n, STR_PTR("Select-Object"), STR_LEN("Select-Object"), false);
@@ -1050,8 +1452,13 @@ fn ap_select_first_last(p: ptr, n: u64) -> bool {
     if start < 0 { start = e2; };
     if start < 0 { return false; };
     let i: u64 = start as u64;
+    // The source requires \s+ between the command word and the
+    // first flag, so "Select-First" does not fire.
+    let lead_spaced: bool = false;
+    while i < n && intc_is_space(intc_byte(p, i)) { i = i + 1; lead_spaced = true; }
+    if !lead_spaced { return false; };
     while i < n {
-        while i < n && (intc_byte(p, i) == 32 || intc_byte(p, i) == 9) { i = i + 1; }
+        while i < n && intc_is_space(intc_byte(p, i)) { i = i + 1; }
         if i >= n || intc_byte(p, i) != 45 { return false; };
         // flag token: -[A-Za-z]+
         let fs: u64 = i + 1;
@@ -1066,8 +1473,13 @@ fn ap_select_first_last(p: ptr, n: u64) -> bool {
             let fp: ptr = PTR_NULL();
             PTR_BYTE_ADD(fp, p, fs);
             let fl: u64 = fe - fs;
-            if intc_eq_ci(fp, fl, STR_PTR("First"), STR_LEN("First")) { return true; };
-            if intc_eq_ci(fp, fl, STR_PTR("Last"), STR_LEN("Last")) { return true; };
+            let is_fl: bool = intc_eq_ci(fp, fl, STR_PTR("First"), STR_LEN("First")) || intc_eq_ci(fp, fl, STR_PTR("Last"), STR_LEN("Last"));
+            if is_fl {
+                // Source: -(?:First|Last)\b — a word char right
+                // after the name ("-First5") is not a hit; the
+                // token then counts as an ordinary flag below.
+                if fe >= n || !intc_is_word(intc_byte(p, fe)) { return true; };
+            };
         };
         i = fe;
         // skip a possible flag value token (e.g. -First 5 is terminal;
@@ -1075,7 +1487,7 @@ fn ap_select_first_last(p: ptr, n: u64) -> bool {
         // (?:-[A-Za-z]+\s+)* before -(First|Last), i.e. flag tokens
         // only; a bare value ends the flag run.
         let j: u64 = i;
-        while j < n && (intc_byte(p, j) == 32 || intc_byte(p, j) == 9) { j = j + 1; }
+        while j < n && intc_is_space(intc_byte(p, j)) { j = j + 1; }
         if j < n && intc_byte(p, j) != 45 { return false; };
         i = j;
     }
@@ -1083,18 +1495,32 @@ fn ap_select_first_last(p: ptr, n: u64) -> bool {
 }
 
 fn ap_error_action(p: ptr, n: u64) -> bool {
-    let at = intc_find_ci(p, n, STR_PTR("-ErrorAction"), STR_LEN("-ErrorAction"));
+    // Source left context is (?:^|\s): an occurrence glued to a
+    // word (e.g. "foo-ErrorAction") must not fire; scan for the
+    // first occurrence with a valid left context.
+    let t_len: u64 = STR_LEN("-ErrorAction");
+    let from: u64 = 0;
+    let at: i64 = -1;
+    while from + t_len <= n {
+        let rest: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rest, p, from);
+        let f = intc_find_ci(rest, n - from, STR_PTR("-ErrorAction"), STR_LEN("-ErrorAction"));
+        if f < 0 { break; };
+        let pos: u64 = from + (f as u64);
+        if pos == 0 || intc_is_space(intc_byte(p, pos - 1)) { at = pos as i64; break; };
+        from = pos + 1;
+    }
     if at < 0 { return false; };
-    let i: u64 = (at as u64) + STR_LEN("-ErrorAction");
+    let i: u64 = (at as u64) + t_len;
     let spaced: bool = false;
-    while i < n && (intc_byte(p, i) == 32 || intc_byte(p, i) == 9) { i = i + 1; spaced = true; }
+    while i < n && intc_is_space(intc_byte(p, i)) { i = i + 1; spaced = true; }
     if !spaced || i >= n { return false; };
     let c = intc_byte(p, i);
     if c == 39 || c == 34 { i = i + 1; };
-    let rest: ptr = PTR_NULL();
-    PTR_BYTE_ADD(rest, p, i);
+    let rest2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rest2, p, i);
     let rn: u64 = n - i;
-    if intc_starts_word_ci(rest, rn, STR_PTR("SilentlyContinue"), STR_LEN("SilentlyContinue")) { return true; };
+    if intc_starts_word_ci(rest2, rn, STR_PTR("SilentlyContinue"), STR_LEN("SilentlyContinue")) { return true; };
     if rn >= 1 && intc_byte(p, i) == 48 {
         if rn == 1 || !intc_is_word(intc_byte(p, i + 1)) { return true; };
     };
@@ -1106,7 +1532,7 @@ fn ap_null_redirect(p: ptr, n: u64) -> bool {
     while i < n {
         if intc_byte(p, i) == 62 {
             let k: u64 = i + 1;
-            while k < n && (intc_byte(p, k) == 32 || intc_byte(p, k) == 9) { k = k + 1; }
+            while k < n && intc_is_space(intc_byte(p, k)) { k = k + 1; }
             if k < n && (intc_byte(p, k) == 39 || intc_byte(p, k) == 34) { k = k + 1; };
             if k < n {
                 let rest: ptr = PTR_NULL();
@@ -1144,7 +1570,7 @@ fn ap_redirection(p: ptr, n: u64) -> bool {
             if pre_ok {
                 let k: u64 = i + 1;
                 if k < n && intc_byte(p, k) == 62 { k = k + 1; };
-                while k < n && (intc_byte(p, k) == 32 || intc_byte(p, k) == 9) { k = k + 1; }
+                while k < n && intc_is_space(intc_byte(p, k)) { k = k + 1; }
                 if k < n {
                     let c = intc_byte(p, k);
                     if c != 38 && c != 36 { return true; };
@@ -1166,7 +1592,7 @@ fn ap_runtime_invoke(p: ptr, n: u64) -> bool {
         if e >= 0 {
             let i: u64 = e as u64;
             let spaced: bool = false;
-            while i < n && (intc_byte(p, i) == 32 || intc_byte(p, i) == 9) { i = i + 1; spaced = true; }
+            while i < n && intc_is_space(intc_byte(p, i)) { i = i + 1; spaced = true; }
             if spaced && i < n {
                 // rest of the line
                 let le: u64 = i;
@@ -1320,14 +1746,14 @@ fn interceptSaVmRequest(method_ptr: ptr, method_len: u64, params_doc: u64, input
     };
     // 2. Direct command methods.
     if isSaVmDirectCommandMethod(method_ptr, method_len) {
-        let full = StrOut { bytes: [0u8; 2048], len: 0, has: false };
+        let full = StrOut { bytes: [0u8; 2048], len: 0, has: false, overflow: false };
         build_full_cmd(params_doc, &full);
         let fp: ptr = PTR_NULL();
         PTR_BYTE_ADD(fp, &full.bytes, 0);
-        let anti = StrOut { bytes: [0u8; 2048], len: 0, has: false };
+        let anti = StrOut { bytes: [0u8; 2048], len: 0, has: false, overflow: false };
         detectPowerShellAntiPattern(fp, full.len, &anti);
         if anti.has {
-            let msg = StrOut { bytes: [0u8; 2048], len: 0, has: true };
+            let msg = StrOut { bytes: [0u8; 2048], len: 0, has: true, overflow: false };
             intc_out_append(&msg, STR_PTR("direct host command execution is disabled in SA-VM mode; use sa_vm_run. Prohibited shell anti-pattern detected: "), STR_LEN("direct host command execution is disabled in SA-VM mode; use sa_vm_run. Prohibited shell anti-pattern detected: "));
             let ap: ptr = PTR_NULL();
             PTR_BYTE_ADD(ap, &anti.bytes, 0);
@@ -1338,12 +1764,23 @@ fn interceptSaVmRequest(method_ptr: ptr, method_len: u64, params_doc: u64, input
             dec_set_reason(out, mp, msg.len);
             return;
         };
+        if full.overflow {
+            // Fail-closed (deliberate deviation from the source,
+            // which has unbounded strings): the command exceeded
+            // the 2048-byte inspection buffer, so the anti-pattern
+            // scan above only saw a prefix. Deny — as every direct
+            // command is denied here — but with the explicit
+            // reason instead of silently trusting the partial
+            // scan.
+            dec_deny(out, STR_PTR("direct host command execution is disabled in SA-VM mode; use sa_vm_run (command exceeded the 2048-byte anti-pattern inspection buffer; denied fail-closed)"), STR_LEN("direct host command execution is disabled in SA-VM mode; use sa_vm_run (command exceeded the 2048-byte anti-pattern inspection buffer; denied fail-closed)"));
+            return;
+        };
         dec_deny(out, STR_PTR("direct host command execution is disabled in SA-VM mode; use sa_vm_run"), STR_LEN("direct host command execution is disabled in SA-VM mode; use sa_vm_run"));
         return;
     };
     // 3. Web-search bypass.
     {
-        let text = StrOut { bytes: [0u8; 2048], len: 0, has: false };
+        let text = StrOut { bytes: [0u8; 2048], len: 0, has: false, overflow: false };
         let item = StrItem { bytes: [0u8; 1024], len: 0 };
         if rec_str(params_doc, STR_PTR("query"), STR_LEN("query"), &item) {
             if text.len > 0 { intc_out_append(&text, STR_PTR(" "), STR_LEN(" ")); };

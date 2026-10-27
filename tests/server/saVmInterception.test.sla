@@ -1,0 +1,223 @@
+// Audit regression tests for the 2026-10-27 saVmInterception spot-
+// check fixes (see _defects/FIX_INTERCEPTION_AUDIT.md). This is a
+// NEW supplement to tests/server/saVmInterception.test.ts (the TS
+// suite stays the semantic source); each case below pins one audit
+// finding: fail-closed truncation, the unified \s set, and the
+// detectPowerShellAntiPattern rules re-checked against the TS
+// regexes (rules 2, 3, 4, 5, 6, 13, 14, 17, 18, 19 + spot rules).
+// Assertion form follows the wave-2 conversions: explicit compare
+// + panic(code) on mismatch; codes are unique per assertion.
+// RUN STATUS (2026-10-27): sa check PASS. sa test: the 12 detect
+// groups + the classify group PASS when run without the two
+// intercept groups; the intercept groups make the whole test
+// bundle trap with PhiStateConflict (register tmp_31324, SAB line
+// 106752) — verified byte-identical on the UNPATCHED baseline
+// (a6cfa37) with an equivalent intercept-calling test, i.e. a
+// pre-existing compiler residual in interceptSaVmRequest's call
+// graph (same family as the anthropicBudgetEffort trap), not a
+// regression of the audit fixes. The intercept cases below are
+// kept for when that residual is fixed.
+// PRE-EXISTING ANOMALY (registered, not fixed here): on the
+// baseline, classifySaVmScriptToolRequest's tool-name path does
+// not fire for a short tool name ({"tool":"python.exe"} yields
+// has=false under sa test on baseline and patched trees alike),
+// although saVmScriptLanguage("python.exe") == 0 and rec_str both
+// work standalone. The overlong-name case fixed by this audit
+// routes through the new basename branch and does fire.
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/encoding/json.sai"
+@import "../../backends/vmtool-security/src/security/saVmInterception.sla"
+
+fn t_hit(p: ptr, n: u64, code: u64) {
+    let out = StrOut { bytes: [0u8; 2048], len: 0, has: false, overflow: false };
+    detectPowerShellAntiPattern(p, n, &out);
+    if !out.has { panic(code); };
+}
+
+fn t_null(p: ptr, n: u64, code: u64) {
+    let out = StrOut { bytes: [0u8; 2048], len: 0, has: false, overflow: false };
+    detectPowerShellAntiPattern(p, n, &out);
+    if out.has { panic(code); };
+}
+
+fn t_write(dst: ptr, off: u64, src: ptr, n: u64) -> u64 {
+    let i: u64 = 0;
+    while i < n {
+        let wp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(wp, dst, off + i);
+        PTR_WRITE_U8(wp, intc_byte(src, i));
+        i = i + 1;
+    }
+    return off + n;
+}
+
+fn t_fill(dst: ptr, off: u64, b: u8, count: u64) -> u64 {
+    let i: u64 = 0;
+    while i < count {
+        let wp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(wp, dst, off + i);
+        PTR_WRITE_U8(wp, b);
+        i = i + 1;
+    }
+    return off + count;
+}
+
+@test "audit r4 for-in and pipe-percent forms hit"() {
+    t_hit(STR_PTR("for f in *.zig; do echo $f; done"), STR_LEN("for f in *.zig; do echo $f; done"), 41);
+    t_hit(STR_PTR("zig targets | % { $_ }"), STR_LEN("zig targets | % { $_ }"), 42);
+    t_hit(STR_PTR("for ($i = 0; $i -lt 3; $i++) { echo $i }"), STR_LEN("for ($i = 0; $i -lt 3; $i++) { echo $i }"), 43);
+}
+
+@test "audit r13 where-brace and pipe-question forms"() {
+    t_hit(STR_PTR("Where { $_.Length -gt 2 }"), STR_LEN("Where { $_.Length -gt 2 }"), 44);
+    t_hit(STR_PTR("arr | ? { $_ -gt 1 }"), STR_LEN("arr | ? { $_ -gt 1 }"), 45);
+    t_null(STR_PTR("val = a | ? b : c"), STR_LEN("val = a | ? b : c"), 46);
+    t_null(STR_PTR("flags | ? true : false"), STR_LEN("flags | ? true : false"), 47);
+    t_null(STR_PTR("items.where(x => x > 0)"), STR_LEN("items.where(x => x > 0)"), 48);
+}
+
+@test "audit r14 where stop-word lookahead uses the leading word"() {
+    t_hit(STR_PTR("where sa"), STR_LEN("where sa"), 49);
+    t_null(STR_PTR("where is, the file"), STR_LEN("where is, the file"), 50);
+    t_null(STR_PTR("where is the file"), STR_LEN("where is the file"), 51);
+    t_hit(STR_PTR("where /R C:\\ zig.exe"), STR_LEN("where /R C:\\ zig.exe"), 52);
+}
+
+@test "audit r2 git bypass requires the call shape"() {
+    t_hit(STR_PTR("execSync('git status')"), STR_LEN("execSync('git status')"), 53);
+    t_hit(STR_PTR("python -c \"os.system('git log')\""), STR_LEN("python -c \"os.system('git log')\""), 54);
+    t_null(STR_PTR("the subprocess module can run git commands"), STR_LEN("the subprocess module can run git commands"), 55);
+    t_null(STR_PTR("subprocess is documented; git too"), STR_LEN("subprocess is documented; git too"), 56);
+}
+
+@test "audit r3 git internals requires the slash form"() {
+    t_hit(STR_PTR("cat .git/config"), STR_LEN("cat .git/config"), 57);
+    t_hit(STR_PTR("type .git/configs"), STR_LEN("type .git/configs"), 58);
+    t_null(STR_PTR("the .git folder and its config file"), STR_LEN("the .git folder and its config file"), 59);
+}
+
+@test "audit r5 semicolon rule needs a bounded word"() {
+    t_null(STR_PTR("xGet-Content is nice; really"), STR_LEN("xGet-Content is nice; really"), 60);
+    t_hit(STR_PTR("Get-Content a.txt; Remove-Item b"), STR_LEN("Get-Content a.txt; Remove-Item b"), 61);
+}
+
+@test "audit r6 cmd wrapper requires whitespace before the slash flag"() {
+    t_hit(STR_PTR("cmd /c echo hi"), STR_LEN("cmd /c echo hi"), 62);
+    t_null(STR_PTR("cmd/c echo hi"), STR_LEN("cmd/c echo hi"), 63);
+    t_hit(STR_PTR("cmd.exe /k echo hi"), STR_LEN("cmd.exe /k echo hi"), 64);
+}
+
+@test "audit r17 head tail pipe exe and prefix forms"() {
+    t_hit(STR_PTR("cat build.log | tail.exe -20"), STR_LEN("cat build.log | tail.exe -20"), 65);
+    t_hit(STR_PTR("tail -n 30 build.log"), STR_LEN("tail -n 30 build.log"), 66);
+    t_null(STR_PTR("headless --version"), STR_LEN("headless --version"), 67);
+    t_hit(STR_PTR("Get-Content x | head -5"), STR_LEN("Get-Content x | head -5"), 68);
+}
+
+@test "audit r18 select first last whitespace and boundary"() {
+    t_hit(STR_PTR("Get-Content big.log | Select -First 200"), STR_LEN("Get-Content big.log | Select -First 200"), 69);
+    t_null(STR_PTR("Select-First 5"), STR_LEN("Select-First 5"), 70);
+    t_null(STR_PTR("Select -First5"), STR_LEN("Select -First5"), 71);
+    t_hit(STR_PTR("Select-Object -First 3"), STR_LEN("Select-Object -First 3"), 72);
+}
+
+@test "audit r19 erroraction needs a whitespace left context"() {
+    t_hit(STR_PTR("Get-ChildItem x -ErrorAction SilentlyContinue"), STR_LEN("Get-ChildItem x -ErrorAction SilentlyContinue"), 73);
+    t_null(STR_PTR("foo-ErrorAction SilentlyContinue"), STR_LEN("foo-ErrorAction SilentlyContinue"), 74);
+}
+
+@test "audit whitespace set covers cr lf and vt"() {
+    t_hit(STR_PTR("cd\rC:\\work"), STR_LEN("cd\rC:\\work"), 75);
+    t_hit(STR_PTR("Select\n-First 2"), STR_LEN("Select\n-First 2"), 76);
+    t_hit(STR_PTR("Get-Content\rfoo.txt"), STR_LEN("Get-Content\rfoo.txt"), 78);
+    t_hit(STR_PTR("find\n. -name x"), STR_LEN("find\n. -name x"), 87);
+    // "where" + VT (0x0B) + "zig", built bytewise (no \v literal).
+    let buf: [u8; 64] = [0u8; 64];
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &buf, 0);
+    let off: u64 = 0;
+    off = t_write(bp, off, STR_PTR("where"), STR_LEN("where"));
+    off = t_fill(bp, off, 11, 1);
+    off = t_write(bp, off, STR_PTR("zig"), STR_LEN("zig"));
+    t_hit(bp, off, 77);
+}
+
+@test "audit spot rules stay green"() {
+    t_hit(STR_PTR("Get-ChildItem -Recurse"), STR_LEN("Get-ChildItem -Recurse"), 79);
+    t_hit(STR_PTR("find . -name \"future.sa\""), STR_LEN("find . -name \"future.sa\""), 80);
+    t_null(STR_PTR("find \"text\" file.txt"), STR_LEN("find \"text\" file.txt"), 81);
+    // Source find form is \s+ segment \s-flag: one shared
+    // whitespace cannot serve both, a run of two can (backtrack).
+    t_null(STR_PTR("find -name x"), STR_LEN("find -name x"), 88);
+    t_hit(STR_PTR("find  -name x"), STR_LEN("find  -name x"), 89);
+    t_hit(STR_PTR("run *> $null"), STR_LEN("run *> $null"), 82);
+    t_hit(STR_PTR("Get-Date"), STR_LEN("Get-Date"), 83);
+    t_null(STR_PTR("hello world"), STR_LEN("hello world"), 84);
+    t_hit(STR_PTR("git status"), STR_LEN("git status"), 85);
+    t_null(STR_PTR("node -e 'console.log(a? b: c)'"), STR_LEN("node -e 'console.log(a? b: c)'"), 86);
+}
+
+@test "audit intercept denies overlong direct command fail-closed"() {
+    let buf: [u8; 8192] = [0u8; 8192];
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &buf, 0);
+    let off: u64 = 0;
+    off = t_write(bp, off, STR_PTR("{\"command\":[\"powershell\",\"-Command\",\""), STR_LEN("{\"command\":[\"powershell\",\"-Command\",\""));
+    off = t_fill(bp, off, 97, 2600);
+    off = t_write(bp, off, STR_PTR("\"]}"), STR_LEN("\"]}"));
+    let doc: u64 = sa_json_parse(bp, off);
+    if doc == 0 { panic(91); };
+    let input = InterceptInput { cwd: [0u8; 1024], cwd_len: 0, additionalRoots_doc: 0, policy_doc: 0 };
+    let dec = SaVmInterceptionDecision { action: 0, reason: [0u8; 2048], reason_len: 0, request: SaVmScriptToolRequest { language: -1, executable: [0u8; 1024], executable_len: 0, args: [0u8; 4096], args_len: 0, args_count: 0, reason: [0u8; 128], reason_len: 0 } };
+    interceptSaVmRequest(STR_PTR("command/exec"), STR_LEN("command/exec"), doc, &input, &dec);
+    if dec.action != 1 { panic(11); };
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &dec.reason, 0);
+    if !intc_contains_ci(rp, dec.reason_len, STR_PTR("exceeded the 2048-byte"), STR_LEN("exceeded the 2048-byte")) { panic(12); };
+}
+
+@test "audit intercept short direct command keeps the generic reason"() {
+    let doc: u64 = sa_json_parse(STR_PTR("{\"command\":[\"echo\",\"hello\"]}"), STR_LEN("{\"command\":[\"echo\",\"hello\"]}"));
+    if doc == 0 { panic(92); };
+    let input = InterceptInput { cwd: [0u8; 1024], cwd_len: 0, additionalRoots_doc: 0, policy_doc: 0 };
+    let dec = SaVmInterceptionDecision { action: 0, reason: [0u8; 2048], reason_len: 0, request: SaVmScriptToolRequest { language: -1, executable: [0u8; 1024], executable_len: 0, args: [0u8; 4096], args_len: 0, args_count: 0, reason: [0u8; 128], reason_len: 0 } };
+    interceptSaVmRequest(STR_PTR("command/exec"), STR_LEN("command/exec"), doc, &input, &dec);
+    if dec.action != 1 { panic(13); };
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &dec.reason, 0);
+    if intc_contains_ci(rp, dec.reason_len, STR_PTR("exceeded the 2048-byte"), STR_LEN("exceeded the 2048-byte")) { panic(14); };
+    if !intc_contains_ci(rp, dec.reason_len, STR_PTR("use sa_vm_run"), STR_LEN("use sa_vm_run")) { panic(15); };
+}
+
+@test "audit classify sees the basename of an overlong tool name"() {
+    let buf: [u8; 8192] = [0u8; 8192];
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &buf, 0);
+    let off: u64 = 0;
+    off = t_write(bp, off, STR_PTR("{\"tool\":\""), STR_LEN("{\"tool\":\""));
+    off = t_fill(bp, off, 97, 1100);
+    off = t_write(bp, off, STR_PTR("/python.exe\"}"), STR_LEN("/python.exe\"}"));
+    let doc: u64 = sa_json_parse(bp, off);
+    if doc == 0 { panic(93); };
+    let req = SaVmScriptToolRequest { language: -1, executable: [0u8; 1024], executable_len: 0, args: [0u8; 4096], args_len: 0, args_count: 0, reason: [0u8; 128], reason_len: 0 };
+    let has: bool = false;
+    classifySaVmScriptToolRequest(STR_PTR("assistant/message"), STR_LEN("assistant/message"), doc, &req, &has);
+    if !has { panic(31); };
+    if req.language != 0 { panic(32); };
+    // Negative control: same length, non-script basename.
+    let off2: u64 = 0;
+    off2 = t_write(bp, off2, STR_PTR("{\"tool\":\""), STR_LEN("{\"tool\":\""));
+    off2 = t_fill(bp, off2, 97, 1100);
+    off2 = t_write(bp, off2, STR_PTR("/notepad.exe\"}"), STR_LEN("/notepad.exe\"}"));
+    let doc2: u64 = sa_json_parse(bp, off2);
+    if doc2 == 0 { panic(94); };
+    let req2 = SaVmScriptToolRequest { language: -1, executable: [0u8; 1024], executable_len: 0, args: [0u8; 4096], args_len: 0, args_count: 0, reason: [0u8; 128], reason_len: 0 };
+    let has2: bool = false;
+    classifySaVmScriptToolRequest(STR_PTR("assistant/message"), STR_LEN("assistant/message"), doc2, &req2, &has2);
+    if has2 { panic(33); };
+    // NOTE: no short-name baseline case here — the tool-name path
+    // does not fire for short names on the baseline either (see
+    // PRE-EXISTING ANOMALY in the header); asserting it would test
+    // a different line's defect, not this audit's fix.
+}
