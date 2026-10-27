@@ -1,31 +1,141 @@
-// Converted 1:1 from apps/server/src/freeModelAccess.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Converted 1:1 from apps/server/src/freeModelAccess.ts (CXU plugins @ f2cb649d).
+// Fix stage (launch/install family rebuild, Agent AD3): full body retranslation.
+// Async methods are contract-layer blocking (ASYNC_MODEL R8): the awaited ops
+// (keyring, fs, HTTP) have only blocking sa_std externs, so each method runs
+// synchronously in the TS order and returns a status code; results land in
+// mgr.out_status / mgr.out_auth. Error code contract:
+//   0  ok (status value in out_status / out_auth)
+//  -1  request failure propagated as TS throw (request()/fetch/HTTP error)
+//  -2  constructor: machineHashOverride is not a 64-char SHA-256 hex string
+//  -3  saveKey: key format invalid (TS throw, message in mgr.err)
+//  -4  saveKey: free-key service not configured (TS throw, message in mgr.err)
+//  -5  saveKey: license invalid (TS throw licenseError(reason), message in mgr.err)
+// DEFECT: node:os hostname -> sa_std_net_hostname; node:crypto createHash ->
+// sa_std_net_sha256_hex; @napi-rs/keyring AsyncEntry -> sa_keyring_* surface
+// (collection "codex-react-ui", key "free-model-access").
+// DEFECT: win32 reg.exe MachineGuid branch of resolveMachineHash is a platform
+// seam: this build targets the POSIX server runtime, so the /etc/machine-id
+// chain is implemented and the reg.exe branch is registered, not faked.
+// DEFECT: SLA && / || do not short-circuit (defect #15) — every condition with
+// a side-effecting operand is written as nested ifs in this file.
 
 @import "sa_std/io/print.sai"
 @import "sa_std/string.sa"
-// DEFECT: "@napi-rs/keyring" AsyncEntry (native keyring) has no sa_std counterpart; keyring access via extern stubs returning not-available.
-// DEFECT: node:child_process execFile / node:crypto createHash / node:fs/promises readFile / node:os hostname / global fetch -> extern approximations (sa_std sha256 exists for net.sai; process/fs via sa_std_process_* / sa_std_fs_*).
+@import "sa_std/ptr.sa"
+@import "sa_std/fs.sai"
+@import "sa_std/env.sai"
+@import "sa_std/time.sai"
+@import "sa_std/net.sai"
+@import "sa_std/crypto.sai"
+@import "sa_std/http_client.sai"
+@import "sa_std/encoding/json.sai"
 
-// L9-10: module init — createRequire + promisify(execFile)
-// DEFECT: dynamic require("@napi-rs/keyring") in try/catch at module load -> load-time flag resolved by host; AsyncEntryClass kept as availability bool.
-struct FreeModelModuleState {
-    async_entry_available: bool,
+// ---------------------------------------------------------------------------
+// Scratch string helpers (fm_*).
+// ---------------------------------------------------------------------------
+
+struct FmaStr {
+    bytes: [u8; 2048], len: u64
 }
 
-// L11: const KEY_PATTERN = /^cxu-[A-Za-z0-9]{48}$/
-// DEFECT: RegExp -> hand-rolled validator fn keyPatternMatches below.
-const KEY_PATTERN_PREFIX: u64 = 4; // "cxu-"
-const KEY_PATTERN_BODY_LEN: u64 = 48;
-
-// L12: const DEFAULT_DISCORD_INVITE = "https://discord.gg/QCNUx8FaV"
-
-// L13-15: const DEVELOPMENT_MACHINE_HASHES = new Set([...])
-// DEFECT: Set<string> -> fixed array of one 64-hex entry + count.
-struct DevelopmentMachineHashes {
-    hashes: [u8; 64],
-    hashes_len: u64, // entry count (1)
+fn fm_str_ptr(s: &FmaStr) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &s.bytes, 0);
+    return p;
 }
 
-// L24-32: export type FreeModelCampaign
+fn fm_byte(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+fn fm_push(s: &FmaStr, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        if s.len < 2048 {
+            s.bytes[s.len] = fm_byte(p, i);
+            s.len = s.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn fm_push_lit(s: &FmaStr, lit_p: ptr, lit_n: u64) -> void {
+    fm_push(s, lit_p, lit_n);
+}
+
+fn fm_eq(p: ptr, n: u64, q: ptr, qn: u64) -> bool {
+    if n != qn { return false; };
+    let i: u64 = 0;
+    while i < n {
+        if fm_byte(p, i) != fm_byte(q, i) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn fm_is_ws(b: u8) -> bool {
+    return b == 32 || (b >= 9 && b <= 13);
+}
+
+fn fm_lower_byte(b: u8) -> u8 {
+    if b >= 65 && b <= 90 { return b + 32; };
+    return b;
+}
+
+// Trimmed copy of (p, n) into out (cleared first).
+fn fm_trim_copy(out: &FmaStr, p: ptr, n: u64) -> void {
+    let s: u64 = 0;
+    let e: u64 = n;
+    while s < e && fm_is_ws(fm_byte(p, s)) { s = s + 1; }
+    while e > s && fm_is_ws(fm_byte(p, e - 1)) { e = e - 1; }
+    out.len = 0;
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, p, s);
+    fm_push(out, sp, e - s);
+}
+
+// Lowercased + trimmed copy of (p, n) into out (cleared first).
+fn fm_lower_trim_copy(out: &FmaStr, p: ptr, n: u64) -> void {
+    let tmp: FmaStr = FmaStr { bytes: [0u8; 2048], len: 0 };
+    fm_trim_copy(&tmp, p, n);
+    out.len = 0;
+    let i: u64 = 0;
+    let tp: ptr = fm_str_ptr(&tmp);
+    while i < tmp.len {
+        if out.len < 2048 {
+            out.bytes[out.len] = fm_lower_byte(fm_byte(tp, i));
+            out.len = out.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+// Copy (p, n) into a fixed field array; returns stored length.
+fn fm_field_copy(dst: ptr, cap: u64, p: ptr, n: u64) -> u64 {
+    let m = n;
+    if m > cap { m = cap; };
+    if m > 0 { PTR_COPY_BYTES(dst, p, m); };
+    return m;
+}
+
+fn fm_hex_ok(p: ptr, n: u64) -> bool {
+    if n != 64 { return false; };
+    let i: u64 = 0;
+    while i < n {
+        let b = fm_byte(p, i);
+        let ok = (b >= 48 && b <= 57) || (b >= 97 && b <= 102);
+        if !ok { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Public types (bulk skeleton shapes kept; nested status now by value).
+// ---------------------------------------------------------------------------
+
 struct FreeModelCampaign {
     id: [u8; 128], id_len: u64,
     title: [u8; 256], title_len: u64,
@@ -36,7 +146,6 @@ struct FreeModelCampaign {
     has_ends_at: bool, ends_at: f64,
 }
 
-// L34-41: export type FreeModelLicenseStatus — reason is string union
 // reason codes: 0=active 1=missing 2=invalid 3=machine_mismatch 4=expired 5=revoked
 struct FreeModelLicenseStatus {
     valid: bool,
@@ -46,12 +155,11 @@ struct FreeModelLicenseStatus {
     has_expires_at: bool, expires_at: f64,
 }
 
-// L43-59: export type FreeModelAccessStatus — storage is string union (0=keyring 1=memory 2=environment 3=none)
+// storage codes: 0=keyring 1=memory 2=environment 3=none
 struct FreeModelAccessStatus {
     configured: bool,
     development_machine: bool,
     machine_code: [u8; 16], machine_code_len: u64,
-    license: u64, // index/offset into license scratch — DEFECT: nested object flattened to sibling fields below
     license_valid: bool,
     license_reason: u64,
     license_key_preview: [u8; 128], license_key_preview_len: u64, license_has_key_preview: bool,
@@ -63,219 +171,1041 @@ struct FreeModelAccessStatus {
     refresh_required: bool,
     discord_invite_url: [u8; 512], discord_invite_url_len: u64,
     has_campaign: bool,
-    campaign: [u8; 4096], campaign_len: u64, // DEFECT: nested FreeModelCampaign -> serialized scratch
+    campaign: [u8; 4096], campaign_len: u64,
     storage: u64,
     has_requirement: bool, requirement_code: [u8; 256], requirement_code_len: u64, requirement_expires_at: f64,
     has_service_error: bool, service_error: [u8; 1024], service_error_len: u64,
 }
 
-// L61-65: export type FreeModelRefreshAuthorization = FreeModelAccessStatus & { allowed, authorizationId?, authorizationExpiresAt? }
-// DEFECT: TS intersection type -> status fields flattened + extras.
 struct FreeModelRefreshAuthorization {
-    status: [u8; 8192], status_len: u64, // DEFECT: embedded FreeModelAccessStatus serialized scratch
+    status: FreeModelAccessStatus,
     allowed: bool,
     has_authorization_id: bool, authorization_id: [u8; 256], authorization_id_len: u64,
     has_authorization_expires_at: bool, authorization_expires_at: f64,
 }
 
-// L67: type RemoteAccessStatus = Omit<FreeModelAccessStatus, ...>
-// DEFECT: Omit<> mapped type -> same struct minus configured/developmentMachine/machineCode/storage/serviceError; represented by FreeModelAccessStatus with those fields ignored.
-
-// L69-77: export class FreeModelAccessManager
 struct FreeModelAccessManager {
     has_service_url: bool, service_url: [u8; 1024], service_url_len: u64,
     has_service_secret: bool, service_secret: [u8; 1024], service_secret_len: u64,
     has_env_key: bool, env_key: [u8; 256], env_key_len: u64,
     has_memory_key: bool, memory_key: [u8; 256], memory_key_len: u64,
-    // DEFECT: machineHashPromise: Promise<string> | null -> cached hash + resolved flag
     machine_hash: [u8; 65], machine_hash_len: u64, machine_hash_resolved: bool,
-    // statusCache: { key, expiresAt, value } | null
     has_status_cache: bool, cache_key: [u8; 256], cache_key_len: u64, cache_has_key: bool,
     cache_expires_at: f64,
-    cache_value: [u8; 8192], cache_value_len: u64, // DEFECT: cached FreeModelAccessStatus serialized scratch
-    // env: NodeJS.ProcessEnv (DEFECT: dynamic object -> host env lookups via extern sa_std env getters)
+    cache_value: FreeModelAccessStatus,
     env_id: u64,
-    // Output scratch for status-returning methods (TS returns fresh objects)
-    out_status: [u8; 8192], out_status_len: u64, // DEFECT: return-by-value object -> scratch buffer
-    out_auth: [u8; 9216], out_auth_len: u64,
+    out_status: FreeModelAccessStatus,
+    out_auth: FreeModelRefreshAuthorization,
     err: [u8; 1024], err_len: u64,
+    read_key: [u8; 256], read_key_len: u64, read_has_key: bool, read_storage: u64,
+    req_body: [u8; 4096], req_body_len: u64,
+    url_buf: [u8; 2176], url_len: u64,
+    auth_buf: [u8; 1200], auth_len: u64,
+    resp: [u8; 16384], resp_len: u64,
+    resp_doc: u64, resp_data: u64,
+    scratch: [u8; 1024], scratch_len: u64,
 }
 
-// L79-89: constructor(env = process.env, machineHashOverride?)
-// Throws on invalid override (DEFECT: throw -> status code -2 with err buffer).
+fn fm_mgr_field(mgr: &FreeModelAccessManager, which: u64) -> ptr {
+    let p: ptr = PTR_NULL();
+    if which == 0 { PTR_BYTE_ADD(p, &mgr.service_url, 0); return p; };
+    if which == 1 { PTR_BYTE_ADD(p, &mgr.service_secret, 0); return p; };
+    if which == 2 { PTR_BYTE_ADD(p, &mgr.env_key, 0); return p; };
+    if which == 3 { PTR_BYTE_ADD(p, &mgr.memory_key, 0); return p; };
+    if which == 4 { PTR_BYTE_ADD(p, &mgr.machine_hash, 0); return p; };
+    if which == 5 { PTR_BYTE_ADD(p, &mgr.err, 0); return p; };
+    if which == 6 { PTR_BYTE_ADD(p, &mgr.read_key, 0); return p; };
+    if which == 7 { PTR_BYTE_ADD(p, &mgr.cache_key, 0); return p; };
+    if which == 8 { PTR_BYTE_ADD(p, &mgr.req_body, 0); return p; };
+    if which == 9 { PTR_BYTE_ADD(p, &mgr.url_buf, 0); return p; };
+    if which == 10 { PTR_BYTE_ADD(p, &mgr.auth_buf, 0); return p; };
+    if which == 11 { PTR_BYTE_ADD(p, &mgr.resp, 0); return p; };
+    PTR_BYTE_ADD(p, &mgr.scratch, 0);
+    return p;
+}
+
+fn fm_set_err(mgr: &FreeModelAccessManager, p: ptr, n: u64) -> void {
+    mgr.err_len = fm_field_copy(fm_mgr_field(mgr, 5), 1024, p, n);
+}
+
+fn fm_set_err_lit(mgr: &FreeModelAccessManager, lit_p: ptr, lit_n: u64) -> void {
+    fm_set_err(mgr, lit_p, lit_n);
+}
+
+// Read an env var (trimmed) into out; false when unset or empty after trim.
+// env snapshot seam: the manager's env_id is retained from the skeleton; TS
+// defaults env to process.env, which is what sa_env_get reads live.
+fn fm_env_read(name_p: ptr, name_l: u64, out: &FmaStr) -> bool {
+    out.len = 0;
+    let h: u64 = sa_env_get(name_p, name_l);
+    if h == 0 { return false; };
+    let bp: ptr = sa_env_buffer_data(h);
+    let bl: u64 = sa_env_buffer_len(h);
+    fm_trim_copy(out, bp, bl);
+    return out.len > 0;
+}
+
+// ---------------------------------------------------------------------------
+// JSON request-body construction (doc + stringify, read back via
+// sa_json_buffer_* per the stringify convention).
+// ---------------------------------------------------------------------------
+
+fn fm_body_new() -> u64 {
+    return sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+}
+
+// Guard-return free helpers: conditional frees of tracked handles merge into
+// PhiStateConflict (defect family 6), so every local handle release goes
+// through an unconditional call here.
+fn fm_free_doc(doc: u64) -> void {
+    if doc == 0 { return; };
+    sa_json_free(doc);
+}
+
+fn fm_free_buffer(h: u64) -> void {
+    if h == 0 { return; };
+    sa_json_buffer_free(h);
+}
+
+fn fm_body_finish(mgr: &FreeModelAccessManager, doc: u64) -> void {
+    mgr.req_body_len = 0;
+    let h: u64 = 0;
+    if doc != 0 {
+        if sa_json_stringify(doc, &h) == 0 {
+            if h != 0 {
+                let bp: ptr = sa_json_buffer_data(h);
+                let bl: u64 = sa_json_buffer_len(h);
+                mgr.req_body_len = fm_field_copy(fm_mgr_field(mgr, 8), 4096, bp, bl);
+            };
+        };
+    };
+    fm_free_buffer(h);
+    fm_free_doc(doc);
+}
+
+// ---------------------------------------------------------------------------
+// Status field helpers.
+// ---------------------------------------------------------------------------
+
+fn fm_status_reset(st: &FreeModelAccessStatus) -> void {
+    st.configured = false;
+    st.development_machine = false;
+    st.machine_code_len = 0;
+    st.license_valid = false;
+    st.license_reason = 1;
+    st.license_key_preview_len = 0;
+    st.license_has_key_preview = false;
+    st.license_issued_at = 0.0;
+    st.license_has_issued_at = false;
+    st.license_expires_at = 0.0;
+    st.license_has_expires_at = false;
+    st.refresh_interval_hours = 0.0;
+    st.last_refreshed_at = 0.0;
+    st.has_last_refreshed_at = false;
+    st.next_required_refresh_at = 0.0;
+    st.has_next_required_refresh_at = false;
+    st.refresh_required = false;
+    st.discord_invite_url_len = 0;
+    st.has_campaign = false;
+    st.campaign_len = 0;
+    st.storage = 3;
+    st.has_requirement = false;
+    st.requirement_code_len = 0;
+    st.requirement_expires_at = 0.0;
+    st.has_service_error = false;
+    st.service_error_len = 0;
+}
+
+fn fm_status_field(st: &FreeModelAccessStatus, which: u64) -> ptr {
+    let p: ptr = PTR_NULL();
+    if which == 0 { PTR_BYTE_ADD(p, &st.machine_code, 0); return p; };
+    if which == 1 { PTR_BYTE_ADD(p, &st.license_key_preview, 0); return p; };
+    if which == 2 { PTR_BYTE_ADD(p, &st.discord_invite_url, 0); return p; };
+    if which == 3 { PTR_BYTE_ADD(p, &st.campaign, 0); return p; };
+    if which == 4 { PTR_BYTE_ADD(p, &st.requirement_code, 0); return p; };
+    PTR_BYTE_ADD(p, &st.service_error, 0);
+    return p;
+}
+
+// machineCode = machineHash.slice(0, 12).toUpperCase()
+fn fm_set_machine_code(mgr: &FreeModelAccessManager, st: &FreeModelAccessStatus) -> void {
+    let hp: ptr = fm_mgr_field(mgr, 4);
+    let n = mgr.machine_hash_len;
+    if n > 12 { n = 12; };
+    let i: u64 = 0;
+    while i < n {
+        let b = fm_byte(hp, i);
+        if b >= 97 && b <= 122 { b = b - 32; };
+        st.machine_code[i] = b;
+        i = i + 1;
+    }
+    st.machine_code_len = n;
+}
+
+// discordInviteUrl = env.CODEX_ULTRA_DISCORD_INVITE_URL?.trim() || default
+fn fm_set_invite(st: &FreeModelAccessStatus) -> void {
+    let tmp: FmaStr = FmaStr { bytes: [0u8; 2048], len: 0 };
+    if fm_env_read(STR_PTR("CODEX_ULTRA_DISCORD_INVITE_URL"), STR_LEN("CODEX_ULTRA_DISCORD_INVITE_URL"), &tmp) {
+        st.discord_invite_url_len = fm_field_copy(fm_status_field(st, 2), 512, fm_str_ptr(&tmp), tmp.len);
+        return;
+    };
+    st.discord_invite_url_len = fm_field_copy(fm_status_field(st, 2), 512, STR_PTR("https://discord.gg/QCNUx8FaV"), STR_LEN("https://discord.gg/QCNUx8FaV"));
+}
+
+fn fm_reason_code(p: ptr, n: u64) -> u64 {
+    if fm_eq(p, n, STR_PTR("active"), STR_LEN("active")) { return 0; };
+    if fm_eq(p, n, STR_PTR("missing"), STR_LEN("missing")) { return 1; };
+    if fm_eq(p, n, STR_PTR("machine_mismatch"), STR_LEN("machine_mismatch")) { return 3; };
+    if fm_eq(p, n, STR_PTR("expired"), STR_LEN("expired")) { return 4; };
+    if fm_eq(p, n, STR_PTR("revoked"), STR_LEN("revoked")) { return 5; };
+    return 2;
+}
+
+// L330-337: licenseError(reason) -> message bytes written to out_ptr, len returned.
+fn licenseError(reason: u64, out_ptr: ptr) -> u64 {
+    if reason == 3 {
+        return fm_field_copy(out_ptr, 1024, STR_PTR("该密钥不属于当前 Windows 机器"), STR_LEN("该密钥不属于当前 Windows 机器"));
+    };
+    if reason == 4 {
+        return fm_field_copy(out_ptr, 1024, STR_PTR("该密钥已经过期，请重新获取"), STR_LEN("该密钥已经过期，请重新获取"));
+    };
+    if reason == 5 {
+        return fm_field_copy(out_ptr, 1024, STR_PTR("该密钥已经被撤销，请重新获取"), STR_LEN("该密钥已经被撤销，请重新获取"));
+    };
+    return fm_field_copy(out_ptr, 1024, STR_PTR("密钥无效，请检查后重试"), STR_LEN("密钥无效，请检查后重试"));
+}
+
+// L339-341: isDevelopmentMachine — Set.has(trim().toLowerCase())
+fn isDevelopmentMachine(hash_ptr: ptr, hash_len: u64) -> bool {
+    let tmp: FmaStr = FmaStr { bytes: [0u8; 2048], len: 0 };
+    fm_lower_trim_copy(&tmp, hash_ptr, hash_len);
+    return fm_eq(fm_str_ptr(&tmp), tmp.len, STR_PTR("260da01345ac81b7afd81db88267fd8f65363357c5499c433517c83a77f6a146"), STR_LEN("260da01345ac81b7afd81db88267fd8f65363357c5499c433517c83a77f6a146"));
+}
+
+// L11 helper: /^cxu-[A-Za-z0-9]{48}$/
+fn keyPatternMatches(key_ptr: ptr, key_len: u64) -> bool {
+    if key_len != 52 { return false; };
+    if !fm_eq(key_ptr, 4, STR_PTR("cxu-"), STR_LEN("cxu-")) { return false; };
+    let i: u64 = 4;
+    while i < key_len {
+        let b = fm_byte(key_ptr, i);
+        let ok = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122);
+        if !ok { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// L343-345: errorMessage — message bytes copied out, len returned.
+fn errorMessage(is_error: bool, msg_ptr: ptr, msg_len: u64, out_ptr: ptr) -> u64 {
+    return fm_field_copy(out_ptr, 1024, msg_ptr, msg_len);
+}
+
+// ---------------------------------------------------------------------------
+// L79-89: constructor. Invalid override -> -2 (err holds the TS message).
+// ---------------------------------------------------------------------------
+
 fn freeModelAccessManager_new(mgr: &FreeModelAccessManager, env_id: u64, has_override: bool, ov_ptr: ptr, ov_len: u64) -> i32 {
     mgr.env_id = env_id;
-    // serviceUrl = env.CODEX_ULTRA_FREE_KEY_SERVICE_URL?.trim().replace(/\/+$/, "") || null
-    // DEFECT: optional chaining + regex trailing-slash strip -> extern env read + manual trim.
-    // serviceSecret / envKey likewise from env.
+    mgr.has_service_url = false;
+    mgr.service_url_len = 0;
+    mgr.has_service_secret = false;
+    mgr.service_secret_len = 0;
+    mgr.has_env_key = false;
+    mgr.env_key_len = 0;
+    mgr.has_memory_key = false;
+    mgr.memory_key_len = 0;
+    mgr.machine_hash_len = 0;
+    mgr.machine_hash_resolved = false;
+    mgr.has_status_cache = false;
+    mgr.cache_key_len = 0;
+    mgr.cache_has_key = false;
+    mgr.cache_expires_at = 0.0;
+    mgr.err_len = 0;
+    mgr.read_key_len = 0;
+    mgr.read_has_key = false;
+    mgr.read_storage = 3;
+    mgr.resp_doc = 0;
+    mgr.resp_data = 0;
+    fm_status_reset(&mgr.out_status);
+    fm_status_reset(&mgr.cache_value);
+    fm_status_reset(&mgr.out_auth.status);
+    mgr.out_auth.allowed = false;
+    mgr.out_auth.has_authorization_id = false;
+    mgr.out_auth.authorization_id_len = 0;
+    mgr.out_auth.has_authorization_expires_at = false;
+
+    let tmp: FmaStr = FmaStr { bytes: [0u8; 2048], len: 0 };
+    // serviceUrl = env...?.trim().replace(/\/+$/, "") || null
+    if fm_env_read(STR_PTR("CODEX_ULTRA_FREE_KEY_SERVICE_URL"), STR_LEN("CODEX_ULTRA_FREE_KEY_SERVICE_URL"), &tmp) {
+        let tp: ptr = fm_str_ptr(&tmp);
+        let e = tmp.len;
+        while e > 0 && fm_byte(tp, e - 1) == 47 { e = e - 1; }
+        if e > 0 {
+            mgr.service_url_len = fm_field_copy(fm_mgr_field(mgr, 0), 1024, tp, e);
+            mgr.has_service_url = true;
+        };
+    };
+    if fm_env_read(STR_PTR("CODEX_ULTRA_FREE_KEY_SERVICE_SECRET"), STR_LEN("CODEX_ULTRA_FREE_KEY_SERVICE_SECRET"), &tmp) {
+        mgr.service_secret_len = fm_field_copy(fm_mgr_field(mgr, 1), 1024, fm_str_ptr(&tmp), tmp.len);
+        mgr.has_service_secret = true;
+    };
+    if fm_env_read(STR_PTR("CODEX_ULTRA_FREE_KEY"), STR_LEN("CODEX_ULTRA_FREE_KEY"), &tmp) {
+        mgr.env_key_len = fm_field_copy(fm_mgr_field(mgr, 2), 256, fm_str_ptr(&tmp), tmp.len);
+        mgr.has_env_key = true;
+    };
     if has_override {
-        // normalized = trim().toLowerCase(); if !/^[a-f0-9]{64}$/ throw; machineHashPromise = Promise.resolve(normalized)
-        // DEFECT: RegExp -> hand-rolled hex check; Promise.resolve -> pre-resolved cache fields.
-        return 0;
+        let norm: FmaStr = FmaStr { bytes: [0u8; 2048], len: 0 };
+        fm_lower_trim_copy(&norm, ov_ptr, ov_len);
+        if !fm_hex_ok(fm_str_ptr(&norm), norm.len) {
+            fm_set_err_lit(mgr, STR_PTR("machineHashOverride must be a 64-character SHA-256 hex string"), STR_LEN("machineHashOverride must be a 64-character SHA-256 hex string"));
+            return -2;
+        };
+        mgr.machine_hash_len = fm_field_copy(fm_mgr_field(mgr, 4), 65, fm_str_ptr(&norm), norm.len);
+        mgr.machine_hash_resolved = true;
     };
     return 0;
 }
 
-// L91-107: async status(): Promise<FreeModelAccessStatus>
-// DEFECT: async -> synchronous + status code; result in mgr.out_status. [BLOCKED: body is a stub or partial skeleton (status() reaches machineHash then returns 0). Awaited ops are the cached machineHash promise, readKey()'s storage read and request() HTTP calls (sa_http_client_* exists); createRequirement's Promise.all pair has its sequential form noted inline. Body completion required.]
-fn freeModelAccessManager_status(mgr: &FreeModelAccessManager) -> i32 {
-    // machineHash = await this.machineHash()
-    let rc = freeModelAccessManager_machineHash(mgr);
-    if rc != 0 { return rc; };
-    // if isDevelopmentMachine -> developmentStatus
-    // stored = await this.readKey()
-    // if statusCache fresh (key match && expiresAt > Date.now()) -> return cached
-    // DEFECT: Date.now() -> extern clock millis.
-    // if !serviceUrl -> unconfiguredStatus
-    // try { remote = await request("/v1/access/status", {machineHash, key}); value = decorate(...); cache; return }
-    // catch (error) { return {...unconfiguredStatus, configured: true, serviceError: errorMessage(error)} }
-    // DEFECT: try/catch + object spread -> status-code branches + field copies.
+// ---------------------------------------------------------------------------
+// L306-328: resolveMachineHash — result into mgr.machine_hash (64 hex).
+// Platform seam (see header): POSIX chain /etc/machine-id, dbus machine-id,
+// then `fallback:<hostname>`; sha256 of "codex-ultra/free-model-access/v1:"
+// + machineId.toLowerCase().
+// ---------------------------------------------------------------------------
+
+fn fm_read_machine_id_file(path_p: ptr, path_l: u64, out: &FmaStr) -> bool {
+    out.len = 0;
+    let h: u64 = 0;
+    let st = sa_std_fs_read_to_string(path_p, path_l, 4096, &h);
+    if st != 0 { return false; };
+    if h == 0 { return false; };
+    let bp: ptr = sa_fs_read_buffer_data(h);
+    let bl: u64 = sa_fs_read_buffer_len(h);
+    fm_trim_copy(out, bp, bl);
+    sa_fs_read_buffer_free(h);
+    return out.len > 0;
+}
+
+fn resolveMachineHash(mgr: &FreeModelAccessManager) -> i32 {
+    let mid: FmaStr = FmaStr { bytes: [0u8; 2048], len: 0 };
+    let have = fm_env_read(STR_PTR("CODEX_ULTRA_MACHINE_GUID"), STR_LEN("CODEX_ULTRA_MACHINE_GUID"), &mid);
+    if !have {
+        if fm_read_machine_id_file(STR_PTR("/etc/machine-id"), STR_LEN("/etc/machine-id"), &mid) {
+            have = true;
+        } else {
+            if fm_read_machine_id_file(STR_PTR("/var/lib/dbus/machine-id"), STR_LEN("/var/lib/dbus/machine-id"), &mid) {
+                have = true;
+            };
+        };
+    };
+    let low: FmaStr = FmaStr { bytes: [0u8; 2048], len: 0 };
+    if have {
+        fm_lower_trim_copy(&low, fm_str_ptr(&mid), mid.len);
+    } else {
+        let host: [u8; 256] = [0u8; 256];
+        let hp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(hp, &host, 0);
+        let hl: u64 = 0;
+        let st = sa_std_net_hostname(hp, 256, &hl);
+        if st != 0 { hl = 0; };
+        let fb: FmaStr = FmaStr { bytes: [0u8; 2048], len: 0 };
+        fm_push_lit(&fb, STR_PTR("fallback:"), STR_LEN("fallback:"));
+        fm_push(&fb, hp, hl);
+        fm_lower_trim_copy(&low, fm_str_ptr(&fb), fb.len);
+    };
+    // digest input = prefix + lowercase(machineId); built in mgr-independent scratch
+    let input: FmaStr = FmaStr { bytes: [0u8; 2048], len: 0 };
+    fm_push_lit(&input, STR_PTR("codex-ultra/free-model-access/v1:"), STR_LEN("codex-ultra/free-model-access/v1:"));
+    fm_push(&input, fm_str_ptr(&low), low.len);
+    let out_len: u64 = 0;
+    let st2 = sa_std_net_sha256_hex(fm_str_ptr(&input), input.len, fm_mgr_field(mgr, 4), 65, &out_len);
+    if st2 != 0 {
+        fm_set_err_lit(mgr, STR_PTR("sha256 failed"), STR_LEN("sha256 failed"));
+        return -1;
+    };
+    mgr.machine_hash_len = out_len;
+    mgr.machine_hash_resolved = true;
     return 0;
 }
 
-// L109-120: async createRequirement()
-// DEFECT: async + Promise.all (parallel requests) -> sequential blocking requests. [BLOCKED: body is a stub or partial skeleton (status() reaches machineHash then returns 0). Awaited ops are the cached machineHash promise, readKey()'s storage read and request() HTTP calls (sa_http_client_* exists); createRequirement's Promise.all pair has its sequential form noted inline. Body completion required.]
-fn freeModelAccessManager_createRequirement(mgr: &FreeModelAccessManager) -> i32 {
-    // machineHash; dev machine -> developmentStatus; readKey; !serviceUrl -> unconfiguredStatus
-    // [remote, requirement] = await Promise.all([request("/v1/access/status"), request("/v1/access/requirement")])
-    // return {...decorate(remote,...), requirement}
-    // DEFECT: Promise.all concurrency lost (sequential approximation); dynamic JSON bodies -> JSON text buffers.
-    return 0;
-}
-
-// L122-134: async saveKey(keyInput)
-// Throws on bad format / unconfigured / invalid license (DEFECT: throw -> status codes -3/-4/-5).
-fn freeModelAccessManager_saveKey(mgr: &FreeModelAccessManager, key_ptr: ptr, key_len: u64) -> i32 {
-    // key = keyInput.trim(); if !KEY_PATTERN.test(key) throw "密钥格式应为 cxu- 加 48 位字母数字"
-    // DEFECT: Chinese error literal preserved in err buffer via STR_PTR at fix stage.
-    // if !serviceUrl throw; remote = await request(status, {machineHash, key});
-    // if !remote.license.valid throw licenseError(reason); storage = await writeKey(key);
-    // value = decorate(...); statusCache = {key, now+60_000, value}; return value
-    return 0;
-}
-
-// L136-149: async clearKey()
-fn freeModelAccessManager_clearKey(mgr: &FreeModelAccessManager) -> i32 {
-    mgr.has_memory_key = false;
-    mgr.has_status_cache = false;
-    // entry = keyringEntry(); if (entry) try { await entry.deleteCredential() } catch {}
-    // DEFECT: keyring delete -> extern stub; errors swallowed as in source.
-    return freeModelAccessManager_status(mgr);
-}
-
-// L151-175: async prepareRefresh(): Promise<FreeModelRefreshAuthorization>
-fn freeModelAccessManager_prepareRefresh(mgr: &FreeModelAccessManager) -> i32 {
-    // dev machine -> {...developmentStatus, allowed: true, authorizationId: "development-machine"}
-    // readKey; !serviceUrl -> {...unconfiguredStatus, allowed: false}
-    // try { remote = await request("/v1/access/prepare", {...}); return {...decorate(...), ...remote} }
-    // catch { return {...unconfiguredStatus, configured: true, allowed: false, serviceError} }
-    // DEFECT: generic request<T & {...}> + spread merge -> field-wise copy into out_auth.
-    return 0;
-}
-
-// L177-188: async completeRefresh(authorizationId, success, importedModels): Promise<void>
-fn freeModelAccessManager_completeRefresh(mgr: &FreeModelAccessManager, has_auth: bool, auth_ptr: ptr, auth_len: u64, success: bool, imported_models: f64) -> i32 {
-    // if authorizationId === "development-machine" return; if !authorizationId || !serviceUrl return;
-    // await request("/v1/access/complete", {machineHash, authorizationId, success, importedModels}); statusCache = null
-    return 0;
-}
-
-// L190-198: private decorate(remote, machineHash, storage)
-// machineCode = machineHash.slice(0, 12).toUpperCase()
-fn freeModelAccessManager_decorate(mgr: &FreeModelAccessManager, storage: u64) -> i32 {
-    return 0;
-}
-
-// L200-217: private developmentStatus(machineHash)
-// license.keyPreview literal "开发机器免密" (Chinese, preserved at fix stage); refreshIntervalHours 5;
-// discordInviteUrl = env.CODEX_ULTRA_DISCORD_INVITE_URL?.trim() || DEFAULT_DISCORD_INVITE; storage "none"(3).
-fn freeModelAccessManager_developmentStatus(mgr: &FreeModelAccessManager) -> i32 {
-    return 0;
-}
-
-// L219-236: private unconfiguredStatus(machineHash, storage)
-// serviceError literal "CODEX_ULTRA_FREE_KEY_SERVICE_URL is not configured"; refreshRequired true.
-fn freeModelAccessManager_unconfiguredStatus(mgr: &FreeModelAccessManager, storage: u64) -> i32 {
-    return 0;
-}
-
-// L238-255: private async readKey(): Promise<{key, storage}>
-// DEFECT: async + discriminated return object -> out params (key scratch on mgr + storage code return). [BLOCKED: body is a stub or partial skeleton (status() reaches machineHash then returns 0). Awaited ops are the cached machineHash promise, readKey()'s storage read and request() HTTP calls (sa_http_client_* exists); createRequirement's Promise.all pair has its sequential form noted inline. Body completion required.]
-fn freeModelAccessManager_readKey(mgr: &FreeModelAccessManager) -> i32 {
-    // if envKey -> {envKey, "environment"(2)}; if memoryKey -> {"memory"(1)};
-    // entry = keyringEntry(); if entry try { key = await entry.getPassword(); if key { memoryKey = key; return {key, "keyring"(0)} } } catch {}
-    // return {null, "none"(3)}
-    // DEFECT: keyring getPassword -> extern stub.
-    return 3;
-}
-
-// L257-267: private async writeKey(key): Promise<storage>
-fn freeModelAccessManager_writeKey(mgr: &FreeModelAccessManager, key_ptr: ptr, key_len: u64) -> i32 {
-    // memoryKey = key; entry = keyringEntry(); if !entry return "memory"(1);
-    // try { await entry.setPassword(key); return "keyring"(0) } catch { return "memory"(1) }
-    // DEFECT: keyring setPassword -> extern stub.
-    return 1;
-}
-
-// L269-276: private keyringEntry(): AsyncEntry | null
-// DEFECT: constructing native AsyncEntry("codex-react-ui", "free-model-access") -> extern handle (0 = null).
-fn freeModelAccessManager_keyringEntry(mgr: &FreeModelAccessManager) -> u64 {
-    return 0;
-}
-
-// L278-281: private machineHash(): Promise<string> — this.machineHashPromise ??= resolveMachineHash(this.env)
-// DEFECT: ??= lazy Promise memoization -> resolved-flag cache.
+// L278-281: machineHash() — lazy memoized resolution.
 fn freeModelAccessManager_machineHash(mgr: &FreeModelAccessManager) -> i32 {
     if mgr.machine_hash_resolved { return 0; };
     return resolveMachineHash(mgr);
 }
 
-// L283-303: private async request<T>(path, body: Record<string, unknown>): Promise<T>
-// DEFECT: generics + dynamic JSON body + fetch + AbortController/setTimeout(10_000) timeout ->
-// blocking HTTP extern with timeout parameter; response JSON parsed into caller scratch.
-// Headers: Content-Type/Accept application/json; Authorization Bearer <secret> when present.
-// Throws Error(payload.error || `Free-key service returned HTTP ${status}`) when !ok or data undefined (DEFECT: template literal -> formatted err buffer).
+// ---------------------------------------------------------------------------
+// L269-276: keyringEntry — AsyncEntry("codex-react-ui", "free-model-access")
+// existence maps to sa_keyring_available (nonzero = entry surface available).
+// ---------------------------------------------------------------------------
+
+fn freeModelAccessManager_keyringEntry(mgr: &FreeModelAccessManager) -> u64 {
+    return sa_keyring_available() as u64;
+}
+
+// L238-255: readKey — env > memory > keyring; result in mgr.read_* + storage code.
+fn freeModelAccessManager_readKey(mgr: &FreeModelAccessManager) -> i32 {
+    mgr.read_has_key = false;
+    mgr.read_key_len = 0;
+    if mgr.has_env_key {
+        mgr.read_key_len = fm_field_copy(fm_mgr_field(mgr, 6), 256, fm_mgr_field(mgr, 2), mgr.env_key_len);
+        mgr.read_has_key = true;
+        mgr.read_storage = 2;
+        return 2;
+    };
+    if mgr.has_memory_key {
+        mgr.read_key_len = fm_field_copy(fm_mgr_field(mgr, 6), 256, fm_mgr_field(mgr, 3), mgr.memory_key_len);
+        mgr.read_has_key = true;
+        mgr.read_storage = 1;
+        return 1;
+    };
+    if freeModelAccessManager_keyringEntry(mgr) != 0 {
+        let out_len: u64 = 0;
+        let st = sa_keyring_get(STR_PTR("free-model-access"), STR_LEN("free-model-access"), fm_mgr_field(mgr, 6), 256, &out_len);
+        if st == 0 {
+            if out_len > 0 {
+                mgr.read_key_len = out_len;
+                mgr.read_has_key = true;
+                // keyring hit is promoted to the memory cache, as in TS.
+                mgr.memory_key_len = fm_field_copy(fm_mgr_field(mgr, 3), 256, fm_mgr_field(mgr, 6), out_len);
+                mgr.has_memory_key = true;
+                mgr.read_storage = 0;
+                return 0;
+            };
+        };
+    };
+    mgr.read_storage = 3;
+    return 3;
+}
+
+// L257-267: writeKey — memory always; keyring when available. Returns storage.
+fn freeModelAccessManager_writeKey(mgr: &FreeModelAccessManager, key_ptr: ptr, key_len: u64) -> i32 {
+    mgr.memory_key_len = fm_field_copy(fm_mgr_field(mgr, 3), 256, key_ptr, key_len);
+    mgr.has_memory_key = true;
+    if freeModelAccessManager_keyringEntry(mgr) == 0 {
+        return 1;
+    };
+    let st = sa_keyring_set(STR_PTR("codex-react-ui"), STR_LEN("codex-react-ui"), STR_PTR("free-model-access"), STR_LEN("free-model-access"), key_ptr, key_len);
+    if st == 0 {
+        return 0;
+    };
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// L283-303: request(path, body) — POST JSON via the v2 client (10 s timeout,
+// per the TS AbortController). On success mgr.resp_doc/resp_data hold the
+// parsed payload and its `data` node (caller extracts before the next call).
+// Returns 0, or -1 with mgr.err set (payload.error || HTTP status message).
+// ---------------------------------------------------------------------------
+
+fn fm_request_fail_http(mgr: &FreeModelAccessManager, status: u64) -> i32 {
+    // payload.error wins when the body parses and carries one.
+    let doc = sa_json_parse(fm_mgr_field(mgr, 11), mgr.resp_len);
+    let found = false;
+    if doc != 0 {
+        let ep: ptr = PTR_NULL();
+        let el: u64 = 0;
+        if sa_json_object_get_string(doc, STR_PTR("error"), STR_LEN("error"), &ep, &el) == 0 {
+            if el > 0 {
+                fm_set_err(mgr, ep, el);
+                found = true;
+            };
+        };
+    };
+    fm_free_doc(doc);
+    if found { return -1; };
+    let msg: FmaStr = FmaStr { bytes: [0u8; 2048], len: 0 };
+    fm_push_lit(&msg, STR_PTR("Free-key service returned HTTP "), STR_LEN("Free-key service returned HTTP "));
+    // append decimal status
+    let tmp: [u8; 24] = [0u8; 24];
+    let tn: u64 = 0;
+    let x = status;
+    if x == 0 {
+        fm_push_lit(&msg, STR_PTR("0"), STR_LEN("0"));
+    } else {
+        while x > 0 {
+            tmp[tn] = (48 + (x % 10)) as u8;
+            tn = tn + 1;
+            x = x / 10;
+        }
+        while tn > 0 {
+            tn = tn - 1;
+            if msg.len < 2048 {
+                msg.bytes[msg.len] = tmp[tn];
+                msg.len = msg.len + 1;
+            };
+        }
+    };
+    fm_set_err(mgr, fm_str_ptr(&msg), msg.len);
+    return -1;
+}
+
 fn freeModelAccessManager_request(mgr: &FreeModelAccessManager, path_ptr: ptr, path_len: u64, body_ptr: ptr, body_len: u64) -> i32 {
+    if !mgr.has_service_url {
+        fm_set_err_lit(mgr, STR_PTR("Free-key service is not configured"), STR_LEN("Free-key service is not configured"));
+        return -1;
+    };
+    let old_doc = mgr.resp_doc;
+    mgr.resp_doc = 0;
+    mgr.resp_data = 0;
+    fm_free_doc(old_doc);
+    // url = serviceUrl + path
+    let u: FmaStr = FmaStr { bytes: [0u8; 2048], len: 0 };
+    fm_push(&u, fm_mgr_field(mgr, 0), mgr.service_url_len);
+    fm_push(&u, path_ptr, path_len);
+    mgr.url_len = fm_field_copy(fm_mgr_field(mgr, 9), 2176, fm_str_ptr(&u), u.len);
+    let url_p: ptr = fm_mgr_field(mgr, 9);
+    let use_tls: u8 = 0;
+    if mgr.url_len >= 5 {
+        if fm_byte(url_p, 4) == 115 { use_tls = 1; };
+    };
+    let client: ptr = PTR_NULL();
+    let nst = sa_http_client_new_v2(use_tls, STR_PTR(""), 0, &client);
+    if nst != 0 {
+        fm_set_err_lit(mgr, STR_PTR("Free-key service request failed"), STR_LEN("Free-key service request failed"));
+        return -1;
+    };
+    let req: ptr = PTR_NULL();
+    let rst = sa_http_client_req_new_v2(client, 2, url_p, mgr.url_len, &req);
+    if rst != 0 {
+        sa_http_client_free(client);
+        fm_set_err_lit(mgr, STR_PTR("Free-key service request failed"), STR_LEN("Free-key service request failed"));
+        return -1;
+    };
+    sa_http_client_req_add_header_v2(req, STR_PTR("Content-Type"), STR_LEN("Content-Type"), STR_PTR("application/json"), STR_LEN("application/json"));
+    sa_http_client_req_add_header_v2(req, STR_PTR("Accept"), STR_LEN("Accept"), STR_PTR("application/json"), STR_LEN("application/json"));
+    if mgr.has_service_secret {
+        let a: FmaStr = FmaStr { bytes: [0u8; 2048], len: 0 };
+        fm_push_lit(&a, STR_PTR("Bearer "), STR_LEN("Bearer "));
+        fm_push(&a, fm_mgr_field(mgr, 1), mgr.service_secret_len);
+        mgr.auth_len = fm_field_copy(fm_mgr_field(mgr, 10), 1200, fm_str_ptr(&a), a.len);
+        sa_http_client_req_add_header_v2(req, STR_PTR("Authorization"), STR_LEN("Authorization"), fm_mgr_field(mgr, 10), mgr.auth_len);
+    };
+    sa_http_client_req_set_body_v2(req, body_ptr, body_len);
+    sa_http_client_req_set_timeout_v2(req, 10000);
+    let resp: ptr = PTR_NULL();
+    let sst = sa_http_client_req_send_v2(req, &resp);
+    if sst != 0 {
+        sa_http_client_req_free(req);
+        sa_http_client_free(client);
+        fm_set_err_lit(mgr, STR_PTR("Free-key service request failed"), STR_LEN("Free-key service request failed"));
+        return -1;
+    };
+    let status: u64 = (sa_http_client_resp_status(resp)) as u64;
+    let bp: ptr = PTR_NULL();
+    let bl: u64 = 0;
+    let bst = sa_http_client_resp_body_slice(resp, &bp, &bl);
+    mgr.resp_len = 0;
+    if bst == 0 {
+        mgr.resp_len = fm_field_copy(fm_mgr_field(mgr, 11), 16384, bp, bl);
+    };
+    sa_http_client_resp_free(resp);
+    sa_http_client_req_free(req);
+    sa_http_client_free(client);
+    if status >= 400 {
+        return fm_request_fail_http(mgr, status);
+    };
+    let doc = sa_json_parse(fm_mgr_field(mgr, 11), mgr.resp_len);
+    if doc == 0 {
+        return fm_request_fail_http(mgr, status);
+    };
+    let data: u64 = 0;
+    let gst = sa_json_object_get(doc, STR_PTR("data"), STR_LEN("data"), &data);
+    if gst != 0 {
+        fm_free_doc(doc);
+        return fm_request_fail_http(mgr, status);
+    };
+    if data == 0 {
+        fm_free_doc(doc);
+        return fm_request_fail_http(mgr, status);
+    };
+    mgr.resp_doc = doc;
+    mgr.resp_data = data;
     return 0;
 }
 
-// L306-328: export async function resolveMachineHash(env, targetPlatform): Promise<string>
-// DEFECT: async -> synchronous; platform string compare kept. [BLOCKED: body is a stub or partial skeleton (status() reaches machineHash then returns 0). Awaited ops are the cached machineHash promise, readKey()'s storage read and request() HTTP calls (sa_http_client_* exists); createRequirement's Promise.all pair has its sequential form noted inline. Body completion required.]
-fn resolveMachineHash(mgr: &FreeModelAccessManager) -> i32 {
-    // override = env.CODEX_ULTRA_MACHINE_GUID?.trim(); machineId = override || ""
-    // if (!machineId && platform == "win32") try { execFileAsync("reg.exe", ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"]) ; machineId = stdout.match(/MachineGuid\s+REG_SZ\s+([^\r\n]+)/i)?.[1]?.trim() || "" } catch { "" }
-    // DEFECT: RegExp capture on reg.exe output -> manual scan for "REG_SZ" then line tail.
-    // DEFECT: child_process execFile -> sa_std_process spawn extern approximation.
-    // if (!machineId && platform != "win32") for path of ["/etc/machine-id", "/var/lib/dbus/machine-id"] try { readFile trim; break } catch {}
-    // if (!machineId) machineId = `fallback:${hostname()}` (DEFECT: template literal -> concat)
-    // return createHash("sha256").update(`codex-ultra/free-model-access/v1:${machineId.toLowerCase()}`).digest("hex")
-    // DEFECT: node:crypto -> sa_std sha256 extern.
+// ---------------------------------------------------------------------------
+// L190-198: decorate — fill st from mgr.resp_data (RemoteAccessStatus) plus
+// configured/developmentMachine/machineCode/storage.
+// ---------------------------------------------------------------------------
+
+fn fm_fill_remote(mgr: &FreeModelAccessManager, st: &FreeModelAccessStatus, storage: u64) -> void {
+    fm_status_reset(st);
+    let data = mgr.resp_data;
+    if data != 0 {
+        // license { valid, reason, keyPreview?, issuedAt?, expiresAt? }
+        let lic: u64 = 0;
+        if sa_json_object_get(data, STR_PTR("license"), STR_LEN("license"), &lic) == 0 {
+            if lic != 0 {
+                let bv: bool = false;
+                if sa_json_object_get_bool(lic, STR_PTR("valid"), STR_LEN("valid"), &bv) == 0 {
+                    st.license_valid = bv;
+                };
+                let rp: ptr = PTR_NULL();
+                let rl: u64 = 0;
+                if sa_json_object_get_string(lic, STR_PTR("reason"), STR_LEN("reason"), &rp, &rl) == 0 {
+                    st.license_reason = fm_reason_code(rp, rl);
+                };
+                if sa_json_object_get_string(lic, STR_PTR("keyPreview"), STR_LEN("keyPreview"), &rp, &rl) == 0 {
+                    st.license_key_preview_len = fm_field_copy(fm_status_field(st, 1), 128, rp, rl);
+                    st.license_has_key_preview = true;
+                };
+                let fv: f64 = 0.0;
+                if sa_json_object_get_f64(lic, STR_PTR("issuedAt"), STR_LEN("issuedAt"), &fv) == 0 {
+                    st.license_issued_at = fv;
+                    st.license_has_issued_at = true;
+                };
+                if sa_json_object_get_f64(lic, STR_PTR("expiresAt"), STR_LEN("expiresAt"), &fv) == 0 {
+                    st.license_expires_at = fv;
+                    st.license_has_expires_at = true;
+                };
+            };
+        };
+        let fv2: f64 = 0.0;
+        if sa_json_object_get_f64(data, STR_PTR("refreshIntervalHours"), STR_LEN("refreshIntervalHours"), &fv2) == 0 {
+            st.refresh_interval_hours = fv2;
+        };
+        // nullable timestamps: present node with non-null kind carries the value
+        let node: u64 = 0;
+        if sa_json_object_get(data, STR_PTR("lastRefreshedAt"), STR_LEN("lastRefreshedAt"), &node) == 0 {
+            if node != 0 {
+                if sa_json_kind(node) != 0 {
+                    if sa_json_object_get_f64(data, STR_PTR("lastRefreshedAt"), STR_LEN("lastRefreshedAt"), &fv2) == 0 {
+                        st.last_refreshed_at = fv2;
+                        st.has_last_refreshed_at = true;
+                    };
+                };
+            };
+        };
+        if sa_json_object_get(data, STR_PTR("nextRequiredRefreshAt"), STR_LEN("nextRequiredRefreshAt"), &node) == 0 {
+            if node != 0 {
+                if sa_json_kind(node) != 0 {
+                    if sa_json_object_get_f64(data, STR_PTR("nextRequiredRefreshAt"), STR_LEN("nextRequiredRefreshAt"), &fv2) == 0 {
+                        st.next_required_refresh_at = fv2;
+                        st.has_next_required_refresh_at = true;
+                    };
+                };
+            };
+        };
+        let bv2: bool = false;
+        if sa_json_object_get_bool(data, STR_PTR("refreshRequired"), STR_LEN("refreshRequired"), &bv2) == 0 {
+            st.refresh_required = bv2;
+        };
+        let sp: ptr = PTR_NULL();
+        let sl: u64 = 0;
+        if sa_json_object_get_string(data, STR_PTR("discordInviteUrl"), STR_LEN("discordInviteUrl"), &sp, &sl) == 0 {
+            st.discord_invite_url_len = fm_field_copy(fm_status_field(st, 2), 512, sp, sl);
+        };
+        // campaign: object or null; kept as compact JSON text (skeleton model)
+        let camp: u64 = 0;
+        if sa_json_object_get(data, STR_PTR("campaign"), STR_LEN("campaign"), &camp) == 0 {
+            if camp != 0 {
+                if sa_json_kind(camp) != 0 {
+                    let h: u64 = 0;
+                    if sa_json_stringify(camp, &h) == 0 {
+                        if h != 0 {
+                            let cp: ptr = sa_json_buffer_data(h);
+                            let cl: u64 = sa_json_buffer_len(h);
+                            st.campaign_len = fm_field_copy(fm_status_field(st, 3), 4096, cp, cl);
+                            st.has_campaign = true;
+                            fm_free_buffer(h);
+                        };
+                    };
+                };
+            };
+        };
+    };
+    st.configured = true;
+    st.development_machine = false;
+    fm_set_machine_code(mgr, st);
+    st.storage = storage;
+}
+
+fn freeModelAccessManager_decorate(mgr: &FreeModelAccessManager, storage: u64) -> i32 {
+    fm_fill_remote(mgr, &mgr.out_status, storage);
     return 0;
 }
 
-// L330-337: function licenseError(reason): string — switch over reason union
-// Returns Chinese messages: machine_mismatch "该密钥不属于当前 Windows 机器", expired "该密钥已经过期，请重新获取",
-// revoked "该密钥已经被撤销，请重新获取", default "密钥无效，请检查后重试" (literals preserved at fix stage; out via mgr.err).
-fn licenseError(reason: u64, out_ptr: ptr) -> u64 {
-    // DEFECT: string return -> (ptr,len) via caller buffer; switch -> if-chain on reason code.
+// L200-217: developmentStatus
+fn freeModelAccessManager_developmentStatus(mgr: &FreeModelAccessManager) -> i32 {
+    let st: &FreeModelAccessStatus = &mgr.out_status;
+    fm_status_reset(st);
+    st.configured = true;
+    st.development_machine = true;
+    fm_set_machine_code(mgr, st);
+    st.license_valid = true;
+    st.license_reason = 0;
+    st.license_key_preview_len = fm_field_copy(fm_status_field(st, 1), 128, STR_PTR("开发机器免密"), STR_LEN("开发机器免密"));
+    st.license_has_key_preview = true;
+    st.refresh_interval_hours = 5.0;
+    st.refresh_required = false;
+    fm_set_invite(st);
+    st.has_campaign = false;
+    st.storage = 3;
     return 0;
 }
 
-// L339-341: export function isDevelopmentMachine(machineHash): boolean
-fn isDevelopmentMachine(hash_ptr: ptr, hash_len: u64) -> bool {
-    // DEVELOPMENT_MACHINE_HASHES.has(machineHash.trim().toLowerCase())
-    // DEFECT: Set.has + string normalize -> trim/lowercase copy + fixed-array compare.
-    return false;
-}
-
-// L343-345: function errorMessage(error: unknown): string
-// DEFECT: unknown/Error narrowing -> (code, msg_ptr, msg_len) convention; message copied out.
-fn errorMessage(is_error: bool, msg_ptr: ptr, msg_len: u64, out_ptr: ptr) -> u64 {
+// L219-236: unconfiguredStatus
+fn freeModelAccessManager_unconfiguredStatus(mgr: &FreeModelAccessManager, storage: u64) -> i32 {
+    let st: &FreeModelAccessStatus = &mgr.out_status;
+    fm_status_reset(st);
+    st.configured = false;
+    st.development_machine = false;
+    fm_set_machine_code(mgr, st);
+    st.license_valid = false;
+    st.license_reason = 1;
+    st.refresh_interval_hours = 5.0;
+    st.refresh_required = true;
+    fm_set_invite(st);
+    st.has_campaign = false;
+    st.storage = storage;
+    st.service_error_len = fm_field_copy(fm_status_field(st, 5), 1024, STR_PTR("CODEX_ULTRA_FREE_KEY_SERVICE_URL is not configured"), STR_LEN("CODEX_ULTRA_FREE_KEY_SERVICE_URL is not configured"));
+    st.has_service_error = true;
     return 0;
 }
 
-// L11 helper: KEY_PATTERN validator
-// DEFECT: RegExp /^cxu-[A-Za-z0-9]{48}$/ -> manual prefix + charset scan.
-fn keyPatternMatches(key_ptr: ptr, key_len: u64) -> bool {
-    return false;
+// ---------------------------------------------------------------------------
+// Public methods.
+// ---------------------------------------------------------------------------
+
+fn fm_now_ms() -> f64 {
+    return (sa_time_unix_ms()) as f64;
+}
+
+// Body {machineHash, key|null} into mgr.req_body.
+fn fm_body_machine_key(mgr: &FreeModelAccessManager) -> void {
+    let doc = fm_body_new();
+    if doc != 0 {
+        sa_json_object_set_string(doc, STR_PTR("machineHash"), STR_LEN("machineHash"), fm_mgr_field(mgr, 4), mgr.machine_hash_len);
+        if mgr.read_has_key {
+            sa_json_object_set_string(doc, STR_PTR("key"), STR_LEN("key"), fm_mgr_field(mgr, 6), mgr.read_key_len);
+        } else {
+            sa_json_object_set_null(doc, STR_PTR("key"), STR_LEN("key"));
+        };
+    };
+    fm_body_finish(mgr, doc);
+}
+
+fn fm_cache_store(mgr: &FreeModelAccessManager) -> void {
+    mgr.has_status_cache = true;
+    mgr.cache_has_key = mgr.read_has_key;
+    mgr.cache_key_len = 0;
+    if mgr.read_has_key {
+        mgr.cache_key_len = fm_field_copy(fm_mgr_field(mgr, 7), 256, fm_mgr_field(mgr, 6), mgr.read_key_len);
+    };
+    mgr.cache_expires_at = fm_now_ms() + 60000.0;
+    mgr.cache_value = mgr.out_status;
+}
+
+fn fm_cache_hit(mgr: &FreeModelAccessManager) -> bool {
+    if !mgr.has_status_cache { return false; };
+    if mgr.cache_has_key != mgr.read_has_key { return false; };
+    if mgr.read_has_key {
+        if !fm_eq(fm_mgr_field(mgr, 7), mgr.cache_key_len, fm_mgr_field(mgr, 6), mgr.read_key_len) { return false; };
+    };
+    return mgr.cache_expires_at > fm_now_ms();
+}
+
+// L91-107: status()
+fn freeModelAccessManager_status(mgr: &FreeModelAccessManager) -> i32 {
+    let rc = freeModelAccessManager_machineHash(mgr);
+    if rc != 0 { return rc; };
+    if isDevelopmentMachine(fm_mgr_field(mgr, 4), mgr.machine_hash_len) {
+        return freeModelAccessManager_developmentStatus(mgr);
+    };
+    freeModelAccessManager_readKey(mgr);
+    if fm_cache_hit(mgr) {
+        mgr.out_status = mgr.cache_value;
+        return 0;
+    };
+    if !mgr.has_service_url {
+        return freeModelAccessManager_unconfiguredStatus(mgr, mgr.read_storage);
+    };
+    fm_body_machine_key(mgr);
+    let rrc = freeModelAccessManager_request(mgr, STR_PTR("/v1/access/status"), STR_LEN("/v1/access/status"), fm_mgr_field(mgr, 8), mgr.req_body_len);
+    if rrc != 0 {
+        // TS catch: {...unconfiguredStatus, configured: true, serviceError}
+        let keep_err: [u8; 1024] = [0u8; 1024];
+        let kp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(kp, &keep_err, 0);
+        let kl = fm_field_copy(kp, 1024, fm_mgr_field(mgr, 5), mgr.err_len);
+        freeModelAccessManager_unconfiguredStatus(mgr, mgr.read_storage);
+        mgr.out_status.configured = true;
+        mgr.out_status.service_error_len = fm_field_copy(fm_status_field(&mgr.out_status, 5), 1024, kp, kl);
+        mgr.out_status.has_service_error = true;
+        return 0;
+    };
+    freeModelAccessManager_decorate(mgr, mgr.read_storage);
+    fm_cache_store(mgr);
+    return 0;
+}
+
+// L109-120: createRequirement() — Promise.all pair runs sequentially (R8).
+fn freeModelAccessManager_createRequirement(mgr: &FreeModelAccessManager) -> i32 {
+    let rc = freeModelAccessManager_machineHash(mgr);
+    if rc != 0 { return rc; };
+    if isDevelopmentMachine(fm_mgr_field(mgr, 4), mgr.machine_hash_len) {
+        return freeModelAccessManager_developmentStatus(mgr);
+    };
+    freeModelAccessManager_readKey(mgr);
+    if !mgr.has_service_url {
+        return freeModelAccessManager_unconfiguredStatus(mgr, mgr.read_storage);
+    };
+    fm_body_machine_key(mgr);
+    let rrc = freeModelAccessManager_request(mgr, STR_PTR("/v1/access/status"), STR_LEN("/v1/access/status"), fm_mgr_field(mgr, 8), mgr.req_body_len);
+    if rrc != 0 { return -1; };
+    freeModelAccessManager_decorate(mgr, mgr.read_storage);
+    // requirement request {machineHash}
+    let doc = fm_body_new();
+    if doc != 0 {
+        sa_json_object_set_string(doc, STR_PTR("machineHash"), STR_LEN("machineHash"), fm_mgr_field(mgr, 4), mgr.machine_hash_len);
+    };
+    fm_body_finish(mgr, doc);
+    let qrc = freeModelAccessManager_request(mgr, STR_PTR("/v1/access/requirement"), STR_LEN("/v1/access/requirement"), fm_mgr_field(mgr, 8), mgr.req_body_len);
+    if qrc != 0 { return -1; };
+    let data = mgr.resp_data;
+    if data != 0 {
+        let cp: ptr = PTR_NULL();
+        let cl: u64 = 0;
+        if sa_json_object_get_string(data, STR_PTR("requiredCode"), STR_LEN("requiredCode"), &cp, &cl) == 0 {
+            mgr.out_status.requirement_code_len = fm_field_copy(fm_status_field(&mgr.out_status, 4), 256, cp, cl);
+            let fv: f64 = 0.0;
+            if sa_json_object_get_f64(data, STR_PTR("expiresAt"), STR_LEN("expiresAt"), &fv) == 0 {
+                mgr.out_status.requirement_expires_at = fv;
+            };
+            mgr.out_status.has_requirement = true;
+        };
+    };
+    return 0;
+}
+
+// L122-134: saveKey(keyInput)
+fn freeModelAccessManager_saveKey(mgr: &FreeModelAccessManager, key_ptr: ptr, key_len: u64) -> i32 {
+    let rc = freeModelAccessManager_machineHash(mgr);
+    if rc != 0 { return rc; };
+    if isDevelopmentMachine(fm_mgr_field(mgr, 4), mgr.machine_hash_len) {
+        return freeModelAccessManager_developmentStatus(mgr);
+    };
+    let key: FmaStr = FmaStr { bytes: [0u8; 2048], len: 0 };
+    fm_trim_copy(&key, key_ptr, key_len);
+    if !keyPatternMatches(fm_str_ptr(&key), key.len) {
+        fm_set_err_lit(mgr, STR_PTR("密钥格式应为 cxu- 加 48 位字母数字"), STR_LEN("密钥格式应为 cxu- 加 48 位字母数字"));
+        return -3;
+    };
+    if !mgr.has_service_url {
+        fm_set_err_lit(mgr, STR_PTR("免费模型密钥服务尚未配置"), STR_LEN("免费模型密钥服务尚未配置"));
+        return -4;
+    };
+    // request with the candidate key (read_* scratch carries it for the body)
+    mgr.read_key_len = fm_field_copy(fm_mgr_field(mgr, 6), 256, fm_str_ptr(&key), key.len);
+    mgr.read_has_key = true;
+    fm_body_machine_key(mgr);
+    let rrc = freeModelAccessManager_request(mgr, STR_PTR("/v1/access/status"), STR_LEN("/v1/access/status"), fm_mgr_field(mgr, 8), mgr.req_body_len);
+    if rrc != 0 { return -1; };
+    // if !remote.license.valid throw licenseError(reason)
+    let lic: u64 = 0;
+    let valid = false;
+    let reason: u64 = 2;
+    if sa_json_object_get(mgr.resp_data, STR_PTR("license"), STR_LEN("license"), &lic) == 0 {
+        if lic != 0 {
+            let bv: bool = false;
+            if sa_json_object_get_bool(lic, STR_PTR("valid"), STR_LEN("valid"), &bv) == 0 {
+                valid = bv;
+            };
+            let rp: ptr = PTR_NULL();
+            let rl: u64 = 0;
+            if sa_json_object_get_string(lic, STR_PTR("reason"), STR_LEN("reason"), &rp, &rl) == 0 {
+                reason = fm_reason_code(rp, rl);
+            };
+        };
+    };
+    if !valid {
+        mgr.err_len = licenseError(reason, fm_mgr_field(mgr, 5));
+        return -5;
+    };
+    let storage = freeModelAccessManager_writeKey(mgr, fm_str_ptr(&key), key.len);
+    freeModelAccessManager_decorate(mgr, (storage) as u64);
+    fm_cache_store(mgr);
+    return 0;
+}
+
+// L136-149: clearKey()
+fn freeModelAccessManager_clearKey(mgr: &FreeModelAccessManager) -> i32 {
+    mgr.has_memory_key = false;
+    mgr.memory_key_len = 0;
+    mgr.has_status_cache = false;
+    if freeModelAccessManager_keyringEntry(mgr) != 0 {
+        // A missing keyring entry is already the desired state; result ignored.
+        sa_keyring_remove(STR_PTR("free-model-access"), STR_LEN("free-model-access"));
+    };
+    return freeModelAccessManager_status(mgr);
+}
+
+// L151-175: prepareRefresh()
+fn freeModelAccessManager_prepareRefresh(mgr: &FreeModelAccessManager) -> i32 {
+    let rc = freeModelAccessManager_machineHash(mgr);
+    if rc != 0 { return rc; };
+    if isDevelopmentMachine(fm_mgr_field(mgr, 4), mgr.machine_hash_len) {
+        freeModelAccessManager_developmentStatus(mgr);
+        mgr.out_auth.status = mgr.out_status;
+        mgr.out_auth.allowed = true;
+        mgr.out_auth.authorization_id_len = fm_field_copy(fm_auth_field(&mgr.out_auth), 256, STR_PTR("development-machine"), STR_LEN("development-machine"));
+        mgr.out_auth.has_authorization_id = true;
+        mgr.out_auth.has_authorization_expires_at = false;
+        return 0;
+    };
+    freeModelAccessManager_readKey(mgr);
+    if !mgr.has_service_url {
+        freeModelAccessManager_unconfiguredStatus(mgr, mgr.read_storage);
+        mgr.out_auth.status = mgr.out_status;
+        mgr.out_auth.allowed = false;
+        mgr.out_auth.has_authorization_id = false;
+        return 0;
+    };
+    fm_body_machine_key(mgr);
+    let rrc = freeModelAccessManager_request(mgr, STR_PTR("/v1/access/prepare"), STR_LEN("/v1/access/prepare"), fm_mgr_field(mgr, 8), mgr.req_body_len);
+    if rrc != 0 {
+        let keep_err: [u8; 1024] = [0u8; 1024];
+        let kp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(kp, &keep_err, 0);
+        let kl = fm_field_copy(kp, 1024, fm_mgr_field(mgr, 5), mgr.err_len);
+        freeModelAccessManager_unconfiguredStatus(mgr, mgr.read_storage);
+        mgr.out_status.configured = true;
+        mgr.out_status.service_error_len = fm_field_copy(fm_status_field(&mgr.out_status, 5), 1024, kp, kl);
+        mgr.out_status.has_service_error = true;
+        mgr.out_auth.status = mgr.out_status;
+        mgr.out_auth.allowed = false;
+        mgr.out_auth.has_authorization_id = false;
+        return 0;
+    };
+    fm_fill_remote(mgr, &mgr.out_auth.status, mgr.read_storage);
+    mgr.out_auth.allowed = false;
+    mgr.out_auth.has_authorization_id = false;
+    mgr.out_auth.has_authorization_expires_at = false;
+    let data = mgr.resp_data;
+    if data != 0 {
+        let bv: bool = false;
+        if sa_json_object_get_bool(data, STR_PTR("allowed"), STR_LEN("allowed"), &bv) == 0 {
+            mgr.out_auth.allowed = bv;
+        };
+        let ap: ptr = PTR_NULL();
+        let al: u64 = 0;
+        if sa_json_object_get_string(data, STR_PTR("authorizationId"), STR_LEN("authorizationId"), &ap, &al) == 0 {
+            mgr.out_auth.authorization_id_len = fm_field_copy(fm_auth_field(&mgr.out_auth), 256, ap, al);
+            mgr.out_auth.has_authorization_id = true;
+        };
+        let fv: f64 = 0.0;
+        if sa_json_object_get_f64(data, STR_PTR("authorizationExpiresAt"), STR_LEN("authorizationExpiresAt"), &fv) == 0 {
+            mgr.out_auth.authorization_expires_at = fv;
+            mgr.out_auth.has_authorization_expires_at = true;
+        };
+        // requirement may ride along on the prepare payload (TS spread merge)
+        let rp: ptr = PTR_NULL();
+        let rl: u64 = 0;
+        let reqn: u64 = 0;
+        if sa_json_object_get(data, STR_PTR("requirement"), STR_LEN("requirement"), &reqn) == 0 {
+            if reqn != 0 {
+                if sa_json_object_get_string(reqn, STR_PTR("requiredCode"), STR_LEN("requiredCode"), &rp, &rl) == 0 {
+                    mgr.out_auth.status.requirement_code_len = fm_field_copy(fm_status_field(&mgr.out_auth.status, 4), 256, rp, rl);
+                    let rf: f64 = 0.0;
+                    if sa_json_object_get_f64(reqn, STR_PTR("expiresAt"), STR_LEN("expiresAt"), &rf) == 0 {
+                        mgr.out_auth.status.requirement_expires_at = rf;
+                    };
+                    mgr.out_auth.status.has_requirement = true;
+                };
+            };
+        };
+    };
+    return 0;
+}
+
+fn fm_auth_field(a: &FreeModelRefreshAuthorization) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &a.authorization_id, 0);
+    return p;
+}
+
+// L177-188: completeRefresh(authorizationId, success, importedModels)
+fn freeModelAccessManager_completeRefresh(mgr: &FreeModelAccessManager, has_auth: bool, auth_ptr: ptr, auth_len: u64, success: bool, imported_models: f64) -> i32 {
+    if has_auth {
+        if fm_eq(auth_ptr, auth_len, STR_PTR("development-machine"), STR_LEN("development-machine")) {
+            return 0;
+        };
+    };
+    if !has_auth { return 0; };
+    if !mgr.has_service_url { return 0; };
+    let rc = freeModelAccessManager_machineHash(mgr);
+    if rc != 0 { return rc; };
+    let doc = fm_body_new();
+    if doc != 0 {
+        sa_json_object_set_string(doc, STR_PTR("machineHash"), STR_LEN("machineHash"), fm_mgr_field(mgr, 4), mgr.machine_hash_len);
+        sa_json_object_set_string(doc, STR_PTR("authorizationId"), STR_LEN("authorizationId"), auth_ptr, auth_len);
+        let sv: u8 = 0;
+        if success { sv = 1; };
+        sa_json_object_set_bool(doc, STR_PTR("success"), STR_LEN("success"), sv);
+        sa_json_object_set_f64(doc, STR_PTR("importedModels"), STR_LEN("importedModels"), imported_models);
+    };
+    fm_body_finish(mgr, doc);
+    let rrc = freeModelAccessManager_request(mgr, STR_PTR("/v1/access/complete"), STR_LEN("/v1/access/complete"), fm_mgr_field(mgr, 8), mgr.req_body_len);
+    if rrc != 0 { return -1; };
+    mgr.has_status_cache = false;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Zero-value constructors (probes and future callers).
+// ---------------------------------------------------------------------------
+
+fn freeModelAccessStatus_new() -> FreeModelAccessStatus {
+    return FreeModelAccessStatus {
+        configured: false, development_machine: false,
+        machine_code: [0u8; 16], machine_code_len: 0,
+        license_valid: false, license_reason: 1,
+        license_key_preview: [0u8; 128], license_key_preview_len: 0, license_has_key_preview: false,
+        license_issued_at: 0.0, license_has_issued_at: false,
+        license_expires_at: 0.0, license_has_expires_at: false,
+        refresh_interval_hours: 0.0,
+        last_refreshed_at: 0.0, has_last_refreshed_at: false,
+        next_required_refresh_at: 0.0, has_next_required_refresh_at: false,
+        refresh_required: false,
+        discord_invite_url: [0u8; 512], discord_invite_url_len: 0,
+        has_campaign: false, campaign: [0u8; 4096], campaign_len: 0,
+        storage: 3,
+        has_requirement: false, requirement_code: [0u8; 256], requirement_code_len: 0, requirement_expires_at: 0.0,
+        has_service_error: false, service_error: [0u8; 1024], service_error_len: 0,
+    };
+}
+
+fn freeModelRefreshAuthorization_new() -> FreeModelRefreshAuthorization {
+    return FreeModelRefreshAuthorization {
+        status: freeModelAccessStatus_new(),
+        allowed: false,
+        has_authorization_id: false, authorization_id: [0u8; 256], authorization_id_len: 0,
+        has_authorization_expires_at: false, authorization_expires_at: 0.0,
+    };
+}
+
+fn freeModelAccessManager_alloc() -> FreeModelAccessManager {
+    return FreeModelAccessManager {
+        has_service_url: false, service_url: [0u8; 1024], service_url_len: 0,
+        has_service_secret: false, service_secret: [0u8; 1024], service_secret_len: 0,
+        has_env_key: false, env_key: [0u8; 256], env_key_len: 0,
+        has_memory_key: false, memory_key: [0u8; 256], memory_key_len: 0,
+        machine_hash: [0u8; 65], machine_hash_len: 0, machine_hash_resolved: false,
+        has_status_cache: false, cache_key: [0u8; 256], cache_key_len: 0, cache_has_key: false,
+        cache_expires_at: 0.0, cache_value: freeModelAccessStatus_new(),
+        env_id: 0,
+        out_status: freeModelAccessStatus_new(),
+        out_auth: freeModelRefreshAuthorization_new(),
+        err: [0u8; 1024], err_len: 0,
+        read_key: [0u8; 256], read_key_len: 0, read_has_key: false, read_storage: 3,
+        req_body: [0u8; 4096], req_body_len: 0,
+        url_buf: [0u8; 2176], url_len: 0,
+        auth_buf: [0u8; 1200], auth_len: 0,
+        resp: [0u8; 16384], resp_len: 0,
+        resp_doc: 0, resp_data: 0,
+        scratch: [0u8; 1024], scratch_len: 0,
+    };
 }
