@@ -1,12 +1,64 @@
-// Converted 1:1 from apps/server/src/saVmSplitWorkflow.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Converted 1:1 from apps/server/src/saVmSplitWorkflow.ts (CXU plugins @ f2cb649d).
+//
+// Fix pass (launch/install family batch): all bodies retranslated from
+// the TS. Method notes:
+// - All awaited fs calls are blocking sa_std_fs externs (ASYNC_MODEL R8);
+//   the TS try/catch funnel becomes status codes + an error string in the
+//   SwCtx scratch, and runSplitWorkflowAction's catch-all composes the
+//   same result(false, "", message) shape as the TS catch.
+// - The manifest's files Record<string, SplitFileState> lives in
+//   SplitManifest.files_scratch as its JSON object text (exactly the
+//   "files" value of the manifest JSON); file_paths/file_path_lens keep
+//   the insertion order for iteration, and per-state load/store goes
+//   through sa_json on that text (sw_files_*).
+// - stageOps writes its sorted touched paths into the stage_paths store
+//   at the slot for stage index stages_len WITHOUT committing the stage
+//   record; split_stage/split_refine then fill kind/module/at/count and
+//   increment stages_len. split_repair phase=stage leaves the slot
+//   uncommitted (overwritten by the next stage), mirroring the TS where
+//   repair staging records no stage entry.
+// - Cross-unit seams:
+//   * Policy: backends/vmtool-security saVmPolicy.sla is fully
+//     implemented; policy_id is the SaVmPolicyConfig JSON doc handle
+//     (0 when has_policy=false). Internal helpers receive additionalRoots
+//     as a &StrList passed by address in roots_ptr (roots_len = its len).
+//   * TreeSitter: saVmTreeSitter.sla is implemented; a fresh
+//     TreeSitterState literal is constructed per call (the saVmTool
+//     consumer pattern). Its StrBuf content cap is 65536 bytes, so
+//     outline/diagnostics see at most the first 64 KiB of a staged file
+//     (that unit's own cap, registered here).
+//   * [BLOCKED cross-file: saVmApplyPatch body] parseAndCheckSaVmPatch
+//     is still a conversion-era comment skeleton (empty body), so every
+//     patch op is currently rejected as `invalid split patch: ` with an
+//     empty reason. The stageOps patch path is implemented faithfully
+//     against its declared SaVmPatchResult contract and unblocks the
+//     moment that unit is retranslated.
+//   * [BLOCKED cross-file: miniTaskIntent predicates] not used here.
+// - Error texts: TS Error messages are reproduced verbatim for all
+//   thrown workflow errors. Node fs error texts are approximated:
+//   a missing file produces the node-shaped
+//   `ENOENT: no such file or directory, open '<path>'`; other fs
+//   failures and JSON.parse failures use explicit status texts
+//   (registered approximation, same class as the vendor units).
+// - Content caps follow the structs (SplitFileState buffers 1048576;
+//   SplitResult stdout 262144) — the tree's fixed-buffer DEFECT class.
+//   sha256 is one-shot (sa_std_net_sha256_hex), so hashing covers the
+//   stored (possibly capped) content.
+// - Date.toISOString uses sa_time_iso_from_unix_ms (same JS shape).
 
 @import "sa_std/io/print.sai"
 @import "sa_std/string.sa"
-// @import "./saVmTreeSitter.sla"  // analyzeFileCoupling, extractFileOutline, getSyntaxDiagnostics (converted by another unit)
-// @import "../../../backends/vmtool-security/src/security/saVmPolicy.sla"  // checkSaVmPath, normalizeSaVmPolicy, pathWithin (outside this mirror tree)
-// @import "./saVmApplyPatch.sla"  // parseAndCheckSaVmPatch (converted by another unit)
-// DEFECT: node:crypto createHash/randomUUID, node:fs sync+promises, node:os homedir, node:path -> sa_std sha256 / uuid / fs / path extern approximations.
-// DEFECT: SaVmPolicyConfig (@codex-ui/shared) dynamic object -> opaque policy handle u64 + JSON text buffer.
+@import "sa_std/ptr.sa"
+@import "sa_std/fs.sai"
+@import "sa_std/fmt.sai"
+@import "sa_std/time.sai"
+@import "sa_std/env.sai"
+@import "sa_std/crypto.sai"
+@import "sa_std/net.sai"
+@import "sa_std/encoding/json.sai"
+@import "./saVmTreeSitter.sla"
+@import "./saVmApplyPatch.sla"
+@import "../../../backends/vmtool-security/src/security/saVmPolicy.sla"
 
 // L13-19: type SplitFileState
 struct SplitFileState {
@@ -74,192 +126,3108 @@ struct SplitResult {
     duration_ms: u64,
 }
 
+// ---------------------------------------------------------------------------
+// sw_ helpers: byte scratch, paths, hashing, time, fs.
+// ---------------------------------------------------------------------------
+
+const SW_ST_PLANNED: u64 = 0;
+const SW_ST_STAGED: u64 = 1;
+const SW_ST_COMMITTED: u64 = 2;
+const SW_ST_ROLLED_BACK: u64 = 3;
+
+struct SwStr {
+    bytes: [u8; 8192], len: u64
+}
+
+struct SwMid {
+    bytes: [u8; 131072], len: u64
+}
+
+struct SwBig {
+    bytes: [u8; 1048576], len: u64
+}
+
+struct SwHuge {
+    bytes: [u8; 4456448], len: u64
+}
+
+// Error channel for the TS throw/catch funnel inside this unit.
+struct SwCtx {
+    err: [u8; 8192], err_len: u64
+}
+
+fn sw_ctx_clear(ctx: &SwCtx) -> void {
+    ctx.err_len = 0;
+}
+
+fn sw_ctx_ptr(ctx: &SwCtx) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &ctx.err, 0);
+    return p;
+}
+
+fn sw_str_ptr(s: &SwStr) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &s.bytes, 0);
+    return p;
+}
+
+fn sw_mid_ptr(s: &SwMid) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &s.bytes, 0);
+    return p;
+}
+
+fn sw_big_ptr(s: &SwBig) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &s.bytes, 0);
+    return p;
+}
+
+fn sw_huge_ptr(s: &SwHuge) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &s.bytes, 0);
+    return p;
+}
+
+fn sw_byte(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+fn sw_eq(p: ptr, n: u64, q: ptr, qn: u64) -> bool {
+    if n != qn { return false; };
+    let i: u64 = 0;
+    while i < n {
+        if sw_byte(p, i) != sw_byte(q, i) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn sw_field_copy(dst: ptr, cap: u64, src: ptr, n: u64) -> u64 {
+    let m = n;
+    if m > cap { m = cap; };
+    if m > 0 { PTR_COPY_BYTES(dst, src, m); };
+    return m;
+}
+
+fn sw_push(s: &SwStr, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        if s.len < 8192 {
+            s.bytes[s.len] = sw_byte(p, i);
+            s.len = s.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn sw_push_lit(s: &SwStr, lit_p: ptr, lit_n: u64) -> void {
+    sw_push(s, lit_p, lit_n);
+}
+
+fn sw_mid_push(s: &SwMid, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        if s.len < 131072 {
+            s.bytes[s.len] = sw_byte(p, i);
+            s.len = s.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn sw_mid_push_lit(s: &SwMid, lit_p: ptr, lit_n: u64) -> void {
+    sw_mid_push(s, lit_p, lit_n);
+}
+
+fn sw_big_push(s: &SwBig, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        if s.len < 1048576 {
+            s.bytes[s.len] = sw_byte(p, i);
+            s.len = s.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn sw_big_push_lit(s: &SwBig, lit_p: ptr, lit_n: u64) -> void {
+    sw_big_push(s, lit_p, lit_n);
+}
+
+fn sw_huge_push(s: &SwHuge, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        if s.len < 4456448 {
+            s.bytes[s.len] = sw_byte(p, i);
+            s.len = s.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn sw_huge_push_lit(s: &SwHuge, lit_p: ptr, lit_n: u64) -> void {
+    sw_huge_push(s, lit_p, lit_n);
+}
+
+fn sw_push_u64(s: &SwStr, v: u64) -> void {
+    if v == 0 {
+        sw_push_lit(s, STR_PTR("0"), STR_LEN("0"));
+        return;
+    };
+    let tmp: [u8; 24] = [0; 24];
+    let tn: u64 = 0;
+    let x = v;
+    while x > 0 {
+        tmp[tn] = (48 + (x % 10)) as u8;
+        tn = tn + 1;
+        x = x / 10;
+    }
+    while tn > 0 {
+        tn = tn - 1;
+        if s.len < 8192 {
+            s.bytes[s.len] = tmp[tn];
+            s.len = s.len + 1;
+        };
+    }
+}
+
+fn sw_mid_push_u64(s: &SwMid, v: u64) -> void {
+    let t = SwStr { bytes: [0; 8192], len: 0 };
+    sw_push_u64(&t, v);
+    sw_mid_push(s, sw_str_ptr(&t), t.len);
+}
+
+fn sw_err_set(ctx: &SwCtx, p: ptr, n: u64) -> void {
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, &ctx.err, 0);
+    ctx.err_len = sw_field_copy(dp, 8192, p, n);
+}
+
+fn sw_err_set_lit(ctx: &SwCtx, lit_p: ptr, lit_n: u64) -> void {
+    sw_err_set(ctx, lit_p, lit_n);
+}
+
+// err = prefix + (p, n) + suffix (template-literal shaped messages).
+fn sw_err_format(ctx: &SwCtx, pre_p: ptr, pre_n: u64, p: ptr, n: u64, suf_p: ptr, suf_n: u64) -> void {
+    let t = SwStr { bytes: [0; 8192], len: 0 };
+    sw_push(&t, pre_p, pre_n);
+    sw_push(&t, p, n);
+    sw_push(&t, suf_p, suf_n);
+    sw_err_set(ctx, sw_str_ptr(&t), t.len);
+}
+
 // L50: const hashContent = (content) => createHash("sha256").update(content).digest("hex")
-// DEFECT: arrow-function const -> named fn; node:crypto -> sa_std sha256 extern; hex digest into out (65 bytes).
 fn hashContent(content_ptr: ptr, content_len: u64, out_ptr: ptr) -> u64 {
-    return 64;
+    let written: u64 = 0;
+    let st = sa_std_net_sha256_hex(content_ptr, content_len, out_ptr, 65, &written);
+    if st != 0 { return 0; };
+    return written;
 }
 
-// L51: const stagedDigest = (files) => sha256 over sorted entries of `${path}\0${hashContent(stagedContent)}` joined "\n"
-// DEFECT: Object.entries + sort(localeCompare) + template literals -> copy paths, byte-wise sort (localeCompare approximated), manual join with NUL/newline separators.
-fn stagedDigest(manifest: &SplitManifest, out_ptr: ptr) -> u64 {
-    return 64;
+fn sw_now_ms() -> i64 {
+    return sa_time_unix_ms();
 }
 
-// L52: const splitRoot = (cwd) => join(process.env.CODEX_HOME || join(homedir(), ".codex"), "sa-vm", "split-workflows", hashContent(resolve(cwd)).slice(0, 24))
-// DEFECT: || env fallback + path joins + slice -> buffer assembly; env read via extern.
-fn splitRoot(cwd_ptr: ptr, cwd_len: u64, out_ptr: ptr) -> u64 {
+// Copy the JS Date.toISOString() text for `ms` into dst (cap-clamped).
+fn sw_iso_into(dst: ptr, cap: u64, ms: i64) -> u64 {
+    let h = sa_time_iso_from_unix_ms(ms);
+    if h == 0 { return 0; };
+    let hp: ptr = sa_fmt_buffer_data(h);
+    let hl = sa_fmt_buffer_len(h);
+    let m = sw_field_copy(dst, cap, hp, hl);
+    sa_fmt_buffer_free(h);
+    return m;
+}
+
+fn sw_uuid_into(dst: ptr, cap: u64) -> u64 {
+    let h = sa_deno_random_uuid();
+    if h == 0 { return 0; };
+    let hp: ptr = sa_fmt_buffer_data(h);
+    let hl = sa_fmt_buffer_len(h);
+    let m = sw_field_copy(dst, cap, hp, hl);
+    sa_fmt_buffer_free(h);
+    return m;
+}
+
+// The single fs_exists throat for this file (status code, 0 = exists).
+fn sw_fs_exists(p: ptr, n: u64) -> bool {
+    return sa_std_fs_exists(p, n) == 0;
+}
+
+// Read a whole file into a SwBig (struct cap 1048576). Returns 0 on
+// success, the std status otherwise (3 = missing).
+fn sw_read_file(p: ptr, n: u64, out: &SwBig) -> i32 {
+    out.len = 0;
+    let total: u64 = 0;
+    let lst = sa_std_fs_len(p, n, &total);
+    if lst != 0 { return lst; };
+    let fh: u64 = 0;
+    let ost = sa_std_fs_open_read(p, n, &fh);
+    if ost != 0 { return ost; };
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &out.bytes, 0);
+    let want = total;
+    if want > 1048576 { want = 1048576; };
+    let read_n: u64 = 0;
+    let rst = sa_std_fs_file_read(fh, bp, want, &read_n);
+    sa_fs_file_close(fh);
+    if rst != 0 { return rst; };
+    out.len = read_n;
     return 0;
+}
+
+fn sw_write_file(p: ptr, n: u64, data: ptr, data_n: u64) -> i32 {
+    return sa_fs_write_file(p, n, data, data_n);
+}
+
+// Node-shaped read error into ctx (see header note on error texts).
+fn sw_err_read(ctx: &SwCtx, status: i32, path_p: ptr, path_n: u64) -> void {
+    if status == 3 {
+        let t = SwStr { bytes: [0; 8192], len: 0 };
+        sw_push_lit(&t, STR_PTR("ENOENT: no such file or directory, open '"), STR_LEN("ENOENT: no such file or directory, open '"));
+        sw_push(&t, path_p, path_n);
+        sw_push_lit(&t, STR_PTR("'"), STR_LEN("'"));
+        sw_err_set(ctx, sw_str_ptr(&t), t.len);
+        return;
+    };
+    let t2 = SwStr { bytes: [0; 8192], len: 0 };
+    sw_push_lit(&t2, STR_PTR("read failed with status "), STR_LEN("read failed with status "));
+    if status < 0 {
+        sw_push_lit(&t2, STR_PTR("-"), STR_LEN("-"));
+        sw_push_u64(&t2, ((0 - status)) as u64);
+    } else {
+        sw_push_u64(&t2, (status) as u64);
+    };
+    sw_err_set(ctx, sw_str_ptr(&t2), t2.len);
+}
+
+
+// ---------------------------------------------------------------------------
+// Path algebra (node:path POSIX semantics used by the TS).
+// ---------------------------------------------------------------------------
+
+fn sw_is_absolute(p: ptr, n: u64) -> bool {
+    return n > 0 && sw_byte(p, 0) == 47;
+}
+
+// Append one segment to a normalized path under construction in `out`:
+// "." and "" are skipped, ".." pops the last segment.
+fn sw_norm_segment(out: &SwStr, seg_p: ptr, seg_n: u64) -> void {
+    if seg_n == 0 { return; };
+    if seg_n == 1 && sw_byte(seg_p, 0) == 46 { return; };
+    if seg_n == 2 && sw_byte(seg_p, 0) == 46 && sw_byte(seg_p, 1) == 46 {
+        // pop: strip trailing "/segment" (never below the leading "/")
+        while out.len > 1 && sw_byte(sw_str_ptr(out), out.len - 1) != 47 {
+            out.len = out.len - 1;
+        }
+        if out.len > 1 { out.len = out.len - 1; };
+        return;
+    };
+    if out.len == 0 || sw_byte(sw_str_ptr(out), out.len - 1) != 47 {
+        sw_push_lit(out, STR_PTR("/"), STR_LEN("/"));
+    };
+    sw_push(out, seg_p, seg_n);
+}
+
+// Normalize (p, n) into out: out starts as "/" for absolute inputs,
+// "" for relative ones (segments joined without a leading slash).
+fn sw_path_normalize(out: &SwStr, p: ptr, n: u64) -> void {
+    out.len = 0;
+    let absolute = sw_is_absolute(p, n);
+    if absolute {
+        sw_push_lit(out, STR_PTR("/"), STR_LEN("/"));
+    };
+    let i: u64 = 0;
+    let seg_start: u64 = 0;
+    while i <= n {
+        if i == n || sw_byte(p, i) == 47 {
+            let seg_p: ptr = PTR_NULL();
+            PTR_BYTE_ADD(seg_p, p, seg_start);
+            sw_norm_segment(out, seg_p, i - seg_start);
+            seg_start = i + 1;
+        };
+        i = i + 1;
+    }
+    if out.len == 0 && !absolute {
+        sw_push_lit(out, STR_PTR("."), STR_LEN("."));
+    };
+}
+
+// resolve(cwd, p): absolute p wins; otherwise cwd + "/" + p, normalized.
+fn sw_path_resolve(out: &SwStr, cwd_p: ptr, cwd_n: u64, p: ptr, n: u64) -> void {
+    if sw_is_absolute(p, n) {
+        sw_path_normalize(out, p, n);
+        return;
+    };
+    let joined = SwStr { bytes: [0; 8192], len: 0 };
+    sw_push(&joined, cwd_p, cwd_n);
+    sw_push_lit(&joined, STR_PTR("/"), STR_LEN("/"));
+    sw_push(&joined, p, n);
+    sw_path_normalize(out, sw_str_ptr(&joined), joined.len);
+}
+
+// join(a, b) for already-clean parts: single "/" seam, no normalization.
+fn sw_path_join2(out: &SwStr, a_p: ptr, a_n: u64, b_p: ptr, b_n: u64) -> void {
+    out.len = 0;
+    sw_push(out, a_p, a_n);
+    if a_n > 0 && sw_byte(a_p, a_n - 1) != 47 {
+        sw_push_lit(out, STR_PTR("/"), STR_LEN("/"));
+    };
+    if b_n > 0 && sw_byte(b_p, 0) == 47 {
+        let bp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(bp, b_p, 1);
+        sw_push(out, bp, b_n - 1);
+        return;
+    };
+    sw_push(out, b_p, b_n);
+}
+
+fn sw_dirname(out: &SwStr, p: ptr, n: u64) -> void {
+    out.len = 0;
+    if n == 0 {
+        sw_push_lit(out, STR_PTR("."), STR_LEN("."));
+        return;
+    };
+    let last: u64 = 0;
+    let found = false;
+    let i: u64 = 0;
+    while i < n {
+        if sw_byte(p, i) == 47 { last = i; found = true; };
+        i = i + 1;
+    }
+    if !found {
+        sw_push_lit(out, STR_PTR("."), STR_LEN("."));
+        return;
+    };
+    if last == 0 {
+        sw_push_lit(out, STR_PTR("/"), STR_LEN("/"));
+        return;
+    };
+    sw_push(out, p, last);
+}
+
+// L52: const splitRoot = (cwd) => join(CODEX_HOME || join(homedir(), ".codex"), "sa-vm", "split-workflows", hashContent(resolve(cwd)).slice(0, 24))
+fn sw_push_env(out: &SwStr, name_p: ptr, name_n: u64) -> bool {
+    let h = sa_env_get(name_p, name_n);
+    if h == 0 { return false; };
+    let hp: ptr = sa_env_buffer_data(h);
+    let hl = sa_env_buffer_len(h);
+    sw_push(out, hp, hl);
+    sa_env_buffer_free(h);
+    return true;
+}
+
+fn splitRoot(cwd_ptr: ptr, cwd_len: u64, out_ptr: ptr) -> u64 {
+    let out = SwStr { bytes: [0; 8192], len: 0 };
+    let have_home = sw_push_env(&out, STR_PTR("CODEX_HOME"), STR_LEN("CODEX_HOME"));
+    if !have_home || out.len == 0 {
+        out.len = 0;
+        sw_push_env(&out, STR_PTR("HOME"), STR_LEN("HOME"));
+        sw_push_lit(&out, STR_PTR("/.codex"), STR_LEN("/.codex"));
+    };
+    sw_push_lit(&out, STR_PTR("/sa-vm/split-workflows/"), STR_LEN("/sa-vm/split-workflows/"));
+    let resolved = SwStr { bytes: [0; 8192], len: 0 };
+    let cwd_abs = SwStr { bytes: [0; 8192], len: 0 };
+    sw_push(&cwd_abs, cwd_ptr, cwd_len);
+    // resolve(cwd) with an empty base = normalize as-is when absolute;
+    // relative cwd is resolved against the process cwd per node.
+    if sw_is_absolute(cwd_ptr, cwd_len) {
+        sw_path_normalize(&resolved, cwd_ptr, cwd_len);
+    } else {
+        let pwd = SwStr { bytes: [0; 8192], len: 0 };
+        sw_push_env(&pwd, STR_PTR("PWD"), STR_LEN("PWD"));
+        sw_path_resolve(&resolved, sw_str_ptr(&pwd), pwd.len, cwd_ptr, cwd_len);
+    };
+    let hex: [u8; 65] = [0; 65];
+    let hp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(hp, &hex, 0);
+    let hl = hashContent(sw_str_ptr(&resolved), resolved.len, hp);
+    let take = hl;
+    if take > 24 { take = 24; };
+    sw_push(&out, hp, take);
+    return sw_field_copy(out_ptr, 8192, sw_str_ptr(&out), out.len);
 }
 
 // L53: const manifestPath = (cwd, id) => join(splitRoot(cwd), `${id}.json`)
 fn manifestPath(cwd_ptr: ptr, cwd_len: u64, id_ptr: ptr, id_len: u64, out_ptr: ptr) -> u64 {
-    return 0;
+    let root = SwStr { bytes: [0; 8192], len: 0 };
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &root.bytes, 0);
+    root.len = splitRoot(cwd_ptr, cwd_len, rp);
+    let out = SwStr { bytes: [0; 8192], len: 0 };
+    sw_push(&out, rp, root.len);
+    sw_push_lit(&out, STR_PTR("/"), STR_LEN("/"));
+    sw_push(&out, id_ptr, id_len);
+    sw_push_lit(&out, STR_PTR(".json"), STR_LEN(".json"));
+    return sw_field_copy(out_ptr, 8192, sw_str_ptr(&out), out.len);
 }
 
-// L54-56: function result(ok, stdout, stderr = "", exitCode = ok ? 0 : 2, kind = ok ? "success" : "sa_error", events = [])
-// DEFECT: default parameters -> call sites pass explicit values; events array -> empty JSON "[]" default.
+// L54-56: result() helper defaults; call sites override duration/events.
 fn split_result(out: &SplitResult, ok: bool, stdout_ptr: ptr, stdout_len: u64, stderr_ptr: ptr, stderr_len: u64, exit_code: i32, kind_ptr: ptr, kind_len: u64) -> i32 {
+    out.ok = ok;
+    let d1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d1, &out.kind, 0);
+    out.kind_len = sw_field_copy(d1, 64, kind_ptr, kind_len);
+    out.exit_code = exit_code;
+    let d2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d2, &out.stdout_buf, 0);
+    out.stdout_len = sw_field_copy(d2, 262144, stdout_ptr, stdout_len);
+    let d3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d3, &out.stderr_buf, 0);
+    out.stderr_len = sw_field_copy(d3, 65536, stderr_ptr, stderr_len);
+    let d4: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d4, &out.events_json, 0);
+    out.events_json_len = sw_field_copy(d4, 65536, STR_PTR("[]"), STR_LEN("[]"));
+    out.has_violation = false;
+    out.violation_reason_len = 0;
+    out.duration_ms = 0;
     return 0;
 }
 
-// L58-64: function safeRelativePath(rawPath, cwd): string — throws on empty/absolute/escaping path
-// DEFECT: throw -> status code (-1 empty/absolute, -2 escapes) with err buffer on caller scratch.
+fn sw_result_finish(out: &SplitResult, started_at_ms: u64) -> void {
+    let now = sw_now_ms();
+    let dur = now - (started_at_ms as i64);
+    if dur < 0 { dur = 0; };
+    out.duration_ms = (dur) as u64;
+}
+
+// L58-64: safeRelativePath — status 0 = ok (out holds the relative path),
+// -1 = not workspace-relative, -2 = escapes workspace; err text in ctx.
 fn safeRelativePath(raw_ptr: ptr, raw_len: u64, cwd_ptr: ptr, cwd_len: u64, out_ptr: ptr, err_ptr: ptr) -> i32 {
-    // value = rawPath.trim().replace(/\\/g, "/") (DEFECT: regex replace -> manual backslash scan)
-    // if (!value || isAbsolute(value)) throw `split path must be workspace-relative: ${rawPath}`
-    // absolute = resolve(cwd, value); if (!pathWithin(resolve(cwd), absolute) || absolute === resolve(cwd)) throw `split path escapes workspace: ${rawPath}`
-    // return relative(cwd, absolute).split(sep).join("/") (DEFECT: path sep normalization -> manual)
-    return 0;
+    // value = rawPath.trim().replace(/\\/g, "/")
+    let value = SwStr { bytes: [0; 8192], len: 0 };
+    let s: u64 = 0;
+    let e: u64 = raw_len;
+    while s < e && (sw_byte(raw_ptr, s) == 32 || (sw_byte(raw_ptr, s) >= 9 && sw_byte(raw_ptr, s) <= 13)) { s = s + 1; }
+    while e > s && (sw_byte(raw_ptr, e - 1) == 32 || (sw_byte(raw_ptr, e - 1) >= 9 && sw_byte(raw_ptr, e - 1) <= 13)) { e = e - 1; }
+    let i: u64 = s;
+    while i < e {
+        let b = sw_byte(raw_ptr, i);
+        if value.len < 8192 {
+            if b == 92 { value.bytes[value.len] = 47; } else { value.bytes[value.len] = b; };
+            value.len = value.len + 1;
+        };
+        i = i + 1;
+    }
+    let ctx = SwCtx { err: [0; 8192], err_len: 0 };
+    if value.len == 0 || sw_is_absolute(sw_str_ptr(&value), value.len) {
+        sw_err_format(&ctx, STR_PTR("split path must be workspace-relative: "), STR_LEN("split path must be workspace-relative: "), raw_ptr, raw_len, STR_PTR(""), STR_LEN(""));
+        sw_field_copy(err_ptr, 8192, sw_ctx_ptr(&ctx), ctx.err_len);
+        sw_err_len_publish(err_ptr, ctx.err_len);
+        return -1;
+    };
+    let cwd_res = SwStr { bytes: [0; 8192], len: 0 };
+    sw_path_resolve(&cwd_res, cwd_ptr, cwd_len, STR_PTR(""), STR_LEN(""));
+    // resolve(cwd) itself: normalize cwd as absolute when it is absolute,
+    // else resolve against itself per node (cwd is absolute in practice).
+    if sw_is_absolute(cwd_ptr, cwd_len) {
+        sw_path_normalize(&cwd_res, cwd_ptr, cwd_len);
+    };
+    let absolute = SwStr { bytes: [0; 8192], len: 0 };
+    sw_path_resolve(&absolute, sw_str_ptr(&cwd_res), cwd_res.len, sw_str_ptr(&value), value.len);
+    if !pathWithin(sw_str_ptr(&cwd_res), cwd_res.len, sw_str_ptr(&absolute), absolute.len) || sw_eq(sw_str_ptr(&absolute), absolute.len, sw_str_ptr(&cwd_res), cwd_res.len) {
+        sw_err_format(&ctx, STR_PTR("split path escapes workspace: "), STR_LEN("split path escapes workspace: "), raw_ptr, raw_len, STR_PTR(""), STR_LEN(""));
+        sw_field_copy(err_ptr, 8192, sw_ctx_ptr(&ctx), ctx.err_len);
+        sw_err_len_publish(err_ptr, ctx.err_len);
+        return -2;
+    };
+    // relative(cwd, absolute): the within-check guarantees the prefix form.
+    let rel = SwStr { bytes: [0; 8192], len: 0 };
+    let ap = sw_str_ptr(&absolute);
+    if cwd_res.len == 1 {
+        // cwd is "/": relative is absolute without the leading slash
+        let rp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp, ap, 1);
+        sw_push(&rel, rp, absolute.len - 1);
+    } else {
+        let rp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp2, ap, cwd_res.len + 1);
+        sw_push(&rel, rp2, absolute.len - cwd_res.len - 1);
+    };
+    return (sw_field_copy(out_ptr, 8192, sw_str_ptr(&rel), rel.len)) as i32;
 }
 
-// L66-73: async function saveManifest(manifest): Promise<void>
-// DEFECT: async -> synchronous + status code; await mkdir/writeFile/rename -> blocking sa_std_fs externs. [BLOCKED: body is a conversion-era comment skeleton (logic only in comments, preset return). The R8 form is already chosen inline (awaited mkdir/writeFile/rename/readFile map to blocking sa_std_fs externs); body retranslation required.]
-fn saveManifest(manifest: &SplitManifest) -> i32 {
-    // manifest.updatedAt = new Date().toISOString()
-    // target = manifestPath(manifest.cwd, manifest.id); await mkdir(dirname(target), {recursive: true})
-    // temporary = `${target}.${randomUUID()}.tmp` (DEFECT: template literal + randomUUID -> extern uuid + concat)
-    // await writeFile(temporary, JSON.stringify(manifest), "utf8") (DEFECT: JSON.stringify of typed object -> hand-rolled serializer into scratch)
-    // await rename(temporary, target)
-    return 0;
+// ---------------------------------------------------------------------------
+// Files Record access over SplitManifest.files_scratch (JSON object text)
+// + file_paths insertion-order index kept in sync by sw_state_store.
+// ---------------------------------------------------------------------------
+
+fn sw_files_ptr(manifest: &SplitManifest) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &manifest.files_scratch, 0);
+    return p;
 }
 
-// L75-81: async function loadManifest(cwd, id): Promise<SplitManifest>
-fn loadManifest(cwd_ptr: ptr, cwd_len: u64, id_ptr: ptr, id_len: u64, out: &SplitManifest) -> i32 {
-    // if (!/^[a-f0-9-]{36}$/i.test(id)) throw "session_id must be a workflow id returned by split_plan" (DEFECT: RegExp -> manual charset/length check)
-    // manifest = JSON.parse(await readFile(target, "utf8")) as SplitManifest (DEFECT: JSON.parse + cast -> sa_json parse into struct fields)
-    // if (version !== 1 || id mismatch || resolve(manifest.cwd) !== resolve(cwd)) throw "split workflow does not belong to this workspace"
-    return 0;
+fn sw_files_parse(manifest: &SplitManifest) -> u64 {
+    if manifest.files_scratch_len == 0 {
+        return sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+    };
+    return sa_json_parse(sw_files_ptr(manifest), manifest.files_scratch_len);
 }
 
-// L83-87: function checkAllowed(policy, cwd, operation: "read"|"write", path, roots?): void — throws on denial
-// operation codes: 0=read 1=write. DEFECT: throw -> status code -1; template literal reason -> err buffer.
+// Serialize a files doc back into the scratch (frees the doc).
+fn sw_files_commit(manifest: &SplitManifest, doc: u64) -> void {
+    let h: u64 = 0;
+    if sa_json_stringify(doc, &h) == 0 && h != 0 {
+        let hp: ptr = sa_fmt_buffer_data(h);
+        let hl = sa_fmt_buffer_len(h);
+        manifest.files_scratch_len = sw_field_copy(sw_files_ptr(manifest), 4194304, hp, hl);
+        sa_fmt_buffer_free(h);
+    };
+    sa_json_free(doc);
+}
+
+fn sw_file_index(manifest: &SplitManifest, path_p: ptr, path_n: u64) -> i64 {
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < manifest.files_len {
+        let lp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(lp, &manifest.file_paths, off);
+        if sw_eq(lp, manifest.file_path_lens[i], path_p, path_n) { return (i) as i64; };
+        off = off + manifest.file_path_lens[i];
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn sw_file_path_at(manifest: &SplitManifest, idx: u64, out: &SwStr) -> void {
+    out.len = 0;
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < idx {
+        off = off + manifest.file_path_lens[i];
+        i = i + 1;
+    }
+    let lp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(lp, &manifest.file_paths, off);
+    sw_push(out, lp, manifest.file_path_lens[idx]);
+}
+
+fn sw_state_clear(state: &SplitFileState) -> void {
+    state.base_exists = false;
+    state.base_content_len = 0;
+    state.has_base_hash = false;
+    state.base_hash_len = 0;
+    state.staged_content_len = 0;
+    state.has_committed_hash = false;
+    state.committed_hash_len = 0;
+}
+
+// Load one file state from the scratch JSON. Returns false when absent.
+fn sw_state_load(manifest: &SplitManifest, path_p: ptr, path_n: u64, state: &SplitFileState) -> bool {
+    sw_state_clear(state);
+    let doc = sw_files_parse(manifest);
+    if doc == 0 { return false; };
+    let node: u64 = 0;
+    if sa_json_object_get(doc, path_p, path_n, &node) != 0 || node == 0 || sa_json_kind(node) != 7 {
+        sa_json_free(doc);
+        return false;
+    };
+    let bv: bool = false;
+    if sa_json_object_get_bool(node, STR_PTR("baseExists"), STR_LEN("baseExists"), &bv) == 0 {
+        state.base_exists = bv;
+    };
+    let sp: ptr = PTR_NULL();
+    let sl: u64 = 0;
+    if sa_json_object_get_string(node, STR_PTR("baseContent"), STR_LEN("baseContent"), &sp, &sl) == 0 {
+        let d1: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d1, &state.base_content, 0);
+        state.base_content_len = sw_field_copy(d1, 1048576, sp, sl);
+    };
+    if sa_json_object_get_string(node, STR_PTR("baseHash"), STR_LEN("baseHash"), &sp, &sl) == 0 {
+        let d2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d2, &state.base_hash, 0);
+        state.base_hash_len = sw_field_copy(d2, 65, sp, sl);
+        state.has_base_hash = true;
+    };
+    if sa_json_object_get_string(node, STR_PTR("stagedContent"), STR_LEN("stagedContent"), &sp, &sl) == 0 {
+        let d3: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d3, &state.staged_content, 0);
+        state.staged_content_len = sw_field_copy(d3, 1048576, sp, sl);
+    };
+    if sa_json_object_get_string(node, STR_PTR("committedHash"), STR_LEN("committedHash"), &sp, &sl) == 0 {
+        let d4: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d4, &state.committed_hash, 0);
+        state.committed_hash_len = sw_field_copy(d4, 65, sp, sl);
+        state.has_committed_hash = true;
+    };
+    sa_json_free(doc);
+    return true;
+}
+
+// Store one file state into the scratch JSON (insertion order preserved;
+// a new path is appended to file_paths).
+fn sw_state_store(manifest: &SplitManifest, path_p: ptr, path_n: u64, state: &SplitFileState) -> void {
+    let doc = sw_files_parse(manifest);
+    if doc == 0 { return; };
+    let obj = sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if obj == 0 {
+        sa_json_free(doc);
+        return;
+    };
+    sa_json_object_set_bool(obj, STR_PTR("baseExists"), STR_LEN("baseExists"), state.base_exists);
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &state.base_content, 0);
+    sa_json_object_set_string(obj, STR_PTR("baseContent"), STR_LEN("baseContent"), bp, state.base_content_len);
+    if state.has_base_hash {
+        let hp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(hp, &state.base_hash, 0);
+        sa_json_object_set_string(obj, STR_PTR("baseHash"), STR_LEN("baseHash"), hp, state.base_hash_len);
+    } else {
+        sa_json_object_set_null(obj, STR_PTR("baseHash"), STR_LEN("baseHash"));
+    };
+    let sp2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp2, &state.staged_content, 0);
+    sa_json_object_set_string(obj, STR_PTR("stagedContent"), STR_LEN("stagedContent"), sp2, state.staged_content_len);
+    if state.has_committed_hash {
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, &state.committed_hash, 0);
+        sa_json_object_set_string(obj, STR_PTR("committedHash"), STR_LEN("committedHash"), cp, state.committed_hash_len);
+    };
+    let existed = sw_file_index(manifest, path_p, path_n) >= 0;
+    sa_json_object_set_node(doc, path_p, path_n, obj);
+    sw_files_commit(manifest, doc);
+    if !existed && manifest.files_len < 64 {
+        let off: u64 = 0;
+        let i: u64 = 0;
+        while i < manifest.files_len {
+            off = off + manifest.file_path_lens[i];
+            i = i + 1;
+        }
+        let dp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp, &manifest.file_paths, off);
+        let m = sw_field_copy(dp, 65536 - off, path_p, path_n);
+        manifest.file_path_lens[manifest.files_len] = m;
+        manifest.files_len = manifest.files_len + 1;
+    };
+}
+
+// L51: stagedDigest over the files Record (paths sorted byte-wise).
+fn stagedDigest(manifest: &SplitManifest, out_ptr: ptr) -> u64 {
+    let acc = SwMid { bytes: [0; 131072], len: 0 };
+    // Collect indices sorted by path bytes (insertion sort over <=64).
+    let order: [u64; 64] = [0; 64];
+    let i: u64 = 0;
+    while i < manifest.files_len {
+        order[i] = i;
+        i = i + 1;
+    }
+    let a: u64 = 1;
+    while a < manifest.files_len {
+        let key = order[a];
+        let kp = SwStr { bytes: [0; 8192], len: 0 };
+        sw_file_path_at(manifest, key, &kp);
+        let b = a;
+        while b > 0 {
+            let pp = SwStr { bytes: [0; 8192], len: 0 };
+            sw_file_path_at(manifest, order[b - 1], &pp);
+            if sw_bytes_le(sw_str_ptr(&pp), pp.len, sw_str_ptr(&kp), kp.len) { break; };
+            order[b] = order[b - 1];
+            b = b - 1;
+        }
+        order[b] = key;
+        a = a + 1;
+    }
+    let doc = sw_files_parse(manifest);
+    let oi: u64 = 0;
+    while oi < manifest.files_len {
+        let path = SwStr { bytes: [0; 8192], len: 0 };
+        sw_file_path_at(manifest, order[oi], &path);
+        if oi > 0 { sw_mid_push_lit(&acc, STR_PTR("\n"), STR_LEN("\n")); };
+        sw_mid_push(&acc, sw_str_ptr(&path), path.len);
+        sw_mid_push_lit(&acc, STR_PTR("\0"), STR_LEN("\0"));
+        // stagedContent hash straight from the files doc node
+        let hex: [u8; 65] = [0; 65];
+        let hp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(hp, &hex, 0);
+        let hl: u64 = 0;
+        if doc != 0 {
+            let node: u64 = 0;
+            if sa_json_object_get(doc, sw_str_ptr(&path), path.len, &node) == 0 && node != 0 {
+                let sp: ptr = PTR_NULL();
+                let sl: u64 = 0;
+                if sa_json_object_get_string(node, STR_PTR("stagedContent"), STR_LEN("stagedContent"), &sp, &sl) == 0 {
+                    hl = hashContent(sp, sl, hp);
+                };
+            };
+        };
+        sw_mid_push(&acc, hp, hl);
+        oi = oi + 1;
+    }
+    if doc != 0 { sa_json_free(doc); };
+    return hashContent(sw_mid_ptr(&acc), acc.len, out_ptr);
+}
+
+fn sw_bytes_le(p: ptr, n: u64, q: ptr, qn: u64) -> bool {
+    let m = n;
+    if qn < m { m = qn; };
+    let i: u64 = 0;
+    while i < m {
+        let a = sw_byte(p, i);
+        let b = sw_byte(q, i);
+        if a != b { return a < b; };
+        i = i + 1;
+    }
+    return n <= qn;
+}
+
+// Publish an error text's length at err_ptr+8192. Callers pass the base
+// of a SwCtx (err at offset 0, err_len at offset 8192), so the length
+// lands in the caller's ctx.err_len.
+fn sw_err_len_publish(err_ptr: ptr, n: u64) -> void {
+    let lp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(lp, err_ptr, 8192);
+    PTR_WRITE_U64(lp, n);
+}
+
+
+// ---------------------------------------------------------------------------
+// Policy gate, stage-file ensuring, unique edit, diff rendering.
+// ---------------------------------------------------------------------------
+
+// L83-87: checkAllowed — status 0 = allowed; -1 = denied (err in ctx via
+// err_ptr buffer, which receives the message text, length = return of
+// sw_err_len marker: the caller reads err_ptr as NUL-free text whose
+// length is tracked by the SwCtx it came from; here the message is also
+// copied into manifest.err by callers that have one).
+// Convention (see header): roots_ptr is the address of a caller-built
+// StrList (or PTR_NULL for none), roots_len its item count.
 fn checkAllowed(policy_id: u64, has_policy: bool, cwd_ptr: ptr, cwd_len: u64, operation: u64, path_ptr: ptr, path_len: u64, roots_ptr: ptr, roots_len: u64, err_ptr: ptr) -> i32 {
-    // normalized = normalizeSaVmPolicy(policy, cwd, roots); decision = checkSaVmPath(normalized, operation, path, cwd)
-    // if (!decision.allowed) throw `Policy violation for ${operation} ${path}: ${decision.reason}`
-    return 0;
-}
-
-// L89-103: async function ensureStageFile(manifest, path, policy, roots?): Promise<SplitFileState>
-// DEFECT: async -> synchronous; returns entry index into manifest files (or -1 with err set). [BLOCKED: body is a conversion-era comment skeleton (logic only in comments, preset return). The R8 form is already chosen inline (awaited mkdir/writeFile/rename/readFile map to blocking sa_std_fs externs); body retranslation required.]
-fn ensureStageFile(manifest: &SplitManifest, path_ptr: ptr, path_len: u64, policy_id: u64, has_policy: bool, roots_ptr: ptr, roots_len: u64) -> i64 {
-    // existingStage = manifest.files[path]; if (existingStage) return existingStage
-    // checkAllowed(policy, cwd, "write", path, roots); absolute = resolve(cwd, path); baseExists = existsSync(absolute)
-    // if (baseExists) { checkAllowed(..., "read", ...); baseContent = await readFile(absolute, "utf8") }
-    // state = { baseExists, baseContent, baseHash: baseExists ? hashContent(baseContent) : null, stagedContent: baseContent }
-    // manifest.files[path] = state; return state
+    let roots = StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 };
+    if roots_ptr != PTR_NULL() {
+        sw_copy_strlist(roots_ptr, roots_len, &roots);
+    };
+    let norm = NormalizedSaVmPolicy { engine: 0, fs: NormalizedFs { entries: FsEntryList { items: [SaVmFsEntry { path: [0u8; 1024], path_len: 0, access: 0 }; 128], len: 0 }, read: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, write: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, transfer: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, delete: 0, backupDir: [0u8; 1024], backupDir_len: 0, backupDir_has: false }, http_allow: HttpRuleList { items: [SaVmHttpAllowRule { host: [0u8; 512], host_len: 0, methods: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_methods: false, paths: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_paths: false }; 128], len: 0 }, env_allow: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, process: NormalizedProcess { spawn: false, exec: ExecRuleList { items: [SaVmProcessExecRule { path: [0u8; 4096], path_len: 0, args: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_args: false }; 128], len: 0 }, bunProfiles: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_bunProfiles: false, bun_enabled: false, bun_allowedSubcommands: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_bun: false }, execution_javascript: false, execution_python: false, tools: NormalizedTools { replaceRead: false, replaceWrite: false, replaceApplyPatch: false, replaceExec: false, readFiles: false, editFiles: false, applyPatch: false, fastSearch: false, clearToolHistory: false, findReferences: false, renameSymbol: false, fileOutline: false, moveWithImports: false, findDefinition: false, extractToFile: false, addImport: false, getDiagnostics: false, organizeImports: false, analyzeScope: false, codeGraph: false }, contextSavings: SaVmContextSavingsConfig { locateBeforeRead: false, maxReadFileBytes: 0, maxReadFileBytes_has: false, grepCircuitBreaker: false, grepMaxResults: 0, grepMaxResults_has: false, grepMaxTokens: 0, grepMaxTokens_has: false, slimRunnerOutput: false, parallelBudget: false, parallelMaxTotalBytes: 0, parallelMaxTotalBytes_has: false, parallelMaxReadFiles: 0, parallelMaxReadFiles_has: false, parallelDeduplication: false, tieredSkillInjection: false, foldWaterfallEvents: false, foldHistoryReadSummaries: false, historyReadFoldTurns: 0, historyReadFoldTurns_has: false }, contextSavings_has: false };
+    let config_doc: u64 = 0;
+    if has_policy { config_doc = policy_id; };
+    normalizeSaVmPolicy(config_doc, cwd_ptr, cwd_len, &roots, &norm);
+    let decision = SaVmPolicyDecision { allowed: false, reason: [0u8; 2048], reason_len: 0, path: [0u8; 1024], path_len: 0, path_has: false };
+    checkSaVmPath(&norm, (operation) as u32, path_ptr, path_len, cwd_ptr, cwd_len, &decision);
+    if decision.allowed { return 0; };
+    let ctx = SwCtx { err: [0; 8192], err_len: 0 };
+    let msg = SwStr { bytes: [0; 8192], len: 0 };
+    sw_push_lit(&msg, STR_PTR("Policy violation for "), STR_LEN("Policy violation for "));
+    if operation == 0 {
+        sw_push_lit(&msg, STR_PTR("read "), STR_LEN("read "));
+    } else {
+        sw_push_lit(&msg, STR_PTR("write "), STR_LEN("write "));
+    };
+    sw_push(&msg, path_ptr, path_len);
+    sw_push_lit(&msg, STR_PTR(": "), STR_LEN(": "));
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &decision.reason, 0);
+    sw_push(&msg, rp, decision.reason_len);
+    sw_err_set(&ctx, sw_str_ptr(&msg), msg.len);
+    sw_field_copy(err_ptr, 8192, sw_ctx_ptr(&ctx), ctx.err_len);
+    sw_err_len_publish(err_ptr, ctx.err_len);
     return -1;
 }
 
-// L105-110: function applyUniqueEdit(content, oldText, newText, path): string — throws when context missing/ambiguous
+// Copy the caller's StrList (address in src_ptr, count in src_len) into
+// the local `out` (field-wise; StrList is a plain struct in the policy
+// unit — the copy goes through byte copy of the items region).
+fn sw_copy_strlist(src_ptr: ptr, src_len: u64, out: &StrList) -> void {
+    out.len = 0;
+    if src_len > 128 { return; };
+    // The source is a &StrList in the caller's frame: its items array
+    // starts right after the 0-offset base. Read items one by one via
+    // the known layout: StrItem = 1024 bytes + u64 len (1032 bytes).
+    let i: u64 = 0;
+    while i < src_len {
+        let item_off = i * 1032;
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, src_ptr, item_off);
+        let lp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(lp, src_ptr, item_off + 1024);
+        let ln: u64 = 0;
+        PTR_READ_U64(ln, lp);
+        let dp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp, &out.items[i].bytes, 0);
+        out.items[i].len = sw_field_copy(dp, 1024, sp, ln);
+        out.len = out.len + 1;
+        i = i + 1;
+    }
+}
+
+// Build a StrList from a SplitInput's packed roots (callers keep the
+// returned struct alive in their frame and pass its address down).
+fn sw_roots_from_input(input: &SplitInput, out: &StrList) -> void {
+    out.len = 0;
+    if !input.has_roots { return; };
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < input.roots_len && i < 16 && out.len < 128 {
+        let rp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp, &input.roots, off);
+        let dp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp, &out.items[out.len].bytes, 0);
+        out.items[out.len].len = sw_field_copy(dp, 1024, rp, input.root_lens[i]);
+        out.len = out.len + 1;
+        off = off + input.root_lens[i];
+        i = i + 1;
+    }
+}
+
+// L89-103: ensureStageFile — returns the file index, or -1 with the
+// message in manifest.err.
+fn ensureStageFile(manifest: &SplitManifest, path_ptr: ptr, path_len: u64, policy_id: u64, has_policy: bool, roots_ptr: ptr, roots_len: u64) -> i64 {
+    let existing = sw_file_index(manifest, path_ptr, path_len);
+    if existing >= 0 { return existing; };
+    let cwd_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cwd_p, &manifest.cwd, 0);
+    let ectx = SwCtx { err: [0; 8192], err_len: 0 };
+    let ep = sw_ctx_ptr(&ectx);
+    let wrc = checkAllowed(policy_id, has_policy, cwd_p, manifest.cwd_len, 1, path_ptr, path_len, roots_ptr, roots_len, ep);
+    if wrc != 0 {
+        let mp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(mp, &manifest.err, 0);
+        manifest.err_len = sw_field_copy(mp, 2048, ep, ectx.err_len);
+        return -1;
+    };
+    let absolute = SwStr { bytes: [0; 8192], len: 0 };
+    sw_path_resolve(&absolute, cwd_p, manifest.cwd_len, path_ptr, path_len);
+    let state = SplitFileState {
+        base_exists: false,
+        base_content: [0u8; 1048576], base_content_len: 0,
+        has_base_hash: false, base_hash: [0u8; 65], base_hash_len: 0,
+        staged_content: [0u8; 1048576], staged_content_len: 0,
+        has_committed_hash: false, committed_hash: [0u8; 65], committed_hash_len: 0,
+    };
+    let exists = sw_fs_exists(sw_str_ptr(&absolute), absolute.len);
+    if exists {
+        let rrc = checkAllowed(policy_id, has_policy, cwd_p, manifest.cwd_len, 0, path_ptr, path_len, roots_ptr, roots_len, ep);
+        if rrc != 0 {
+            let mp2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(mp2, &manifest.err, 0);
+            manifest.err_len = sw_field_copy(mp2, 2048, ep, ectx.err_len);
+            return -1;
+        };
+        let content = SwBig { bytes: [0; 1048576], len: 0 };
+        let fst = sw_read_file(sw_str_ptr(&absolute), absolute.len, &content);
+        if fst != 0 {
+            let ctx = SwCtx { err: [0; 8192], err_len: 0 };
+            sw_err_read(&ctx, fst, sw_str_ptr(&absolute), absolute.len);
+            let mp3: ptr = PTR_NULL();
+            PTR_BYTE_ADD(mp3, &manifest.err, 0);
+            manifest.err_len = sw_field_copy(mp3, 2048, sw_ctx_ptr(&ctx), ctx.err_len);
+            return -1;
+        };
+        state.base_exists = true;
+        let cp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp, &state.base_content, 0);
+        state.base_content_len = sw_field_copy(cp, 1048576, sw_big_ptr(&content), content.len);
+        let hp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(hp, &state.base_hash, 0);
+        state.base_hash_len = hashContent(cp, state.base_content_len, hp);
+        state.has_base_hash = true;
+    };
+    // stagedContent starts as baseContent
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &state.base_content, 0);
+    let sp3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp3, &state.staged_content, 0);
+    state.staged_content_len = sw_field_copy(sp3, 1048576, bp, state.base_content_len);
+    sw_state_store(manifest, path_ptr, path_len, &state);
+    return sw_file_index(manifest, path_ptr, path_len);
+}
+
+
+// L105-110: applyUniqueEdit — 0 = ok (out holds the result, return value
+// is its length), -1 = not found, -2 = ambiguous; err text in err_ptr
+// (same buffer convention as checkAllowed).
 fn applyUniqueEdit(content_ptr: ptr, content_len: u64, old_ptr: ptr, old_len: u64, new_ptr: ptr, new_len: u64, path_ptr: ptr, path_len: u64, out_ptr: ptr, err_ptr: ptr) -> i32 {
-    // first = content.indexOf(oldText); if (first < 0) throw `split patch context not found in ${path}`
-    // if (content.indexOf(oldText, first + max(1, oldText.length)) >= 0) throw `split patch context is ambiguous in ${path}`
-    // return content.slice(0, first) + newText + content.slice(first + oldText.length) (DEFECT: string slice/concat -> buffer splice)
-    return 0;
+    let first = sw_index_of(content_ptr, content_len, old_ptr, old_len, 0);
+    let ctx = SwCtx { err: [0; 8192], err_len: 0 };
+    if first < 0 {
+        sw_err_format(&ctx, STR_PTR("split patch context not found in "), STR_LEN("split patch context not found in "), path_ptr, path_len, STR_PTR(""), STR_LEN(""));
+        sw_field_copy(err_ptr, 8192, sw_ctx_ptr(&ctx), ctx.err_len);
+        sw_err_len_publish(err_ptr, ctx.err_len);
+        return -1;
+    };
+    let step = old_len;
+    if step < 1 { step = 1; };
+    let second = sw_index_of(content_ptr, content_len, old_ptr, old_len, (first as u64) + step);
+    if second >= 0 {
+        sw_err_format(&ctx, STR_PTR("split patch context is ambiguous in "), STR_LEN("split patch context is ambiguous in "), path_ptr, path_len, STR_PTR(""), STR_LEN(""));
+        sw_field_copy(err_ptr, 8192, sw_ctx_ptr(&ctx), ctx.err_len);
+        sw_err_len_publish(err_ptr, ctx.err_len);
+        return -2;
+    };
+    let fu = (first) as u64;
+    let total = fu + new_len + (content_len - fu - old_len);
+    let cap = total;
+    if cap > 1048576 {
+        sw_err_set_lit(&ctx, STR_PTR("split patch result exceeds the staged content capacity"), STR_LEN("split patch result exceeds the staged content capacity"));
+        sw_field_copy(err_ptr, 8192, sw_ctx_ptr(&ctx), ctx.err_len);
+        sw_err_len_publish(err_ptr, ctx.err_len);
+        return -3;
+    };
+    PTR_COPY_BYTES(out_ptr, content_ptr, fu);
+    let np: ptr = PTR_NULL();
+    PTR_BYTE_ADD(np, out_ptr, fu);
+    PTR_COPY_BYTES(np, new_ptr, new_len);
+    let tp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tp, out_ptr, fu + new_len);
+    let tail_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tail_p, content_ptr, fu + old_len);
+    PTR_COPY_BYTES(tp, tail_p, content_len - fu - old_len);
+    return (total) as i32;
 }
 
-// L112-126: function renderStagedDiff(path, state): string
+fn sw_index_of(p: ptr, n: u64, q: ptr, qn: u64, from: u64) -> i64 {
+    if qn == 0 { return (from) as i64; };
+    if n < qn { return -1; };
+    let i: u64 = from;
+    while i + qn <= n {
+        let j: u64 = 0;
+        let ok = true;
+        while j < qn {
+            if sw_byte(p, i + j) != sw_byte(q, j) { ok = false; break; };
+            j = j + 1;
+        }
+        if ok { return (i) as i64; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// L112-126: renderStagedDiff — line-offset model over the state buffers.
+// ---------------------------------------------------------------------------
+
+// Split (p, n) into lines on \n (a preceding \r belongs to the
+// separator, JS split(/\r?\n/)); fills starts/lengths (line text without
+// the separator), returns the line count (cap 20000).
+fn sw_split_lines(p: ptr, n: u64, starts: &[u64; 20002], lens: &[u64; 20002]) -> u64 {
+    let count: u64 = 0;
+    let start: u64 = 0;
+    let i: u64 = 0;
+    while i <= n && count < 20000 {
+        if i == n || sw_byte(p, i) == 10 {
+            let ln = i - start;
+            if ln > 0 && sw_byte(p, start + ln - 1) == 13 { ln = ln - 1; };
+            sw_lens_set(starts, count, start);
+            sw_lens_set(lens, count, ln);
+            count = count + 1;
+            start = i + 1;
+        };
+        i = i + 1;
+    }
+    return count;
+}
+
+fn sw_line_eq(bp: ptr, bs: u64, bl: u64, sp: ptr, ss: u64, sl: u64) -> bool {
+    let bpp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bpp, bp, bs);
+    let spp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(spp, sp, ss);
+    return sw_eq(bpp, bl, spp, sl);
+}
+
 fn renderStagedDiff(path_ptr: ptr, path_len: u64, state_idx: u64, manifest: &SplitManifest, out_ptr: ptr) -> u64 {
-    // if (baseContent === stagedContent) return `--- a/${path}\n+++ b/${path}\n(no content changes)`
-    // oldLines/newLines = split(/\r?\n/) (DEFECT: regex split -> manual line scan into offset arrays, capacity 20000 lines)
-    // common prefix/suffix trim; oldChanged/newChanged slices; maxChangedLines = 240;
-    // visible(lines) truncates middle with `... ${lines.length - 240} changed lines omitted ...` (DEFECT: spread arrays -> two-segment copy)
-    // return [`--- a/${path}`, `+++ b/${path}`, `@@ -${prefix+1},${oldChanged.length} +${prefix+1},${newChanged.length} @@`, ...visible(old).map(-line), ...visible(new).map(+line)].join("\n")
-    // DEFECT: template literals + Array.map/join -> formatted appends into out buffer.
+    let out = SwMid { bytes: [0; 131072], len: 0 };
+    let path = SwStr { bytes: [0; 8192], len: 0 };
+    sw_file_path_at(manifest, state_idx, &path);
+    let state = SplitFileState {
+        base_exists: false,
+        base_content: [0u8; 1048576], base_content_len: 0,
+        has_base_hash: false, base_hash: [0u8; 65], base_hash_len: 0,
+        staged_content: [0u8; 1048576], staged_content_len: 0,
+        has_committed_hash: false, committed_hash: [0u8; 65], committed_hash_len: 0,
+    };
+    sw_state_load(manifest, sw_str_ptr(&path), path.len, &state);
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &state.base_content, 0);
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, &state.staged_content, 0);
+    sw_mid_push_lit(&out, STR_PTR("--- a/"), STR_LEN("--- a/"));
+    sw_mid_push(&out, path_ptr, path_len);
+    sw_mid_push_lit(&out, STR_PTR("\n+++ b/"), STR_LEN("\n+++ b/"));
+    sw_mid_push(&out, path_ptr, path_len);
+    if sw_eq(bp, state.base_content_len, sp, state.staged_content_len) {
+        sw_mid_push_lit(&out, STR_PTR("\n(no content changes)"), STR_LEN("\n(no content changes)"));
+        return sw_field_copy(out_ptr, 131072, sw_mid_ptr(&out), out.len);
+    };
+    let old_starts: [u64; 20002] = [0; 20002];
+    let old_lens: [u64; 20002] = [0; 20002];
+    let new_starts: [u64; 20002] = [0; 20002];
+    let new_lens: [u64; 20002] = [0; 20002];
+    let old_count = sw_split_lines(bp, state.base_content_len, &old_starts, &old_lens);
+    let new_count = sw_split_lines(sp, state.staged_content_len, &new_starts, &new_lens);
+    let prefix: u64 = 0;
+    while prefix < old_count && prefix < new_count && sw_line_eq(bp, old_starts[prefix], old_lens[prefix], sp, new_starts[prefix], new_lens[prefix]) {
+        prefix = prefix + 1;
+    }
+    let suffix: u64 = 0;
+    while suffix < old_count - prefix && suffix < new_count - prefix && sw_line_eq(bp, old_starts[old_count - 1 - suffix], old_lens[old_count - 1 - suffix], sp, new_starts[new_count - 1 - suffix], new_lens[new_count - 1 - suffix]) {
+        suffix = suffix + 1;
+    }
+    let old_changed = old_count - prefix - suffix;
+    let new_changed = new_count - prefix - suffix;
+    sw_mid_push_lit(&out, STR_PTR("\n@@ -"), STR_LEN("\n@@ -"));
+    sw_mid_push_u64(&out, prefix + 1);
+    sw_mid_push_lit(&out, STR_PTR(","), STR_LEN(","));
+    sw_mid_push_u64(&out, old_changed);
+    sw_mid_push_lit(&out, STR_PTR(" +"), STR_LEN(" +"));
+    sw_mid_push_u64(&out, prefix + 1);
+    sw_mid_push_lit(&out, STR_PTR(","), STR_LEN(","));
+    sw_mid_push_u64(&out, new_changed);
+    sw_mid_push_lit(&out, STR_PTR(" @@"), STR_LEN(" @@"));
+    sw_diff_visible(&out, bp, &old_starts, &old_lens, prefix, old_changed, STR_PTR("-"), STR_LEN("-"));
+    sw_diff_visible(&out, sp, &new_starts, &new_lens, prefix, new_changed, STR_PTR("+"), STR_LEN("+"));
+    return sw_field_copy(out_ptr, 131072, sw_mid_ptr(&out), out.len);
+}
+
+// visible(): all lines when <= 240, else head 120 + omission + tail 120.
+fn sw_diff_visible(out: &SwMid, base_p: ptr, starts: &[u64; 20002], lens: &[u64; 20002], from: u64, count: u64, sign_p: ptr, sign_n: u64) -> void {
+    if count <= 240 {
+        sw_diff_lines(out, base_p, starts, lens, from, count, sign_p, sign_n);
+        return;
+    };
+    sw_diff_lines(out, base_p, starts, lens, from, 120, sign_p, sign_n);
+    sw_mid_push_lit(out, STR_PTR("\n... "), STR_LEN("\n... "));
+    sw_mid_push_u64(out, count - 240);
+    sw_mid_push_lit(out, STR_PTR(" changed lines omitted ..."), STR_LEN(" changed lines omitted ..."));
+    sw_diff_lines(out, base_p, starts, lens, from + count - 120, 120, sign_p, sign_n);
+}
+
+fn sw_diff_lines(out: &SwMid, base_p: ptr, starts: &[u64; 20002], lens: &[u64; 20002], from: u64, count: u64, sign_p: ptr, sign_n: u64) -> void {
+    let i: u64 = 0;
+    while i < count {
+        let idx = from + i;
+        sw_mid_push_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+        sw_mid_push(out, sign_p, sign_n);
+        let lp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(lp, base_p, sw_lens_at(starts, idx));
+        sw_mid_push(out, lp, sw_lens_at(lens, idx));
+        i = i + 1;
+    }
+}
+
+fn sw_lens_at(a: &[u64; 20002], idx: u64) -> u64 {
+    let base: ptr = PTR_NULL();
+    PTR_BYTE_ADD(base, a, idx * 8);
+    let v: u64 = 0;
+    PTR_READ_U64(v, base);
+    return v;
+}
+
+fn sw_lens_set(a: &[u64; 20002], idx: u64, v: u64) -> void {
+    let base: ptr = PTR_NULL();
+    PTR_BYTE_ADD(base, a, idx * 8);
+    PTR_WRITE_U64(base, v);
+}
+
+
+// ---------------------------------------------------------------------------
+// Manifest save/load, stageOps, rollbackCommitted.
+// ---------------------------------------------------------------------------
+
+fn sw_huge_push_byte(s: &SwHuge, c: u8) -> void {
+    if s.len < 4456448 {
+        s.bytes[s.len] = c;
+        s.len = s.len + 1;
+    };
+}
+
+fn sw_huge_push_json_string(s: &SwHuge, p: ptr, n: u64) -> void {
+    sw_huge_push_lit(s, STR_PTR("\""), STR_LEN("\""));
+    let i: u64 = 0;
+    while i < n {
+        let c = sw_byte(p, i);
+        if c == 34 {
+            sw_huge_push_lit(s, STR_PTR("\\\""), STR_LEN("\\\""));
+        } else if c == 92 {
+            sw_huge_push_lit(s, STR_PTR("\\\\"), STR_LEN("\\\\"));
+        } else if c == 8 {
+            sw_huge_push_lit(s, STR_PTR("\\b"), STR_LEN("\\b"));
+        } else if c == 9 {
+            sw_huge_push_lit(s, STR_PTR("\\t"), STR_LEN("\\t"));
+        } else if c == 10 {
+            sw_huge_push_lit(s, STR_PTR("\\n"), STR_LEN("\\n"));
+        } else if c == 12 {
+            sw_huge_push_lit(s, STR_PTR("\\f"), STR_LEN("\\f"));
+        } else if c == 13 {
+            sw_huge_push_lit(s, STR_PTR("\\r"), STR_LEN("\\r"));
+        } else if c < 32 {
+            let hexd: ptr = STR_PTR("0123456789abcdef");
+            sw_huge_push_byte(s, 92);
+            sw_huge_push_byte(s, 117);
+            sw_huge_push_byte(s, 48);
+            sw_huge_push_byte(s, 48);
+            sw_huge_push_byte(s, sw_byte(hexd, ((c >> 4) & 15) as u64));
+            sw_huge_push_byte(s, sw_byte(hexd, (c & 15) as u64));
+        } else {
+            sw_huge_push_byte(s, c);
+        };
+        i = i + 1;
+    }
+    sw_huge_push_lit(s, STR_PTR("\""), STR_LEN("\""));
+}
+
+fn sw_status_name(code: u64, out: &SwStr) -> void {
+    out.len = 0;
+    if code == SW_ST_PLANNED { sw_push_lit(out, STR_PTR("planned"), STR_LEN("planned")); return; };
+    if code == SW_ST_STAGED { sw_push_lit(out, STR_PTR("staged"), STR_LEN("staged")); return; };
+    if code == SW_ST_COMMITTED { sw_push_lit(out, STR_PTR("committed"), STR_LEN("committed")); return; };
+    if code == SW_ST_ROLLED_BACK { sw_push_lit(out, STR_PTR("rolled_back"), STR_LEN("rolled_back")); return; };
+    sw_push_lit(out, STR_PTR("planned"), STR_LEN("planned"));
+}
+
+fn sw_status_code(p: ptr, n: u64, out: &u64, ok: &bool) -> void {
+    *ok = true;
+    if sw_eq(p, n, STR_PTR("planned"), STR_LEN("planned")) { *out = SW_ST_PLANNED; return; };
+    if sw_eq(p, n, STR_PTR("staged"), STR_LEN("staged")) { *out = SW_ST_STAGED; return; };
+    if sw_eq(p, n, STR_PTR("committed"), STR_LEN("committed")) { *out = SW_ST_COMMITTED; return; };
+    if sw_eq(p, n, STR_PTR("rolled_back"), STR_LEN("rolled_back")) { *out = SW_ST_ROLLED_BACK; return; };
+    *ok = false;
+}
+
+// JSON.stringify(manifest) in TS field order into out.
+fn sw_manifest_serialize(manifest: &SplitManifest, out: &SwHuge) -> void {
+    out.len = 0;
+    sw_huge_push_lit(out, STR_PTR("{\"version\":1,\"id\":"), STR_LEN("{\"version\":1,\"id\":"));
+    let p1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p1, &manifest.id, 0);
+    sw_huge_push_json_string(out, p1, manifest.id_len);
+    sw_huge_push_lit(out, STR_PTR(",\"cwd\":"), STR_LEN(",\"cwd\":"));
+    let p2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p2, &manifest.cwd, 0);
+    sw_huge_push_json_string(out, p2, manifest.cwd_len);
+    sw_huge_push_lit(out, STR_PTR(",\"source\":"), STR_LEN(",\"source\":"));
+    let p3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p3, &manifest.source, 0);
+    sw_huge_push_json_string(out, p3, manifest.source_len);
+    sw_huge_push_lit(out, STR_PTR(",\"sourceHash\":"), STR_LEN(",\"sourceHash\":"));
+    let p4: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p4, &manifest.source_hash, 0);
+    sw_huge_push_json_string(out, p4, manifest.source_hash_len);
+    sw_huge_push_lit(out, STR_PTR(",\"createdAt\":"), STR_LEN(",\"createdAt\":"));
+    let p5: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p5, &manifest.created_at, 0);
+    sw_huge_push_json_string(out, p5, manifest.created_at_len);
+    sw_huge_push_lit(out, STR_PTR(",\"updatedAt\":"), STR_LEN(",\"updatedAt\":"));
+    let p6: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p6, &manifest.updated_at, 0);
+    sw_huge_push_json_string(out, p6, manifest.updated_at_len);
+    sw_huge_push_lit(out, STR_PTR(",\"status\":"), STR_LEN(",\"status\":"));
+    let sn = SwStr { bytes: [0; 8192], len: 0 };
+    sw_status_name(manifest.status, &sn);
+    sw_huge_push_json_string(out, sw_str_ptr(&sn), sn.len);
+    sw_huge_push_lit(out, STR_PTR(",\"task\":"), STR_LEN(",\"task\":"));
+    let p7: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p7, &manifest.task, 0);
+    sw_huge_push_json_string(out, p7, manifest.task_len);
+    if manifest.has_reviewed_hash {
+        sw_huge_push_lit(out, STR_PTR(",\"reviewedHash\":"), STR_LEN(",\"reviewedHash\":"));
+        let p8: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p8, &manifest.reviewed_hash, 0);
+        sw_huge_push_json_string(out, p8, manifest.reviewed_hash_len);
+    };
+    if manifest.has_validated_hash {
+        sw_huge_push_lit(out, STR_PTR(",\"validatedHash\":"), STR_LEN(",\"validatedHash\":"));
+        let p9: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p9, &manifest.validated_hash, 0);
+        sw_huge_push_json_string(out, p9, manifest.validated_hash_len);
+    };
+    sw_huge_push_lit(out, STR_PTR(",\"files\":"), STR_LEN(",\"files\":"));
+    if manifest.files_scratch_len == 0 {
+        sw_huge_push_lit(out, STR_PTR("{}"), STR_LEN("{}"));
+    } else {
+        sw_huge_push(out, sw_files_ptr(manifest), manifest.files_scratch_len);
+    };
+    sw_huge_push_lit(out, STR_PTR(",\"stages\":["), STR_LEN(",\"stages\":["));
+    let si: u64 = 0;
+    while si < manifest.stages_len {
+        if si > 0 { sw_huge_push_lit(out, STR_PTR(","), STR_LEN(",")); };
+        sw_huge_push_lit(out, STR_PTR("{\"at\":"), STR_LEN("{\"at\":"));
+        let at_off: u64 = 0;
+        let aj: u64 = 0;
+        while aj < si { at_off = at_off + manifest.stage_at_lens[aj]; aj = aj + 1; }
+        let ap: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ap, &manifest.stage_ats, at_off);
+        sw_huge_push_json_string(out, ap, manifest.stage_at_lens[si]);
+        sw_huge_push_lit(out, STR_PTR(",\"kind\":"), STR_LEN(",\"kind\":"));
+        if manifest.stage_kinds[si] == 1 {
+            sw_huge_push_json_string(out, STR_PTR("refine"), STR_LEN("refine"));
+        } else {
+            sw_huge_push_json_string(out, STR_PTR("coarse"), STR_LEN("coarse"));
+        };
+        sw_huge_push_lit(out, STR_PTR(",\"moduleName\":"), STR_LEN(",\"moduleName\":"));
+        let mo_off: u64 = 0;
+        let mj: u64 = 0;
+        while mj < si { mo_off = mo_off + manifest.stage_mod_lens[mj]; mj = mj + 1; }
+        let mp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(mp, &manifest.stage_mods, mo_off);
+        sw_huge_push_json_string(out, mp, manifest.stage_mod_lens[si]);
+        sw_huge_push_lit(out, STR_PTR(",\"paths\":["), STR_LEN(",\"paths\":["));
+        // paths for stage si: lens prefix over all stages' path counts
+        let cnt = manifest.stage_path_counts[si];
+        let base_idx: u64 = 0;
+        let bk: u64 = 0;
+        while bk < si { base_idx = base_idx + manifest.stage_path_counts[bk]; bk = bk + 1; }
+        let poff: u64 = 0;
+        let pj: u64 = 0;
+        while pj < base_idx { poff = poff + manifest.stage_path_lens[pj]; pj = pj + 1; }
+        let pi2: u64 = 0;
+        while pi2 < cnt {
+            if pi2 > 0 { sw_huge_push_lit(out, STR_PTR(","), STR_LEN(",")); };
+            let pp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(pp, &manifest.stage_paths, poff);
+            sw_huge_push_json_string(out, pp, manifest.stage_path_lens[base_idx + pi2]);
+            poff = poff + manifest.stage_path_lens[base_idx + pi2];
+            pi2 = pi2 + 1;
+        }
+        sw_huge_push_lit(out, STR_PTR("]}"), STR_LEN("]}"));
+        si = si + 1;
+    }
+    sw_huge_push_lit(out, STR_PTR("]}"), STR_LEN("]}"));
+}
+
+// L66-73: saveManifest — 0 on success, else the std fs status; the
+// message for the catch funnel is composed by the caller.
+fn saveManifest(manifest: &SplitManifest) -> i32 {
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, &manifest.updated_at, 0);
+    manifest.updated_at_len = sw_iso_into(dp, 40, sw_now_ms());
+    let target = SwStr { bytes: [0; 8192], len: 0 };
+    let tp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tp, &target.bytes, 0);
+    let cwp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cwp, &manifest.cwd, 0);
+    let idp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(idp, &manifest.id, 0);
+    target.len = manifestPath(cwp, manifest.cwd_len, idp, manifest.id_len, tp);
+    let dir = SwStr { bytes: [0; 8192], len: 0 };
+    sw_dirname(&dir, tp, target.len);
+    sa_fs_mkdir_p(sw_str_ptr(&dir), dir.len);
+    let text = SwHuge { bytes: [0; 4456448], len: 0 };
+    sw_manifest_serialize(manifest, &text);
+    let temp = SwStr { bytes: [0; 8192], len: 0 };
+    sw_push(&temp, tp, target.len);
+    sw_push_lit(&temp, STR_PTR("."), STR_LEN("."));
+    let ub: [u8; 64] = [0; 64];
+    let ubp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ubp, &ub, 0);
+    let unl = sw_uuid_into(ubp, 64);
+    sw_push(&temp, ubp, unl);
+    sw_push_lit(&temp, STR_PTR(".tmp"), STR_LEN(".tmp"));
+    let wst = sw_write_file(sw_str_ptr(&temp), temp.len, sw_huge_ptr(&text), text.len);
+    if wst != 0 { return wst; };
+    let rst = sa_fs_rename(sw_str_ptr(&temp), temp.len, tp, target.len);
+    if rst != 0 { return rst; };
     return 0;
 }
 
-// L128-152: async function stageOps(manifest, ops, policy, roots?): Promise<string[]>
-// DEFECT: async -> synchronous; returns touched count, paths written into manifest-stage scratch arrays (sorted). [BLOCKED: body is a conversion-era comment skeleton (logic only in comments, preset return). The R8 form is already chosen inline (awaited mkdir/writeFile/rename/readFile map to blocking sa_std_fs externs); body retranslation required.]
+// L75-81: loadManifest — 0 ok; -1 bad id format, -2 read failure,
+// -3 parse failure, -4 workspace validation; message in out.err.
+fn loadManifest(cwd_ptr: ptr, cwd_len: u64, id_ptr: ptr, id_len: u64, out: &SplitManifest) -> i32 {
+    out.err_len = 0;
+    let ctx = SwCtx { err: [0; 8192], err_len: 0 };
+    let id_ok = id_len == 36;
+    if id_ok {
+        let i: u64 = 0;
+        while i < id_len {
+            let b = sw_byte(id_ptr, i);
+            let okc = (b >= 48 && b <= 57) || (b >= 97 && b <= 102) || (b >= 65 && b <= 70) || b == 45;
+            if !okc { id_ok = false; };
+            i = i + 1;
+        }
+    };
+    if !id_ok {
+        sw_err_set_lit(&ctx, STR_PTR("session_id must be a workflow id returned by split_plan"), STR_LEN("session_id must be a workflow id returned by split_plan"));
+        let ep: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ep, &out.err, 0);
+        out.err_len = sw_field_copy(ep, 2048, sw_ctx_ptr(&ctx), ctx.err_len);
+        return -1;
+    };
+    let target = SwStr { bytes: [0; 8192], len: 0 };
+    let tp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tp, &target.bytes, 0);
+    target.len = manifestPath(cwd_ptr, cwd_len, id_ptr, id_len, tp);
+    let text = SwHuge { bytes: [0; 4456448], len: 0 };
+    let rst = sw_read_file_huge(tp, target.len, &text);
+    if rst != 0 {
+        sw_err_read(&ctx, rst, tp, target.len);
+        let ep2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ep2, &out.err, 0);
+        out.err_len = sw_field_copy(ep2, 2048, sw_ctx_ptr(&ctx), ctx.err_len);
+        return -2;
+    };
+    let doc = sa_json_parse(sw_huge_ptr(&text), text.len);
+    if doc == 0 {
+        sw_err_set_lit(&ctx, STR_PTR("failed to parse split workflow manifest JSON"), STR_LEN("failed to parse split workflow manifest JSON"));
+        let ep3: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ep3, &out.err, 0);
+        out.err_len = sw_field_copy(ep3, 2048, sw_ctx_ptr(&ctx), ctx.err_len);
+        return -3;
+    };
+    let rc = sw_manifest_parse(doc, cwd_ptr, cwd_len, id_ptr, id_len, out);
+    sa_json_free(doc);
+    if rc != 0 {
+        // out.err already filled by sw_manifest_parse
+        return -4;
+    };
+    return 0;
+}
+
+fn sw_read_file_huge(p: ptr, n: u64, out: &SwHuge) -> i32 {
+    out.len = 0;
+    let total: u64 = 0;
+    let lst = sa_std_fs_len(p, n, &total);
+    if lst != 0 { return lst; };
+    let fh: u64 = 0;
+    let ost = sa_std_fs_open_read(p, n, &fh);
+    if ost != 0 { return ost; };
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &out.bytes, 0);
+    let want = total;
+    if want > 4456448 { want = 4456448; };
+    let read_n: u64 = 0;
+    let rst = sa_std_fs_file_read(fh, bp, want, &read_n);
+    sa_fs_file_close(fh);
+    if rst != 0 { return rst; };
+    out.len = read_n;
+    return 0;
+}
+
+// Fill `out` from a parsed manifest doc; returns 0 or -4 (validation).
+fn sw_manifest_parse(doc: u64, cwd_ptr: ptr, cwd_len: u64, id_ptr: ptr, id_len: u64, out: &SplitManifest) -> i32 {
+    let ver: i64 = 0;
+    if sa_json_object_get_i64(doc, STR_PTR("version"), STR_LEN("version"), &ver) != 0 || ver != 1 {
+        return sw_manifest_invalid(out);
+    };
+    let sp: ptr = PTR_NULL();
+    let sl: u64 = 0;
+    if sa_json_object_get_string(doc, STR_PTR("id"), STR_LEN("id"), &sp, &sl) != 0 || !sw_eq(sp, sl, id_ptr, id_len) {
+        return sw_manifest_invalid(out);
+    };
+    let d1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d1, &out.id, 0);
+    out.id_len = sw_field_copy(d1, 64, sp, sl);
+    if sa_json_object_get_string(doc, STR_PTR("cwd"), STR_LEN("cwd"), &sp, &sl) != 0 {
+        return sw_manifest_invalid(out);
+    };
+    // resolve(manifest.cwd) !== resolve(cwd) -> invalid
+    let mcwd = SwStr { bytes: [0; 8192], len: 0 };
+    sw_push(&mcwd, sp, sl);
+    let r1 = SwStr { bytes: [0; 8192], len: 0 };
+    sw_resolve_self(&r1, sw_str_ptr(&mcwd), mcwd.len);
+    let r2 = SwStr { bytes: [0; 8192], len: 0 };
+    sw_resolve_self(&r2, cwd_ptr, cwd_len);
+    if !sw_eq(sw_str_ptr(&r1), r1.len, sw_str_ptr(&r2), r2.len) {
+        return sw_manifest_invalid(out);
+    };
+    let d2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(d2, &out.cwd, 0);
+    out.cwd_len = sw_field_copy(d2, 1024, sp, sl);
+    out.version = 1;
+    if sa_json_object_get_string(doc, STR_PTR("source"), STR_LEN("source"), &sp, &sl) == 0 {
+        let d3: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d3, &out.source, 0);
+        out.source_len = sw_field_copy(d3, 1024, sp, sl);
+    };
+    if sa_json_object_get_string(doc, STR_PTR("sourceHash"), STR_LEN("sourceHash"), &sp, &sl) == 0 {
+        let d4: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d4, &out.source_hash, 0);
+        out.source_hash_len = sw_field_copy(d4, 65, sp, sl);
+    };
+    if sa_json_object_get_string(doc, STR_PTR("createdAt"), STR_LEN("createdAt"), &sp, &sl) == 0 {
+        let d5: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d5, &out.created_at, 0);
+        out.created_at_len = sw_field_copy(d5, 40, sp, sl);
+    };
+    if sa_json_object_get_string(doc, STR_PTR("updatedAt"), STR_LEN("updatedAt"), &sp, &sl) == 0 {
+        let d6: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d6, &out.updated_at, 0);
+        out.updated_at_len = sw_field_copy(d6, 40, sp, sl);
+    };
+    out.status = SW_ST_PLANNED;
+    if sa_json_object_get_string(doc, STR_PTR("status"), STR_LEN("status"), &sp, &sl) == 0 {
+        let okc: bool = false;
+        sw_status_code(sp, sl, &out.status, &okc);
+        if !okc { return sw_manifest_invalid(out); };
+    };
+    if sa_json_object_get_string(doc, STR_PTR("task"), STR_LEN("task"), &sp, &sl) == 0 {
+        let d7: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d7, &out.task, 0);
+        out.task_len = sw_field_copy(d7, 4096, sp, sl);
+    };
+    out.has_reviewed_hash = false;
+    if sa_json_object_get_string(doc, STR_PTR("reviewedHash"), STR_LEN("reviewedHash"), &sp, &sl) == 0 {
+        let d8: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d8, &out.reviewed_hash, 0);
+        out.reviewed_hash_len = sw_field_copy(d8, 65, sp, sl);
+        out.has_reviewed_hash = true;
+    };
+    out.has_validated_hash = false;
+    if sa_json_object_get_string(doc, STR_PTR("validatedHash"), STR_LEN("validatedHash"), &sp, &sl) == 0 {
+        let d9: ptr = PTR_NULL();
+        PTR_BYTE_ADD(d9, &out.validated_hash, 0);
+        out.validated_hash_len = sw_field_copy(d9, 65, sp, sl);
+        out.has_validated_hash = true;
+    };
+    // files: stringify the object into the scratch + rebuild the index
+    out.files_len = 0;
+    out.files_scratch_len = 0;
+    let files_node: u64 = 0;
+    if sa_json_object_get(doc, STR_PTR("files"), STR_LEN("files"), &files_node) == 0 && files_node != 0 && sa_json_kind(files_node) == 7 {
+        let h: u64 = 0;
+        if sa_json_stringify(files_node, &h) == 0 && h != 0 {
+            let hp: ptr = sa_fmt_buffer_data(h);
+            let hl = sa_fmt_buffer_len(h);
+            out.files_scratch_len = sw_field_copy(sw_files_ptr(out), 4194304, hp, hl);
+            sa_fmt_buffer_free(h);
+        };
+        let cnt: u64 = 0;
+        sa_json_value_count(files_node, &cnt);
+        let off: u64 = 0;
+        let ki: u64 = 0;
+        while ki < cnt && out.files_len < 64 {
+            let kp: ptr = PTR_NULL();
+            let kl: u64 = 0;
+            if sa_json_object_key_at(files_node, ki, &kp, &kl) == 0 {
+                let dp2: ptr = PTR_NULL();
+                PTR_BYTE_ADD(dp2, &out.file_paths, off);
+                let m = sw_field_copy(dp2, 65536 - off, kp, kl);
+                out.file_path_lens[out.files_len] = m;
+                off = off + m;
+                out.files_len = out.files_len + 1;
+            };
+            ki = ki + 1;
+        }
+    };
+    // stages
+    out.stages_len = 0;
+    let stages_node: u64 = 0;
+    if sa_json_object_get(doc, STR_PTR("stages"), STR_LEN("stages"), &stages_node) == 0 && stages_node != 0 && sa_json_kind(stages_node) == 6 {
+        let cnt: u64 = 0;
+        sa_json_value_count(stages_node, &cnt);
+        let si: u64 = 0;
+        while si < cnt && si < 64 {
+            let sn2: u64 = 0;
+            if sa_json_array_get(stages_node, si, &sn2) == 0 && sn2 != 0 {
+                sw_manifest_parse_stage(sn2, out, si);
+                out.stages_len = out.stages_len + 1;
+            };
+            si = si + 1;
+        }
+    };
+    return 0;
+}
+
+fn sw_manifest_invalid(out: &SplitManifest) -> i32 {
+    let ep: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ep, &out.err, 0);
+    out.err_len = sw_field_copy(ep, 2048, STR_PTR("split workflow does not belong to this workspace"), STR_LEN("split workflow does not belong to this workspace"));
+    return -4;
+}
+
+fn sw_manifest_parse_stage(node: u64, out: &SplitManifest, si: u64) -> void {
+    let sp: ptr = PTR_NULL();
+    let sl: u64 = 0;
+    // at
+    let aoff: u64 = 0;
+    let aj: u64 = 0;
+    while aj < si { aoff = aoff + out.stage_at_lens[aj]; aj = aj + 1; }
+    let ap: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ap, &out.stage_ats, aoff);
+    out.stage_at_lens[si] = 0;
+    if sa_json_object_get_string(node, STR_PTR("at"), STR_LEN("at"), &sp, &sl) == 0 {
+        out.stage_at_lens[si] = sw_field_copy(ap, 2560 - aoff, sp, sl);
+    };
+    // kind
+    out.stage_kinds[si] = 0;
+    if sa_json_object_get_string(node, STR_PTR("kind"), STR_LEN("kind"), &sp, &sl) == 0 && sw_eq(sp, sl, STR_PTR("refine"), STR_LEN("refine")) {
+        out.stage_kinds[si] = 1;
+    };
+    // moduleName
+    let moff: u64 = 0;
+    let mj: u64 = 0;
+    while mj < si { moff = moff + out.stage_mod_lens[mj]; mj = mj + 1; }
+    let mp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(mp, &out.stage_mods, moff);
+    out.stage_mod_lens[si] = 0;
+    if sa_json_object_get_string(node, STR_PTR("moduleName"), STR_LEN("moduleName"), &sp, &sl) == 0 {
+        out.stage_mod_lens[si] = sw_field_copy(mp, 16384 - moff, sp, sl);
+    };
+    // paths
+    out.stage_path_counts[si] = 0;
+    let paths_node: u64 = 0;
+    if sa_json_object_get(node, STR_PTR("paths"), STR_LEN("paths"), &paths_node) == 0 && paths_node != 0 && sa_json_kind(paths_node) == 6 {
+        let base_idx: u64 = 0;
+        let bk: u64 = 0;
+        while bk < si { base_idx = base_idx + out.stage_path_counts[bk]; bk = bk + 1; }
+        let poff: u64 = 0;
+        let pj: u64 = 0;
+        while pj < base_idx { poff = poff + out.stage_path_lens[pj]; pj = pj + 1; }
+        let cnt: u64 = 0;
+        sa_json_value_count(paths_node, &cnt);
+        let pi2: u64 = 0;
+        while pi2 < cnt && base_idx + pi2 < 256 {
+            let el: u64 = 0;
+            if sa_json_array_get(paths_node, pi2, &el) == 0 && el != 0 && sa_json_kind(el) == 5 {
+                let ep: ptr = sa_json_string_ptr(el);
+                let el2 = sa_json_string_len(el);
+                let dp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(dp, &out.stage_paths, poff);
+                let m = sw_field_copy(dp, 65536 - poff, ep, el2);
+                out.stage_path_lens[base_idx + pi2] = m;
+                poff = poff + m;
+                out.stage_path_counts[si] = out.stage_path_counts[si] + 1;
+            };
+            pi2 = pi2 + 1;
+        }
+    };
+}
+
+// resolve(x) for a standalone path: absolute -> normalize; relative ->
+// resolve against the process PWD (node resolve semantics).
+fn sw_resolve_self(out: &SwStr, p: ptr, n: u64) -> void {
+    if sw_is_absolute(p, n) {
+        sw_path_normalize(out, p, n);
+        return;
+    };
+    let pwd = SwStr { bytes: [0; 8192], len: 0 };
+    sw_push_env(&pwd, STR_PTR("PWD"), STR_LEN("PWD"));
+    sw_path_resolve(out, sw_str_ptr(&pwd), pwd.len, p, n);
+}
+
+
+// ---------------------------------------------------------------------------
+// stageOps + rollbackCommitted.
+// ---------------------------------------------------------------------------
+
+fn sw_push_byte(s: &SwStr, b: u8) -> void {
+    if s.len < 8192 {
+        s.bytes[s.len] = b;
+        s.len = s.len + 1;
+    };
+}
+
+fn sw_put_u64(s: &SwStr, v: u64) -> void {
+    let digits: [u8; 20] = [0; 20];
+    let n: u64 = 0;
+    let x = v;
+    if x == 0 {
+        sw_push_byte(s, 48);
+        return;
+    };
+    while x > 0 {
+        digits[n] = (48 + (x % 10)) as u8;
+        n = n + 1;
+        x = x / 10;
+    }
+    let i = n;
+    while i > 0 {
+        i = i - 1;
+        sw_push_byte(s, digits[i]);
+    }
+}
+
+fn sw_mid_push_byte(s: &SwMid, b: u8) -> void {
+    if s.len < 131072 {
+        s.bytes[s.len] = b;
+        s.len = s.len + 1;
+    };
+}
+
+fn sw_mid_put_u64(s: &SwMid, v: u64) -> void {
+    let digits: [u8; 20] = [0; 20];
+    let n: u64 = 0;
+    let x = v;
+    if x == 0 {
+        sw_mid_push_byte(s, 48);
+        return;
+    };
+    while x > 0 {
+        digits[n] = (48 + (x % 10)) as u8;
+        n = n + 1;
+        x = x / 10;
+    }
+    let i = n;
+    while i > 0 {
+        i = i - 1;
+        sw_mid_push_byte(s, digits[i]);
+    }
+}
+
+
+
+fn sw_manifest_err(manifest: &SplitManifest, ctx: &SwCtx) -> void {
+    let ep: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ep, &manifest.err, 0);
+    manifest.err_len = sw_field_copy(ep, 2048, sw_ctx_ptr(ctx), ctx.err_len);
+}
+
+fn sw_manifest_err_lit(manifest: &SplitManifest, p: ptr, n: u64) -> void {
+    let ep: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ep, &manifest.err, 0);
+    manifest.err_len = sw_field_copy(ep, 2048, p, n);
+}
+
+// L148-173: stageOps — returns the touched count (>= 0) and fills the
+// pending stage slot; -1 with manifest.err set on a thrown error.
 fn stageOps(manifest: &SplitManifest, input: &SplitInput, policy_id: u64, has_policy: bool) -> i32 {
-    // if (!Array.isArray(ops) || ops.length === 0 || ops.length > 20) throw "ops must contain 1 to 20 staged file operations"
-    // touched = new Set<string>() (DEFECT: Set -> fixed array + dedup scan)
-    // for op of ops:
-    //   if (!op || typeof op.path !== "string") throw "each split op requires a workspace-relative path"
-    //   path = safeRelativePath(op.path, manifest.cwd)
-    //   if (typeof content === "string" && typeof patch !== "string") { state = await ensureStageFile(...); state.stagedContent = op.content }
-    //   else if (typeof patch === "string" && typeof content !== "string") {
-    //     parsed = parseAndCheckSaVmPatch(op.patch, cwd, policy, roots); if (!parsed.ok) throw `invalid split patch: ${parsed.reason}`
-    //     for patchOp of parsed.operations:
-    //       if (kind === "delete" || kind === "rename") throw "split staging currently accepts add/update patches only; delete/rename must be planned separately"
-    //       patchPath = safeRelativePath(patchOp.path, cwd); if (patchPath !== path) throw `split patch path ${patchPath} must match op.path ${path}`
-    //       patchState = await ensureStageFile(...); patchState.stagedContent = kind === "write" ? patchOp.contents : applyUniqueEdit(staged, oldContents, newContents, patchPath)
-    //       touched.add(patchPath)
-    //   } else throw `split op for ${path} must provide exactly one of content or patch`
-    //   touched.add(path)
-    // return [...touched].sort() (DEFECT: Set spread + sort -> dedup array + byte sort)
+    if !input.has_ops || input.ops_len == 0 || input.ops_len > 20 {
+        sw_manifest_err_lit(manifest, STR_PTR("ops must contain 1 to 20 staged file operations"), STR_LEN("ops must contain 1 to 20 staged file operations"));
+        return -1;
+    };
+    let cwp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cwp, &manifest.cwd, 0);
+    let roots = StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 };
+    sw_roots_from_input(input, &roots);
+    let roots_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(roots_ptr, &roots, 0);
+    let tpaths: [u8; 65536] = [0; 65536];
+    let tlens: [u64; 256] = [0; 256];
+    let tcount: u64 = 0;
+    let toff: u64 = 0;
+    let pathoff: u64 = 0;
+    let i: u64 = 0;
+    while i < input.ops_len {
+        let op_path_p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(op_path_p, &input.op_paths, pathoff);
+        let op_path_n = input.op_path_lens[i];
+        let ctx = SwCtx { err: [0; 8192], err_len: 0 };
+        let rel = SwStr { bytes: [0; 8192], len: 0 };
+        let rel_base: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rel_base, &rel.bytes, 0);
+        let rel_rc = safeRelativePath(op_path_p, op_path_n, cwp, manifest.cwd_len, rel_base, sw_ctx_ptr(&ctx));
+        if rel_rc < 0 {
+            sw_manifest_err(manifest, &ctx);
+            return -1;
+        };
+        rel.len = (rel_rc) as u64;
+        let rel_p = sw_str_ptr(&rel);
+        if input.op_has_content[i] && !input.op_has_patch[i] {
+            let idx = ensureStageFile(manifest, rel_p, rel.len, policy_id, has_policy, roots_ptr, roots.len);
+            if idx < 0 { return -1; };
+            let st = SplitFileState { base_exists: false, base_content: [0; 1048576], base_content_len: 0, base_hash: [0; 65], base_hash_len: 0, has_base_hash: false, staged_content: [0; 1048576], staged_content_len: 0, committed_hash: [0; 65], committed_hash_len: 0, has_committed_hash: false };
+            sw_state_load(manifest, rel_p, rel.len, &st);
+            let coff: u64 = 0;
+            let cj: u64 = 0;
+            while cj < i { coff = coff + input.op_content_lens[cj]; cj = cj + 1; }
+            let cp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(cp, &input.op_contents, coff);
+            let sdp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(sdp, &st.staged_content, 0);
+            st.staged_content_len = sw_field_copy(sdp, 1048576, cp, input.op_content_lens[i]);
+            sw_state_store(manifest, rel_p, rel.len, &st);
+        } else if input.op_has_patch[i] && !input.op_has_content[i] {
+            let poff: u64 = 0;
+            let pj: u64 = 0;
+            while pj < i { poff = poff + input.op_patch_lens[pj]; pj = pj + 1; }
+            let patch_p: ptr = PTR_NULL();
+            PTR_BYTE_ADD(patch_p, &input.op_patches, poff);
+            let checked = SaVmPatchResult { ok: false, operations: [SaVmPatchOperation { kind: 0, path: [0u8; 2048], path_len: 0, a: [0u8; 65536], a_len: 0, b: [0u8; 65536], b_len: 0, backupPath: [0u8; 2048], backupPath_len: 0, has_backupPath: false }; 256], operations_len: 0, reason: [0u8; 4096], reason_len: 0, policyDenied: false, has_policyDenied: false };
+            let roots_doc = sa_json_parse(STR_PTR("[]"), STR_LEN("[]"));
+            if roots_doc != 0 {
+                let roff: u64 = 0;
+                let ri: u64 = 0;
+                while ri < input.roots_len && ri < 16 {
+                    let rp3: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(rp3, &input.roots, roff);
+                    sa_json_array_push_string(roots_doc, rp3, input.root_lens[ri]);
+                    roff = roff + input.root_lens[ri];
+                    ri = ri + 1;
+                }
+            };
+            parseAndCheckSaVmPatch(patch_p, input.op_patch_lens[i], cwp, manifest.cwd_len, policy_id, has_policy, roots_doc, &checked);
+            if roots_doc != 0 { sa_json_free(roots_doc); };
+            if !checked.ok {
+                let m = SwStr { bytes: [0; 8192], len: 0 };
+                sw_push_lit(&m, STR_PTR("invalid split patch: "), STR_LEN("invalid split patch: "));
+                let rp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(rp, &checked.reason, 0);
+                sw_push(&m, rp, checked.reason_len);
+                sw_manifest_err_lit(manifest, sw_str_ptr(&m), m.len);
+                return -1;
+            };
+            let k: u64 = 0;
+            while k < checked.operations_len {
+                let kop = checked.operations[k].kind;
+                if kop == 2 || kop == 3 {
+                    sw_manifest_err_lit(manifest, STR_PTR("split staging currently accepts add/update patches only; delete/rename must be planned separately"), STR_LEN("split staging currently accepts add/update patches only; delete/rename must be planned separately"));
+                    return -1;
+                };
+                let pp_raw: ptr = PTR_NULL();
+                PTR_BYTE_ADD(pp_raw, &checked.operations[k].path, 0);
+                let ctx2 = SwCtx { err: [0; 8192], err_len: 0 };
+                let prel = SwStr { bytes: [0; 8192], len: 0 };
+                let prel_base: ptr = PTR_NULL();
+                PTR_BYTE_ADD(prel_base, &prel.bytes, 0);
+                let prc = safeRelativePath(pp_raw, checked.operations[k].path_len, cwp, manifest.cwd_len, prel_base, sw_ctx_ptr(&ctx2));
+                if prc < 0 {
+                    sw_manifest_err(manifest, &ctx2);
+                    return -1;
+                };
+                prel.len = (prc) as u64;
+                if !sw_eq(sw_str_ptr(&prel), prel.len, rel_p, rel.len) {
+                    let m2 = SwStr { bytes: [0; 8192], len: 0 };
+                    sw_push_lit(&m2, STR_PTR("split patch path "), STR_LEN("split patch path "));
+                    sw_push(&m2, sw_str_ptr(&prel), prel.len);
+                    sw_push_lit(&m2, STR_PTR(" must match op.path "), STR_LEN(" must match op.path "));
+                    sw_push(&m2, rel_p, rel.len);
+                    sw_manifest_err_lit(manifest, sw_str_ptr(&m2), m2.len);
+                    return -1;
+                };
+                let idx2 = ensureStageFile(manifest, sw_str_ptr(&prel), prel.len, policy_id, has_policy, roots_ptr, roots.len);
+                if idx2 < 0 { return -1; };
+                let st2 = SplitFileState { base_exists: false, base_content: [0; 1048576], base_content_len: 0, base_hash: [0; 65], base_hash_len: 0, has_base_hash: false, staged_content: [0; 1048576], staged_content_len: 0, committed_hash: [0; 65], committed_hash_len: 0, has_committed_hash: false };
+                sw_state_load(manifest, sw_str_ptr(&prel), prel.len, &st2);
+                if kop == 0 {
+                    let ap: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(ap, &checked.operations[k].a, 0);
+                    let sdp2: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(sdp2, &st2.staged_content, 0);
+                    st2.staged_content_len = sw_field_copy(sdp2, 1048576, ap, checked.operations[k].a_len);
+                } else {
+                    let ctx3 = SwCtx { err: [0; 8192], err_len: 0 };
+                    let outb = SwBig { bytes: [0; 1048576], len: 0 };
+                    let scp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(scp, &st2.staged_content, 0);
+                    let aop: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(aop, &checked.operations[k].a, 0);
+                    let bop: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(bop, &checked.operations[k].b, 0);
+                    let erc = applyUniqueEdit(scp, st2.staged_content_len, aop, checked.operations[k].a_len, bop, checked.operations[k].b_len, sw_str_ptr(&prel), prel.len, sw_big_ptr(&outb), sw_ctx_ptr(&ctx3));
+                    if erc < 0 {
+                        sw_manifest_err(manifest, &ctx3);
+                        return -1;
+                    };
+                    let sdp3: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(sdp3, &st2.staged_content, 0);
+                    st2.staged_content_len = sw_field_copy(sdp3, 1048576, sw_big_ptr(&outb), (erc) as u64);
+                };
+                sw_state_store(manifest, sw_str_ptr(&prel), prel.len, &st2);
+                k = k + 1;
+            }
+        } else {
+            let m3 = SwStr { bytes: [0; 8192], len: 0 };
+            sw_push_lit(&m3, STR_PTR("split op for "), STR_LEN("split op for "));
+            sw_push(&m3, rel_p, rel.len);
+            sw_push_lit(&m3, STR_PTR(" must provide exactly one of content or patch"), STR_LEN(" must provide exactly one of content or patch"));
+            sw_manifest_err_lit(manifest, sw_str_ptr(&m3), m3.len);
+            return -1;
+        };
+        // touched.add(path)
+        let dup = false;
+        let di: u64 = 0;
+        let doff: u64 = 0;
+        while di < tcount {
+            let dp2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(dp2, &tpaths, doff);
+            if sw_eq(dp2, tlens[di], rel_p, rel.len) { dup = true; };
+            doff = doff + tlens[di];
+            di = di + 1;
+        }
+        if !dup && tcount < 256 {
+            let dp3: ptr = PTR_NULL();
+            PTR_BYTE_ADD(dp3, &tpaths, toff);
+            let m = sw_field_copy(dp3, 65536 - toff, rel_p, rel.len);
+            tlens[tcount] = m;
+            toff = toff + m;
+            tcount = tcount + 1;
+        };
+        pathoff = pathoff + op_path_n;
+        i = i + 1;
+    }
+    // [...touched].sort() — byte-wise insertion sort over the packed store
+    let si: u64 = 1;
+    while si < tcount {
+        let sj = si;
+        while sj > 0 {
+            // offsets of sj-1 and sj
+            let o1: u64 = 0;
+            let oj: u64 = 0;
+            while oj < sj - 1 { o1 = o1 + tlens[oj]; oj = oj + 1; }
+            let o2 = o1 + tlens[sj - 1];
+            let q1: ptr = PTR_NULL();
+            PTR_BYTE_ADD(q1, &tpaths, o1);
+            let q2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(q2, &tpaths, o2);
+            if !sw_bytes_le(q2, tlens[sj], q1, tlens[sj - 1]) { break; };
+            // swap the two entries (via temp buffers)
+            let t1 = SwStr { bytes: [0; 8192], len: 0 };
+            sw_push(&t1, q1, tlens[sj - 1]);
+            let t2 = SwStr { bytes: [0; 8192], len: 0 };
+            sw_push(&t2, q2, tlens[sj]);
+            let w1: ptr = PTR_NULL();
+            PTR_BYTE_ADD(w1, &tpaths, o1);
+            let nw = sw_field_copy(w1, 65536 - o1, sw_str_ptr(&t2), t2.len);
+            let w2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(w2, &tpaths, o1 + nw);
+            sw_field_copy(w2, 65536 - o1 - nw, sw_str_ptr(&t1), t1.len);
+            let lt = tlens[sj - 1];
+            tlens[sj - 1] = tlens[sj];
+            tlens[sj] = lt;
+            sj = sj - 1;
+        }
+        si = si + 1;
+    }
+    // write into the pending stage slot (counts committed by the caller)
+    let base_idx: u64 = 0;
+    let bk: u64 = 0;
+    while bk < manifest.stages_len { base_idx = base_idx + manifest.stage_path_counts[bk]; bk = bk + 1; }
+    let poff2: u64 = 0;
+    let pj2: u64 = 0;
+    while pj2 < base_idx { poff2 = poff2 + manifest.stage_path_lens[pj2]; pj2 = pj2 + 1; }
+    let dst: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dst, &manifest.stage_paths, poff2);
+    let srcp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(srcp, &tpaths, 0);
+    sw_field_copy(dst, 65536 - poff2, srcp, toff);
+    let ci: u64 = 0;
+    while ci < tcount {
+        manifest.stage_path_lens[base_idx + ci] = tlens[ci];
+        ci = ci + 1;
+    }
+    return (tcount) as i32;
+}
+
+fn sw_policy_doc(policy_id: u64, has_policy: bool) -> u64 {
+    if has_policy { return policy_id; };
     return 0;
 }
 
-// L154-179: async function rollbackCommitted(manifest): Promise<void>
+// L175-197: rollbackCommitted — 0 ok; -1 with manifest.err set (the
+// completed prefix has been restored to staged contents, as in TS).
 fn rollbackCommitted(manifest: &SplitManifest) -> i32 {
-    // completed: string[] = []
-    // try { for ([path, state] of Object.entries(manifest.files)) {  // DEFECT: Object.entries -> index loop
-    //   if (!state.committedHash) continue; absolute = resolve(cwd, path);
-    //   if (!existsSync(absolute) || hashContent(await readFile(absolute, "utf8")) !== state.committedHash) throw `rollback blocked: ${path} changed after split commit`
-    //   if (state.baseExists) await writeFile(absolute, state.baseContent, "utf8"); else await rm(absolute, {force: true});
-    //   completed.push(path) }
-    //   manifest.status = "rolled_back"; await saveManifest(manifest);
-    // } catch (error) { for (path of completed.reverse()) { mkdir -p dirname; writeFile(absolute, state.stagedContent) } throw error }
-    // DEFECT: try/catch + rethrow -> status codes with compensating loop preserved; non-null assertion manifest.files[path]! -> checked index.
+    let cwp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cwp, &manifest.cwd, 0);
+    let clens: [u64; 64] = [0; 64];
+    let ccount: u64 = 0;
+    let ctx = SwCtx { err: [0; 8192], err_len: 0 };
+    let failed = false;
+    let i: u64 = 0;
+    while i < manifest.files_len {
+        let pathb = SwStr { bytes: [0; 8192], len: 0 };
+        sw_file_path_at(manifest, i, &pathb);
+        let pp = sw_str_ptr(&pathb);
+        let pl = pathb.len;
+        let st = SplitFileState { base_exists: false, base_content: [0; 1048576], base_content_len: 0, base_hash: [0; 65], base_hash_len: 0, has_base_hash: false, staged_content: [0; 1048576], staged_content_len: 0, committed_hash: [0; 65], committed_hash_len: 0, has_committed_hash: false };
+        sw_state_load(manifest, pp, pl, &st);
+        if st.has_committed_hash {
+            let abs = SwStr { bytes: [0; 8192], len: 0 };
+            sw_path_resolve(&abs, cwp, manifest.cwd_len, pp, pl);
+            let ap = sw_str_ptr(&abs);
+            if !sw_fs_exists(ap, abs.len) {
+                let m = SwStr { bytes: [0; 8192], len: 0 };
+                sw_push_lit(&m, STR_PTR("rollback blocked: "), STR_LEN("rollback blocked: "));
+                sw_push(&m, pp, pl);
+                sw_push_lit(&m, STR_PTR(" changed after split commit"), STR_LEN(" changed after split commit"));
+                sw_err_set(&ctx, sw_str_ptr(&m), m.len);
+                failed = true;
+                break;
+            };
+            let cur = SwHuge { bytes: [0; 4456448], len: 0 };
+            let rst = sw_read_file_huge(ap, abs.len, &cur);
+            if rst != 0 {
+                sw_err_read(&ctx, rst, ap, abs.len);
+                failed = true;
+                break;
+            };
+            let hb: [u8; 64] = [0; 64];
+            let hbp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(hbp, &hb, 0);
+            let hl = hashContent(sw_huge_ptr(&cur), cur.len, hbp);
+            let chp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(chp, &st.committed_hash, 0);
+            if !sw_eq(hbp, hl, chp, st.committed_hash_len) {
+                let m2 = SwStr { bytes: [0; 8192], len: 0 };
+                sw_push_lit(&m2, STR_PTR("rollback blocked: "), STR_LEN("rollback blocked: "));
+                sw_push(&m2, pp, pl);
+                sw_push_lit(&m2, STR_PTR(" changed after split commit"), STR_LEN(" changed after split commit"));
+                sw_err_set(&ctx, sw_str_ptr(&m2), m2.len);
+                failed = true;
+                break;
+            };
+            if st.base_exists {
+                let bcp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(bcp, &st.base_content, 0);
+                let wst = sw_write_file(ap, abs.len, bcp, st.base_content_len);
+                if wst != 0 {
+                    sw_err_set_lit(&ctx, STR_PTR("failed to write file during split rollback"), STR_LEN("failed to write file during split rollback"));
+                    failed = true;
+                    break;
+                };
+            } else {
+                let rm_st = sa_fs_remove_file(ap, abs.len);
+            };
+            if ccount < 64 {
+                clens[ccount] = i;
+                ccount = ccount + 1;
+            };
+        };
+        i = i + 1;
+    }
+    if !failed {
+        manifest.status = SW_ST_ROLLED_BACK;
+        let sst = saveManifest(manifest);
+        if sst != 0 {
+            sw_err_set_lit(&ctx, STR_PTR("failed to save split workflow manifest"), STR_LEN("failed to save split workflow manifest"));
+            failed = true;
+        };
+    };
+    if failed {
+        // compensate: restore the completed prefix (reversed) to staged
+        let ci = ccount;
+        while ci > 0 {
+            ci = ci - 1;
+            let fi = clens[ci];
+            let pathb2 = SwStr { bytes: [0; 8192], len: 0 };
+            sw_file_path_at(manifest, fi, &pathb2);
+            let pp2 = sw_str_ptr(&pathb2);
+            let pl2 = pathb2.len;
+            let st2 = SplitFileState { base_exists: false, base_content: [0; 1048576], base_content_len: 0, base_hash: [0; 65], base_hash_len: 0, has_base_hash: false, staged_content: [0; 1048576], staged_content_len: 0, committed_hash: [0; 65], committed_hash_len: 0, has_committed_hash: false };
+            sw_state_load(manifest, pp2, pl2, &st2);
+            let abs2 = SwStr { bytes: [0; 8192], len: 0 };
+            sw_path_resolve(&abs2, cwp, manifest.cwd_len, pp2, pl2);
+            let dir2 = SwStr { bytes: [0; 8192], len: 0 };
+            sw_dirname(&dir2, sw_str_ptr(&abs2), abs2.len);
+            sa_fs_mkdir_p(sw_str_ptr(&dir2), dir2.len);
+            let scp2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(scp2, &st2.staged_content, 0);
+            sw_write_file(sw_str_ptr(&abs2), abs2.len, scp2, st2.staged_content_len);
+        }
+        sw_manifest_err(manifest, &ctx);
+        return -1;
+    };
     return 0;
 }
 
-// L181-299: export async function runSplitWorkflowAction(input, policy, cwd, startedAt)
-// DEFECT: async -> synchronous; the source's single try/catch around the action dispatch -> status-code branches funneling into the catch-all result(false, "", errorMessage) at the end. [BLOCKED: body is a conversion-era comment skeleton (logic only in comments, preset return). The R8 form is already chosen inline (awaited mkdir/writeFile/rename/readFile map to blocking sa_std_fs externs); body retranslation required.]
-// DEFECT: every return spreads {...result(...), durationMs: Date.now() - startedAt, saVmEvents: [...]} -> fields set explicitly on out result; Date.now() -> extern clock.
+
+// ---------------------------------------------------------------------------
+// Action handlers + runSplitWorkflowAction (L199-299).
+// Handler convention: 0 = out fully composed; -1 = ctx.err holds the
+// thrown message and the caller produces the catch-all result.
+// ---------------------------------------------------------------------------
+
+fn sw_count_lines(p: ptr, n: u64) -> u64 {
+    let c: u64 = 1;
+    let i: u64 = 0;
+    while i < n {
+        if sw_byte(p, i) == 10 { c = c + 1; };
+        i = i + 1;
+    }
+    return c;
+}
+
+fn sw_trim_ascii(out: &SwStr, p: ptr, n: u64) -> void {
+    let a: u64 = 0;
+    let b = n;
+    while a < b {
+        let c = sw_byte(p, a);
+        if c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12 { a = a + 1; } else { break; };
+    }
+    while b > a {
+        let c = sw_byte(p, b - 1);
+        if c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12 { b = b - 1; } else { break; };
+    }
+    out.len = 0;
+    if b > a {
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, p, a);
+        sw_push(out, sp, b - a);
+    };
+}
+
+fn sw_mid_push_json_string(s: &SwMid, p: ptr, n: u64) -> void {
+    sw_mid_push_byte(s, 34);
+    let i: u64 = 0;
+    while i < n {
+        let c = sw_byte(p, i);
+        if c == 34 { sw_mid_push_lit(s, STR_PTR("\\\""), STR_LEN("\\\"")); }
+        else if c == 92 { sw_mid_push_lit(s, STR_PTR("\\\\"), STR_LEN("\\\\")); }
+        else if c == 8 { sw_mid_push_lit(s, STR_PTR("\\b"), STR_LEN("\\b")); }
+        else if c == 9 { sw_mid_push_lit(s, STR_PTR("\\t"), STR_LEN("\\t")); }
+        else if c == 10 { sw_mid_push_lit(s, STR_PTR("\\n"), STR_LEN("\\n")); }
+        else if c == 12 { sw_mid_push_lit(s, STR_PTR("\\f"), STR_LEN("\\f")); }
+        else if c == 13 { sw_mid_push_lit(s, STR_PTR("\\r"), STR_LEN("\\r")); }
+        else if c < 32 {
+            let hexd: ptr = STR_PTR("0123456789abcdef");
+            sw_mid_push_byte(s, 92);
+            sw_mid_push_byte(s, 117);
+            sw_mid_push_byte(s, 48);
+            sw_mid_push_byte(s, 48);
+            sw_mid_push_byte(s, sw_byte(hexd, ((c >> 4) & 15) as u64));
+            sw_mid_push_byte(s, sw_byte(hexd, (c & 15) as u64));
+        } else {
+            sw_mid_push_byte(s, c);
+        };
+        i = i + 1;
+    }
+    sw_mid_push_byte(s, 34);
+}
+
+fn sw_set_events(out: &SplitResult, p: ptr, n: u64) -> void {
+    let ep: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ep, &out.events_json, 0);
+    out.events_json_len = sw_field_copy(ep, 65536, p, n);
+}
+
+fn sw_ev_open(ev: &SwMid, ts: i64) -> void {
+    ev.len = 0;
+    sw_mid_push_lit(ev, STR_PTR("[{\"timestamp\":"), STR_LEN("[{\"timestamp\":"));
+    sw_mid_put_u64(ev, (ts) as u64);
+    sw_mid_push_lit(ev, STR_PTR(",\"type\":"), STR_LEN(",\"type\":"));
+}
+
+fn sw_ev_session(ev: &SwMid, type_p: ptr, type_n: u64, id_p: ptr, id_n: u64) -> void {
+    sw_mid_push_json_string(ev, type_p, type_n);
+    sw_mid_push_lit(ev, STR_PTR(",\"sessionId\":"), STR_LEN(",\"sessionId\":"));
+    sw_mid_push_json_string(ev, id_p, id_n);
+}
+
+fn sw_ev_paths(ev: &SwMid, manifest: &SplitManifest, base_idx: u64, cnt: u64) -> void {
+    sw_mid_push_lit(ev, STR_PTR(",\"paths\":["), STR_LEN(",\"paths\":["));
+    let poff: u64 = 0;
+    let pj: u64 = 0;
+    while pj < base_idx { poff = poff + manifest.stage_path_lens[pj]; pj = pj + 1; }
+    let i: u64 = 0;
+    while i < cnt {
+        if i > 0 { sw_mid_push_lit(ev, STR_PTR(","), STR_LEN(",")); };
+        let pp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(pp, &manifest.stage_paths, poff);
+        sw_mid_push_json_string(ev, pp, manifest.stage_path_lens[base_idx + i]);
+        poff = poff + manifest.stage_path_lens[base_idx + i];
+        i = i + 1;
+    }
+    sw_mid_push_lit(ev, STR_PTR("]"), STR_LEN("]"));
+}
+
+fn sw_ev_all_file_paths(ev: &SwMid, manifest: &SplitManifest) -> void {
+    sw_mid_push_lit(ev, STR_PTR(",\"paths\":["), STR_LEN(",\"paths\":["));
+    let i: u64 = 0;
+    while i < manifest.files_len {
+        if i > 0 { sw_mid_push_lit(ev, STR_PTR(","), STR_LEN(",")); };
+        let pathb_pp = SwStr { bytes: [0; 8192], len: 0 };
+        sw_file_path_at(manifest, i, &pathb_pp);
+        let pp = sw_str_ptr(&pathb_pp);
+        let pl = pathb_pp.len;
+        sw_mid_push_json_string(ev, pp, pl);
+        i = i + 1;
+    }
+    sw_mid_push_lit(ev, STR_PTR("]"), STR_LEN("]"));
+}
+
+fn sw_ev_close(ev: &SwMid) -> void {
+    sw_mid_push_lit(ev, STR_PTR("}]"), STR_LEN("}]"));
+}
+
+fn sw_manifest_zero(out: &SplitManifest) -> void {
+    *out = SplitManifest { version: 1, id: [0; 64], id_len: 0, cwd: [0; 1024], cwd_len: 0, source: [0; 1024], source_len: 0, source_hash: [0; 65], source_hash_len: 0, created_at: [0; 40], created_at_len: 0, updated_at: [0; 40], updated_at_len: 0, status: 0, task: [0; 4096], task_len: 0, reviewed_hash: [0; 65], reviewed_hash_len: 0, has_reviewed_hash: false, validated_hash: [0; 65], validated_hash_len: 0, has_validated_hash: false, files_scratch: [0; 4194304], files_scratch_len: 0, file_paths: [0; 65536], file_path_lens: [0; 64], files_len: 0, stage_ats: [0; 2560], stage_at_lens: [0; 64], stage_kinds: [0; 64], stage_mods: [0; 16384], stage_mod_lens: [0; 64], stage_paths: [0; 65536], stage_path_lens: [0; 256], stage_path_counts: [0; 64], stages_len: 0, err: [0; 2048], err_len: 0 };
+}
+
+fn sw_state_zero(out: &SplitFileState) -> void {
+    *out = SplitFileState { base_exists: false, base_content: [0; 1048576], base_content_len: 0, base_hash: [0; 65], base_hash_len: 0, has_base_hash: false, staged_content: [0; 1048576], staged_content_len: 0, committed_hash: [0; 65], committed_hash_len: 0, has_committed_hash: false };
+}
+
+// --- split_plan -------------------------------------------------------------
+fn sw_action_plan(input: &SplitInput, ncwd_p: ptr, ncwd_n: u64, policy_id: u64, has_policy: bool, roots_ptr: ptr, roots_len: u64, ctx: &SwCtx, out: &SplitResult, started_ms: u64) -> i32 {
+    let raw_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(raw_p, &input.path, 0);
+    let raw_n: u64 = 0;
+    if input.has_path { raw_n = input.path_len; };
+    let rel = SwStr { bytes: [0; 8192], len: 0 };
+    let rel_base: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rel_base, &rel.bytes, 0);
+    let rel_rc = safeRelativePath(raw_p, raw_n, ncwd_p, ncwd_n, rel_base, sw_ctx_ptr(ctx));
+    if rel_rc < 0 { return -1; };
+    rel.len = (rel_rc) as u64;
+    let rel_p = sw_str_ptr(&rel);
+    if checkAllowed(policy_id, has_policy, ncwd_p, ncwd_n, 0, rel_p, rel.len, roots_ptr, roots_len, sw_ctx_ptr(ctx)) < 0 { return -1; };
+    let abs = SwStr { bytes: [0; 8192], len: 0 };
+    sw_path_resolve(&abs, ncwd_p, ncwd_n, rel_p, rel.len);
+    let content = SwHuge { bytes: [0; 4456448], len: 0 };
+    let rst = sw_read_file_huge(sw_str_ptr(&abs), abs.len, &content);
+    if rst != 0 {
+        sw_err_read(ctx, rst, sw_str_ptr(&abs), abs.len);
+        return -1;
+    };
+    // tree-sitter outline + coupling (content capped at the unit's
+    // 64 KiB StrBuf, registered)
+    let st = TreeSitterState { parserInitDone: false, parserInstance: 0, languageCache_names: [0u8; 4096], languageCache_names_len: 0, languageCache_vals: [0u64; 128], languageCache_len: 0, sfCache_paths: [0u8; 8192], sfCache_paths_len: 0, sfCache_contents_first: 0, sfCache_len: 0 };
+    let pool = OutlineSymbolList { items: [OutlineSymbol { name: [0u8; 256], name_len: 0, kind: 0, startLine: 0, endLine: 0, signature: [0u8; 512], signature_len: 0, has_signature: false, children_first: 0, children_len: 0 }; 1024], len: 0 };
+    let ores = FileOutlineResult { filePath: [0u8; 1024], filePath_len: 0, language: [0u8; 64], language_len: 0, has_language: false, totalLines: 0, symbols_first: 0, symbols_len: 0, formatted: [0u8; 65536], formatted_len: 0 };
+    let pb = StrBuf { bytes: [0u8; 65536], len: 0 };
+    let cb = StrBuf { bytes: [0u8; 65536], len: 0 };
+    {
+        let dp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp, &pb.bytes, 0);
+        pb.len = sw_field_copy(dp, 65536, rel_p, rel.len);
+        let dp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp2, &cb.bytes, 0);
+        cb.len = sw_field_copy(dp2, 65536, sw_huge_ptr(&content), content.len);
+    } 
+    extractFileOutline(&st, &pool, &pb, &cb, true, &ores);
+    let candidates = CouplingCandidateList { items: [CouplingCandidate { name: [0u8; 256], name_len: 0, kind: [0u8; 64], kind_len: 0, startLine: 0, endLine: 0, capturedOuterState: 0, importedDeps: 0, internalLines: 0, recommendation: [0u8; 256], recommendation_len: 0 }; 64], len: 0 };
+    let summary = StrBuf { bytes: [0u8; 65536], len: 0 };
+    analyzeFileCoupling(&st, &pb, &cb, 30, true, &candidates, &summary);
+    // manifest
+    let manifest = SplitManifest { version: 1, id: [0; 64], id_len: 0, cwd: [0; 1024], cwd_len: 0, source: [0; 1024], source_len: 0, source_hash: [0; 65], source_hash_len: 0, created_at: [0; 40], created_at_len: 0, updated_at: [0; 40], updated_at_len: 0, status: 0, task: [0; 4096], task_len: 0, reviewed_hash: [0; 65], reviewed_hash_len: 0, has_reviewed_hash: false, validated_hash: [0; 65], validated_hash_len: 0, has_validated_hash: false, files_scratch: [0; 4194304], files_scratch_len: 0, file_paths: [0; 65536], file_path_lens: [0; 64], files_len: 0, stage_ats: [0; 2560], stage_at_lens: [0; 64], stage_kinds: [0; 64], stage_mods: [0; 16384], stage_mod_lens: [0; 64], stage_paths: [0; 65536], stage_path_lens: [0; 256], stage_path_counts: [0; 64], stages_len: 0, err: [0; 2048], err_len: 0 };
+    {
+        let dp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp, &manifest.id, 0);
+        manifest.id_len = sw_uuid_into(dp, 64);
+        let dp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp2, &manifest.cwd, 0);
+        manifest.cwd_len = sw_field_copy(dp2, 1024, ncwd_p, ncwd_n);
+        let dp3: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp3, &manifest.source, 0);
+        manifest.source_len = sw_field_copy(dp3, 1024, rel_p, rel.len);
+        let dp4: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp4, &manifest.source_hash, 0);
+        manifest.source_hash_len = hashContent(sw_huge_ptr(&content), content.len, dp4);
+        let now = sw_now_ms();
+        let dp5: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp5, &manifest.created_at, 0);
+        manifest.created_at_len = sw_iso_into(dp5, 40, now);
+        let dp6: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp6, &manifest.updated_at, 0);
+        manifest.updated_at_len = sw_iso_into(dp6, 40, now);
+        manifest.status = SW_ST_PLANNED;
+        if input.has_task {
+            let tb = SwStr { bytes: [0; 8192], len: 0 };
+            let tp2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(tp2, &input.task, 0);
+            sw_trim_ascii(&tb, tp2, input.task_len);
+            let dp7: ptr = PTR_NULL();
+            PTR_BYTE_ADD(dp7, &manifest.task, 0);
+            manifest.task_len = sw_field_copy(dp7, 4096, sw_str_ptr(&tb), tb.len);
+        };
+    } 
+    let sst = saveManifest(&manifest);
+    if sst != 0 {
+        sw_err_set_lit(ctx, STR_PTR("failed to save split workflow manifest"), STR_LEN("failed to save split workflow manifest"));
+        return -1;
+    };
+    // stdout
+    let ob = SwBig { bytes: [0; 1048576], len: 0 };
+    sw_big_push_lit(&ob, STR_PTR("[split_plan] session_id="), STR_LEN("[split_plan] session_id="));
+    {
+        let ip: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ip, &manifest.id, 0);
+        sw_big_push(&ob, ip, manifest.id_len);
+    } 
+    sw_big_push_lit(&ob, STR_PTR("\nSource: "), STR_LEN("\nSource: "));
+    sw_big_push(&ob, rel_p, rel.len);
+    sw_big_push_lit(&ob, STR_PTR(" ("), STR_LEN(" ("));
+    {
+        let nb = SwStr { bytes: [0; 8192], len: 0 };
+        sw_put_u64(&nb, ores.totalLines);
+        sw_big_push(&ob, sw_str_ptr(&nb), nb.len);
+    } 
+    sw_big_push_lit(&ob, STR_PTR(" lines, "), STR_LEN(" lines, "));
+    {
+        let nb2 = SwStr { bytes: [0; 8192], len: 0 };
+        sw_put_u64(&nb2, content.len);
+        sw_big_push(&ob, sw_str_ptr(&nb2), nb2.len);
+    } 
+    sw_big_push_lit(&ob, STR_PTR(" chars)\nTask: "), STR_LEN(" chars)\nTask: "));
+    if manifest.task_len > 0 {
+        let tp3: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp3, &manifest.task, 0);
+        sw_big_push(&ob, tp3, manifest.task_len);
+    } else {
+        sw_big_push_lit(&ob, STR_PTR("(none)"), STR_LEN("(none)"));
+    };
+    let shown = ores.symbols_len;
+    if shown > 160 { shown = 160; };
+    sw_big_push_lit(&ob, STR_PTR("\n\nAST outline (first "), STR_LEN("\n\nAST outline (first "));
+    {
+        let nb3 = SwStr { bytes: [0; 8192], len: 0 };
+        sw_put_u64(&nb3, shown);
+        sw_big_push(&ob, sw_str_ptr(&nb3), nb3.len);
+    } 
+    sw_big_push_lit(&ob, STR_PTR(" symbols):\n"), STR_LEN(" symbols):\n"));
+    let sj: u64 = 0;
+    while sj < shown {
+        if sj > 0 { sw_big_push_lit(&ob, STR_PTR("\n"), STR_LEN("\n")); };
+        let sym = &pool.items[ores.symbols_first + sj];
+        let kb = StrBuf { bytes: [0u8; 65536], len: 0 };
+        kind_name(sym.kind, &kb);
+        {
+            let kp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(kp, &kb.bytes, 0);
+            sw_big_push(&ob, kp, kb.len);
+        } 
+        sw_big_push_lit(&ob, STR_PTR(" "), STR_LEN(" "));
+        {
+            let np: ptr = PTR_NULL();
+            PTR_BYTE_ADD(np, &sym.name, 0);
+            sw_big_push(&ob, np, sym.name_len);
+        } 
+        sw_big_push_lit(&ob, STR_PTR(" [L"), STR_LEN(" [L"));
+        {
+            let nb4 = SwStr { bytes: [0; 8192], len: 0 };
+            sw_put_u64(&nb4, sym.startLine);
+            sw_big_push(&ob, sw_str_ptr(&nb4), nb4.len);
+        } 
+        sw_big_push_lit(&ob, STR_PTR("-"), STR_LEN("-"));
+        {
+            let nb5 = SwStr { bytes: [0; 8192], len: 0 };
+            sw_put_u64(&nb5, sym.endLine);
+            sw_big_push(&ob, sw_str_ptr(&nb5), nb5.len);
+        } 
+        sw_big_push_lit(&ob, STR_PTR("]"), STR_LEN("]"));
+        sj = sj + 1;
+    }
+    sw_big_push_lit(&ob, STR_PTR("\n\nCoupling candidates:\n"), STR_LEN("\n\nCoupling candidates:\n"));
+    {
+        let sp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp2, &summary.bytes, 0);
+        sw_big_push(&ob, sp2, summary.len);
+    } 
+    sw_big_push_lit(&ob, STR_PTR("\n\nNext: group symbols into coarse modules, then call split_stage with patch ops; intermediate drafts stay off-worktree."), STR_LEN("\n\nNext: group symbols into coarse modules, then call split_stage with patch ops; intermediate drafts stay off-worktree."));
+    split_result(out, true, sw_big_ptr(&ob), ob.len, STR_PTR(""), 0, 0, STR_PTR("success"), STR_LEN("success"));
+    // event
+    let ev = SwMid { bytes: [0; 131072], len: 0 };
+    let now2 = sw_now_ms();
+    sw_ev_open(&ev, now2);
+    {
+        let ip2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ip2, &manifest.id, 0);
+        sw_ev_session(&ev, STR_PTR("split_plan_created"), STR_LEN("split_plan_created"), ip2, manifest.id_len);
+    } 
+    sw_mid_push_lit(&ev, STR_PTR(",\"source\":"), STR_LEN(",\"source\":"));
+    sw_mid_push_json_string(&ev, rel_p, rel.len);
+    sw_mid_push_lit(&ev, STR_PTR(",\"symbolCount\":"), STR_LEN(",\"symbolCount\":"));
+    sw_mid_put_u64(&ev, ores.symbols_len);
+    sw_ev_close(&ev);
+    sw_set_events(out, sw_mid_ptr(&ev), ev.len);
+    sw_result_finish(out, started_ms);
+    return 0;
+}
+
+
+// --- split_status -----------------------------------------------------------
+fn sw_action_status(manifest: &SplitManifest, id_p: ptr, id_n: u64, out: &SplitResult, started_ms: u64) -> i32 {
+    let digest: [u8; 64] = [0; 64];
+    let dbp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dbp, &digest, 0);
+    let dlen = stagedDigest(manifest, dbp);
+    let ob = SwBig { bytes: [0; 1048576], len: 0 };
+    sw_big_push_lit(&ob, STR_PTR("[split_status] session_id="), STR_LEN("[split_status] session_id="));
+    sw_big_push(&ob, id_p, id_n);
+    sw_big_push_lit(&ob, STR_PTR("\nSource: "), STR_LEN("\nSource: "));
+    {
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, &manifest.source, 0);
+        sw_big_push(&ob, sp, manifest.source_len);
+    } 
+    sw_big_push_lit(&ob, STR_PTR("\nTask: "), STR_LEN("\nTask: "));
+    if manifest.task_len > 0 {
+        let tp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp, &manifest.task, 0);
+        sw_big_push(&ob, tp, manifest.task_len);
+    } else {
+        sw_big_push_lit(&ob, STR_PTR("(none)"), STR_LEN("(none)"));
+    };
+    sw_big_push_lit(&ob, STR_PTR("\nStatus: "), STR_LEN("\nStatus: "));
+    {
+        let sn = SwStr { bytes: [0; 8192], len: 0 };
+        sw_status_name(manifest.status, &sn);
+        sw_big_push(&ob, sw_str_ptr(&sn), sn.len);
+    } 
+    sw_big_push_lit(&ob, STR_PTR("\nUpdated: "), STR_LEN("\nUpdated: "));
+    {
+        let up: ptr = PTR_NULL();
+        PTR_BYTE_ADD(up, &manifest.updated_at, 0);
+        sw_big_push(&ob, up, manifest.updated_at_len);
+    } 
+    sw_big_push_lit(&ob, STR_PTR("\nStages:\n"), STR_LEN("\nStages:\n"));
+    if manifest.stages_len == 0 {
+        sw_big_push_lit(&ob, STR_PTR("(none)"), STR_LEN("(none)"));
+    } else {
+        let si: u64 = 0;
+        while si < manifest.stages_len {
+            if si > 0 { sw_big_push_lit(&ob, STR_PTR("\n"), STR_LEN("\n")); };
+            {
+                let nb = SwStr { bytes: [0; 8192], len: 0 };
+                sw_put_u64(&nb, si + 1);
+                sw_big_push(&ob, sw_str_ptr(&nb), nb.len);
+            } 
+            sw_big_push_lit(&ob, STR_PTR(". "), STR_LEN(". "));
+            if manifest.stage_kinds[si] == 1 {
+                sw_big_push_lit(&ob, STR_PTR("refine"), STR_LEN("refine"));
+            } else {
+                sw_big_push_lit(&ob, STR_PTR("coarse"), STR_LEN("coarse"));
+            };
+            sw_big_push_lit(&ob, STR_PTR(" "), STR_LEN(" "));
+            {
+                let moff: u64 = 0;
+                let mj: u64 = 0;
+                while mj < si { moff = moff + manifest.stage_mod_lens[mj]; mj = mj + 1; }
+                let mp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(mp, &manifest.stage_mods, moff);
+                if manifest.stage_mod_lens[si] > 0 {
+                    sw_big_push(&ob, mp, manifest.stage_mod_lens[si]);
+                } else {
+                    sw_big_push_lit(&ob, STR_PTR("(unnamed)"), STR_LEN("(unnamed)"));
+                };
+            } 
+            sw_big_push_lit(&ob, STR_PTR(": "), STR_LEN(": "));
+            {
+                let base_idx: u64 = 0;
+                let bk: u64 = 0;
+                while bk < si { base_idx = base_idx + manifest.stage_path_counts[bk]; bk = bk + 1; }
+                let poff: u64 = 0;
+                let pj: u64 = 0;
+                while pj < base_idx { poff = poff + manifest.stage_path_lens[pj]; pj = pj + 1; }
+                let cnt = manifest.stage_path_counts[si];
+                let pi2: u64 = 0;
+                while pi2 < cnt {
+                    if pi2 > 0 { sw_big_push_lit(&ob, STR_PTR(", "), STR_LEN(", ")); };
+                    let pp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(pp, &manifest.stage_paths, poff);
+                    sw_big_push(&ob, pp, manifest.stage_path_lens[base_idx + pi2]);
+                    poff = poff + manifest.stage_path_lens[base_idx + pi2];
+                    pi2 = pi2 + 1;
+                }
+            } 
+            si = si + 1;
+        }
+    };
+    sw_big_push_lit(&ob, STR_PTR("\nFiles:\n"), STR_LEN("\nFiles:\n"));
+    if manifest.files_len == 0 {
+        sw_big_push_lit(&ob, STR_PTR("(none)"), STR_LEN("(none)"));
+    } else {
+        let fi: u64 = 0;
+        while fi < manifest.files_len {
+            if fi > 0 { sw_big_push_lit(&ob, STR_PTR("\n"), STR_LEN("\n")); };
+            let pathb = SwStr { bytes: [0; 8192], len: 0 };
+            sw_file_path_at(manifest, fi, &pathb);
+            let pp = sw_str_ptr(&pathb);
+            let pl = pathb.len;
+            sw_big_push(&ob, pp, pl);
+            sw_big_push_lit(&ob, STR_PTR(": "), STR_LEN(": "));
+            let st = SplitFileState { base_exists: false, base_content: [0; 1048576], base_content_len: 0, base_hash: [0; 65], base_hash_len: 0, has_base_hash: false, staged_content: [0; 1048576], staged_content_len: 0, committed_hash: [0; 65], committed_hash_len: 0, has_committed_hash: false };
+            sw_state_load(manifest, pp, pl, &st);
+            {
+                let scp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(scp, &st.staged_content, 0);
+                let nb2 = SwStr { bytes: [0; 8192], len: 0 };
+                sw_put_u64(&nb2, sw_count_lines(scp, st.staged_content_len));
+                sw_big_push(&ob, sw_str_ptr(&nb2), nb2.len);
+            } 
+            sw_big_push_lit(&ob, STR_PTR(" staged lines, "), STR_LEN(" staged lines, "));
+            if st.base_exists {
+                sw_big_push_lit(&ob, STR_PTR("existing"), STR_LEN("existing"));
+            } else {
+                sw_big_push_lit(&ob, STR_PTR("new"), STR_LEN("new"));
+            };
+            fi = fi + 1;
+        }
+    };
+    sw_big_push_lit(&ob, STR_PTR("\nDiff reviewed: "), STR_LEN("\nDiff reviewed: "));
+    if manifest.has_reviewed_hash {
+        let rp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp, &manifest.reviewed_hash, 0);
+        if sw_eq(rp, manifest.reviewed_hash_len, dbp, dlen) {
+            sw_big_push_lit(&ob, STR_PTR("true"), STR_LEN("true"));
+        } else {
+            sw_big_push_lit(&ob, STR_PTR("false"), STR_LEN("false"));
+        };
+    } else {
+        sw_big_push_lit(&ob, STR_PTR("false"), STR_LEN("false"));
+    };
+    sw_big_push_lit(&ob, STR_PTR("\nValidation current: "), STR_LEN("\nValidation current: "));
+    if manifest.has_validated_hash {
+        let vp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(vp, &manifest.validated_hash, 0);
+        if sw_eq(vp, manifest.validated_hash_len, dbp, dlen) {
+            sw_big_push_lit(&ob, STR_PTR("true"), STR_LEN("true"));
+        } else {
+            sw_big_push_lit(&ob, STR_PTR("false"), STR_LEN("false"));
+        };
+    } else {
+        sw_big_push_lit(&ob, STR_PTR("false"), STR_LEN("false"));
+    };
+    split_result(out, true, sw_big_ptr(&ob), ob.len, STR_PTR(""), 0, 0, STR_PTR("success"), STR_LEN("success"));
+    let ev = SwMid { bytes: [0; 131072], len: 0 };
+    sw_ev_open(&ev, sw_now_ms());
+    sw_ev_session(&ev, STR_PTR("split_status_read"), STR_LEN("split_status_read"), id_p, id_n);
+    sw_ev_close(&ev);
+    sw_set_events(out, sw_mid_ptr(&ev), ev.len);
+    sw_result_finish(out, started_ms);
+    return 0;
+}
+
+// --- split_stage / split_refine ---------------------------------------------
+fn sw_action_stage(input: &SplitInput, manifest: &SplitManifest, id_p: ptr, id_n: u64, policy_id: u64, has_policy: bool, ctx: &SwCtx, out: &SplitResult, started_ms: u64) -> i32 {
+    if manifest.status == SW_ST_COMMITTED || manifest.status == SW_ST_ROLLED_BACK {
+        let sn = SwStr { bytes: [0; 8192], len: 0 };
+        sw_status_name(manifest.status, &sn);
+        let m = SwStr { bytes: [0; 8192], len: 0 };
+        sw_push_lit(&m, STR_PTR("workflow is "), STR_LEN("workflow is "));
+        sw_push(&m, sw_str_ptr(&sn), sn.len);
+        sw_push_lit(&m, STR_PTR("; create a new split_plan to continue"), STR_LEN("; create a new split_plan to continue"));
+        sw_err_set(ctx, sw_str_ptr(&m), m.len);
+        return -1;
+    };
+    if manifest.status == SW_ST_PLANNED {
+        let abs = SwStr { bytes: [0; 8192], len: 0 };
+        let cwp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cwp, &manifest.cwd, 0);
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, &manifest.source, 0);
+        sw_path_resolve(&abs, cwp, manifest.cwd_len, sp, manifest.source_len);
+        let cur = SwHuge { bytes: [0; 4456448], len: 0 };
+        let rst = sw_read_file_huge(sw_str_ptr(&abs), abs.len, &cur);
+        if rst != 0 {
+            sw_err_read(ctx, rst, sw_str_ptr(&abs), abs.len);
+            return -1;
+        };
+        let hb: [u8; 64] = [0; 64];
+        let hbp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(hbp, &hb, 0);
+        let hl = hashContent(sw_huge_ptr(&cur), cur.len, hbp);
+        let shp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(shp, &manifest.source_hash, 0);
+        if !sw_eq(hbp, hl, shp, manifest.source_hash_len) {
+            sw_err_set_lit(ctx, STR_PTR("source changed since split_plan; refresh the plan before staging edits"), STR_LEN("source changed since split_plan; refresh the plan before staging edits"));
+            return -1;
+        };
+    };
+    let count = stageOps(manifest, input, policy_id, has_policy);
+    if count < 0 {
+        let ep: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ep, &manifest.err, 0);
+        sw_err_set(ctx, ep, manifest.err_len);
+        return -1;
+    };
+    manifest.has_reviewed_hash = false;
+    manifest.reviewed_hash_len = 0;
+    manifest.has_validated_hash = false;
+    manifest.validated_hash_len = 0;
+    let kind_tag: u64 = 0;
+    {
+        let ap: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ap, &input.action, 0);
+        if sw_eq(ap, input.action_len, STR_PTR("split_refine"), STR_LEN("split_refine")) { kind_tag = 1; };
+        if input.has_phase {
+            let pp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(pp, &input.phase, 0);
+            if sw_eq(pp, input.phase_len, STR_PTR("refine"), STR_LEN("refine")) { kind_tag = 1; };
+        };
+    } 
+    // commit the stage record into slot stages_len
+    let idx = manifest.stages_len;
+    if idx < 64 {
+        let aoff: u64 = 0;
+        let aj: u64 = 0;
+        while aj < idx { aoff = aoff + manifest.stage_at_lens[aj]; aj = aj + 1; }
+        let ap2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ap2, &manifest.stage_ats, aoff);
+        manifest.stage_at_lens[idx] = sw_iso_into(ap2, 2560 - aoff, sw_now_ms());
+        manifest.stage_kinds[idx] = kind_tag;
+        let moff: u64 = 0;
+        let mj: u64 = 0;
+        while mj < idx { moff = moff + manifest.stage_mod_lens[mj]; mj = mj + 1; }
+        let mp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(mp, &manifest.stage_mods, moff);
+        manifest.stage_mod_lens[idx] = 0;
+        if input.has_module_name {
+            let tb = SwStr { bytes: [0; 8192], len: 0 };
+            let tp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(tp, &input.module_name, 0);
+            sw_trim_ascii(&tb, tp, input.module_name_len);
+            manifest.stage_mod_lens[idx] = sw_field_copy(mp, 16384 - moff, sw_str_ptr(&tb), tb.len);
+        };
+        manifest.stage_path_counts[idx] = (count) as u64;
+        manifest.stages_len = idx + 1;
+    };
+    manifest.status = SW_ST_STAGED;
+    let sst = saveManifest(manifest);
+    if sst != 0 {
+        sw_err_set_lit(ctx, STR_PTR("failed to save split workflow manifest"), STR_LEN("failed to save split workflow manifest"));
+        return -1;
+    };
+    // stdout
+    let ob = SwBig { bytes: [0; 1048576], len: 0 };
+    sw_big_push_lit(&ob, STR_PTR("["), STR_LEN("["));
+    {
+        let ap3: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ap3, &input.action, 0);
+        sw_big_push(&ob, ap3, input.action_len);
+    } 
+    sw_big_push_lit(&ob, STR_PTR("] staged "), STR_LEN("] staged "));
+    {
+        let nb = SwStr { bytes: [0; 8192], len: 0 };
+        sw_put_u64(&nb, (count) as u64);
+        sw_big_push(&ob, sw_str_ptr(&nb), nb.len);
+    } 
+    sw_big_push_lit(&ob, STR_PTR(" path(s); worktree unchanged\nsession_id="), STR_LEN(" path(s); worktree unchanged\nsession_id="));
+    sw_big_push(&ob, id_p, id_n);
+    sw_big_push_lit(&ob, STR_PTR("\nmodule="), STR_LEN("\nmodule="));
+    if input.has_module_name {
+        let tb2 = SwStr { bytes: [0; 8192], len: 0 };
+        let tp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp2, &input.module_name, 0);
+        sw_trim_ascii(&tb2, tp2, input.module_name_len);
+        if tb2.len > 0 {
+            sw_big_push(&ob, sw_str_ptr(&tb2), tb2.len);
+        } else {
+            sw_big_push_lit(&ob, STR_PTR("(unnamed)"), STR_LEN("(unnamed)"));
+        };
+    } else {
+        sw_big_push_lit(&ob, STR_PTR("(unnamed)"), STR_LEN("(unnamed)"));
+    };
+    // summaries from the committed slot (idx)
+    {
+        let base_idx: u64 = 0;
+        let bk: u64 = 0;
+        while bk < idx { base_idx = base_idx + manifest.stage_path_counts[bk]; bk = bk + 1; }
+        let poff: u64 = 0;
+        let pj: u64 = 0;
+        while pj < base_idx { poff = poff + manifest.stage_path_lens[pj]; pj = pj + 1; }
+        let cnt = manifest.stage_path_counts[idx];
+        let pi2: u64 = 0;
+        while pi2 < cnt {
+            sw_big_push_lit(&ob, STR_PTR("\n"), STR_LEN("\n"));
+            let pp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(pp, &manifest.stage_paths, poff);
+            let pl = manifest.stage_path_lens[base_idx + pi2];
+            sw_big_push(&ob, pp, pl);
+            sw_big_push_lit(&ob, STR_PTR(": "), STR_LEN(": "));
+            let st = SplitFileState { base_exists: false, base_content: [0; 1048576], base_content_len: 0, base_hash: [0; 65], base_hash_len: 0, has_base_hash: false, staged_content: [0; 1048576], staged_content_len: 0, committed_hash: [0; 65], committed_hash_len: 0, has_committed_hash: false };
+            sw_state_load(manifest, pp, pl, &st);
+            {
+                let scp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(scp, &st.staged_content, 0);
+                let nb2 = SwStr { bytes: [0; 8192], len: 0 };
+                sw_put_u64(&nb2, sw_count_lines(scp, st.staged_content_len));
+                sw_big_push(&ob, sw_str_ptr(&nb2), nb2.len);
+            } 
+            sw_big_push_lit(&ob, STR_PTR(" lines"), STR_LEN(" lines"));
+            poff = poff + pl;
+            pi2 = pi2 + 1;
+        }
+    } 
+    sw_big_push_lit(&ob, STR_PTR("\nRepeat split_refine for nested modules, then split_repair phase=validate."), STR_LEN("\nRepeat split_refine for nested modules, then split_repair phase=validate."));
+    split_result(out, true, sw_big_ptr(&ob), ob.len, STR_PTR(""), 0, 0, STR_PTR("success"), STR_LEN("success"));
+    let ev = SwMid { bytes: [0; 131072], len: 0 };
+    sw_ev_open(&ev, sw_now_ms());
+    sw_ev_session(&ev, STR_PTR("split_stage_saved"), STR_LEN("split_stage_saved"), id_p, id_n);
+    sw_mid_push_lit(&ev, STR_PTR(",\"kind\":"), STR_LEN(",\"kind\":"));
+    if kind_tag == 1 {
+        sw_mid_push_json_string(&ev, STR_PTR("refine"), STR_LEN("refine"));
+    } else {
+        sw_mid_push_json_string(&ev, STR_PTR("coarse"), STR_LEN("coarse"));
+    };
+    sw_ev_paths(&ev, manifest, sw_stage_base_idx(manifest, idx), (count) as u64);
+    sw_ev_close(&ev);
+    sw_set_events(out, sw_mid_ptr(&ev), ev.len);
+    sw_result_finish(out, started_ms);
+    return 0;
+}
+
+fn sw_stage_base_idx(manifest: &SplitManifest, stage_idx: u64) -> u64 {
+    let base: u64 = 0;
+    let k: u64 = 0;
+    while k < stage_idx { base = base + manifest.stage_path_counts[k]; k = k + 1; }
+    return base;
+}
+
+
+// --- split_repair -------------------------------------------------------------
+fn sw_action_repair(input: &SplitInput, manifest: &SplitManifest, id_p: ptr, id_n: u64, policy_id: u64, has_policy: bool, roots_ptr: ptr, roots_len: u64, ctx: &SwCtx, out: &SplitResult, started_ms: u64) -> i32 {
+    let phase_p: ptr = STR_PTR("validate");
+    let phase_n: u64 = STR_LEN("validate");
+    if input.has_phase {
+        PTR_BYTE_ADD(phase_p, &input.phase, 0);
+        phase_n = input.phase_len;
+    };
+    let cwp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cwp, &manifest.cwd, 0);
+    if sw_eq(phase_p, phase_n, STR_PTR("stage"), STR_LEN("stage")) {
+        if manifest.status == SW_ST_COMMITTED || manifest.status == SW_ST_ROLLED_BACK {
+            let sn = SwStr { bytes: [0; 8192], len: 0 };
+            sw_status_name(manifest.status, &sn);
+            let m = SwStr { bytes: [0; 8192], len: 0 };
+            sw_push_lit(&m, STR_PTR("workflow is "), STR_LEN("workflow is "));
+            sw_push(&m, sw_str_ptr(&sn), sn.len);
+            sw_push_lit(&m, STR_PTR("; create a new split_plan to continue"), STR_LEN("; create a new split_plan to continue"));
+            sw_err_set(ctx, sw_str_ptr(&m), m.len);
+            return -1;
+        };
+        let count = stageOps(manifest, input, policy_id, has_policy);
+        if count < 0 {
+            let ep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep, &manifest.err, 0);
+            sw_err_set(ctx, ep, manifest.err_len);
+            return -1;
+        };
+        manifest.has_reviewed_hash = false;
+        manifest.reviewed_hash_len = 0;
+        manifest.has_validated_hash = false;
+        manifest.validated_hash_len = 0;
+        manifest.status = SW_ST_STAGED;
+        let sst = saveManifest(manifest);
+        if sst != 0 {
+            sw_err_set_lit(ctx, STR_PTR("failed to save split workflow manifest"), STR_LEN("failed to save split workflow manifest"));
+            return -1;
+        };
+        let ob = SwBig { bytes: [0; 1048576], len: 0 };
+        sw_big_push_lit(&ob, STR_PTR("[split_repair] staged "), STR_LEN("[split_repair] staged "));
+        {
+            let nb = SwStr { bytes: [0; 8192], len: 0 };
+            sw_put_u64(&nb, (count) as u64);
+            sw_big_push(&ob, sw_str_ptr(&nb), nb.len);
+        } 
+        sw_big_push_lit(&ob, STR_PTR(" repair path(s); worktree unchanged\nsession_id="), STR_LEN(" repair path(s); worktree unchanged\nsession_id="));
+        sw_big_push(&ob, id_p, id_n);
+        {
+            // paths from the pending slot (stages_len not incremented)
+            let base_idx: u64 = 0;
+            let bk: u64 = 0;
+            while bk < manifest.stages_len { base_idx = base_idx + manifest.stage_path_counts[bk]; bk = bk + 1; }
+            let poff: u64 = 0;
+            let pj: u64 = 0;
+            while pj < base_idx { poff = poff + manifest.stage_path_lens[pj]; pj = pj + 1; }
+            let ci: u64 = 0;
+            while ci < (count) as u64 {
+                sw_big_push_lit(&ob, STR_PTR("\n"), STR_LEN("\n"));
+                let pp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(pp, &manifest.stage_paths, poff);
+                sw_big_push(&ob, pp, manifest.stage_path_lens[base_idx + ci]);
+                poff = poff + manifest.stage_path_lens[base_idx + ci];
+                ci = ci + 1;
+            }
+        } 
+        sw_big_push_lit(&ob, STR_PTR("\nNext: split_repair phase=validate."), STR_LEN("\nNext: split_repair phase=validate."));
+        split_result(out, true, sw_big_ptr(&ob), ob.len, STR_PTR(""), 0, 0, STR_PTR("success"), STR_LEN("success"));
+        let ev = SwMid { bytes: [0; 131072], len: 0 };
+        sw_ev_open(&ev, sw_now_ms());
+        sw_ev_session(&ev, STR_PTR("split_repairs_staged"), STR_LEN("split_repairs_staged"), id_p, id_n);
+        {
+            let base_idx2: u64 = 0;
+            let bk2: u64 = 0;
+            while bk2 < manifest.stages_len { base_idx2 = base_idx2 + manifest.stage_path_counts[bk2]; bk2 = bk2 + 1; }
+            sw_ev_paths(&ev, manifest, base_idx2, (count) as u64);
+        } 
+        sw_ev_close(&ev);
+        sw_set_events(out, sw_mid_ptr(&ev), ev.len);
+        sw_result_finish(out, started_ms);
+        return 0;
+    };
+    if sw_eq(phase_p, phase_n, STR_PTR("rollback"), STR_LEN("rollback")) {
+        if manifest.status != SW_ST_COMMITTED {
+            sw_err_set_lit(ctx, STR_PTR("rollback requires a committed split workflow"), STR_LEN("rollback requires a committed split workflow"));
+            return -1;
+        };
+        let rrc = rollbackCommitted(manifest);
+        if rrc < 0 {
+            let ep2: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep2, &manifest.err, 0);
+            sw_err_set(ctx, ep2, manifest.err_len);
+            return -1;
+        };
+        let ob2 = SwBig { bytes: [0; 1048576], len: 0 };
+        sw_big_push_lit(&ob2, STR_PTR("[split_repair] rolled back "), STR_LEN("[split_repair] rolled back "));
+        {
+            let nb2 = SwStr { bytes: [0; 8192], len: 0 };
+            sw_put_u64(&nb2, manifest.files_len);
+            sw_big_push(&ob2, sw_str_ptr(&nb2), nb2.len);
+        } 
+        sw_big_push_lit(&ob2, STR_PTR(" path(s); session_id="), STR_LEN(" path(s); session_id="));
+        sw_big_push(&ob2, id_p, id_n);
+        split_result(out, true, sw_big_ptr(&ob2), ob2.len, STR_PTR(""), 0, 0, STR_PTR("success"), STR_LEN("success"));
+        let ev2 = SwMid { bytes: [0; 131072], len: 0 };
+        sw_ev_open(&ev2, sw_now_ms());
+        sw_ev_session(&ev2, STR_PTR("split_rolled_back"), STR_LEN("split_rolled_back"), id_p, id_n);
+        sw_ev_close(&ev2);
+        sw_set_events(out, sw_mid_ptr(&ev2), ev2.len);
+        sw_result_finish(out, started_ms);
+        return 0;
+    };
+    if manifest.status == SW_ST_ROLLED_BACK {
+        sw_err_set_lit(ctx, STR_PTR("workflow has already been rolled back"), STR_LEN("workflow has already been rolled back"));
+        return -1;
+    };
+    if manifest.files_len == 0 {
+        sw_err_set_lit(ctx, STR_PTR("workflow has no staged files"), STR_LEN("workflow has no staged files"));
+        return -1;
+    };
+    let digest: [u8; 64] = [0; 64];
+    let dbp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dbp, &digest, 0);
+    let dlen = stagedDigest(manifest, dbp);
+    if sw_eq(phase_p, phase_n, STR_PTR("diff"), STR_LEN("diff")) {
+        let dp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp2, &manifest.reviewed_hash, 0);
+        manifest.reviewed_hash_len = sw_field_copy(dp2, 65, dbp, dlen);
+        manifest.has_reviewed_hash = true;
+        let sst2 = saveManifest(manifest);
+        if sst2 != 0 {
+            sw_err_set_lit(ctx, STR_PTR("failed to save split workflow manifest"), STR_LEN("failed to save split workflow manifest"));
+            return -1;
+        };
+        let ob3 = SwBig { bytes: [0; 1048576], len: 0 };
+        sw_big_push_lit(&ob3, STR_PTR("[split_repair] review this staged diff before validation/commit; session_id="), STR_LEN("[split_repair] review this staged diff before validation/commit; session_id="));
+        sw_big_push(&ob3, id_p, id_n);
+        let fi: u64 = 0;
+        while fi < manifest.files_len {
+            sw_big_push_lit(&ob3, STR_PTR("\n"), STR_LEN("\n"));
+            if fi > 0 { sw_big_push_lit(&ob3, STR_PTR("\n"), STR_LEN("\n")); };
+            let pathb_pp = SwStr { bytes: [0; 8192], len: 0 };
+            sw_file_path_at(manifest, fi, &pathb_pp);
+            let pp = sw_str_ptr(&pathb_pp);
+            let pl = pathb_pp.len;
+            let dmid = SwMid { bytes: [0; 131072], len: 0 };
+            let dlen2 = renderStagedDiff(pp, pl, fi, manifest, sw_mid_ptr(&dmid));
+            sw_big_push(&ob3, sw_mid_ptr(&dmid), dlen2);
+            fi = fi + 1;
+        }
+        split_result(out, true, sw_big_ptr(&ob3), ob3.len, STR_PTR(""), 0, 0, STR_PTR("success"), STR_LEN("success"));
+        let ev3 = SwMid { bytes: [0; 131072], len: 0 };
+        sw_ev_open(&ev3, sw_now_ms());
+        sw_ev_session(&ev3, STR_PTR("split_diff_reviewed"), STR_LEN("split_diff_reviewed"), id_p, id_n);
+        sw_ev_all_file_paths(&ev3, manifest);
+        sw_ev_close(&ev3);
+        sw_set_events(out, sw_mid_ptr(&ev3), ev3.len);
+        sw_result_finish(out, started_ms);
+        return 0;
+    };
+    // diagnostics pass (validate / commit / unknown phases, as in TS)
+    let diag = SwStr { bytes: [0; 8192], len: 0 };
+    let fi2: u64 = 0;
+    while fi2 < manifest.files_len {
+        let pathb_pp2 = SwStr { bytes: [0; 8192], len: 0 };
+        sw_file_path_at(manifest, fi2, &pathb_pp2);
+        let pp2 = sw_str_ptr(&pathb_pp2);
+        let pl2 = pathb_pp2.len;
+        let st2 = SplitFileState { base_exists: false, base_content: [0; 1048576], base_content_len: 0, base_hash: [0; 65], base_hash_len: 0, has_base_hash: false, staged_content: [0; 1048576], staged_content_len: 0, committed_hash: [0; 65], committed_hash_len: 0, has_committed_hash: false };
+        sw_state_load(manifest, pp2, pl2, &st2);
+        let tst = TreeSitterState { parserInitDone: false, parserInstance: 0, languageCache_names: [0u8; 4096], languageCache_names_len: 0, languageCache_vals: [0u64; 128], languageCache_len: 0, sfCache_paths: [0u8; 8192], sfCache_paths_len: 0, sfCache_contents_first: 0, sfCache_len: 0 };
+        let dlist = SyntaxDiagnosticList { items: [SyntaxDiagnostic { line: 0, column: 0, message: [0u8; 1024], message_len: 0, preview: [0u8; 1024], preview_len: 0, code: [0u8; 64], code_len: 0, has_code: false }; 256], len: 0 };
+        let dres = SyntaxDiagnosticsResult { filePath: [0u8; 1024], filePath_len: 0, clean: false, errorsCount: 0, errors_first: 0, errors_len: 0, formatted: [0u8; 16384], formatted_len: 0 };
+        let pb2 = StrBuf { bytes: [0u8; 65536], len: 0 };
+        let cb2 = StrBuf { bytes: [0u8; 65536], len: 0 };
+        {
+            let dp3: ptr = PTR_NULL();
+            PTR_BYTE_ADD(dp3, &pb2.bytes, 0);
+            pb2.len = sw_field_copy(dp3, 65536, pp2, pl2);
+            let dp4: ptr = PTR_NULL();
+            PTR_BYTE_ADD(dp4, &cb2.bytes, 0);
+            let scp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(scp, &st2.staged_content, 0);
+            cb2.len = sw_field_copy(dp4, 65536, scp, st2.staged_content_len);
+        } 
+        getSyntaxDiagnostics(&tst, &pb2, &cb2, &dlist, &dres);
+        if !dres.clean {
+            if diag.len > 0 { sw_push_lit(&diag, STR_PTR("\n- "), STR_LEN("\n- ")); };
+            sw_push(&diag, pp2, pl2);
+            sw_push_lit(&diag, STR_PTR(": "), STR_LEN(": "));
+            sw_put_u64(&diag, dres.errorsCount);
+            sw_push_lit(&diag, STR_PTR(" syntax error(s), first "), STR_LEN(" syntax error(s), first "));
+            if dres.errors_len > 0 {
+                let first = &dlist.items[dres.errors_first];
+                if first.has_code {
+                    let cp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(cp, &first.code, 0);
+                    sw_push(&diag, cp, first.code_len);
+                };
+                sw_push_lit(&diag, STR_PTR(" "), STR_LEN(" "));
+                let mp2: ptr = PTR_NULL();
+                PTR_BYTE_ADD(mp2, &first.message, 0);
+                sw_push(&diag, mp2, first.message_len);
+            } else {
+                sw_push_lit(&diag, STR_PTR(" "), STR_LEN(" "));
+            };
+        };
+        fi2 = fi2 + 1;
+    }
+    if diag.len > 0 {
+        let m = SwBig { bytes: [0; 1048576], len: 0 };
+        sw_big_push_lit(&m, STR_PTR("[split_repair] staged syntax validation failed:\n- "), STR_LEN("[split_repair] staged syntax validation failed:\n- "));
+        sw_big_push(&m, sw_str_ptr(&diag), diag.len);
+        split_result(out, false, STR_PTR(""), 0, sw_big_ptr(&m), m.len, 2, STR_PTR("sa_error"), STR_LEN("sa_error"));
+        sw_result_finish(out, started_ms);
+        return 0;
+    };
+    if sw_eq(phase_p, phase_n, STR_PTR("validate"), STR_LEN("validate")) {
+        let dp5: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp5, &manifest.validated_hash, 0);
+        manifest.validated_hash_len = sw_field_copy(dp5, 65, dbp, dlen);
+        manifest.has_validated_hash = true;
+        let sst3 = saveManifest(manifest);
+        if sst3 != 0 {
+            sw_err_set_lit(ctx, STR_PTR("failed to save split workflow manifest"), STR_LEN("failed to save split workflow manifest"));
+            return -1;
+        };
+        let ob4 = SwBig { bytes: [0; 1048576], len: 0 };
+        sw_big_push_lit(&ob4, STR_PTR("[split_repair] staged syntax is clean for "), STR_LEN("[split_repair] staged syntax is clean for "));
+        {
+            let nb3 = SwStr { bytes: [0; 8192], len: 0 };
+            sw_put_u64(&nb3, manifest.files_len);
+            sw_big_push(&ob4, sw_str_ptr(&nb3), nb3.len);
+        } 
+        sw_big_push_lit(&ob4, STR_PTR(" path(s). This is not a project typecheck; run project diagnostics after commit.\nsession_id="), STR_LEN(" path(s). This is not a project typecheck; run project diagnostics after commit.\nsession_id="));
+        sw_big_push(&ob4, id_p, id_n);
+        sw_big_push_lit(&ob4, STR_PTR("\nUse phase=commit with confirm=true to apply, or keep refining."), STR_LEN("\nUse phase=commit with confirm=true to apply, or keep refining."));
+        split_result(out, true, sw_big_ptr(&ob4), ob4.len, STR_PTR(""), 0, 0, STR_PTR("success"), STR_LEN("success"));
+        let ev4 = SwMid { bytes: [0; 131072], len: 0 };
+        sw_ev_open(&ev4, sw_now_ms());
+        sw_ev_session(&ev4, STR_PTR("split_stage_validated"), STR_LEN("split_stage_validated"), id_p, id_n);
+        sw_ev_all_file_paths(&ev4, manifest);
+        sw_ev_close(&ev4);
+        sw_set_events(out, sw_mid_ptr(&ev4), ev4.len);
+        sw_result_finish(out, started_ms);
+        return 0;
+    };
+    if !sw_eq(phase_p, phase_n, STR_PTR("commit"), STR_LEN("commit")) {
+        sw_err_set_lit(ctx, STR_PTR("phase must be validate, commit, or rollback"), STR_LEN("phase must be validate, commit, or rollback"));
+        return -1;
+    };
+    if !(input.has_confirm && input.confirm) {
+        sw_err_set_lit(ctx, STR_PTR("commit requires confirm=true after reviewing staged diff"), STR_LEN("commit requires confirm=true after reviewing staged diff"));
+        return -1;
+    };
+    let reviewed_ok = false;
+    if manifest.has_reviewed_hash {
+        let rp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp2, &manifest.reviewed_hash, 0);
+        reviewed_ok = sw_eq(rp2, manifest.reviewed_hash_len, dbp, dlen);
+    };
+    if !reviewed_ok {
+        sw_err_set_lit(ctx, STR_PTR("commit requires a fresh split_repair phase=diff after the last staged change"), STR_LEN("commit requires a fresh split_repair phase=diff after the last staged change"));
+        return -1;
+    };
+    let validated_ok = false;
+    if manifest.has_validated_hash {
+        let vp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(vp2, &manifest.validated_hash, 0);
+        validated_ok = sw_eq(vp2, manifest.validated_hash_len, dbp, dlen);
+    };
+    if !validated_ok {
+        sw_err_set_lit(ctx, STR_PTR("commit requires a fresh split_repair phase=validate after the last staged change"), STR_LEN("commit requires a fresh split_repair phase=validate after the last staged change"));
+        return -1;
+    };
+    // pre-write checks for every staged file
+    let fi3: u64 = 0;
+    while fi3 < manifest.files_len {
+        let pathb_pp3 = SwStr { bytes: [0; 8192], len: 0 };
+        sw_file_path_at(manifest, fi3, &pathb_pp3);
+        let pp3 = sw_str_ptr(&pathb_pp3);
+        let pl3 = pathb_pp3.len;
+        if checkAllowed(policy_id, has_policy, cwp, manifest.cwd_len, 1, pp3, pl3, roots_ptr, roots_len, sw_ctx_ptr(ctx)) < 0 { return -1; };
+        let st3 = SplitFileState { base_exists: false, base_content: [0; 1048576], base_content_len: 0, base_hash: [0; 65], base_hash_len: 0, has_base_hash: false, staged_content: [0; 1048576], staged_content_len: 0, committed_hash: [0; 65], committed_hash_len: 0, has_committed_hash: false };
+        sw_state_load(manifest, pp3, pl3, &st3);
+        let abs3 = SwStr { bytes: [0; 8192], len: 0 };
+        sw_path_resolve(&abs3, cwp, manifest.cwd_len, pp3, pl3);
+        let exists_now = sw_fs_exists(sw_str_ptr(&abs3), abs3.len);
+        if exists_now != st3.base_exists {
+            let m2 = SwStr { bytes: [0; 8192], len: 0 };
+            sw_push_lit(&m2, STR_PTR("commit blocked: "), STR_LEN("commit blocked: "));
+            sw_push(&m2, pp3, pl3);
+            sw_push_lit(&m2, STR_PTR(" existence changed since staging"), STR_LEN(" existence changed since staging"));
+            sw_err_set(ctx, sw_str_ptr(&m2), m2.len);
+            return -1;
+        };
+        if exists_now {
+            let cur3 = SwHuge { bytes: [0; 4456448], len: 0 };
+            let rst3 = sw_read_file_huge(sw_str_ptr(&abs3), abs3.len, &cur3);
+            if rst3 != 0 {
+                sw_err_read(ctx, rst3, sw_str_ptr(&abs3), abs3.len);
+                return -1;
+            };
+            let hb3: [u8; 64] = [0; 64];
+            let hbp3: ptr = PTR_NULL();
+            PTR_BYTE_ADD(hbp3, &hb3, 0);
+            let hl3 = hashContent(sw_huge_ptr(&cur3), cur3.len, hbp3);
+            let bhp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(bhp, &st3.base_hash, 0);
+            if !sw_eq(hbp3, hl3, bhp, st3.base_hash_len) {
+                let m3 = SwStr { bytes: [0; 8192], len: 0 };
+                sw_push_lit(&m3, STR_PTR("commit blocked: "), STR_LEN("commit blocked: "));
+                sw_push(&m3, pp3, pl3);
+                sw_push_lit(&m3, STR_PTR(" changed since staging"), STR_LEN(" changed since staging"));
+                sw_err_set(ctx, sw_str_ptr(&m3), m3.len);
+                return -1;
+            };
+        };
+        fi3 = fi3 + 1;
+    }
+    // write loop with compensation
+    let written: [u64; 64] = [0; 64];
+    let wcount: u64 = 0;
+    let wfailed = false;
+    let fi4: u64 = 0;
+    while fi4 < manifest.files_len {
+        let pathb_pp4 = SwStr { bytes: [0; 8192], len: 0 };
+        sw_file_path_at(manifest, fi4, &pathb_pp4);
+        let pp4 = sw_str_ptr(&pathb_pp4);
+        let pl4 = pathb_pp4.len;
+        let st4 = SplitFileState { base_exists: false, base_content: [0; 1048576], base_content_len: 0, base_hash: [0; 65], base_hash_len: 0, has_base_hash: false, staged_content: [0; 1048576], staged_content_len: 0, committed_hash: [0; 65], committed_hash_len: 0, has_committed_hash: false };
+        sw_state_load(manifest, pp4, pl4, &st4);
+        let abs4 = SwStr { bytes: [0; 8192], len: 0 };
+        sw_path_resolve(&abs4, cwp, manifest.cwd_len, pp4, pl4);
+        let dir4 = SwStr { bytes: [0; 8192], len: 0 };
+        sw_dirname(&dir4, sw_str_ptr(&abs4), abs4.len);
+        sa_fs_mkdir_p(sw_str_ptr(&dir4), dir4.len);
+        let scp4: ptr = PTR_NULL();
+        PTR_BYTE_ADD(scp4, &st4.staged_content, 0);
+        let wst = sw_write_file(sw_str_ptr(&abs4), abs4.len, scp4, st4.staged_content_len);
+        if wst != 0 {
+            sw_err_set_lit(ctx, STR_PTR("failed to write staged file during split commit"), STR_LEN("failed to write staged file during split commit"));
+            wfailed = true;
+            break;
+        };
+        {
+            let chp4: ptr = PTR_NULL();
+            PTR_BYTE_ADD(chp4, &st4.committed_hash, 0);
+            st4.committed_hash_len = hashContent(scp4, st4.staged_content_len, chp4);
+            st4.has_committed_hash = true;
+        } 
+        sw_state_store(manifest, pp4, pl4, &st4);
+        if wcount < 64 {
+            written[wcount] = fi4;
+            wcount = wcount + 1;
+        };
+        fi4 = fi4 + 1;
+    }
+    if !wfailed {
+        manifest.status = SW_ST_COMMITTED;
+        let sst4 = saveManifest(manifest);
+        if sst4 != 0 {
+            sw_err_set_lit(ctx, STR_PTR("failed to save split workflow manifest"), STR_LEN("failed to save split workflow manifest"));
+            wfailed = true;
+        };
+    };
+    if wfailed {
+        let wi = wcount;
+        while wi > 0 {
+            wi = wi - 1;
+            let wfi = written[wi];
+            let pathb_wp = SwStr { bytes: [0; 8192], len: 0 };
+            sw_file_path_at(manifest, wfi, &pathb_wp);
+            let wp = sw_str_ptr(&pathb_wp);
+            let wl = pathb_wp.len;
+            let st5 = SplitFileState { base_exists: false, base_content: [0; 1048576], base_content_len: 0, base_hash: [0; 65], base_hash_len: 0, has_base_hash: false, staged_content: [0; 1048576], staged_content_len: 0, committed_hash: [0; 65], committed_hash_len: 0, has_committed_hash: false };
+            sw_state_load(manifest, wp, wl, &st5);
+            let abs5 = SwStr { bytes: [0; 8192], len: 0 };
+            sw_path_resolve(&abs5, cwp, manifest.cwd_len, wp, wl);
+            if st5.base_exists {
+                let bcp5: ptr = PTR_NULL();
+                PTR_BYTE_ADD(bcp5, &st5.base_content, 0);
+                sw_write_file(sw_str_ptr(&abs5), abs5.len, bcp5, st5.base_content_len);
+            } else {
+                sa_fs_remove_file(sw_str_ptr(&abs5), abs5.len);
+            };
+        }
+        return -1;
+    };
+    let ob5 = SwBig { bytes: [0; 1048576], len: 0 };
+    sw_big_push_lit(&ob5, STR_PTR("[split_repair] committed "), STR_LEN("[split_repair] committed "));
+    {
+        let nb4 = SwStr { bytes: [0; 8192], len: 0 };
+        sw_put_u64(&nb4, wcount);
+        sw_big_push(&ob5, sw_str_ptr(&nb4), nb4.len);
+    } 
+    sw_big_push_lit(&ob5, STR_PTR(" path(s); checkpoint retained for rollback. Run project-level typecheck/tests now.\nsession_id="), STR_LEN(" path(s); checkpoint retained for rollback. Run project-level typecheck/tests now.\nsession_id="));
+    sw_big_push(&ob5, id_p, id_n);
+    split_result(out, true, sw_big_ptr(&ob5), ob5.len, STR_PTR(""), 0, 0, STR_PTR("success"), STR_LEN("success"));
+    let ev5 = SwMid { bytes: [0; 131072], len: 0 };
+    sw_ev_open(&ev5, sw_now_ms());
+    sw_ev_session(&ev5, STR_PTR("split_committed"), STR_LEN("split_committed"), id_p, id_n);
+    sw_mid_push_lit(&ev5, STR_PTR(",\"paths\":["), STR_LEN(",\"paths\":["));
+    {
+        let wi2: u64 = 0;
+        while wi2 < wcount {
+            if wi2 > 0 { sw_mid_push_lit(&ev5, STR_PTR(","), STR_LEN(",")); };
+            let wp2s = SwStr { bytes: [0; 8192], len: 0 };
+            sw_file_path_at(manifest, written[wi2], &wp2s);
+            sw_mid_push_json_string(&ev5, sw_str_ptr(&wp2s), wp2s.len);
+            wi2 = wi2 + 1;
+        }
+    } 
+    sw_mid_push_lit(&ev5, STR_PTR("]"), STR_LEN("]"));
+    sw_ev_close(&ev5);
+    sw_set_events(out, sw_mid_ptr(&ev5), ev5.len);
+    sw_result_finish(out, started_ms);
+    return 0;
+}
+
+// --- entry --------------------------------------------------------------------
 fn runSplitWorkflowAction(input: &SplitInput, policy_id: u64, has_policy: bool, cwd_ptr: ptr, cwd_len: u64, started_at_ms: u64, out: &SplitResult) -> i32 {
-    // normalizedCwd = resolve(cwd); normalizedPolicy = normalizeSaVmPolicy(policy, normalizedCwd, input.additionalRoots ?? [])
-    // if (normalizedPolicy.tools?.extractToFile !== true)
-    //   return {...result(false, "", "split workflow requires extractToFile capability", 228, "capability_denied"), saVmViolation: {reason: "extractToFile disabled"}, durationMs}
-    // DEFECT: optional chaining tools?.extractToFile -> policy extern field probe.
-    // try {
-    //   if (input.action === "split_plan") {
-    //     source = safeRelativePath(input.path ?? "", cwd); checkAllowed(read, source)
-    //     content = await readFile(resolve(cwd, source), "utf8")
-    //     outline = await extractFileOutline(source, content, {detail: true})  // ASYNC-ADJ(ii) for the awaited callee: extractFileOutline was adjudicated R8-blocking in saVmTreeSitter.sla (batch 2); this call site itself remains [BLOCKED: the enclosing runSplitWorkflowAction body is a comment skeleton]. -> blocking extern; options object -> flag
-    //     coupling = analyzeFileCoupling(source, content, 30)
-    //     id = randomUUID(); manifest = {version: 1, id, cwd, source, sourceHash: hashContent(content), createdAt/updatedAt: now ISO, status: "planned", task: input.task?.trim() ?? "", files: {}, stages: []}
-    //     await saveManifest(manifest)
-    //     symbols = outline.symbols.slice(0, 160).map(s => `${s.kind} ${s.name} [L${s.startLine}-${s.endLine}]`)
-    //     return result(true, `[split_plan] session_id=${id}\nSource: ${source} (${outline.totalLines} lines, ${content.length} chars)\nTask: ${task || "(none)"}\n\nAST outline (first ${symbols.length} symbols):\n${symbols.join("\n")}\n\nCoupling candidates:\n${coupling.summary}\n\nNext: ...`)
-    //       + event {type: "split_plan_created", sessionId: id, source, symbolCount}
-    //     DEFECT: big template literal stdout -> formatted appends into out.stdout_buf.
-    //   }
-    //   id = input.session_id?.trim() ?? ""; manifest = await loadManifest(cwd, id)
-    //   if (action === "split_status") { files/stages summary lines via Object.entries/map/join (DEFECT: -> loops);
-    //     stdout includes `Diff reviewed: ${manifest.reviewedHash === stagedDigest(manifest.files)}` and `Validation current: ${...}`; event split_status_read }
-    //   if (action === "split_stage" || action === "split_refine") {
-    //     if (status committed/rolled_back) throw `workflow is ${status}; create a new split_plan to continue`
-    //     if (status planned && hashContent(await readFile(source)) !== sourceHash) throw "source changed since split_plan; refresh the plan before staging edits"
-    //     paths = await stageOps(...); reviewedHash = undefined; validatedHash = undefined
-    //     kind = (action === split_refine || phase === "refine") ? "refine" : "coarse"
-    //     stages.push({at: now ISO, kind, moduleName: input.module_name?.trim() ?? "", paths}); status = "staged"; await saveManifest
-    //     summaries = paths.map(p => `${p}: ${files[p]!.stagedContent lines}`); return result(true, `[...] staged N path(s); worktree unchanged\n...`) + event split_stage_saved
-    //   }
-    //   if (action === "split_repair") {
-    //     phase = input.phase ?? "validate"
-    //     phase "stage": terminal-status guard; stageOps; clear hashes; status staged; save; result + event split_repairs_staged
-    //     phase "rollback": if (status !== committed) throw "rollback requires a committed split workflow"; await rollbackCommitted; result + event split_rolled_back
-    //     if (status === rolled_back) throw "workflow has already been rolled back"
-    //     staged = Object.entries(files); if empty throw "workflow has no staged files"
-    //     phase "diff": reviewedHash = stagedDigest(files); save; diff = staged.map(renderStagedDiff).join("\n\n"); result + event split_diff_reviewed
-    //     diagnostics: for ([path, state] of staged) { syntax = await getSyntaxDiagnostics(path, stagedContent);
-    //       if (!syntax.clean) diagnostics.push(`${path}: ${syntax.errorsCount} syntax error(s), first ${errors[0]?.code ?? ""} ${errors[0]?.message ?? ""}`) }
-    //     if (diagnostics.length) return result(false, "", `[split_repair] staged syntax validation failed:\n- ${diagnostics.join("\n- ")}`)
-    //     phase "validate": validatedHash = stagedDigest; save; result(true, "...not a project typecheck...") + event split_stage_validated
-    //     if (phase !== "commit") throw "phase must be validate, commit, or rollback"
-    //     if (input.confirm !== true) throw "commit requires confirm=true after reviewing staged diff"
-    //     if (reviewedHash !== stagedDigest) throw "commit requires a fresh split_repair phase=diff after the last staged change"
-    //     if (validatedHash !== stagedDigest) throw "commit requires a fresh split_repair phase=validate after the last staged change"
-    //     for staged: checkAllowed(write); currentlyExists = existsSync; existence/baseHash drift -> throw `commit blocked: ...`
-    //     written = []; try { for staged { mkdir -p; writeFile(stagedContent); state.committedHash = hashContent(stagedContent); written.push } status = committed; save }
-    //       catch { for (path of written.reverse()) restore baseContent or rm; throw }
-    //     return result(true, `[...] committed N path(s); ...`) + event split_committed
-    //   }
-    //   return result(false, "", `unsupported split action: ${input.action}`, 1)
-    // } catch (error) { return {...result(false, "", error instanceof Error ? error.message : String(error)), durationMs} }
-    // DEFECT: catch-all error -> out result with ok=false, kind "sa_error", exitCode 2 via split_result defaults.
+    let started_ms = started_at_ms;
+    let ctx = SwCtx { err: [0; 8192], err_len: 0 };
+    let ncwd = SwStr { bytes: [0; 8192], len: 0 };
+    sw_resolve_self(&ncwd, cwd_ptr, cwd_len);
+    let ncwd_p = sw_str_ptr(&ncwd);
+    let roots = StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 };
+    sw_roots_from_input(input, &roots);
+    let roots_ptr: ptr = PTR_NULL();
+    PTR_BYTE_ADD(roots_ptr, &roots, 0);
+    let norm = NormalizedSaVmPolicy { engine: 0, fs: NormalizedFs { entries: FsEntryList { items: [SaVmFsEntry { path: [0u8; 1024], path_len: 0, access: 0 }; 128], len: 0 }, read: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, write: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, transfer: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, delete: 0, backupDir: [0u8; 1024], backupDir_len: 0, backupDir_has: false }, http_allow: HttpRuleList { items: [SaVmHttpAllowRule { host: [0u8; 512], host_len: 0, methods: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_methods: false, paths: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_paths: false }; 128], len: 0 }, env_allow: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, process: NormalizedProcess { spawn: false, exec: ExecRuleList { items: [SaVmProcessExecRule { path: [0u8; 4096], path_len: 0, args: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_args: false }; 128], len: 0 }, bunProfiles: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_bunProfiles: false, bun_enabled: false, bun_allowedSubcommands: StrList { items: [StrItem { bytes: [0u8; 1024], len: 0 }; 128], len: 0 }, has_bun: false }, execution_javascript: false, execution_python: false, tools: NormalizedTools { replaceRead: false, replaceWrite: false, replaceApplyPatch: false, replaceExec: false, readFiles: false, editFiles: false, applyPatch: false, fastSearch: false, clearToolHistory: false, findReferences: false, renameSymbol: false, fileOutline: false, moveWithImports: false, findDefinition: false, extractToFile: false, addImport: false, getDiagnostics: false, organizeImports: false, analyzeScope: false, codeGraph: false }, contextSavings: SaVmContextSavingsConfig { locateBeforeRead: false, maxReadFileBytes: 0, maxReadFileBytes_has: false, grepCircuitBreaker: false, grepMaxResults: 0, grepMaxResults_has: false, grepMaxTokens: 0, grepMaxTokens_has: false, slimRunnerOutput: false, parallelBudget: false, parallelMaxTotalBytes: 0, parallelMaxTotalBytes_has: false, parallelMaxReadFiles: 0, parallelMaxReadFiles_has: false, parallelDeduplication: false, tieredSkillInjection: false, foldWaterfallEvents: false, foldHistoryReadSummaries: false, historyReadFoldTurns: 0, historyReadFoldTurns_has: false }, contextSavings_has: false };
+    normalizeSaVmPolicy(sw_policy_doc(policy_id, has_policy), ncwd_p, ncwd.len, &roots, &norm);
+    if !norm.tools.extractToFile {
+        split_result(out, false, STR_PTR(""), 0, STR_PTR("split workflow requires extractToFile capability"), STR_LEN("split workflow requires extractToFile capability"), 228, STR_PTR("capability_denied"), STR_LEN("capability_denied"));
+        {
+            let vp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(vp, &out.violation_reason, 0);
+            out.violation_reason_len = sw_field_copy(vp, 1024, STR_PTR("extractToFile disabled"), STR_LEN("extractToFile disabled"));
+            out.has_violation = true;
+        } 
+        sw_result_finish(out, started_ms);
+        return 0;
+    };
+    let action_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(action_p, &input.action, 0);
+    if sw_eq(action_p, input.action_len, STR_PTR("split_plan"), STR_LEN("split_plan")) {
+        let rc = sw_action_plan(input, ncwd_p, ncwd.len, policy_id, has_policy, roots_ptr, roots.len, &ctx, out, started_ms);
+        if rc < 0 {
+            split_result(out, false, STR_PTR(""), 0, sw_ctx_ptr(&ctx), ctx.err_len, 2, STR_PTR("sa_error"), STR_LEN("sa_error"));
+            sw_result_finish(out, started_ms);
+        };
+        return 0;
+    };
+    let idb = SwStr { bytes: [0; 8192], len: 0 };
+    if input.has_session_id {
+        let sp3: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp3, &input.session_id, 0);
+        sw_trim_ascii(&idb, sp3, input.session_id_len);
+    };
+    let manifest = SplitManifest { version: 1, id: [0; 64], id_len: 0, cwd: [0; 1024], cwd_len: 0, source: [0; 1024], source_len: 0, source_hash: [0; 65], source_hash_len: 0, created_at: [0; 40], created_at_len: 0, updated_at: [0; 40], updated_at_len: 0, status: 0, task: [0; 4096], task_len: 0, reviewed_hash: [0; 65], reviewed_hash_len: 0, has_reviewed_hash: false, validated_hash: [0; 65], validated_hash_len: 0, has_validated_hash: false, files_scratch: [0; 4194304], files_scratch_len: 0, file_paths: [0; 65536], file_path_lens: [0; 64], files_len: 0, stage_ats: [0; 2560], stage_at_lens: [0; 64], stage_kinds: [0; 64], stage_mods: [0; 16384], stage_mod_lens: [0; 64], stage_paths: [0; 65536], stage_path_lens: [0; 256], stage_path_counts: [0; 64], stages_len: 0, err: [0; 2048], err_len: 0 };
+    let lrc = loadManifest(ncwd_p, ncwd.len, sw_str_ptr(&idb), idb.len, &manifest);
+    if lrc != 0 {
+        let ep3: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ep3, &manifest.err, 0);
+        split_result(out, false, STR_PTR(""), 0, ep3, manifest.err_len, 2, STR_PTR("sa_error"), STR_LEN("sa_error"));
+        sw_result_finish(out, started_ms);
+        return 0;
+    };
+    let id_p = sw_str_ptr(&idb);
+    if sw_eq(action_p, input.action_len, STR_PTR("split_status"), STR_LEN("split_status")) {
+        sw_action_status(&manifest, id_p, idb.len, out, started_ms);
+        return 0;
+    };
+    if sw_eq(action_p, input.action_len, STR_PTR("split_stage"), STR_LEN("split_stage")) || sw_eq(action_p, input.action_len, STR_PTR("split_refine"), STR_LEN("split_refine")) {
+        let rc2 = sw_action_stage(input, &manifest, id_p, idb.len, policy_id, has_policy, &ctx, out, started_ms);
+        if rc2 < 0 {
+            split_result(out, false, STR_PTR(""), 0, sw_ctx_ptr(&ctx), ctx.err_len, 2, STR_PTR("sa_error"), STR_LEN("sa_error"));
+            sw_result_finish(out, started_ms);
+        };
+        return 0;
+    };
+    if sw_eq(action_p, input.action_len, STR_PTR("split_repair"), STR_LEN("split_repair")) {
+        let rc3 = sw_action_repair(input, &manifest, id_p, idb.len, policy_id, has_policy, roots_ptr, roots.len, &ctx, out, started_ms);
+        if rc3 < 0 {
+            split_result(out, false, STR_PTR(""), 0, sw_ctx_ptr(&ctx), ctx.err_len, 2, STR_PTR("sa_error"), STR_LEN("sa_error"));
+            sw_result_finish(out, started_ms);
+        };
+        return 0;
+    };
+    let m = SwStr { bytes: [0; 8192], len: 0 };
+    sw_push_lit(&m, STR_PTR("unsupported split action: "), STR_LEN("unsupported split action: "));
+    sw_push(&m, action_p, input.action_len);
+    split_result(out, false, STR_PTR(""), 0, sw_str_ptr(&m), m.len, 1, STR_PTR("sa_error"), STR_LEN("sa_error"));
     return 0;
 }
