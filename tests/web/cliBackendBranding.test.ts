@@ -13,6 +13,29 @@ test("top-bar CLI branding follows the composer backend selection", () => {
   expect(source).toContain('src={isClaudeBackend ? "/icons/claudecode-color.svg"');
   expect(source).toContain('alt={isClaudeBackend ? "Claude CLI" : isAgyBackend');
   expect(source).toContain('data-cli-backend={isClaudeBackend ? "claude" : isAgyBackend');
+  // Newer backends (cline / command-code / auggie) must join the same chain:
+  // otherwise their threads fall through to the mini icon in the top bar.
+  expect(source).toContain('isAuggieBackend ? "/icons/auggie-color.svg"');
+  expect(source).toContain('isClineBackend ? "/icons/cline-color.svg"');
+  expect(source).toContain('isCommandCodeBackend ? "/icons/command-code.png"');
+  expect(source).toContain('isAuggieBackend ? "Auggie CLI"');
+  expect(source).toContain('isClineBackend ? "Cline CLI"');
+  expect(source).toContain('isCommandCodeBackend ? "Command Code CLI"');
+  expect(source).toContain('isAuggieBackend ? "auggie"');
+  expect(source).toContain('isClineBackend ? "cline"');
+  expect(source).toContain('isCommandCodeBackend ? "command-code"');
+  const mobile = readFileSync(join(import.meta.dir, "../../apps/web/src/mobile/MobileTopBarDropdown.tsx"), "utf8");
+  expect(mobile).toContain('isClineBackend');
+  expect(mobile).toContain('"/icons/cline-color.svg"');
+  expect(mobile).toContain('"Cline CLI"');
+  const selection = readFileSync(join(import.meta.dir, "../../apps/web/src/app/workbench/useSelectionRuntime.ts"), "utf8");
+  expect(selection).toContain("isClineBackend = isClineCliBackend(runtimeSelection.cliBackend) && clineCliEnabled");
+  expect(selection).toContain("isAuggieBackend = isAuggieCliBackend(runtimeSelection.cliBackend) && auggieCliEnabled");
+  expect(selection).toContain("isCommandCodeBackend = isCommandCodeCliBackend(runtimeSelection.cliBackend) && commandCodeCliEnabled");
+  expect(selection).toContain("!isClineBackend && !isCommandCodeBackend");
+  for (const icon of ["cline-color.svg", "auggie-color.svg", "command-code.png"]) {
+    expect(existsSync(join(import.meta.dir, "../../apps/web/public/icons", icon))).toBe(true);
+  }
   expect(source).not.toContain("openclaude");
   expect(source).not.toContain("OpenClaude");
   expect(source).toContain('DEFAULT_CLI_BACKEND');
