@@ -1,0 +1,289 @@
+// Probe for apps/server/src/saVmBundle.sla (Agent AD3, step 2).
+// Run via _defects/probes/run_bu_probe.sh: fake HOME + fake `claude` CLI on
+// PATH + a PWD workspace carrying scripts/sa-vm-mcp.mjs. Exercises the
+// DEFECT #18 candidate copy path, the TOML/JSON merges, the Claude Code
+// registration state machine and the global installer's client fan-out.
+// Prints BU_PROBE_OK on success.
+
+@import "sa_std/io/print.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/env.sai"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/fmt.sai"
+@import "../../apps/server/src/saVmBundle.sla"
+
+fn ptxt(t: &BuText) -> ptr {
+    return bu_text_ptr(t);
+}
+
+struct ProbeState {
+    fails: u64
+}
+
+fn expect(st: &ProbeState, cond: bool, code: i32) -> void {
+    if cond { return; };
+    st.fails = st.fails + 1;
+    println("BU_FAIL {}", code);
+}
+
+fn env_path(name_p: ptr, name_l: u64, out: &BuPath) -> bool {
+    out.len = 0;
+    let h: u64 = sa_env_get(name_p, name_l);
+    if h == 0 { return false; };
+    let bp2: ptr = sa_env_buffer_data(h);
+    let bl: u64 = sa_env_buffer_len(h);
+    bu_push_path(out, bp2, bl);
+    return out.len > 0;
+}
+
+fn read_all(path: &BuPath, out: &BuText) -> bool {
+    return bu_read_text(bu_path_ptr(path), path.len, out);
+}
+
+fn has(path: &BuPath, sub_p: ptr, sub_l: u64) -> bool {
+    let t = BuText { bytes: [0u8; 65536], len: 0 };
+    if !read_all(path, &t) { return false; };
+    return bu_contains(ptxt(&t), t.len, sub_p, sub_l);
+}
+
+fn json_get_str(doc: u64, key_p: ptr, key_l: u64, out: &BuText) -> bool {
+    out.len = 0;
+    let node = bu_get_obj(doc, key_p, key_l);
+    if node == 0 { return false; };
+    if sa_json_kind(node) != 5 { return false; };
+    let np: ptr = sa_json_string_ptr(node);
+    bu_push(out, np, sa_json_string_len(node));
+    return true;
+}
+
+fn main() -> i32 {
+    let st = ProbeState { fails: 0 };
+    let ws = BuPath { bytes: [0u8; 1024], len: 0 };
+    if !env_path(STR_PTR("PROBE_WS"), STR_LEN("PROBE_WS"), &ws) {
+        println("BU_PROBE_NO_WS");
+        return 1;
+    };
+    let mode_b = false;
+    let mode_txt = BuText { bytes: [0u8; 65536], len: 0 };
+    let mh: u64 = sa_env_get(STR_PTR("BU_MODE"), STR_LEN("BU_MODE"));
+    if mh != 0 {
+        let mbp: ptr = sa_env_buffer_data(mh);
+        bu_push(&mode_txt, mbp, sa_env_buffer_len(mh));
+        mode_b = bu_eq(ptxt(&mode_txt), mode_txt.len, STR_PTR("b"), STR_LEN("b"));
+    };
+
+    // --- pure surfaces ------------------------------------------------------
+    if mode_b {
+        expect(&st, isJevMcpEnabled(), 101);
+    } else {
+        expect(&st, !isJevMcpEnabled(), 102);
+    };
+    expect(&st, isSelfManagedMcpEntry(STR_PTR("{\"command\":\"node\",\"args\":[\"/x/sa-vm-mcp.mjs\"]}"), STR_LEN("{\"command\":\"node\",\"args\":[\"/x/sa-vm-mcp.mjs\"]}")), 103);
+    expect(&st, isSelfManagedMcpEntry(STR_PTR("{\"command\":\"C:\\\\bin\\\\sa-vm-mcp.mjs\"}"), STR_LEN("{\"command\":\"C:\\\\bin\\\\sa-vm-mcp.mjs\"}")), 104);
+    expect(&st, !isSelfManagedMcpEntry(STR_PTR("{\"command\":\"node\",\"args\":[\"/x/other.mjs\"]}"), STR_LEN("{\"command\":\"node\",\"args\":[\"/x/other.mjs\"]}")), 105);
+
+    // strip: jev block referencing the script is dropped; an unrelated
+    // section that also references it (different server name) is kept.
+    let toml_in = BuText { bytes: [0u8; 65536], len: 0 };
+    bu_push_lit(&toml_in, STR_PTR("[mcp_servers.jev]\ncommand = \"node\"\nargs = [\"/s/sa-vm-mcp.mjs\"]\n\n[mcp_servers.other]\ncommand = \"node\"\nargs = [\"/s/sa-vm-mcp.mjs\"]\n"), STR_LEN("[mcp_servers.jev]\ncommand = \"node\"\nargs = [\"/s/sa-vm-mcp.mjs\"]\n\n[mcp_servers.other]\ncommand = \"node\"\nargs = [\"/s/sa-vm-mcp.mjs\"]\n"));
+    let stripped = BuText { bytes: [0u8; 65536], len: 0 };
+    stripSelfManagedTomlServer(ptxt(&toml_in), toml_in.len, STR_PTR("jev"), STR_LEN("jev"), &stripped);
+    expect(&st, !bu_contains(ptxt(&stripped), stripped.len, STR_PTR("[mcp_servers.jev]"), STR_LEN("[mcp_servers.jev]")), 106);
+    expect(&st, bu_contains(ptxt(&stripped), stripped.len, STR_PTR("[mcp_servers.other]"), STR_LEN("[mcp_servers.other]")), 107);
+    // a jev block NOT referencing the script is kept
+    let stripped2 = BuText { bytes: [0u8; 65536], len: 0 };
+    stripSelfManagedTomlServer(STR_PTR("[mcp_servers.jev]\ncommand = \"custom\"\n"), STR_LEN("[mcp_servers.jev]\ncommand = \"custom\"\n"), STR_PTR("jev"), STR_LEN("jev"), &stripped2);
+    expect(&st, bu_contains(ptxt(&stripped2), stripped2.len, STR_PTR("[mcp_servers.jev]"), STR_LEN("[mcp_servers.jev]")), 108);
+
+    // TOML merge from empty
+    let m1 = BuText { bytes: [0u8; 65536], len: 0 };
+    mergeMiniAgentTomlMcpConfig(STR_PTR(""), STR_LEN(""), STR_PTR("/fake/sa-vm-mcp.mjs"), STR_LEN("/fake/sa-vm-mcp.mjs"), &m1);
+    expect(&st, bu_contains(ptxt(&m1), m1.len, STR_PTR("[mcp_servers.sa-vm]"), STR_LEN("[mcp_servers.sa-vm]")), 109);
+    expect(&st, bu_contains(ptxt(&m1), m1.len, STR_PTR("user_agent = \"mini-agent/0.2.176\""), STR_LEN("user_agent = \"mini-agent/0.2.176\"")), 110);
+    if mode_b {
+        expect(&st, bu_contains(ptxt(&m1), m1.len, STR_PTR("[mcp_servers.jev]"), STR_LEN("[mcp_servers.jev]")), 111);
+    } else {
+        expect(&st, !bu_contains(ptxt(&m1), m1.len, STR_PTR("[mcp_servers.jev]"), STR_LEN("[mcp_servers.jev]")), 112);
+    };
+    // second merge is stable (no duplicate sa-vm section)
+    let m2 = BuText { bytes: [0u8; 65536], len: 0 };
+    mergeMiniAgentTomlMcpConfig(ptxt(&m1), m1.len, STR_PTR("/fake/sa-vm-mcp.mjs"), STR_LEN("/fake/sa-vm-mcp.mjs"), &m2);
+    let occurrences: u64 = 0;
+    let scan: u64 = 0;
+    while scan + 19 <= m2.len {
+        let hit = true;
+        let k: u64 = 0;
+        let needle: ptr = STR_PTR("[mcp_servers.sa-vm]");
+        while k < 19 {
+            if bu_byte(ptxt(&m2), scan + k) != bu_byte(needle, k) { hit = false; break; };
+            k = k + 1;
+        }
+        if hit { occurrences = occurrences + 1; };
+        scan = scan + 1;
+    }
+    expect(&st, occurrences == 1, 113);
+
+    // JSON merges
+    let jm = BuText { bytes: [0u8; 65536], len: 0 };
+    mergeMcpServersJsonConfig(STR_PTR("{}"), STR_LEN("{}"), STR_PTR("/fake/sa-vm-mcp.mjs"), STR_LEN("/fake/sa-vm-mcp.mjs"), &jm);
+    let jdoc = bu_parse(ptxt(&jm), jm.len);
+    expect(&st, jdoc != 0, 114);
+    if jdoc != 0 {
+        let servers = bu_get_obj(jdoc, STR_PTR("mcpServers"), STR_LEN("mcpServers"));
+        expect(&st, servers != 0, 115);
+        if servers != 0 {
+            let sv = bu_get_obj(servers, STR_PTR("sa-vm"), STR_LEN("sa-vm"));
+            expect(&st, sv != 0, 116);
+            if sv != 0 {
+                let cv = BuText { bytes: [0u8; 65536], len: 0 };
+                expect(&st, json_get_str(sv, STR_PTR("command"), STR_LEN("command"), &cv), 117);
+                expect(&st, bu_eq(ptxt(&cv), cv.len, STR_PTR("node"), STR_LEN("node")), 151);
+            };
+            if mode_b {
+                expect(&st, bu_get_obj(servers, STR_PTR("jev"), STR_LEN("jev")) != 0, 152);
+            } else {
+                expect(&st, bu_get_obj(servers, STR_PTR("jev"), STR_LEN("jev")) == 0, 153);
+            };
+        };
+        let agent = bu_get_obj(jdoc, STR_PTR("agent"), STR_LEN("agent"));
+        expect(&st, agent != 0, 120);
+        bu_free_doc(jdoc);
+    };
+    let om = BuText { bytes: [0u8; 65536], len: 0 };
+    mergeOpencodeMcpConfig(STR_PTR("{}"), STR_LEN("{}"), STR_PTR("/fake/sa-vm-mcp.mjs"), STR_LEN("/fake/sa-vm-mcp.mjs"), &om);
+    let odoc = bu_parse(ptxt(&om), om.len);
+    expect(&st, odoc != 0, 121);
+    if odoc != 0 {
+        let mcp = bu_get_obj(odoc, STR_PTR("mcp"), STR_LEN("mcp"));
+        expect(&st, mcp != 0, 122);
+        if mcp != 0 {
+            let sv = bu_get_obj(mcp, STR_PTR("sa-vm"), STR_LEN("sa-vm"));
+            expect(&st, sv != 0, 123);
+            if sv != 0 {
+                let tv = BuText { bytes: [0u8; 65536], len: 0 };
+                json_get_str(sv, STR_PTR("type"), STR_LEN("type"), &tv);
+                expect(&st, bu_eq(ptxt(&tv), tv.len, STR_PTR("local"), STR_LEN("local")), 154);
+            };
+            let nested = bu_get_obj(mcp, STR_PTR("servers"), STR_LEN("servers"));
+            expect(&st, nested != 0, 125);
+        };
+        bu_free_doc(odoc);
+    };
+    // parseJsonObjectConfig verdicts
+    let pc2 = BuText { bytes: [0u8; 65536], len: 0 };
+    expect(&st, parseJsonObjectConfig(STR_PTR("{"), STR_LEN("{"), &pc2) == -1, 126);
+    let pc3 = BuText { bytes: [0u8; 65536], len: 0 };
+    expect(&st, parseJsonObjectConfig(STR_PTR("[]"), STR_LEN("[]"), &pc3) == -1, 127);
+    let pc4 = BuText { bytes: [0u8; 65536], len: 0 };
+    expect(&st, parseJsonObjectConfig(STR_PTR("{\"a\":1}"), STR_LEN("{\"a\":1}"), &pc4) == 0, 128);
+
+    if mode_b {
+        if st.fails == 0 {
+            println("BU_PROBE_OK");
+            return 0;
+        };
+        println("BU_PROBE_FAIL");
+        return 1;
+    };
+
+    // --- project bundle install ---------------------------------------------
+    // DEFECT #18 is live (bu_cand_probe: candidates count=3, every item
+    // len=0), so with an empty project dir the candidate copy path cannot
+    // install anything: assert the blocked state honestly instead of the
+    // TS-level outcome.
+    let proj = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_join(&proj, bu_path_ptr(&ws), ws.len, STR_PTR("proj"), STR_LEN("proj"));
+    let res = bu_result_new();
+    let prc = ensureSaVmProjectBundleInstalled(bu_path_ptr(&proj), proj.len, false, true, bu_path_ptr(&ws), ws.len, &res);
+    expect(&st, prc == 0, 129);
+    expect(&st, !res.installed, 158);
+    // Seed an already-installed bundle (script + version stamp) into the
+    // project data dir: the fast path must then report installed and run
+    // the project registration.
+    let data_pb = PathBuf { bytes: [0u8; 4096], len: 0 };
+    getSaVmProjectDataDir(bu_path_ptr(&proj), proj.len, &data_pb);
+    let data_dir = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_pb_to_path(&data_pb, &data_dir);
+    bu_mkdir_p(bu_path_ptr(&data_dir), data_dir.len);
+    let seed_src = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_join(&seed_src, bu_path_ptr(&ws), ws.len, STR_PTR("scripts/sa-vm-mcp.mjs"), STR_LEN("scripts/sa-vm-mcp.mjs"));
+    let seed_dst = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_join(&seed_dst, bu_path_ptr(&data_dir), data_dir.len, STR_PTR("sa-vm-mcp.mjs"), STR_LEN("sa-vm-mcp.mjs"));
+    expect(&st, bu_copy_file(bu_path_ptr(&seed_src), seed_src.len, bu_path_ptr(&seed_dst), seed_dst.len), 159);
+    let vfile = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_join(&vfile, bu_path_ptr(&data_dir), data_dir.len, STR_PTR(".bundle-version"), STR_LEN(".bundle-version"));
+    bu_write_text(bu_path_ptr(&vfile), vfile.len, STR_PTR("6"), STR_LEN("6"));
+    let res2 = bu_result_new();
+    ensureSaVmProjectBundleInstalled(bu_path_ptr(&proj), proj.len, false, true, bu_path_ptr(&ws), ws.len, &res2);
+    expect(&st, res2.installed, 136);
+    let copied = BuText { bytes: [0u8; 65536], len: 0 };
+    expect(&st, read_all(&res2.scriptPath, &copied), 131);
+    expect(&st, bu_contains(ptxt(&copied), copied.len, STR_PTR("SCRIPT-CONTENT-V6"), STR_LEN("SCRIPT-CONTENT-V6")), 132);
+    expect(&st, has(&vfile, STR_PTR("6"), STR_LEN("6")), 155);
+    let ptoml = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_join(&ptoml, bu_path_ptr(&proj), proj.len, STR_PTR(".mini-agent/config.toml"), STR_LEN(".mini-agent/config.toml"));
+    expect(&st, has(&ptoml, STR_PTR("[mcp_servers.sa-vm]"), STR_LEN("[mcp_servers.sa-vm]")), 134);
+    let pdot = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_join(&pdot, bu_path_ptr(&proj), proj.len, STR_PTR(".mcp.json"), STR_LEN(".mcp.json"));
+    expect(&st, has(&pdot, STR_PTR("sa-vm"), STR_LEN("sa-vm")), 156);
+
+    // --- Claude Code state machine (driven directly) -------------------------
+    let fake_script = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_join(&fake_script, bu_path_ptr(&ws), ws.len, STR_PTR("gtarget/sa-vm-mcp.mjs"), STR_LEN("gtarget/sa-vm-mcp.mjs"));
+    let cc1 = ensureClaudeCodeSaVmRegistered(bu_path_ptr(&fake_script), fake_script.len);
+    expect(&st, cc1 == 0, 137);
+    let cc2 = ensureClaudeCodeSaVmRegistered(bu_path_ptr(&fake_script), fake_script.len);
+    expect(&st, cc2 == 2, 138);
+
+    // --- global installer -----------------------------------------------------
+    let gtarget = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_join(&gtarget, bu_path_ptr(&ws), ws.len, STR_PTR("gtarget"), STR_LEN("gtarget"));
+    let gres = bu_result_new();
+    let grc = ensureSaVmGlobalBundleInstalled(false, true, bu_path_ptr(&gtarget), gtarget.len, true, &gres);
+    expect(&st, grc == 0, 139);
+    expect(&st, !gres.installed, 140);
+    expect(&st, bu_eq(bu_path_ptr(&gres.root), gres.root.len, bu_path_ptr(&gtarget), gtarget.len), 141);
+    let gscript = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_join(&gscript, bu_path_ptr(&gtarget), gtarget.len, STR_PTR("sa-vm-mcp.mjs"), STR_LEN("sa-vm-mcp.mjs"));
+    expect(&st, has(&gscript, STR_PTR("SCRIPT-CONTENT-V6"), STR_LEN("SCRIPT-CONTENT-V6")), 142);
+    let gpi = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_join(&gpi, bu_path_ptr(&gtarget), gtarget.len, STR_PTR("sa-vm-pi-extension.ts"), STR_LEN("sa-vm-pi-extension.ts"));
+    expect(&st, has(&gpi, STR_PTR("PI-EXT-CONTENT"), STR_LEN("PI-EXT-CONTENT")), 143);
+
+    // client fan-out under the fake HOME (runner pre-created gemini file,
+    // state file says claude has no sa-vm yet -> this run updates via add
+    // only if the direct calls above did not run; they did, so the state is
+    // "present" and claude-code reports unchanged).
+    let home = BuPath { bytes: [0u8; 1024], len: 0 };
+    env_path(STR_PTR("HOME"), STR_LEN("HOME"), &home);
+    let gem = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_join(&gem, bu_path_ptr(&home), home.len, STR_PTR(".gemini/settings.json"), STR_LEN(".gemini/settings.json"));
+    expect(&st, has(&gem, STR_PTR("sa-vm"), STR_LEN("sa-vm")), 157);
+    let grok = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_join(&grok, bu_path_ptr(&home), home.len, STR_PTR(".grok/config.toml"), STR_LEN(".grok/config.toml"));
+    expect(&st, has(&grok, STR_PTR("[mcp_servers.sa-vm]"), STR_LEN("[mcp_servers.sa-vm]")), 144);
+    let mg = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_join(&mg, bu_path_ptr(&home), home.len, STR_PTR(".mini-agent/config.json"), STR_LEN(".mini-agent/config.json"));
+    expect(&st, has(&mg, STR_PTR("mini-agent/0.2.176"), STR_LEN("mini-agent/0.2.176")), 145);
+    let musef = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_join(&musef, bu_path_ptr(&home), home.len, STR_PTR(".muse/settings.json"), STR_LEN(".muse/settings.json"));
+    expect(&st, has(&musef, STR_PTR("schema_version"), STR_LEN("schema_version")), 146);
+    // Direct ensureSaVmMcpInstalled: clientsConfigured is populated on
+    // this surface (the global wrapper's TS return has no such field).
+    let dt = BuPath { bytes: [0u8; 1024], len: 0 };
+    bu_join(&dt, bu_path_ptr(&ws), ws.len, STR_PTR("gtarget2"), STR_LEN("gtarget2"));
+    let dres = bu_result_new();
+    let drc = ensureSaVmMcpInstalled(bu_path_ptr(&dt), dt.len, true, &dres);
+    expect(&st, drc == 0, 160);
+    expect(&st, dres.installed, 161);
+    expect(&st, dres.clientsConfigured_len >= 4, 147);
+
+    if st.fails == 0 {
+        println("BU_PROBE_OK");
+        return 0;
+    };
+    println("BU_PROBE_FAIL");
+    return 1;
+}
