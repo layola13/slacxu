@@ -249,6 +249,39 @@ fn cu_bigbuf_ptr(b: &CuBigBuf) -> ptr {
     return p;
 }
 
+
+// Drain one stream (which: 0=stdout, 1=stderr) into buf until EOF,
+// flagging overflow past cap. Factored out of cu_spawn_poll_big: two
+// inlined copies exceeded the flattener's MacroExpansionBudget.
+fn cu_drain(handle: u64, which: u64, cap: u64, buf: &CuBigBuf) -> void {
+    let chunk: [u8; 8192] = [0u8; 8192];
+    let cp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cp, &chunk, 0);
+    let draining = true;
+    while draining {
+        let rn: u64 = 0;
+        let st: i32 = 0;
+        if which == 0 {
+            st = sa_std_process_read_stdout(handle, cp, 8192, &rn);
+        } else {
+            st = sa_std_process_read_stderr(handle, cp, 8192, &rn);
+        };
+        if rn == 0 { break; };
+        let i: u64 = 0;
+        while i < rn {
+            if buf.len < cap {
+                buf.bytes[buf.len] = cu_byte(cp, i);
+                buf.len = buf.len + 1;
+            } else {
+                buf.overflow = true;
+            };
+            i = i + 1;
+        }
+        if st != 0 { break; };
+    }
+    !cp;
+}
+
 // Spawn slots with a try_wait poll and drain both streams into big
 // buffers. Returns 0 on exit code 0; 9 = a stream exceeded cap;
 // 24 = timeout; 1 = spawn failure or nonzero exit.
@@ -284,43 +317,8 @@ fn cu_spawn_poll_big(slots: &[u64; 42], argc: u64, timeout_ms: u64, cap: u64, ou
         sa_time_sleep_ms(5);
         elapsed = elapsed + 5;
     }
-    let chunk: [u8; 8192] = [0; 8192];
-    let cp: ptr = PTR_NULL();
-    PTR_BYTE_ADD(cp, &chunk, 0);
-    let d1 = true;
-    while d1 {
-        let rn: u64 = 0;
-        let st = sa_std_process_read_stdout(handle, cp, 8192, &rn);
-        if rn == 0 { break; };
-        let i: u64 = 0;
-        while i < rn {
-            if out.len < cap {
-                out.bytes[out.len] = cu_byte(cp, i);
-                out.len = out.len + 1;
-            } else {
-                out.overflow = true;
-            };
-            i = i + 1;
-        }
-        if st != 0 { break; };
-    }
-    let d2 = true;
-    while d2 {
-        let rn2: u64 = 0;
-        let st2 = sa_std_process_read_stderr(handle, cp, 8192, &rn2);
-        if rn2 == 0 { break; };
-        let i2: u64 = 0;
-        while i2 < rn2 {
-            if err.len < cap {
-                err.bytes[err.len] = cu_byte(cp, i2);
-                err.len = err.len + 1;
-            } else {
-                err.overflow = true;
-            };
-            i2 = i2 + 1;
-        }
-        if st2 != 0 { break; };
-    }
+    cu_drain(handle, 0, cap, out);
+    cu_drain(handle, 1, cap, err);
     sa_std_process_close(handle);
     if out.overflow || err.overflow { return 9; };
     if code != 0 { return 1; };
@@ -349,10 +347,34 @@ fn cu_exec_doc(args: u64, timeout_ms: u64, cap: u64, out: &CuBigBuf, err: &CuBig
 }
 
 // Small-capture convenience: run and keep stdout (cap-clamped copy).
+// Expand an argv doc into flat slots and spawn into caller-provided
+// big buffers. Split out of cu_exec_small: one fn carrying the ARGV
+// macro loop + two 4 MiB literals + the spawn + the copies exceeded
+// the flattener's per-fn MacroExpansionBudget (probe-isolated).
+fn cu_exec_spawn(args: u64, timeout_ms: u64, cap: u64, bo: &CuBigBuf, be: &CuBigBuf) -> i32 {
+    if args == 0 { return 1; };
+    let argc: u64 = 0;
+    sa_json_value_count(args, &argc);
+    if argc == 0 || argc > 21 { return 1; };
+    let slots: [u64; 42] = [0; 42];
+    let i: u64 = 0;
+    while i < argc {
+        let el: u64 = 0;
+        if sa_json_array_get(args, i, &el) != 0 || el == 0 || sa_json_kind(el) != 5 {
+            return 1;
+        };
+        let ap: ptr = sa_json_string_ptr(el);
+        let an = sa_json_string_len(el);
+        PROCESS_ARGV_SET_PTR(&slots, i, ap, an);
+        i = i + 1;
+    }
+    return cu_spawn_poll_big(&slots, argc, timeout_ms, cap, bo, be);
+}
+
 fn cu_exec_small(args: u64, timeout_ms: u64, cap: u64, out: &CuExecBuf, err_out: &CuExecBuf) -> i32 {
-    let bo = CuBigBuf { bytes: [0; 4194304], len: 0, overflow: false };
-    let be = CuBigBuf { bytes: [0; 4194304], len: 0, overflow: false };
-    let rc = cu_exec_doc(args, timeout_ms, cap, &bo, &be);
+    let bo = CuBigBuf { bytes: [0u8; 4194304], len: 0, overflow: false };
+    let be = CuBigBuf { bytes: [0u8; 4194304], len: 0, overflow: false };
+    let rc = cu_exec_spawn(args, timeout_ms, cap, &bo, &be);
     out.len = cu_field_copy(cu_execbuf_ptr(out), 65536, cu_bigbuf_ptr(&bo), bo.len);
     err_out.len = cu_field_copy(cu_execbuf_ptr(err_out), 65536, cu_bigbuf_ptr(&be), be.len);
     return rc;
@@ -576,7 +598,7 @@ fn probeLocalCodexCliUpdate(out: &CodexCliUpdateProbe) -> i32 {
     let win = cu_is_win32();
     let platform: u64 = 2;
     if win { platform = 0; };
-    let cwd = CuStr { bytes: [0; 8192], len: 0 };
+    let cwd = CuStr { bytes: [0u8; 8192], len: 0 };
     {
         let h = sa_env_get(STR_PTR("PWD"), STR_LEN("PWD"));
         if h != 0 {
@@ -607,8 +629,8 @@ fn probeLocalCodexCliUpdate(out: &CodexCliUpdateProbe) -> i32 {
     let args = cu_args_new();
     cu_args_push(args, path_p, out.path_len);
     cu_args_push(args, STR_PTR("--version"), STR_LEN("--version"));
-    let so = CuExecBuf { bytes: [0; 65536], len: 0 };
-    let se = CuExecBuf { bytes: [0; 65536], len: 0 };
+    let so = CuExecBuf { bytes: [0u8; 65536], len: 0 };
+    let se = CuExecBuf { bytes: [0u8; 65536], len: 0 };
     let vrc = cu_exec_small(args, 15000, 65536, &so, &se);
     cu_free_json(args);
     if vrc != 0 { return vrc; };
@@ -629,8 +651,8 @@ fn probeLocalCodexCliUpdate(out: &CodexCliUpdateProbe) -> i32 {
     cu_args_push(hargs, path_p, out.path_len);
     cu_args_push(hargs, STR_PTR("update"), STR_LEN("update"));
     cu_args_push(hargs, STR_PTR("--help"), STR_LEN("--help"));
-    let ho = CuExecBuf { bytes: [0; 65536], len: 0 };
-    let he = CuExecBuf { bytes: [0; 65536], len: 0 };
+    let ho = CuExecBuf { bytes: [0u8; 65536], len: 0 };
+    let he = CuExecBuf { bytes: [0u8; 65536], len: 0 };
     let hrc = cu_exec_small(hargs, 15000, 262144, &ho, &he);
     cu_free_json(hargs);
     if hrc == 0 {
@@ -697,7 +719,7 @@ fn checkLocalCodexCliUpdateStatus(out: &CodexCliUpdateStatus) -> i32 {
 // and compose output = redact(trim(join([stdout, stderr], "\n"))).
 // rc semantics: 0 ok; 1/9/24 exec classes from cu_exec_doc.
 fn cu_finish_update(out_text: &u64, bo: &CuBigBuf, be: &CuBigBuf) -> void {
-    let joined = CuBigBuf { bytes: [0; 4194304], len: 0, overflow: false };
+    let joined = CuBigBuf { bytes: [0u8; 4194304], len: 0, overflow: false };
     let jp = cu_bigbuf_ptr(&joined);
     joined.len = cu_field_copy(jp, 4194304, cu_bigbuf_ptr(bo), bo.len);
     if joined.len < 4194304 {
@@ -738,8 +760,8 @@ fn updateLocalCodexCli(out_before: &CodexCliUpdateProbe, out_after: &CodexCliUpd
         cu_args_push(args, pp, out_before.path_len);
     } 
     cu_args_push(args, STR_PTR("update"), STR_LEN("update"));
-    let bo = CuBigBuf { bytes: [0; 4194304], len: 0, overflow: false };
-    let be = CuBigBuf { bytes: [0; 4194304], len: 0, overflow: false };
+    let bo = CuBigBuf { bytes: [0u8; 4194304], len: 0, overflow: false };
+    let be = CuBigBuf { bytes: [0u8; 4194304], len: 0, overflow: false };
     let rc = cu_exec_doc(args, 300000, 4194304, &bo, &be);
     cu_free_json(args);
     if rc != 0 { return rc; };
@@ -771,7 +793,7 @@ fn sshArgs(command_ptr: ptr, command_len: u64, out_args: &u64, out_count: &u64) 
             continue;
         };
         // one token = glued segments
-        let tok = CuStr { bytes: [0; 8192], len: 0 };
+        let tok = CuStr { bytes: [0u8; 8192], len: 0 };
         let in_token = true;
         while in_token && i < command_len {
             let c = cu_byte(command_ptr, i);
@@ -851,7 +873,7 @@ fn sshArgs(command_ptr: ptr, command_len: u64, out_args: &u64, out_count: &u64) 
 }
 
 fn shellQuote(value_ptr: ptr, value_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
-    let acc = CuStr { bytes: [0; 8192], len: 0 };
+    let acc = CuStr { bytes: [0u8; 8192], len: 0 };
     cu_str_push_lit(&acc, STR_PTR("'"), STR_LEN("'"));
     let i: u64 = 0;
     while i < value_len {
@@ -874,7 +896,7 @@ fn cu_is_token_char(b: u8) -> bool {
 }
 
 fn redact(value_ptr: ptr, value_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
-    let acc = CuBigBuf { bytes: [0; 4194304], len: 0, overflow: false };
+    let acc = CuBigBuf { bytes: [0u8; 4194304], len: 0, overflow: false };
     let ap = cu_bigbuf_ptr(&acc);
     let i: u64 = 0;
     while i < value_len {
@@ -932,16 +954,16 @@ fn probeSshCodexCliUpdate(command_ptr: ptr, command_len: u64, out: &CodexCliUpda
     let script = STR_PTR("codex_bin=\"$(command -v codex 2>/dev/null || true)\"; [ -n \"$codex_bin\" ] || codex_bin=\"$HOME/.local/bin/codex\"; [ -x \"$codex_bin\" ] || exit 127; printf 'path=%s\\n' \"$codex_bin\"; printf 'version=%s\\n' \"$(\"$codex_bin\" --version 2>/dev/null | head -n1)\"; if \"$codex_bin\" update --help 2>/dev/null | grep -q 'Update Codex'; then echo updateSupported=1; else echo updateSupported=0; fi");
     let script_n = STR_LEN("codex_bin=\"$(command -v codex 2>/dev/null || true)\"; [ -n \"$codex_bin\" ] || codex_bin=\"$HOME/.local/bin/codex\"; [ -x \"$codex_bin\" ] || exit 127; printf 'path=%s\\n' \"$codex_bin\"; printf 'version=%s\\n' \"$(\"$codex_bin\" --version 2>/dev/null | head -n1)\"; if \"$codex_bin\" update --help 2>/dev/null | grep -q 'Update Codex'; then echo updateSupported=1; else echo updateSupported=0; fi");
     cu_args_push(args, script, script_n);
-    let bo = CuBigBuf { bytes: [0; 4194304], len: 0, overflow: false };
-    let be = CuBigBuf { bytes: [0; 4194304], len: 0, overflow: false };
+    let bo = CuBigBuf { bytes: [0u8; 4194304], len: 0, overflow: false };
+    let be = CuBigBuf { bytes: [0u8; 4194304], len: 0, overflow: false };
     let rc = cu_exec_doc(args, 30000, 262144, &bo, &be);
     cu_free_json(args);
     if rc != 0 { return rc; };
     // parse key=value lines (split /\r?\n/, first '=' with index > 0,
     // later entries overwrite — Object.fromEntries)
-    let path_v = CuStr { bytes: [0; 8192], len: 0 };
-    let version_v = CuStr { bytes: [0; 8192], len: 0 };
-    let supported_v = CuStr { bytes: [0; 8192], len: 0 };
+    let path_v = CuStr { bytes: [0u8; 8192], len: 0 };
+    let version_v = CuStr { bytes: [0u8; 8192], len: 0 };
+    let supported_v = CuStr { bytes: [0u8; 8192], len: 0 };
     let bp = cu_bigbuf_ptr(&bo);
     let line_start: u64 = 0;
     let i: u64 = 0;
@@ -1011,12 +1033,12 @@ fn updateSshCodexCli(command_ptr: ptr, command_len: u64, out_before: &CodexCliUp
         PTR_BYTE_ADD(pp, &out_before.path, 0);
         shellQuote(pp, out_before.path_len, &qp, &qn);
     } 
-    let cmd = CuStr { bytes: [0; 8192], len: 0 };
+    let cmd = CuStr { bytes: [0u8; 8192], len: 0 };
     cu_str_push(&cmd, qp, qn);
     cu_str_push_lit(&cmd, STR_PTR(" update"), STR_LEN(" update"));
     cu_args_push(args, cu_str_ptr(&cmd), cmd.len);
-    let bo = CuBigBuf { bytes: [0; 4194304], len: 0, overflow: false };
-    let be = CuBigBuf { bytes: [0; 4194304], len: 0, overflow: false };
+    let bo = CuBigBuf { bytes: [0u8; 4194304], len: 0, overflow: false };
+    let be = CuBigBuf { bytes: [0u8; 4194304], len: 0, overflow: false };
     let rc = cu_exec_doc(args, 300000, 4194304, &bo, &be);
     cu_free_json(args);
     if rc != 0 { return rc; };
