@@ -76,8 +76,41 @@ TS 真值中 fs 存在性判断点（译时逐点核极性，落点一律 `== 0`
 | B8a | 5431-约6100 | 运行队列模型（pending_runs + mb_enqueue_run）、delta 族、子线程队列泵、finish_subagent、apply_goal_directive、fail/interrupt/complete 结算三件套骨架、request 第 1 部（thread/start、read/resume、list、turns/items list、compact/start、review/start、delete、archive、fork） | PASS | 67f1a60 |
 | B8b | 约6100-5431 余 | request 第 2 部（capabilities/list、mcp reload/status/tool/resource、command/exec 族、goal set/get/clear、name/set、turn/steer、turn/interrupt、fs/readFile、fs/writeFile）+ schedule_goal_auto_continuation、fs 路径助手 | PASS | 130e0a8 |
 | B8c | 5431-7630 余 | complete_turn/drain_queued_turn/settle_goal、start_goal_continuation_turn、fire_due_goal_timers、answer_status、compact_session、handle_request_user_input、request_approval、子代理状态/收件箱族、handle_subagent_call 全族（spawn/send/followup/read_report/wait/close/resume/interrupt/list）、request 的 turn/start case（含 goal 抢占、auto-compact 屏障、slash 路由、技能展开、目标替换） | PASS | 本笔 |
-| B9 | 7631-10282 | runMiniTurn/Once 主循环 | 待 | — |
+| B8c | 5431-7630 余 | complete_turn/drain_queued_turn/settle_goal、start_goal_continuation_turn、fire_due_goal_timers、answer_status、compact_session、handle_request_user_input、request_approval、子代理状态/收件箱族、handle_subagent_call 全族（spawn/send/followup/read_report/wait/close/resume/interrupt/list）、request 的 turn/start case（含 goal 抢占、auto-compact 屏障、slash 路由、技能展开、目标替换） | PASS | 980a24c |
+| B9a–f | 7631-约9600 | MbTurnCtx + ctx 段/echo/usage 助手、run_mini_turn 包装 + dispatch_pending_runs、run_mini_turn_once 建置、turn_loop 头 + 回滚/内部推送/round headers、chat 线（mb_fetch_chat 含 catch 分类全序）、anthropic 线（build_body/switch/fetch/catch 全序含 max_tokens 续写与 prefill/adaptive/empty 分支）、responses 线（build_body/fetch 含链式 400 恢复与 SSE/JSON 双臂） | PASS | a023b1f |
+| B9g–h | 约9600-10282 | 工具结果推送/计划进度（mb_push_tool_result/mb_plan_progress）、turn_loop_rest（update_plan 提取、空轮级联、文本轮 steer 级联全序）、H1 助手（mb_tool_item/mb_supports_parallel/mb_refused_read_out）、mb_exec_tool 分发全链（校验/子代理/用户输入/web/mcp/sa_vm/image_view/read_skill/capability/mcp-tool）、mb_exec_account 读停滞记账、mb_turn_exec_tools（分区预热 + 守卫观察 + 硬停滞）、mb_turn_finalize（摘要轮、reasoning 项提交、段收尾、历史缓存、会话结算/钩子/目标结算） | PASS | ba9ee80 |
 
-## 7. 普查三账（终态填充）
+## 7. 普查三账（终态，2026-10-27 实测）
 
-（待填：a/b/c、async 终态计数、fs_exists 终点清单、EventEmitter 事件词表→接缝映射表、剩余阻塞四出处证据。）
+**终态结论**：`sa check backends/mini/src/runtime/miniBridge.sla` **PASS**（20,568 行）；回归门 `apps/server/src/saVmTool.sla`、`backends/mini/src/server.sla` 均 PASS；**backends 全域 129/129 PASS，失败名字集 = ∅**（基线为 {miniBridge}，本批清零）。
+
+### 7.1 a/b/c 普查
+- **(a) 忠实重译**：全文件。TS 全部顶层函数与 MiniBridge 类方法均落为 SLA 函数，会话 = 快照形 JSON 文档、类 Map 字段 = 以 id 为键的 JSON 对象、动态记录 = MbJson/MbBig/MbStr 文本载体（§1 模型）。终文件 20,568 行 vs TS 10,282 行，膨胀来自显式 JSON 管线与状态码承接。
+- **(b) 能力缺口显式登记**：共 19 处 `// DEFECT` 行（宿主接缝 12、std 缺口 7，清单见 7.4），全部走 TS 的 optional-call/失败语义，无静默桩、无假通过。
+- **(c) 逐字 TS 残段**：**0**。骨架内未译 TS 段已在 B0–B9 全量替换；代码级扫描（`=>`、`const … =`、`await`、`undefined;` 于注释外）零命中。
+
+### 7.2 async 终账
+- TS async 函数按 ASYNC_MODEL 阻塞契约 1:1 落为同步函数：文件头总登记（第 17 行）+ `ASYNC-REGISTER` 逐点 1 处（第 4077 行，miniToolsWithMcpForDepth）。无静默压平。
+- 运行队列即 TS 的 fire-and-forget 语义载体：run 请求入 `b.pending_runs`，宿主经 `MiniBridge_dispatch_pending_runs` 排空并套 TS catch 映射（"interrupted" → interrupt_turn，其余 → fail_turn）；子运行以 opts{childRun:true} 回泵 child_in_flight。
+- 空轮重试的 sleepWithMiniAbort 落为普通 sleep（中止在循环头观察），已在 fetch 函数头登记。
+- **DEFECT(std) 停滞计时器 ×3**（第 16951/17409/18023 行，chat/anthropic/responses 三线函数头）：阻塞 fetch 不可被抢占，roundStalled 恒 false。四出处：sala 文档无抢占式计时面、sla demos/tests 无对应语料、sa_std 清单（.sai/.sla/.sa + sa_std.h）无 poll 型 fetch 变体。
+
+### 7.3 fs_exists 逐点
+- TS `existsSync` 真实调用恰 1 处（miniBridge.ts:49，`.git` 探针；另一命中为 import 行）。
+- SLA 侧恰 1 个调用点（第 795 行），且全文件 `sa_std_fs_exists` 原始调用只出现在唯一咽喉 `mb_fs_exists`（第 581 行，`sa_std_fs_exists(...) == 0`，极性正确）；其余存在性探测走 mb_file_size / mb_read_file_b 的状态码。**无语义反转点。**
+
+### 7.4 EventEmitter 重构模型（事件词表 → 接缝）
+- TS 事件词表：约 90 处 `emit("notification", {method, params})` + 2 处 `emit("message", serverReq)`。四出处定案 EventEmitter 不支持（CAPABILITY_MAP），本批落法：
+  - **发射**：状态持有监听注册表 + 有序 pending-event 队列挂在 MiniBridgeState 上；业务代码经 `MiniBridge_emit_*` 接缝族发射（item started/completed、agent/reasoning delta、retry notice、turn settled、goal updated 等），宿主排空队列对外分发。
+  - **订阅**：宿主回调表 ServerHookHandlers（finish hook 等）显式传参，不经事件总线。
+  - **禁止项已守**：无 EventEmitter 桩、无空函数体冒充。
+- 宿主接缝阻塞落点（均在码内逐点登记）：
+  1. `pluginHostServices().saVm.runTool`（第 15443 行登记）：宿主 fn 表返回 future<i32>，SLA 侧不可驱动 → `mb_savm_run_tool_blocked` 写出 TS 原文错误 `tool error: plugin host services are not registered (the host must call setPluginHostServices at boot)`；sa_vm 与 capability invoke（invoke_id 注册表，第 19657 行）共用此落点（第 19214 行 H2 头登记）。
+  2. auto-verify 目标：按 TS 计算后丢弃（其 diagnostics 调用同属上述阻塞面且 TS 吞失败），码内注释登记（第 19438 行附近）。
+  3. 兄弟文件登记桩（不在本批改动范围）：`runMiniImageView`（imageView.sla，sharp 不可用 → ok=false）、`extractMiniReadFileKeys`（miniTurnSafety.sla，返回 0 键）——本文件 `mb_refused_read_out` 的判定结构完整，但在这两个兄弟桩落地前不可触发。
+
+### 7.5 开放项（如实登记，非阻塞）
+- `mb_turn_exec_tools` 硬读停滞分支调 miniPromptWantsWrite 时 has_dev_ctx 传 false（once-setup 的开发语境判定为局部量，未穿入 ctx），可能少触发一次写意图 steer。
+- read_skill 条目名按小写与已小写化的 want 比较（与 B9a 中 entries 的既有用法一致），条目原文大小写未逐字复核。
+- once-setup 的 JevToolsIn 以全 false 零值起始后调 resolveJevMethodFlags；会话 jevTools 配置是否应先行填充 tools_in 未定案，留待宿主接线时核。
+- 摘要轮 SSE/JSON 判定走 content-type（与 round 代码同一约定），未按响应体嗅探。
