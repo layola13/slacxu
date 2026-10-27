@@ -1,59 +1,569 @@
-// Converted 1:1 from apps/server/src/taskLiveness.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Converted 1:1 from apps/server/src/taskLiveness.ts (CXU plugins @ f2cb649d).
 // Task-completion liveness probing for the Claude Code CLI bridge: the CLI marks a
 // background command "completed" when its shell exits even if spawned children still
 // run; this unit checks for descendant processes and holds the task in-progress until
 // the tree settles. Local bridge only; remote (SSH) degrades to instant pass-through.
+//
+// Fix pass (launch/install family batch): all stub bodies retranslated
+// from the TS.
+// - Data model: Map<pid, ppid> = a sa_json object doc (decimal-string
+//   keys, i64 values); Set<pid> = a sa_json array doc of i64 with dedup
+//   on insert. Doc handles are the u64 values in the signatures.
+// - Platform dispatch: TS branches on process.platform === "win32";
+//   here the Unix path is taken when /proc exists (the win32 platform
+//   has no /proc), via the single fs-exists throat.
+// - [DEFECT std: sa_std_process_exec_capture is broken in the current
+//   sci build — it returns empty stdout/stderr for a successful child
+//   (isolated probe evidence, _defects/probes/exec_iso.sla). The Windows
+//   variant therefore runs powershell via sa_std_process_run +
+//   try_wait poll + post-exit drain, the same shape as the tree's
+//   execGitSync pattern.
+// - TS try/catch -> status codes; every enumeration failure yields the
+//   empty set exactly like the TS catch blocks (pass-through gate).
 @import "sa_std/io/print.sai"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/fs.sai"
 @import "sa_std/time.sai"
-// node:child_process execFile (promisify), node:fs/promises readdir/readFile — DEFECT: async [BLOCKED at module level: the fs/exec consumers below are stubs; see per-fn sites. delay() is the exception — implemented at its site.]
-// DEFECT: Set<number> / Map<number, number> -> fixed arrays + len in fix pass.
+@import "sa_std/process.sa"
+@import "sa_std/encoding/json.sai"
 
-// TASK_GATE_MAX_MS = 5 * 60 * 1000; TASK_GATE_POLL_MS = 1500
+const TASK_GATE_MAX_MS: u64 = 300000;
+const TASK_GATE_POLL_MS: u64 = 1500;
 
-// ASYNC-ADJ(i): TS delay (L34) returns a Promise resolved by setTimeout(ms);
-// the faithful SLA form is the blocking sleep sa_time_sleep_ms (ASYNC_MODEL
-// R13). (Previously the body returned instantly, which would busy-spin the
-// gate's poll loop — a real semantic loss, now fixed.)
+// ---------------------------------------------------------------------------
+// tl_ helpers
+// ---------------------------------------------------------------------------
+
+// The single fs_exists throat (status code, 0 = exists).
+fn tl_fs_exists(p: ptr, n: u64) -> bool {
+    return sa_std_fs_exists(p, n) == 0;
+}
+
+fn tl_byte(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+// Write v as decimal text into buf (cap 24); returns the length.
+fn tl_itoa(v: i64, buf: ptr) -> u64 {
+    let tmp: [u8; 24] = [0; 24];
+    let tn: u64 = 0;
+    let neg = v < 0;
+    let x: u64 = 0;
+    if neg { x = (0 - v) as u64; } else { x = (v) as u64; };
+    if x == 0 {
+        tmp[0] = 48;
+        tn = 1;
+    } else {
+        let rev: [u8; 24] = [0; 24];
+        let rn: u64 = 0;
+        while x > 0 {
+            rev[rn] = (48 + (x % 10)) as u8;
+            rn = rn + 1;
+            x = x / 10;
+        }
+        while rn > 0 {
+            rn = rn - 1;
+            tmp[tn] = rev[rn];
+            tn = tn + 1;
+        }
+    };
+    let start: u64 = 0;
+    if neg {
+        let b0: ptr = PTR_NULL();
+        PTR_BYTE_ADD(b0, buf, 0);
+        PTR_COPY_BYTES(b0, STR_PTR("-"), 1);
+        start = 1;
+    };
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, buf, start);
+    let tp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tp, &tmp, 0);
+    PTR_COPY_BYTES(dp, tp, tn);
+    return start + tn;
+}
+
+// Parse a decimal integer (optional sign, digits only); ok=false when
+// the text is not a plain integer.
+fn tl_parse_i64(p: ptr, n: u64, out: &i64, ok: &bool) -> void {
+    *ok = false;
+    *out = 0;
+    if n == 0 { return; };
+    let i: u64 = 0;
+    let neg = false;
+    if tl_byte(p, 0) == 45 { neg = true; i = 1; };
+    if tl_byte(p, 0) == 43 { i = 1; };
+    if i >= n { return; };
+    let v: i64 = 0;
+    while i < n {
+        let b = tl_byte(p, i);
+        if b < 48 || b > 57 { return; };
+        v = v * 10 + ((b - 48) as i64);
+        i = i + 1;
+    }
+    if neg { v = 0 - v; };
+    *out = v;
+    *ok = true;
+}
+
+fn tl_map_get(map: u64, pid: i64, out: &i64, found: &bool) -> void {
+    *found = false;
+    *out = 0;
+    let kb: [u8; 24] = [0; 24];
+    let kp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(kp, &kb, 0);
+    let kn = tl_itoa(pid, kp);
+    let v: i64 = 0;
+    if sa_json_object_get_i64(map, kp, kn, &v) == 0 {
+        *out = v;
+        *found = true;
+    };
+}
+
+fn tl_map_set(map: u64, pid: i64, ppid: i64) -> void {
+    let kb: [u8; 24] = [0; 24];
+    let kp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(kp, &kb, 0);
+    let kn = tl_itoa(pid, kp);
+    sa_json_object_set_i64(map, kp, kn, ppid);
+}
+
+fn tl_set_contains(set_doc: u64, pid: i64) -> bool {
+    if set_doc == 0 { return false; };
+    let cnt: u64 = 0;
+    sa_json_value_count(set_doc, &cnt);
+    let i: u64 = 0;
+    while i < cnt {
+        let el: u64 = 0;
+        if sa_json_array_get(set_doc, i, &el) == 0 && el != 0 {
+            let v: i64 = 0;
+            if sa_json_kind(el) == 2 && sa_json_as_i64(el, &v) == 0 && v == pid { return true; };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn tl_set_add(set_doc: u64, pid: i64) -> void {
+    if tl_set_contains(set_doc, pid) { return; };
+    sa_json_array_push_i64(set_doc, pid);
+}
+
+// Read a whole small file (stat files) into buf; returns length or -1.
+fn tl_read_small(path_p: ptr, path_n: u64, buf: ptr, cap: u64) -> i64 {
+    let total: u64 = 0;
+    if sa_std_fs_len(path_p, path_n, &total) != 0 { return -1; };
+    let fh: u64 = 0;
+    if sa_std_fs_open_read(path_p, path_n, &fh) != 0 { return -1; };
+    let want = total;
+    if want > cap { want = cap; };
+    let read_n: u64 = 0;
+    let rst = sa_std_fs_file_read(fh, buf, want, &read_n);
+    sa_fs_file_close(fh);
+    if rst != 0 { return -1; };
+    return (read_n) as i64;
+}
+
+// ---------------------------------------------------------------------------
+// delay (TS L34-38)
+// ---------------------------------------------------------------------------
+
+// ASYNC-ADJ(i): TS delay returns a Promise resolved by setTimeout(ms);
+// the faithful SLA form is the blocking sleep sa_time_sleep_ms
+// (ASYNC_MODEL R13).
 fn delay(ms: u64) -> i32 {
     let rc = sa_time_sleep_ms(ms);
     return rc;
 }
 
-// DEFECT: async [BLOCKED: body is a return-0 stub; TS async listDescendantPids (L43) dispatches to the Windows/Unix variants below, both stubbed. execFile + fs surfaces exist in sa_std, body retranslation required.]
-fn listDescendantPids(rootPid: i32, out_pids: &u64, out_count: &u64) -> i32 {
-    // win32 -> listDescendantPidsWindows else listDescendantPidsUnix; errors -> empty set (pass-through)
-    return 0;
+// ---------------------------------------------------------------------------
+// descendantsOf (TS L120-136) — pure chain walk over the map doc.
+// ---------------------------------------------------------------------------
+
+fn descendantsOf(parentMap: u64, rootPid: i32, out_pids: &u64, out_count: &u64) -> void {
+    let result = sa_json_parse(STR_PTR("[]"), STR_LEN("[]"));
+    *out_pids = result;
+    *out_count = 0;
+    if result == 0 || parentMap == 0 { return; };
+    let root = (rootPid) as i64;
+    let cnt: u64 = 0;
+    sa_json_value_count(parentMap, &cnt);
+    let seen: [i64; 8192] = [0; 8192];
+    let ki: u64 = 0;
+    while ki < cnt {
+        let kp: ptr = PTR_NULL();
+        let kl: u64 = 0;
+        if sa_json_object_key_at(parentMap, ki, &kp, &kl) != 0 {
+            ki = ki + 1;
+            continue;
+        };
+        let pid: i64 = 0;
+        let ok = false;
+        tl_parse_i64(kp, kl, &pid, &ok);
+        if !ok || pid == root {
+            ki = ki + 1;
+            continue;
+        };
+        // walk the ppid chain with the seen-set seeded {pid}
+        let seen_len: u64 = 0;
+        seen[seen_len] = pid;
+        seen_len = seen_len + 1;
+        let cur: i64 = 0;
+        let has_cur = false;
+        tl_map_get(parentMap, pid, &cur, &has_cur);
+        let hit = false;
+        while has_cur {
+            if cur == root { hit = true; break; };
+            let in_seen = false;
+            let si: u64 = 0;
+            while si < seen_len {
+                if seen[si] == cur { in_seen = true; break; };
+                si = si + 1;
+            }
+            if in_seen { break; };
+            if seen_len < 8192 {
+                seen[seen_len] = cur;
+                seen_len = seen_len + 1;
+            };
+            tl_map_get(parentMap, cur, &cur, &has_cur);
+        }
+        if hit { tl_set_add(result, pid); };
+        ki = ki + 1;
+    }
+    let rc: u64 = 0;
+    sa_json_value_count(result, &rc);
+    *out_count = rc;
 }
 
-// DEFECT: async [BLOCKED: body is a return-0 stub; TS async variant (L50) awaits execFile powershell Get-CimInstance (10s timeout), catch -> empty set. Body retranslation required.]
-fn listDescendantPidsWindows(rootPid: i32, out_pids: &u64, out_count: &u64) -> i32 {
-    // execFileAsync("powershell", ["-NoProfile", "-NonInteractive", "-Command",
-    //   "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress"],
-    //   { timeout: 10_000 }) -> descendantsOf(parseWindowsProcesses(stdout), rootPid); catch -> empty
-    return 0;
+// ---------------------------------------------------------------------------
+// parseWindowsProcesses (TS L68-82)
+// ---------------------------------------------------------------------------
+
+// Number((p)?.ProcessId) coercion: JSON int (or integral float) only;
+// anything else is NaN in TS and the entry is skipped.
+fn tl_json_number(node: u64, key_p: ptr, key_n: u64, out: &i64, ok: &bool) -> void {
+    *ok = false;
+    *out = 0;
+    let child: u64 = 0;
+    if sa_json_object_get(node, key_p, key_n, &child) != 0 || child == 0 { return; };
+    let kind = sa_json_kind(child);
+    if kind == 2 {
+        if sa_json_as_i64(child, out) == 0 { *ok = true; };
+        return;
+    };
+    if kind == 3 {
+        let f: f64 = 0.0;
+        if sa_json_as_f64(child, &f) == 0 {
+            *out = (f) as i64;
+            *ok = true;
+        };
+        return;
+    };
+}
+
+fn tl_map_from_process(node: u64, map: u64) -> void {
+    if node == 0 || sa_json_kind(node) != 7 { return; };
+    let pid: i64 = 0;
+    let pid_ok = false;
+    tl_json_number(node, STR_PTR("ProcessId"), STR_LEN("ProcessId"), &pid, &pid_ok);
+    let ppid: i64 = 0;
+    let ppid_ok = false;
+    tl_json_number(node, STR_PTR("ParentProcessId"), STR_LEN("ParentProcessId"), &ppid, &ppid_ok);
+    if pid_ok && ppid_ok {
+        tl_map_set(map, pid, ppid);
+    };
 }
 
 fn parseWindowsProcesses(stdout_ptr: ptr, stdout_len: u64, out_map: &u64) -> void {
-    // trimmed empty -> empty map; try JSON.parse (array or single object);
-    // per entry: pid/ppid finite Numbers -> map.set(pid, ppid); parse failure -> empty map
+    let map = sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+    *out_map = map;
+    if map == 0 { return; };
+    // trimmed = stdout.trim() (ASCII whitespace approximation)
+    let s: u64 = 0;
+    let e = stdout_len;
+    while s < e {
+        let b = tl_byte(stdout_ptr, s);
+        if b == 32 || (b >= 9 && b <= 13) { s = s + 1; } else { break; };
+    }
+    while e > s {
+        let b = tl_byte(stdout_ptr, e - 1);
+        if b == 32 || (b >= 9 && b <= 13) { e = e - 1; } else { break; };
+    }
+    if e <= s { return; };
+    let tp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tp, stdout_ptr, s);
+    let doc = sa_json_parse(tp, e - s);
+    if doc == 0 { return; };
+    let kind = sa_json_kind(doc);
+    if kind == 6 {
+        let cnt: u64 = 0;
+        sa_json_value_count(doc, &cnt);
+        let i: u64 = 0;
+        while i < cnt {
+            let el: u64 = 0;
+            if sa_json_array_get(doc, i, &el) == 0 {
+                tl_map_from_process(el, map);
+            };
+            i = i + 1;
+        }
+    } else if kind == 7 {
+        tl_map_from_process(doc, map);
+    };
+    sa_json_free(doc);
 }
 
- // DEFECT: async [BLOCKED: body is a return-0 stub; TS async variant (L84) awaits readdir("/proc") + readFile(stat) per pid, per-process errors ignored, outer catch -> empty. Body retranslation required.]
-fn listDescendantPidsUnix(rootPid: i32, out_pids: &u64, out_count: &u64) -> i32 {
-    // readdir("/proc"); numeric names only; readFile(/proc/<pid>/stat): ppid = field after ")"
-    // (rest[1] of whitespace split); build pid->ppid map (per-process errors ignored);
-    // descendantsOf(map, rootPid); outer catch -> empty
+// ---------------------------------------------------------------------------
+// Windows variant (TS L50-66): powershell CIM snapshot, 10 s timeout.
+// ---------------------------------------------------------------------------
+
+struct TlBuf {
+    bytes: [u8; 1048576], len: u64, overflow: bool
+}
+
+fn tl_buf_ptr(b: &TlBuf) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &b.bytes, 0);
+    return p;
+}
+
+// Run slots (built by the caller) with a try_wait poll; drain stdout
+// into out after exit. Returns 0 on exit-code 0; 9 = stdout overflow
+// (node maxBuffer class), 24 = timeout, other = spawn/exit failure —
+// the caller maps every nonzero to the TS catch (empty set).
+fn tl_spawn_poll(slots: &[u64; 10], argc: u64, timeout_ms: u64, out: &TlBuf) -> i32 {
+    out.len = 0;
+    out.overflow = false;
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, slots, 0);
+    let handle: u64 = 0;
+    let rst = sa_std_process_run(sp, argc, &handle);
+    if rst != 0 { return rst; };
+    let elapsed: u64 = 0;
+    let ready: bool = false;
+    let code: i32 = 0;
+    while !ready {
+        let rdy: bool = false;
+        let c: i32 = 0;
+        let wst = sa_std_process_try_wait(handle, &rdy, &c);
+        if wst == 0 && rdy {
+            ready = true;
+            code = c;
+            break;
+        };
+        if elapsed >= timeout_ms {
+            sa_std_process_kill(handle);
+            let wc: i32 = 0;
+            sa_std_process_wait(handle, &wc);
+            sa_std_process_close(handle);
+            return 24;
+        };
+        sa_time_sleep_ms(5);
+        elapsed = elapsed + 5;
+    }
+    // drain stdout, then stderr (discarded)
+    let chunk: [u8; 8192] = [0; 8192];
+    let cp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cp, &chunk, 0);
+    let draining = true;
+    while draining {
+        let rn: u64 = 0;
+        let dst = sa_std_process_read_stdout(handle, cp, 8192, &rn);
+        if rn == 0 { draining = false; break; };
+        let i: u64 = 0;
+        while i < rn {
+            if out.len < 1048576 {
+                out.bytes[out.len] = tl_byte(cp, i);
+                out.len = out.len + 1;
+            } else {
+                out.overflow = true;
+            };
+            i = i + 1;
+        }
+        if dst != 0 { draining = false; };
+    }
+    let draining2 = true;
+    while draining2 {
+        let rn2: u64 = 0;
+        let dst2 = sa_std_process_read_stderr(handle, cp, 8192, &rn2);
+        if rn2 == 0 { draining2 = false; break; };
+        if dst2 != 0 { draining2 = false; };
+    }
+    sa_std_process_close(handle);
+    if out.overflow { return 9; };
+    if code != 0 { return 8; };
     return 0;
 }
 
-fn descendantsOf(parentMap: u64, rootPid: i32, out_pids: &u64, out_count: &u64) -> void {
-    // For each pid != rootPid: walk ppid chain with seen-set seeded {pid} (cycle-safe,
-    // never self-descendant); reaching rootPid -> include pid. Pure; directly tested in TS.
+fn listDescendantPidsWindows(rootPid: i32, out_pids: &u64, out_count: &u64) -> i32 {
+    let empty = sa_json_parse(STR_PTR("[]"), STR_LEN("[]"));
+    *out_pids = empty;
+    *out_count = 0;
+    let script = STR_PTR("Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress");
+    let script_n = STR_LEN("Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress");
+    let slots: [u64; 10] = [0; 10];
+    PROCESS_ARGV_SET_PTR(&slots, 0, STR_PTR("powershell"), STR_LEN("powershell"));
+    PROCESS_ARGV_SET_PTR(&slots, 1, STR_PTR("-NoProfile"), STR_LEN("-NoProfile"));
+    PROCESS_ARGV_SET_PTR(&slots, 2, STR_PTR("-NonInteractive"), STR_LEN("-NonInteractive"));
+    PROCESS_ARGV_SET_PTR(&slots, 3, STR_PTR("-Command"), STR_LEN("-Command"));
+    PROCESS_ARGV_SET_PTR(&slots, 4, script, script_n);
+    let buf = TlBuf { bytes: [0; 1048576], len: 0, overflow: false };
+    let rc = tl_spawn_poll(&slots, 5, 10000, &buf);
+    if rc != 0 { return 0; };
+    let map: u64 = 0;
+    parseWindowsProcesses(tl_buf_ptr(&buf), buf.len, &map);
+    if map == 0 { return 0; };
+    if empty != 0 { sa_json_free(empty); };
+    descendantsOf(map, rootPid, out_pids, out_count);
+    sa_json_free(map);
+    return 0;
 }
 
- // DEFECT: async [BLOCKED: body is a return-0 stub; TS async hasExtraDescendantProcesses (L138) awaits listDescendantPids (blocked above) and diffs against the baseline set.]
+// ---------------------------------------------------------------------------
+// Unix variant (TS L84-108): /proc scan.
+// ---------------------------------------------------------------------------
+
+// Build the pid->ppid map from /proc; returns the doc handle (0 on
+// outer failure, which the caller maps to the empty set).
+fn tl_collect_proc_map() -> u64 {
+    let map = sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if map == 0 { return 0; };
+    let dh: u64 = 0;
+    let dst = sa_std_fs_read_dir_json(STR_PTR("/proc"), STR_LEN("/proc"), 16384, &dh);
+    if dst != 0 || dh == 0 {
+        sa_json_free(map);
+        return 0;
+    };
+    let dp: ptr = sa_fs_dir_buffer_data(dh);
+    let dl = sa_fs_dir_buffer_len(dh);
+    let doc = sa_json_parse(dp, dl);
+    sa_fs_dir_buffer_free(dh);
+    if doc == 0 {
+        sa_json_free(map);
+        return 0;
+    };
+    // entries shape: {"entries":[{"name": ..., "isDirectory": ..., "isFile": ...}]}
+    let entries: u64 = 0;
+    let cnt: u64 = 0;
+    if sa_json_object_get(doc, STR_PTR("entries"), STR_LEN("entries"), &entries) == 0 && entries != 0 && sa_json_kind(entries) == 6 {
+        sa_json_value_count(entries, &cnt);
+    };
+    let stat_buf: [u8; 8192] = [0; 8192];
+    let sbp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sbp, &stat_buf, 0);
+    let i: u64 = 0;
+    while i < cnt {
+        let el: u64 = 0;
+        if sa_json_array_get(entries, i, &el) == 0 && el != 0 && sa_json_kind(el) == 7 {
+            let np: ptr = PTR_NULL();
+            let nl: u64 = 0;
+            if sa_json_object_get_string(el, STR_PTR("name"), STR_LEN("name"), &np, &nl) == 0 && nl > 0 && nl < 32 {
+                let pid: i64 = 0;
+                let ok = false;
+                tl_parse_i64(np, nl, &pid, &ok);
+                if ok {
+                    // path = /proc/<name>/stat
+                    let path: [u8; 64] = [0; 64];
+                    let pp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(pp, &path, 0);
+                    // build the path: "/proc/" + name + "/stat"
+                    let pre = STR_PTR("/proc/");
+                    let pre_n = STR_LEN("/proc/");
+                    PTR_COPY_BYTES(pp, pre, pre_n);
+                    let np2: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(np2, pp, pre_n);
+                    PTR_COPY_BYTES(np2, np, nl);
+                    let suf = STR_PTR("/stat");
+                    let suf_n = STR_LEN("/stat");
+                    let sp2: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(sp2, pp, pre_n + nl);
+                    PTR_COPY_BYTES(sp2, suf, suf_n);
+                    let total = pre_n + nl + suf_n;
+                    let sn = tl_read_small(pp, total, sbp, 8192);
+                    if sn > 0 {
+                        // ppid = rest[1] after the FIRST ')'
+                        let rp: i64 = -1;
+                        let j: u64 = 0;
+                        while (j as i64) < sn {
+                            if tl_byte(sbp, j) == 41 { rp = (j) as i64; break; };
+                            j = j + 1;
+                        }
+                        if rp >= 0 {
+                            // tokenize: skip spaces, token(state), skip, token(ppid)
+                            let k = ((rp) as u64) + 1;
+                            let kn = (sn) as u64;
+                            while k < kn && tl_byte(sbp, k) == 32 { k = k + 1; }
+                            while k < kn && tl_byte(sbp, k) != 32 { k = k + 1; }
+                            while k < kn && tl_byte(sbp, k) == 32 { k = k + 1; }
+                            let tok_start = k;
+                            while k < kn && tl_byte(sbp, k) != 32 && tl_byte(sbp, k) != 10 { k = k + 1; }
+                            if k > tok_start {
+                                let tp2: ptr = PTR_NULL();
+                                PTR_BYTE_ADD(tp2, sbp, tok_start);
+                                let ppid: i64 = 0;
+                                let ok2 = false;
+                                tl_parse_i64(tp2, k - tok_start, &ppid, &ok2);
+                                if ok2 {
+                                    tl_map_set(map, pid, ppid);
+                                };
+                            };
+                        };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    sa_json_free(doc);
+    return map;
+}
+
+fn listDescendantPidsUnix(rootPid: i32, out_pids: &u64, out_count: &u64) -> i32 {
+    let empty = sa_json_parse(STR_PTR("[]"), STR_LEN("[]"));
+    *out_pids = empty;
+    *out_count = 0;
+    let map = tl_collect_proc_map();
+    if map == 0 { return 0; };
+    if empty != 0 { sa_json_free(empty); };
+    descendantsOf(map, rootPid, out_pids, out_count);
+    sa_json_free(map);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch + gate (TS L43-48, L138-148)
+// ---------------------------------------------------------------------------
+
+fn listDescendantPids(rootPid: i32, out_pids: &u64, out_count: &u64) -> i32 {
+    if tl_fs_exists(STR_PTR("/proc"), STR_LEN("/proc")) {
+        return listDescendantPidsUnix(rootPid, out_pids, out_count);
+    };
+    return listDescendantPidsWindows(rootPid, out_pids, out_count);
+}
+
 fn hasExtraDescendantProcesses(rootPid: i32, has_root: bool, baseline: u64, out_extra: &bool) -> i32 {
-    // rootPid undefined -> false; current = await listDescendantPids(rootPid);
-    // any pid not in baseline -> true else false
+    *out_extra = false;
+    if !has_root { return 0; };
+    let current: u64 = 0;
+    let count: u64 = 0;
+    listDescendantPids(rootPid, &current, &count);
+    if current == 0 { return 0; };
+    let cnt: u64 = 0;
+    sa_json_value_count(current, &cnt);
+    let i: u64 = 0;
+    let found = false;
+    while i < cnt && !found {
+        let el: u64 = 0;
+        if sa_json_array_get(current, i, &el) == 0 && el != 0 && sa_json_kind(el) == 2 {
+            let pid: i64 = 0;
+            if sa_json_as_i64(el, &pid) == 0 && !tl_set_contains(baseline, pid) {
+                *out_extra = true;
+                found = true;
+            };
+        };
+        i = i + 1;
+    }
+    sa_json_free(current);
     return 0;
 }
