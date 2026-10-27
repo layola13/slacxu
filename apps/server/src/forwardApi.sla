@@ -1,66 +1,852 @@
-// Converted 1:1 from apps/server/src/forwardApi.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Converted 1:1 from apps/server/src/forwardApi.ts (CXU plugins @ f2cb649d).
+// Fix stage (launch/install family rebuild, Agent AD3): full body retranslation.
+// Async handlers are contract-layer blocking (ASYNC_MODEL R8): every awaited
+// op is a blocking seam/extern executed in TS order; handlers fill the out
+// Response and return 0 (the TS Response is the out value, not the status).
+// Registered seams and deviations:
+// - HOST-CALLBACK DISPATCH (B-class seam): deps.listInventory / deps.getBridge
+//   are host closures in TS. SLA dispatch goes through fa_host_list_inventory
+//   / fa_host_get_bridge below, which read payload cells the host adapter
+//   installs via fa_install_inventory_json / fa_install_bridge (sa_global
+//   cells, authStore pattern). Unwired inventory dispatch fails loudly
+//   through the TS 500 path; unwired bridge dispatch yields the TS null
+//   outcome ("CLI 后端未启用" 502), bridge-throw is an installable outcome.
+// - forwardModel.sla / forwardTurn.sla are skeleton providers in this tree:
+//   their landed signatures are called verbatim (parseForwardModelId,
+//   toParseInventory, buildForwardModelIds, runForwardTurn); their bodies
+//   are conversion-era presets, so route/turn outcomes are whatever the
+//   providers produce (runForwardTurn preset 0 leaves the caller-initialized
+//   result untouched). Provider retranslation is those units' own fix stage.
+// - SEQUENTIAL SSE MODEL: ReadableStream + setInterval heartbeat become a
+//   fully materialized SSE body in Response.body_json (is_stream = true,
+//   SSE headers set). No ": ping" frames are emitted; the onDelta
+//   completed-text path is reproduced as a single full-text delta when the
+//   provider produced no deltas, matching the TS dedup rule's outcome.
+// - Null-body micro-deviation: request.json() on an empty body throws in
+//   TS (-> 400 Invalid JSON body); body_json_len == 0 is treated the same.
+// - deps numeric options use 0 as the TS undefined sentinel
+//   (turnTimeoutMs -> FORWARD_DEFAULT_TIMEOUT_MS, maxConcurrent -> 4,
+//   sseKeepaliveMs -> FORWARD_SSE_KEEPALIVE_MS).
+// - forwardResponseObject's echo arrives as ONE JSON object text
+//   {input, instructions} (the skeleton signature carries a single echo
+//   buffer); it is embedded verbatim as forward_echo.
+// - Math.random in id generation is approximated by a time/counter hash;
+//   the id shapes ("resp-fwd-<b36><b36>", "chatcmpl-fwd-<b36><b36>") hold.
+// - JSON object key order in assembled bodies follows sa_json insertion
+//   order, not the TS literal order; the values are identical.
+// - The skeleton's raw (out_ptr, out_cap) text outputs become &FaText
+//   (SLA has no byte-store through a raw ptr in the surface language;
+//   same representation choice as saVmBundle's merge functions).
+
 @import "sa_std/io/print.sai"
 @import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/env.sai"
+@import "sa_std/time.sai"
+@import "sa_std/globals.sai"
+@import "sa_std/encoding/json.sai"
 @import "forwardModel.sla"
 @import "forwardTurn.sla"
-// DEFECT: Web Fetch API Request/Response/Headers/URL/TextEncoder/ReadableStream have no sa_std counterpart; modelled as opaque structs + JSON text buffers.
-// DEFECT: dynamic object Record<string,unknown> / unknown modelled as JSON text buffer throughout.
+
+// ---------------------------------------------------------------------------
+// Buffers and byte helpers (fa_*).
+// ---------------------------------------------------------------------------
+
+struct FaText {
+    bytes: [u8; 262144], len: u64
+}
+
+struct FaStr {
+    bytes: [u8; 4096], len: u64
+}
+
+fn fa_text_ptr(s: &FaText) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &s.bytes, 0);
+    return p;
+}
+
+fn fa_str_ptr(s: &FaStr) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &s.bytes, 0);
+    return p;
+}
+
+fn fa_byte(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+fn fa_push(s: &FaText, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        if s.len < 262144 {
+            s.bytes[s.len] = fa_byte(p, i);
+            s.len = s.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn fa_push_str(s: &FaStr, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        if s.len < 4096 {
+            s.bytes[s.len] = fa_byte(p, i);
+            s.len = s.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn fa_eq(p: ptr, n: u64, q: ptr, qn: u64) -> bool {
+    if n != qn { return false; };
+    let i: u64 = 0;
+    while i < n {
+        if fa_byte(p, i) != fa_byte(q, i) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn fa_lower(b: u8) -> u8 {
+    if b >= 65 && b <= 90 { return b + 32; };
+    return b;
+}
+
+fn fa_eq_ci(p: ptr, n: u64, q: ptr, qn: u64) -> bool {
+    if n != qn { return false; };
+    let i: u64 = 0;
+    while i < n {
+        if fa_lower(fa_byte(p, i)) != fa_lower(fa_byte(q, i)) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn fa_is_ws(b: u8) -> bool {
+    return b == 32 || (b >= 9 && b <= 13);
+}
+
+fn fa_trim_range(p: ptr, n: u64, out_s: &u64, out_e: &u64) -> void {
+    let s: u64 = 0;
+    let e: u64 = n;
+    while s < e && fa_is_ws(fa_byte(p, s)) { s = s + 1; }
+    while e > s && fa_is_ws(fa_byte(p, e - 1)) { e = e - 1; }
+    *out_s = s;
+    *out_e = e;
+}
+
+// Trimmed copy of (p, n) into out.
+fn fa_trimmed(p: ptr, n: u64, out: &FaText) -> void {
+    let s: u64 = 0;
+    let e: u64 = 0;
+    fa_trim_range(p, n, &s, &e);
+    out.len = 0;
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, p, s);
+    fa_push(out, sp, e - s);
+}
+
+fn fa_now_ms() -> u64 {
+    return (sa_time_unix_ms() as u64);
+}
+
+// Base36 of v appended to out (Date.now().toString(36) shape).
+fn fa_base36(out: &FaStr, v: u64) -> void {
+    if v == 0 {
+        fa_push_str(out, STR_PTR("0"), STR_LEN("0"));
+        return;
+    };
+    let tmp: [u8; 16] = [0u8; 16];
+    let n: u64 = 0;
+    let x = v;
+    while x > 0 {
+        let d = (x % 36) as u8;
+        let c: u8 = 48 + d;
+        if d > 9 { c = 87 + d; };
+        tmp[n] = c;
+        n = n + 1;
+        x = x / 36;
+    }
+    let i = n;
+    while i > 0 {
+        i = i - 1;
+        if out.len < 4096 {
+            out.bytes[out.len] = tmp[i];
+            out.len = out.len + 1;
+        };
+    }
+}
+
+// Id entropy counter (Math.random approximation, see header).
+fn fa_rand_bits() -> u64 {
+    let cur: u64 = 0;
+    let st: i32 = sa_global_u64_get(STR_PTR("forwardapi.rand"), STR_LEN("forwardapi.rand"), &cur);
+    if st != 0 { cur = 0; };
+    cur = cur + 1;
+    sa_global_u64_set(STR_PTR("forwardapi.rand"), STR_LEN("forwardapi.rand"), cur);
+    let mixed = fa_now_ms() ^ (cur * 2654435761);
+    return mixed % 16777215;
+}
+
+fn fa_make_id(prefix_p: ptr, prefix_l: u64, out: &FaStr) -> void {
+    out.len = 0;
+    fa_push_str(out, prefix_p, prefix_l);
+    fa_base36(out, fa_now_ms());
+    fa_base36(out, fa_rand_bits());
+}
+
+// ---------------------------------------------------------------------------
+// JSON doc helpers.
+// ---------------------------------------------------------------------------
+
+fn fa_free_doc(doc: u64) -> void {
+    if doc == 0 { return; };
+    sa_json_free(doc);
+}
+
+fn fa_free_buffer(h: u64) -> void {
+    if h == 0 { return; };
+    sa_json_buffer_free(h);
+}
+
+fn fa_parse(p: ptr, n: u64) -> u64 {
+    if n == 0 { return 0; };
+    return sa_json_parse(p, n);
+}
+
+fn fa_new_obj() -> u64 {
+    return sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+}
+
+fn fa_new_arr() -> u64 {
+    return sa_json_parse(STR_PTR("[]"), STR_LEN("[]"));
+}
+
+fn fa_get(parent: u64, key_p: ptr, key_l: u64) -> u64 {
+    let node: u64 = 0;
+    if parent == 0 { return 0; };
+    if sa_json_object_get(parent, key_p, key_l, &node) != 0 { return 0; };
+    return node;
+}
+
+fn fa_stringify_into(doc: u64, out: &FaText) -> bool {
+    out.len = 0;
+    let h: u64 = 0;
+    if sa_json_stringify(doc, &h) != 0 { return false; };
+    if h == 0 { return false; };
+    let bp: ptr = sa_json_buffer_data(h);
+    let bl: u64 = sa_json_buffer_len(h);
+    fa_push(out, bp, bl);
+    fa_free_buffer(h);
+    return true;
+}
+
+// Raw JSON text of an object field (stringified node); false when absent.
+fn fa_node_text(doc: u64, key_p: ptr, key_l: u64, out: &FaText) -> bool {
+    let node = fa_get(doc, key_p, key_l);
+    if node == 0 { return false; };
+    return fa_stringify_into(node, out);
+}
+
+// String field value (decoded) into out; false when not a string.
+fn fa_node_string(doc: u64, key_p: ptr, key_l: u64, out: &FaStr) -> bool {
+    let node = fa_get(doc, key_p, key_l);
+    if node == 0 { return false; };
+    if sa_json_kind(node) != 5 { return false; };
+    out.len = 0;
+    let np: ptr = sa_json_string_ptr(node);
+    fa_push_str(out, np, sa_json_string_len(node));
+    return true;
+}
+
+// Attach a parsed JSON text as a field value (snapshot rule: fully built
+// child first, attach last). Empty text attaches nothing.
+fn fa_set_json_text(parent: u64, key_p: ptr, key_l: u64, text_p: ptr, text_l: u64) -> void {
+    if text_l == 0 { return; };
+    let child = fa_parse(text_p, text_l);
+    if child == 0 { return; };
+    sa_json_object_set_node(parent, key_p, key_l, child);
+    fa_free_doc(child);
+}
+
+// ---------------------------------------------------------------------------
+// Web shapes (skeleton structs kept) + header helpers.
+// Headers text form: "Name: value" lines joined by \n.
+// ---------------------------------------------------------------------------
 
 struct Headers { buf: [u8; 8192], len: u64 }
 struct Request { method: [u8; 16], method_len: u64, headers: Headers, body_json: [u8; 262144], body_len: u64, signal_aborted: bool }
 struct Response { status: i32, headers: Headers, body_json: [u8; 262144], body_len: u64, is_stream: bool }
 struct Url { buf: [u8; 4096], len: u64 }
 
-// re-export FORWARD_RELAY_PROVIDER_ID from forwardModel.sla (source: export { FORWARD_RELAY_PROVIDER_ID })
+fn fa_headers_ptr(h: &Headers) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &h.buf, 0);
+    return p;
+}
+
+fn fa_headers_push(h: &Headers, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        if h.len < 8192 {
+            h.buf[h.len] = fa_byte(p, i);
+            h.len = h.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+// Case-insensitive header lookup; value (trimmed) into out.
+fn fa_header_get(h: &Headers, name_p: ptr, name_l: u64, out: &FaStr) -> bool {
+    out.len = 0;
+    let hp: ptr = fa_headers_ptr(h);
+    let pos: u64 = 0;
+    while pos <= h.len {
+        let le = pos;
+        while le < h.len && fa_byte(hp, le) != 10 { le = le + 1; }
+        let lend = le;
+        if lend > pos {
+            if fa_byte(hp, lend - 1) == 13 { lend = lend - 1; };
+        };
+        // split at first ':'
+        let colon = lend;
+        let i = pos;
+        while i < lend {
+            if fa_byte(hp, i) == 58 { colon = i; break; };
+            i = i + 1;
+        }
+        if colon < lend {
+            let ns: u64 = 0;
+            let ne: u64 = 0;
+            let linep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(linep, hp, pos);
+            fa_trim_range(linep, colon - pos, &ns, &ne);
+            if ne - ns == name_l {
+                let np2: ptr = PTR_NULL();
+                PTR_BYTE_ADD(np2, hp, pos + ns);
+                if fa_eq_ci(np2, ne - ns, name_p, name_l) {
+                    let vs: u64 = 0;
+                    let ve: u64 = 0;
+                    let vp0: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(vp0, hp, colon + 1);
+                    fa_trim_range(vp0, lend - colon - 1, &vs, &ve);
+                    let vp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(vp, hp, colon + 1 + vs);
+                    fa_push_str(out, vp, ve - vs);
+                    return true;
+                };
+            };
+        };
+        if le >= h.len { break; };
+        pos = le + 1;
+    }
+    return false;
+}
+
+// Set (replace or append) a header line.
+fn fa_header_set(h: &Headers, name_p: ptr, name_l: u64, value_p: ptr, value_l: u64) -> void {
+    let kept = FaText { bytes: [0u8; 262144], len: 0 };
+    let hp: ptr = fa_headers_ptr(h);
+    let pos: u64 = 0;
+    while pos <= h.len {
+        let le = pos;
+        while le < h.len && fa_byte(hp, le) != 10 { le = le + 1; }
+        let lend = le;
+        if lend > pos {
+            if fa_byte(hp, lend - 1) == 13 { lend = lend - 1; };
+        };
+        let colon = lend;
+        let i = pos;
+        while i < lend {
+            if fa_byte(hp, i) == 58 { colon = i; break; };
+            i = i + 1;
+        }
+        let drop = false;
+        if colon < lend {
+            let ns: u64 = 0;
+            let ne: u64 = 0;
+            let linep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(linep, hp, pos);
+            fa_trim_range(linep, colon - pos, &ns, &ne);
+            if ne - ns == name_l {
+                let np2: ptr = PTR_NULL();
+                PTR_BYTE_ADD(np2, hp, pos + ns);
+                if fa_eq_ci(np2, ne - ns, name_p, name_l) { drop = true; };
+            };
+        };
+        if !drop {
+            if lend > pos {
+                if kept.len > 0 { fa_push(&kept, STR_PTR("\n"), STR_LEN("\n")); };
+                let lp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(lp, hp, pos);
+                fa_push(&kept, lp, lend - pos);
+            };
+        };
+        if le >= h.len { break; };
+        pos = le + 1;
+    }
+    h.len = 0;
+    fa_headers_push(h, fa_text_ptr(&kept), kept.len);
+    if h.len > 0 { fa_headers_push(h, STR_PTR("\n"), STR_LEN("\n")); };
+    fa_headers_push(h, name_p, name_l);
+    fa_headers_push(h, STR_PTR(": "), STR_LEN(": "));
+    fa_headers_push(h, value_p, value_l);
+}
+
+fn fa_headers_copy(dst: &Headers, src: &Headers) -> void {
+    dst.len = 0;
+    fa_headers_push(dst, fa_headers_ptr(src), src.len);
+}
+
+// ---------------------------------------------------------------------------
+// Constants and pure predicates.
+// ---------------------------------------------------------------------------
 
 fn FORWARD_LOOPBACK_ADDRESSES_count() -> u64 { return 3; }
-// "127.0.0.1", "::1", "::ffff:127.0.0.1" stored as constants
+
 fn isForwardLoopbackAddress(address_ptr: ptr, address_len: u64, has_address: bool) -> bool {
     if !has_address { return true; };
-    // DEFECT: Array.includes on string array -> sequential byte compare approximation
-    return false;
+    if address_len == 0 { return true; };
+    if fa_eq(address_ptr, address_len, STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1")) { return true; };
+    if fa_eq(address_ptr, address_len, STR_PTR("::1"), STR_LEN("::1")) { return true; };
+    return fa_eq(address_ptr, address_len, STR_PTR("::ffff:127.0.0.1"), STR_LEN("::ffff:127.0.0.1"));
 }
+
 fn FORWARD_TOKEN_ENV_KEY() -> ptr { return STR_PTR("CODEX_UI_FORWARD_TOKEN"); }
 fn FORWARD_SETTINGS_OWNER() -> ptr { return STR_PTR("server"); }
-fn isForwardSharingEnabled(prefs_json_ptr: ptr, prefs_json_len: u64, has_prefs: bool) -> bool {
-    // DEFECT: dynamic object property access prefs?.forwardSharingEnabled === true -> JSON scan approximation
-    return false;
-}
 fn FORWARD_RELAY_GROUP_ID() -> ptr { return STR_PTR("default"); }
+
+fn isForwardSharingEnabled(prefs_json_ptr: ptr, prefs_json_len: u64, has_prefs: bool) -> bool {
+    if !has_prefs { return false; };
+    let doc = fa_parse(prefs_json_ptr, prefs_json_len);
+    if doc == 0 { return false; };
+    let node = fa_get(doc, STR_PTR("forwardSharingEnabled"), STR_LEN("forwardSharingEnabled"));
+    let r = false;
+    if node != 0 {
+        if sa_json_kind(node) == 1 {
+            let v: bool = false;
+            if sa_json_as_bool(node, &v) == 0 { r = v; };
+        };
+    };
+    fa_free_doc(doc);
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// buildForwardRelayProvider: the JSON-shaped provider lands in the
+// skeleton struct's fields (models/keys as JSON array texts).
+// ---------------------------------------------------------------------------
 
 struct ForwardRelayGroup { id: [u8; 128], id_len: u64, name: [u8; 128], name_len: u64, baseUrl: [u8; 2048], baseUrl_len: u64, kind_text: bool, status_enabled: bool, groupRatio: f64, models_json: [u8; 16384], models_json_len: u64, keys_json: [u8; 4096], keys_json_len: u64 }
 struct ForwardRelayProvider { id: [u8; 128], id_len: u64, name: [u8; 256], name_len: u64, kind_openai: bool, serviceProvider_id: [u8; 128], serviceProvider_id_len: u64, serviceProvider_name: [u8; 256], serviceProvider_name_len: u64, baseUrl: [u8; 2048], baseUrl_len: u64, defaultModel: [u8; 512], defaultModel_len: u64, nativeModels_json: [u8; 16384], nativeModels_json_len: u64, modelAliases_json: [u8; 1024], modelAliases_json_len: u64, stationType_official: bool, channelMode_fast: bool, remark: [u8; 1024], remark_len: u64, groups: [ForwardRelayGroup; 1], groups_len: u64, createdAt: i64, updatedAt: i64 }
 
+// Dedup a JSON string array (filter Boolean + Set semantics); the deduped
+// array doc is returned (caller frees), count/first written via outs.
+fn fa_dedup_models(models_json_ptr: ptr, models_json_len: u64, first: &FaStr, out_count: &u64) -> u64 {
+    first.len = 0;
+    *out_count = 0;
+    let src = fa_parse(models_json_ptr, models_json_len);
+    let out = fa_new_arr();
+    if src == 0 { return out; };
+    if sa_json_kind(src) != 6 {
+        fa_free_doc(src);
+        return out;
+    };
+    let count: u64 = 0;
+    sa_json_value_count(src, &count);
+    let seen = fa_new_arr();
+    let i: u64 = 0;
+    while i < count {
+        let el: u64 = 0;
+        if sa_json_array_get(src, i, &el) == 0 {
+            if el != 0 {
+                if sa_json_kind(el) == 5 {
+                    let ep: ptr = sa_json_string_ptr(el);
+                    let en: u64 = sa_json_string_len(el);
+                    if en > 0 {
+                        // Set membership over the seen array
+                        let dup = false;
+                        let sc: u64 = 0;
+                        sa_json_value_count(seen, &sc);
+                        let j: u64 = 0;
+                        while j < sc {
+                            let sv: u64 = 0;
+                            if sa_json_array_get(seen, j, &sv) == 0 {
+                                if sv != 0 {
+                                    let sp2: ptr = sa_json_string_ptr(sv);
+                                    if fa_eq(sp2, sa_json_string_len(sv), ep, en) { dup = true; break; };
+                                };
+                            };
+                            j = j + 1;
+                        }
+                        if !dup {
+                            sa_json_array_push_string(seen, ep, en);
+                            sa_json_array_push_string(out, ep, en);
+                            if *out_count == 0 { fa_push_str(first, ep, en); };
+                            let oc_now = *out_count;
+                            *out_count = oc_now + 1;
+                        };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    fa_free_doc(seen);
+    fa_free_doc(src);
+    return out;
+}
+
 fn buildForwardRelayProvider(baseUrl_ptr: ptr, baseUrl_len: u64, token_ptr: ptr, token_len: u64, modelIds_json_ptr: ptr, modelIds_json_len: u64, createdAt: i64, has_createdAt: bool, out: &ForwardRelayProvider) -> i32 {
-    // DEFECT: [...new Set(modelIds.filter(Boolean))] dedup + spread -> JSON buffer dedup approximation
-    // DEFECT: Date.now() -> extern clock approximation
+    let first = FaStr { bytes: [0u8; 4096], len: 0 };
+    let mcount: u64 = 0;
+    let models = fa_dedup_models(modelIds_json_ptr, modelIds_json_len, &first, &mcount);
+    let models_text = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_stringify_into(models, &models_text);
+    fa_free_doc(models);
+    let now = fa_now_ms() as i64;
+    // id / name / kind / serviceProvider
+    out.id_len = 0;
+    let i: u64 = 0;
+    let v_p: ptr = STR_PTR("ultra-forward");
+    let v_n: u64 = STR_LEN("ultra-forward");
+    while i < v_n { out.id[i] = fa_byte(v_p, i); i = i + 1; }
+    out.id_len = v_n;
+    out.name_len = 0;
+    i = 0;
+    v_p = STR_PTR("Ultra本地转发");
+    v_n = STR_LEN("Ultra本地转发");
+    while i < v_n { out.name[i] = fa_byte(v_p, i); i = i + 1; }
+    out.name_len = v_n;
+    out.kind_openai = true;
+    out.serviceProvider_id_len = 0;
+    i = 0;
+    v_p = STR_PTR("ultra-forward");
+    v_n = STR_LEN("ultra-forward");
+    while i < v_n { out.serviceProvider_id[i] = fa_byte(v_p, i); i = i + 1; }
+    out.serviceProvider_id_len = v_n;
+    out.serviceProvider_name_len = 0;
+    i = 0;
+    v_p = STR_PTR("Ultra本地转发");
+    v_n = STR_LEN("Ultra本地转发");
+    while i < v_n { out.serviceProvider_name[i] = fa_byte(v_p, i); i = i + 1; }
+    out.serviceProvider_name_len = v_n;
+    // baseUrl / defaultModel
+    out.baseUrl_len = 0;
+    i = 0;
+    while i < baseUrl_len { if i < 2048 { out.baseUrl[i] = fa_byte(baseUrl_ptr, i); }; i = i + 1; }
+    out.baseUrl_len = baseUrl_len;
+    out.defaultModel_len = 0;
+    i = 0;
+    let fp: ptr = fa_str_ptr(&first);
+    while i < first.len { if i < 512 { out.defaultModel[i] = fa_byte(fp, i); }; i = i + 1; }
+    out.defaultModel_len = first.len;
+    // nativeModels / aliases
+    out.nativeModels_json_len = 0;
+    i = 0;
+    let mp: ptr = fa_text_ptr(&models_text);
+    while i < models_text.len { if i < 16384 { out.nativeModels_json[i] = fa_byte(mp, i); }; i = i + 1; }
+    out.nativeModels_json_len = models_text.len;
+    out.modelAliases_json_len = 0;
+    i = 0;
+    v_p = STR_PTR("[]");
+    v_n = STR_LEN("[]");
+    while i < v_n { out.modelAliases_json[i] = fa_byte(v_p, i); i = i + 1; }
+    out.modelAliases_json_len = v_n;
+    out.stationType_official = true;
+    out.channelMode_fast = true;
+    out.remark_len = 0;
+    i = 0;
+    v_p = STR_PTR("对外共享开关自动生成 (回环 /v1); 关闭开关后停用, key 轮换后重开同步");
+    v_n = STR_LEN("对外共享开关自动生成 (回环 /v1); 关闭开关后停用, key 轮换后重开同步");
+    while i < v_n { if i < 1024 { out.remark[i] = fa_byte(v_p, i); }; i = i + 1; }
+    out.remark_len = v_n;
+    // group[0]
+    out.groups_len = 1;
+    out.groups[0].id_len = 0;
+    i = 0;
+    v_p = STR_PTR("default");
+    v_n = STR_LEN("default");
+    while i < v_n { out.groups[0].id[i] = fa_byte(v_p, i); i = i + 1; }
+    out.groups[0].id_len = v_n;
+    out.groups[0].name_len = 0;
+    i = 0;
+    while i < v_n { out.groups[0].name[i] = fa_byte(v_p, i); i = i + 1; }
+    out.groups[0].name_len = v_n;
+    out.groups[0].baseUrl_len = 0;
+    i = 0;
+    while i < baseUrl_len { if i < 2048 { out.groups[0].baseUrl[i] = fa_byte(baseUrl_ptr, i); }; i = i + 1; }
+    out.groups[0].baseUrl_len = baseUrl_len;
+    out.groups[0].kind_text = true;
+    out.groups[0].status_enabled = true;
+    out.groups[0].groupRatio = 1.0;
+    out.groups[0].models_json_len = 0;
+    i = 0;
+    while i < models_text.len { if i < 16384 { out.groups[0].models_json[i] = fa_byte(mp, i); }; i = i + 1; }
+    out.groups[0].models_json_len = models_text.len;
+    // keys: token ? [token] : []
+    out.groups[0].keys_json_len = 0;
+    let keys = FaStr { bytes: [0u8; 4096], len: 0 };
+    if token_len > 0 {
+        fa_push_str(&keys, STR_PTR("[\""), STR_LEN("[\""));
+        // token embedded raw: tokens are key material without quotes in
+        // practice; JSON-escape only the quote/backslash basics.
+        let j: u64 = 0;
+        while j < token_len {
+            let b = fa_byte(token_ptr, j);
+            if b == 34 || b == 92 { fa_push_str(&keys, STR_PTR("\\"), STR_LEN("\\")); };
+            if keys.len < 4096 { keys.bytes[keys.len] = b; keys.len = keys.len + 1; };
+            j = j + 1;
+        }
+        fa_push_str(&keys, STR_PTR("\"]"), STR_LEN("\"]"));
+    } else {
+        fa_push_str(&keys, STR_PTR("[]"), STR_LEN("[]"));
+    };
+    i = 0;
+    let kp: ptr = fa_str_ptr(&keys);
+    while i < keys.len { if i < 4096 { out.groups[0].keys_json[i] = fa_byte(kp, i); }; i = i + 1; }
+    out.groups[0].keys_json_len = keys.len;
+    if has_createdAt { out.createdAt = createdAt; } else { out.createdAt = now; };
+    out.updatedAt = now;
     return 0;
 }
-fn forwardSharingDisabled(security: &Headers, out: &Response) -> i32 { return forwardError(STR_PTR("forward sharing disabled"), 35, 403, security, STR_PTR("forbidden"), 9, out); }
+
+// ---------------------------------------------------------------------------
+// forwardJson / forwardError / credential / sharing gate.
+// ---------------------------------------------------------------------------
+
+fn fa_req_body_ptr(r: &Request) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &r.body_json, 0);
+    return p;
+}
+
+fn fa_resp_body_ptr(r: &Response) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &r.body_json, 0);
+    return p;
+}
+
+fn fa_resp_append(r: &Response, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        if r.body_len < 262144 {
+            r.body_json[r.body_len] = fa_byte(p, i);
+            r.body_len = r.body_len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn forwardJson(value_json_ptr: ptr, value_json_len: u64, status: i32, security: &Headers, out: &Response) -> i32 {
+    out.status = status;
+    out.is_stream = false;
+    fa_headers_copy(&out.headers, security);
+    fa_header_set(&out.headers, STR_PTR("Content-Type"), STR_LEN("Content-Type"), STR_PTR("application/json; charset=utf-8"), STR_LEN("application/json; charset=utf-8"));
+    out.body_len = 0;
+    fa_resp_append(out, value_json_ptr, value_json_len);
+    return 0;
+}
+
+fn forwardError(msg_ptr: ptr, msg_len: u64, status: i32, security: &Headers, type_ptr: ptr, type_len: u64, out: &Response) -> i32 {
+    let doc = fa_new_obj();
+    let err = fa_new_obj();
+    sa_json_object_set_string(err, STR_PTR("message"), STR_LEN("message"), msg_ptr, msg_len);
+    sa_json_object_set_string(err, STR_PTR("type"), STR_LEN("type"), type_ptr, type_len);
+    sa_json_object_set_node(doc, STR_PTR("error"), STR_LEN("error"), err);
+    fa_free_doc(err);
+    let text = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_stringify_into(doc, &text);
+    fa_free_doc(doc);
+    return forwardJson(fa_text_ptr(&text), text.len, status, security, out);
+}
+
+// TS forwardError default type ("invalid_request_error") variant.
+fn fa_forward_error_default(msg_p: ptr, msg_l: u64, status: i32, security: &Headers, out: &Response) -> i32 {
+    return forwardError(msg_p, msg_l, status, security, STR_PTR("invalid_request_error"), STR_LEN("invalid_request_error"), out);
+}
+
+fn forwardSharingDisabled(security: &Headers, out: &Response) -> i32 {
+    return forwardError(STR_PTR("对外共享未开启 (请在中转站设置中打开对外共享开关)"), STR_LEN("对外共享未开启 (请在中转站设置中打开对外共享开关)"), 403, security, STR_PTR("forbidden"), STR_LEN("forbidden"), out);
+}
+
 fn resolveForwardCredential(req: &Request, remote_ptr: ptr, remote_len: u64, has_remote: bool, token_ptr: ptr, token_len: u64) -> bool {
     if isForwardLoopbackAddress(remote_ptr, remote_len, has_remote) { return true; };
     if token_len == 0 { return false; };
-    // DEFECT: Headers.get("Authorization") / template literal Bearer compare -> byte compare approximation
+    let auth = FaStr { bytes: [0u8; 4096], len: 0 };
+    if fa_header_get(&req.headers, STR_PTR("Authorization"), STR_LEN("Authorization"), &auth) {
+        let want = FaStr { bytes: [0u8; 4096], len: 0 };
+        fa_push_str(&want, STR_PTR("Bearer "), STR_LEN("Bearer "));
+        fa_push_str(&want, token_ptr, token_len);
+        if fa_eq(fa_str_ptr(&auth), auth.len, fa_str_ptr(&want), want.len) { return true; };
+    };
+    let key = FaStr { bytes: [0u8; 4096], len: 0 };
+    if fa_header_get(&req.headers, STR_PTR("x-api-key"), STR_LEN("x-api-key"), &key) {
+        return fa_eq(fa_str_ptr(&key), key.len, token_ptr, token_len);
+    };
     return false;
 }
-fn forwardJson(value_json_ptr: ptr, value_json_len: u64, status: i32, security: &Headers, out: &Response) -> i32 {
-    // DEFECT: JSON.stringify(value) + new Headers(security) + new Response -> buffer copy approximation
-    out.status = status;
+
+// ---------------------------------------------------------------------------
+// Host-callback dispatch seam (B-class; see header). The host adapter
+// installs payload cells; fa_install_* are the wiring surface.
+// ---------------------------------------------------------------------------
+
+fn fa_install_inventory_json(json_ptr: ptr, json_len: u64) -> void {
+    let doc = fa_parse(json_ptr, json_len);
+    if doc == 0 { return; };
+    sa_global_u64_set(STR_PTR("forwardapi.inventory"), STR_LEN("forwardapi.inventory"), doc);
+}
+
+fn fa_clear_inventory() -> void {
+    let old: u64 = 0;
+    let st: i32 = sa_global_u64_get(STR_PTR("forwardapi.inventory"), STR_LEN("forwardapi.inventory"), &old);
+    if st == 0 { fa_free_doc(old); };
+    sa_global_u64_set(STR_PTR("forwardapi.inventory"), STR_LEN("forwardapi.inventory"), 0);
+}
+
+// Install a bridge outcome: mode 0 = null (未启用), 1 = bridge with handle,
+// 2 = throw with message. Default (never installed) is mode 0.
+fn fa_install_bridge(mode: u64, handle: u64, err_ptr: ptr, err_len: u64) -> void {
+    sa_global_u64_set(STR_PTR("forwardapi.bridge.mode"), STR_LEN("forwardapi.bridge.mode"), mode);
+    sa_global_u64_set(STR_PTR("forwardapi.bridge.handle"), STR_LEN("forwardapi.bridge.handle"), handle);
+    let doc = fa_new_obj();
+    sa_json_object_set_string(doc, STR_PTR("error"), STR_LEN("error"), err_ptr, err_len);
+    sa_global_u64_set(STR_PTR("forwardapi.bridge.err"), STR_LEN("forwardapi.bridge.err"), doc);
+}
+
+// listInventory dispatch: 0 ok (inventory array doc in out_doc), 1 threw
+// (message in out_err). Unwired = threw "host inventory seam not wired".
+fn fa_host_list_inventory(out_doc: &u64, out_err: &FaStr) -> i32 {
+    out_err.len = 0;
+    let doc: u64 = 0;
+    let st: i32 = sa_global_u64_get(STR_PTR("forwardapi.inventory"), STR_LEN("forwardapi.inventory"), &doc);
+    if st != 0 || doc == 0 {
+        fa_push_str(out_err, STR_PTR("host inventory seam not wired"), STR_LEN("host inventory seam not wired"));
+        *out_doc = 0;
+        return 1;
+    };
+    *out_doc = doc;
     return 0;
 }
-fn forwardError(msg_ptr: ptr, msg_len: u64, status: i32, security: &Headers, type_ptr: ptr, type_len: u64, out: &Response) -> i32 {
-    return forwardJson(msg_ptr, msg_len, status, security, out);
+
+// Inventory failure shaped like the TS catch: "Failed to list forward
+// inventory: <message>" with status 500 / server_error.
+fn fa_inventory_fail(security: &Headers, err: &FaStr, out: &Response) -> i32 {
+    let msg = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_push(&msg, STR_PTR("Failed to list forward inventory: "), STR_LEN("Failed to list forward inventory: "));
+    fa_push(&msg, fa_str_ptr(err), err.len);
+    return forwardError(fa_text_ptr(&msg), msg.len, 500, security, STR_PTR("server_error"), STR_LEN("server_error"), out);
 }
+
+// getBridge dispatch: 0 ok bridge, 1 null, 2 threw (message in out_err).
+fn fa_host_get_bridge(out_bridge: &ForwardBridge, out_err: &FaStr) -> i32 {
+    out_err.len = 0;
+    let mode: u64 = 0;
+    let st: i32 = sa_global_u64_get(STR_PTR("forwardapi.bridge.mode"), STR_LEN("forwardapi.bridge.mode"), &mode);
+    if st != 0 { mode = 0; };
+    if mode == 0 { return 1; };
+    if mode == 2 {
+        let doc: u64 = 0;
+        let st2: i32 = sa_global_u64_get(STR_PTR("forwardapi.bridge.err"), STR_LEN("forwardapi.bridge.err"), &doc);
+        if st2 == 0 {
+            if doc != 0 {
+                fa_node_string(doc, STR_PTR("error"), STR_LEN("error"), out_err);
+            };
+        };
+        return 2;
+    };
+    let handle: u64 = 0;
+    sa_global_u64_get(STR_PTR("forwardapi.bridge.handle"), STR_LEN("forwardapi.bridge.handle"), &handle);
+    out_bridge.handle = handle;
+    out_bridge.resp_len = 0;
+    out_bridge.err_len = 0;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Deps + models handler.
+// ---------------------------------------------------------------------------
 
 struct ForwardModelsDeps { remoteAddress_ptr: ptr, remoteAddress_len: u64, has_remote: bool, forwardToken: [u8; 1024], forwardToken_len: u64, sharingEnabled: bool, listInventory_fn: u64 }
 struct ForwardChatDeps { remoteAddress_ptr: ptr, remoteAddress_len: u64, has_remote: bool, forwardToken: [u8; 1024], forwardToken_len: u64, sharingEnabled: bool, listInventory_fn: u64, getBridge_fn: u64, cwd: [u8; 4096], cwd_len: u64, turnTimeoutMs: i64, maxConcurrent: i64, sseKeepaliveMs: i64 }
 
-// DEFECT: async handleForwardModelsRequest Promise<Response> -> synchronous + status code [BLOCKED: body is a conversion-era comment skeleton (preset return). Handlers await resolveForwardResponsesRun and upstream fetch/Responses streaming (sa_http_client_* exists); no body is implemented.]
-fn handleForwardModelsRequest(req: &Request, url: &Url, security: &Headers, deps: &ForwardModelsDeps, out: &Response) -> i32 {
-    // GET check -> 405; !sharingEnabled -> 403; credential -> 401; await listInventory try/catch -> 500; buildForwardModelIds + forwardJson list
-    return 0;
+fn fa_token_ptr(d: &ForwardModelsDeps) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &d.forwardToken, 0);
+    return p;
 }
-// module-level mutable let forwardInFlight
+
+fn fa_chat_token_ptr(d: &ForwardChatDeps) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &d.forwardToken, 0);
+    return p;
+}
+
+fn fa_method_is(req: &Request, name_p: ptr, name_l: u64) -> bool {
+    let mp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(mp, &req.method, 0);
+    return fa_eq(mp, req.method_len, name_p, name_l);
+}
+
+fn handleForwardModelsRequest(req: &Request, url: &Url, security: &Headers, deps: &ForwardModelsDeps, out: &Response) -> i32 {
+    if !fa_method_is(req, STR_PTR("GET"), STR_LEN("GET")) {
+        return fa_forward_error_default(STR_PTR("Only GET /v1/models is supported"), STR_LEN("Only GET /v1/models is supported"), 405, security, out);
+    };
+    if !deps.sharingEnabled { return forwardSharingDisabled(security, out); };
+    let tp: ptr = fa_token_ptr(deps);
+    if !resolveForwardCredential(req, deps.remoteAddress_ptr, deps.remoteAddress_len, deps.has_remote, tp, deps.forwardToken_len) {
+        return forwardError(STR_PTR("Invalid or missing forward API key"), STR_LEN("Invalid or missing forward API key"), 401, security, STR_PTR("authentication_error"), STR_LEN("authentication_error"), out);
+    };
+    let inv_doc: u64 = 0;
+    let inv_err = FaStr { bytes: [0u8; 4096], len: 0 };
+    if fa_host_list_inventory(&inv_doc, &inv_err) != 0 {
+        return fa_inventory_fail(security, &inv_err, out);
+    };
+    // buildForwardModelIds(FORWARD_ACTIVE_CLIS, inventory)
+    let clis = fa_parse(STR_PTR("[\"opencode\",\"muse\"]"), STR_LEN("[\"opencode\",\"muse\"]"));
+    let ids: u64 = 0;
+    let id_count: u64 = 0;
+    buildForwardModelIds(clis, inv_doc, &ids, &id_count);
+    let root = fa_new_obj();
+    sa_json_object_set_string(root, STR_PTR("object"), STR_LEN("object"), STR_PTR("list"), STR_LEN("list"));
+    let data = fa_new_arr();
+    let i: u64 = 0;
+    while i < id_count {
+        let el: u64 = 0;
+        let got = false;
+        if ids != 0 {
+            if sa_json_array_get(ids, i, &el) == 0 { got = el != 0; };
+        };
+        if got {
+            let item = fa_new_obj();
+            let ep: ptr = sa_json_string_ptr(el);
+            sa_json_object_set_string(item, STR_PTR("id"), STR_LEN("id"), ep, sa_json_string_len(el));
+            sa_json_object_set_string(item, STR_PTR("object"), STR_LEN("object"), STR_PTR("model"), STR_LEN("model"));
+            sa_json_object_set_i64(item, STR_PTR("created"), STR_LEN("created"), 0);
+            sa_json_object_set_string(item, STR_PTR("owned_by"), STR_LEN("owned_by"), STR_PTR("codex-ultra"), STR_LEN("codex-ultra"));
+            sa_json_array_push_node(data, item);
+            fa_free_doc(item);
+        };
+        i = i + 1;
+    }
+    sa_json_object_set_node(root, STR_PTR("data"), STR_LEN("data"), data);
+    fa_free_doc(data);
+    let text = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_stringify_into(root, &text);
+    fa_free_doc(root);
+    fa_free_doc(clis);
+    return forwardJson(fa_text_ptr(&text), text.len, 200, security, out);
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency slots: skeleton state-param forms + the module-global cell
+// the handlers use (TS module-level `let forwardInFlight`).
+// ---------------------------------------------------------------------------
+
 struct ForwardSlotState { forwardInFlight: i64 }
 fn forwardSlotStatus(state: &ForwardSlotState) -> i64 { return state.forwardInFlight; }
 fn acquireForwardSlot(state: &ForwardSlotState, limit: i64) -> bool {
@@ -69,74 +855,1593 @@ fn acquireForwardSlot(state: &ForwardSlotState, limit: i64) -> bool {
     return true;
 }
 fn releaseForwardSlot(state: &ForwardSlotState) -> i32 {
-    // DEFECT: Math.max(0, n-1) -> manual clamp
     if state.forwardInFlight > 0 { state.forwardInFlight = state.forwardInFlight - 1; };
     return 0;
 }
+
+fn fa_inflight() -> i64 {
+    let v: u64 = 0;
+    let st: i32 = sa_global_u64_get(STR_PTR("forwardapi.inflight"), STR_LEN("forwardapi.inflight"), &v);
+    if st != 0 { return 0; };
+    return (v as i64) - 1;
+}
+
+fn fa_inflight_set(n: i64) -> void {
+    let v: u64 = (n + 1) as u64;
+    sa_global_u64_set(STR_PTR("forwardapi.inflight"), STR_LEN("forwardapi.inflight"), v);
+}
+
+fn forwardSlotStatusGlobal() -> i64 { return fa_inflight(); }
+
+fn fa_acquire_slot(limit: i64) -> bool {
+    let n = fa_inflight();
+    if n >= limit { return false; };
+    fa_inflight_set(n + 1);
+    return true;
+}
+
+fn fa_release_slot() -> void {
+    let n = fa_inflight();
+    if n > 0 { fa_inflight_set(n - 1); } else { fa_inflight_set(0); };
+}
+
 fn FORWARD_SSE_KEEPALIVE_MS() -> i64 { return 20000; }
 
+// ---------------------------------------------------------------------------
+// Prompt transforms. Buckets accumulate raw texts; the winner joins with
+// "\n\n" and trims (TS semantics at each function tail).
+// ---------------------------------------------------------------------------
+
 struct ForwardChatMessage { role: [u8; 64], role_len: u64, has_role: bool, content_json: [u8; 65536], content_json_len: u64, has_content: bool }
-fn chatMessagesToPrompt(messages_json_ptr: ptr, messages_json_len: u64, out_ptr: ptr, out_cap: u64) -> u64 {
-    // DEFECT: Array.isArray / typeof / Record cast / role bucketing (user>tool>assistant, system/developer discarded) -> JSON scan approximation
-    // DEFECT: closure-free loop over unknown[] -> index loop approximation
-    return 0;
+
+struct FaBuckets {
+    user: FaText, tool: FaText, assistant: FaText,
+    user_len: u64, tool_len: u64, assistant_len: u64,
 }
-fn chatContentToText(content_json_ptr: ptr, content_json_len: u64, out_ptr: ptr, out_cap: u64) -> u64 {
-    // string | object{text,content,refusal,output} | array of parts; non-text parts skipped
-    return 0;
+
+fn fa_buckets_new() -> FaBuckets {
+    return FaBuckets {
+        user: FaText { bytes: [0u8; 262144], len: 0 },
+        tool: FaText { bytes: [0u8; 262144], len: 0 },
+        assistant: FaText { bytes: [0u8; 262144], len: 0 },
+        user_len: 0, tool_len: 0, assistant_len: 0,
+    };
 }
-fn responsesInputToPrompt(input_json_ptr: ptr, input_json_len: u64, instructions_json_ptr: ptr, instructions_json_len: u64, out_ptr: ptr, out_cap: u64) -> u64 {
-    // DEFECT: nested closure pushText capturing buckets -> inlined bucket append approximation
-    // string input trimmed; array: message/function_call_output handled; function_call/reasoning/item_reference dropped
-    return 0;
+
+// Append one block (with separator) to a bucket buffer tracked by count.
+fn fa_bucket_push(buf: &FaText, count: &u64, p: ptr, n: u64) -> void {
+    if *count > 0 { fa_push(buf, STR_PTR("\n\n"), STR_LEN("\n\n")); };
+    fa_push(buf, p, n);
+    let c_now = *count;
+    *count = c_now + 1;
 }
-fn forwardResponseId(out_ptr: ptr, out_cap: u64) -> u64 {
-    // DEFECT: Date.now().toString(36) + Math.random()*0xffffff -> extern time/random approximation, prefix resp-fwd-
-    return 0;
+
+// pushText: only non-blank texts land (bucket keeps the untrimmed text).
+fn fa_push_text(b: &FaBuckets, which: u64, p: ptr, n: u64) -> void {
+    let t = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_trimmed(p, n, &t);
+    if t.len == 0 { return; };
+    if which == 0 {
+        fa_bucket_push(&b.user, &b.user_len, p, n);
+    } else if which == 1 {
+        fa_bucket_push(&b.tool, &b.tool_len, p, n);
+    } else {
+        fa_bucket_push(&b.assistant, &b.assistant_len, p, n);
+    };
 }
+
+fn fa_buckets_finish(b: &FaBuckets, out: &FaText) -> void {
+    if b.user_len > 0 {
+        fa_trimmed(fa_text_ptr(&b.user), b.user.len, out);
+        return;
+    };
+    if b.tool_len > 0 {
+        fa_trimmed(fa_text_ptr(&b.tool), b.tool.len, out);
+        return;
+    };
+    if b.assistant_len > 0 {
+        fa_trimmed(fa_text_ptr(&b.assistant), b.assistant.len, out);
+        return;
+    };
+    out.len = 0;
+}
+
+// chatContentToText over a parsed node (0 = absent value -> "").
+fn fa_content_text(node: u64, out: &FaText) -> void {
+    out.len = 0;
+    if node == 0 { return; };
+    let kind = sa_json_kind(node);
+    if kind == 5 {
+        let np: ptr = sa_json_string_ptr(node);
+        fa_push(out, np, sa_json_string_len(node));
+        return;
+    };
+    if kind == 7 {
+        // object form: first string among text/content/refusal/output
+        let v = FaStr { bytes: [0u8; 4096], len: 0 };
+        if fa_node_string(node, STR_PTR("text"), STR_LEN("text"), &v) {
+            fa_push(out, fa_str_ptr(&v), v.len);
+            return;
+        };
+        if fa_node_string(node, STR_PTR("content"), STR_LEN("content"), &v) {
+            fa_push(out, fa_str_ptr(&v), v.len);
+            return;
+        };
+        if fa_node_string(node, STR_PTR("refusal"), STR_LEN("refusal"), &v) {
+            fa_push(out, fa_str_ptr(&v), v.len);
+            return;
+        };
+        if fa_node_string(node, STR_PTR("output"), STR_LEN("output"), &v) {
+            fa_push(out, fa_str_ptr(&v), v.len);
+            return;
+        };
+        return;
+    };
+    if kind == 6 {
+        let count: u64 = 0;
+        sa_json_value_count(node, &count);
+        let i: u64 = 0;
+        while i < count {
+            let part: u64 = 0;
+            if sa_json_array_get(node, i, &part) == 0 {
+                if part != 0 {
+                    let pk = sa_json_kind(part);
+                    if pk == 5 {
+                        let pp: ptr = sa_json_string_ptr(part);
+                        fa_push(out, pp, sa_json_string_len(part));
+                    } else if pk == 7 {
+                        let v = FaStr { bytes: [0u8; 4096], len: 0 };
+                        let landed = false;
+                        if fa_node_string(part, STR_PTR("text"), STR_LEN("text"), &v) {
+                            fa_push(out, fa_str_ptr(&v), v.len);
+                            landed = true;
+                        };
+                        if !landed {
+                            if fa_node_string(part, STR_PTR("content"), STR_LEN("content"), &v) {
+                                fa_push(out, fa_str_ptr(&v), v.len);
+                                landed = true;
+                            };
+                        };
+                        if !landed {
+                            if fa_node_string(part, STR_PTR("refusal"), STR_LEN("refusal"), &v) {
+                                if v.len > 0 {
+                                    fa_push(out, fa_str_ptr(&v), v.len);
+                                    landed = true;
+                                };
+                            };
+                        };
+                        if !landed {
+                            if fa_node_string(part, STR_PTR("output"), STR_LEN("output"), &v) {
+                                if v.len > 0 { fa_push(out, fa_str_ptr(&v), v.len); };
+                            };
+                        };
+                    };
+                };
+            };
+            i = i + 1;
+        }
+    };
+}
+
+fn chatContentToText(content_json_ptr: ptr, content_json_len: u64, out: &FaText) -> u64 {
+    let doc = fa_parse(content_json_ptr, content_json_len);
+    if doc == 0 { out.len = 0; return 0; };
+    fa_content_text(doc, out);
+    fa_free_doc(doc);
+    return out.len;
+}
+
+
+// Role of a message record: lowercased string role, default "user".
+fn fa_role_of(rec: u64, out: &FaStr) -> void {
+    out.len = 0;
+    if !fa_node_string(rec, STR_PTR("role"), STR_LEN("role"), out) {
+        fa_push_str(out, STR_PTR("user"), STR_LEN("user"));
+        return;
+    };
+    let i: u64 = 0;
+    let op: ptr = fa_str_ptr(out);
+    while i < out.len {
+        out.bytes[i] = fa_lower(fa_byte(op, i));
+        i = i + 1;
+    }
+}
+
+fn fa_bucket_for(role_p: ptr, role_l: u64, out_which: &u64, out_known: &bool) -> void {
+    *out_known = true;
+    if fa_eq(role_p, role_l, STR_PTR("user"), STR_LEN("user")) { *out_which = 0; return; };
+    if fa_eq(role_p, role_l, STR_PTR("tool"), STR_LEN("tool")) { *out_which = 1; return; };
+    if fa_eq(role_p, role_l, STR_PTR("assistant"), STR_LEN("assistant")) { *out_which = 2; return; };
+    *out_known = false;
+    *out_which = 0;
+}
+
+fn chatMessagesToPrompt(messages_json_ptr: ptr, messages_json_len: u64, out: &FaText) -> u64 {
+    out.len = 0;
+    let doc = fa_parse(messages_json_ptr, messages_json_len);
+    if doc == 0 { return 0; };
+    if sa_json_kind(doc) != 6 {
+        fa_free_doc(doc);
+        return 0;
+    };
+    let b = fa_buckets_new();
+    let count: u64 = 0;
+    sa_json_value_count(doc, &count);
+    let i: u64 = 0;
+    while i < count {
+        let entry: u64 = 0;
+        if sa_json_array_get(doc, i, &entry) == 0 {
+            if entry != 0 {
+                if sa_json_kind(entry) == 7 {
+                    let role = FaStr { bytes: [0u8; 4096], len: 0 };
+                    fa_role_of(entry, &role);
+                    let content = fa_get(entry, STR_PTR("content"), STR_LEN("content"));
+                    let text = FaText { bytes: [0u8; 262144], len: 0 };
+                    fa_content_text(content, &text);
+                    let tt = FaText { bytes: [0u8; 262144], len: 0 };
+                    fa_trimmed(fa_text_ptr(&text), text.len, &tt);
+                    if tt.len > 0 {
+                        let which: u64 = 0;
+                        let known = false;
+                        fa_bucket_for(fa_str_ptr(&role), role.len, &which, &known);
+                        if known { fa_push_text(&b, which, fa_text_ptr(&text), text.len); };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    fa_free_doc(doc);
+    fa_buckets_finish(&b, out);
+    return out.len;
+}
+
+fn responsesInputToPrompt(input_json_ptr: ptr, input_json_len: u64, instructions_json_ptr: ptr, instructions_json_len: u64, out: &FaText) -> u64 {
+    out.len = 0;
+    // instructions are discarded by design (TS: system layer never runs).
+    let doc = fa_parse(input_json_ptr, input_json_len);
+    if doc == 0 { return 0; };
+    let kind = sa_json_kind(doc);
+    if kind == 5 {
+        let np: ptr = sa_json_string_ptr(doc);
+        let raw = FaText { bytes: [0u8; 262144], len: 0 };
+        fa_push(&raw, np, sa_json_string_len(doc));
+        fa_trimmed(fa_text_ptr(&raw), raw.len, out);
+        fa_free_doc(doc);
+        return out.len;
+    };
+    if kind != 6 {
+        fa_free_doc(doc);
+        return 0;
+    };
+    let b = fa_buckets_new();
+    let count: u64 = 0;
+    sa_json_value_count(doc, &count);
+    let i: u64 = 0;
+    while i < count {
+        let entry: u64 = 0;
+        if sa_json_array_get(doc, i, &entry) == 0 {
+            if entry != 0 {
+                let ek = sa_json_kind(entry);
+                if ek == 5 {
+                    let ep: ptr = sa_json_string_ptr(entry);
+                    let raw = FaText { bytes: [0u8; 262144], len: 0 };
+                    fa_push(&raw, ep, sa_json_string_len(entry));
+                    let tt = FaText { bytes: [0u8; 262144], len: 0 };
+                    fa_trimmed(fa_text_ptr(&raw), raw.len, &tt);
+                    fa_push_text(&b, 0, fa_text_ptr(&tt), tt.len);
+                } else if ek == 7 {
+                    let kind_s = FaStr { bytes: [0u8; 4096], len: 0 };
+                    let has_kind = fa_node_string(entry, STR_PTR("type"), STR_LEN("type"), &kind_s);
+                    let kp: ptr = fa_str_ptr(&kind_s);
+                    if has_kind && fa_eq(kp, kind_s.len, STR_PTR("function_call_output"), STR_LEN("function_call_output")) {
+                        let output = fa_get(entry, STR_PTR("output"), STR_LEN("output"));
+                        let text = FaText { bytes: [0u8; 262144], len: 0 };
+                        if output != 0 {
+                            if sa_json_kind(output) == 5 {
+                                let op2: ptr = sa_json_string_ptr(output);
+                                fa_push(&text, op2, sa_json_string_len(output));
+                            };
+                            if sa_json_kind(output) != 5 {
+                                fa_content_text(output, &text);
+                            };
+                        };
+                        fa_push_text(&b, 1, fa_text_ptr(&text), text.len);
+                    } else {
+                        let is_message = false;
+                        if has_kind {
+                            if fa_eq(kp, kind_s.len, STR_PTR("message"), STR_LEN("message")) {
+                                is_message = true;
+                            };
+                        } else {
+                            if fa_get(entry, STR_PTR("role"), STR_LEN("role")) != 0 {
+                                is_message = true;
+                            };
+                            if fa_get(entry, STR_PTR("content"), STR_LEN("content")) != 0 {
+                                is_message = true;
+                            };
+                        };
+                        if is_message {
+                            let role = FaStr { bytes: [0u8; 4096], len: 0 };
+                            fa_role_of(entry, &role);
+                            let content = fa_get(entry, STR_PTR("content"), STR_LEN("content"));
+                            let text = FaText { bytes: [0u8; 262144], len: 0 };
+                            fa_content_text(content, &text);
+                            let tt = FaText { bytes: [0u8; 262144], len: 0 };
+                            fa_trimmed(fa_text_ptr(&text), text.len, &tt);
+                            if tt.len > 0 {
+                                let rp: ptr = fa_str_ptr(&role);
+                                if fa_eq(rp, role.len, STR_PTR("user"), STR_LEN("user")) {
+                                    fa_push_text(&b, 0, fa_text_ptr(&text), text.len);
+                                } else if fa_eq(rp, role.len, STR_PTR("assistant"), STR_LEN("assistant")) {
+                                    fa_push_text(&b, 2, fa_text_ptr(&text), text.len);
+                                };
+                            };
+                        };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    fa_free_doc(doc);
+    fa_buckets_finish(&b, out);
+    return out.len;
+}
+
+// ---------------------------------------------------------------------------
+// Response assembly: ids, response object, usage estimators, chat
+// completion body.
+// ---------------------------------------------------------------------------
+
+fn forwardResponseId(out: &FaStr) -> u64 {
+    fa_make_id(STR_PTR("resp-fwd-"), STR_LEN("resp-fwd-"), out);
+    return out.len;
+}
+
+fn forwardCompletionId(out: &FaStr) -> u64 {
+    fa_make_id(STR_PTR("chatcmpl-fwd-"), STR_LEN("chatcmpl-fwd-"), out);
+    return out.len;
+}
+
 struct ForwardResponseRestore { instructions_json: [u8; 65536], instructions_json_len: u64, has_instructions: bool, tools_json: [u8; 65536], tools_json_len: u64, tool_choice_json: [u8; 4096], tool_choice_json_len: u64, parallel_tool_calls: bool, has_parallel: bool }
-fn forwardResponseObject(modelId_ptr: ptr, modelId_len: u64, text_ptr: ptr, text_len: u64, completed: bool, usage_json_ptr: ptr, usage_json_len: u64, has_usage: bool, restore: &ForwardResponseRestore, has_restore: bool, echo_json_ptr: ptr, echo_json_len: u64, has_echo: bool, out_json_ptr: ptr, out_cap: u64) -> u64 {
-    // DEFECT: dynamic object literal + spread ...(echo===undefined?{}:{forward_echo}) -> JSON buffer assembly approximation
-    // DEFECT: `"instructions" in restore` operator -> has_instructions flag approximation
-    return 0;
+
+fn fa_restore_field_ptr(r: &ForwardResponseRestore, which: u64) -> ptr {
+    let p: ptr = PTR_NULL();
+    if which == 0 {
+        PTR_BYTE_ADD(p, &r.instructions_json, 0);
+    } else if which == 1 {
+        PTR_BYTE_ADD(p, &r.tools_json, 0);
+    } else {
+        PTR_BYTE_ADD(p, &r.tool_choice_json, 0);
+    };
+    return p;
 }
+
 fn estimateForwardTokens(text_ptr: ptr, text_len: u64) -> i64 {
     if text_len <= 0 { return 0; };
     let v: i64 = (text_len as i64 + 3) / 4;
     if v < 1 { return 1; };
     return v;
 }
-fn forwardChatUsage(orig_json_ptr: ptr, orig_json_len: u64, result_ptr: ptr, result_len: u64, out_prompt: &i64, out_completion: &i64, out_total: &i64) -> i32 { return 0; }
-fn forwardResponsesUsage(orig_json_ptr: ptr, orig_json_len: u64, instr_json_ptr: ptr, instr_json_len: u64, result_ptr: ptr, result_len: u64, out_input: &i64, out_output: &i64, out_total: &i64) -> i32 { return 0; }
-fn buildChatCompletionResponse(modelId_ptr: ptr, modelId_len: u64, cliText_ptr: ptr, cliText_len: u64, orig_json_ptr: ptr, orig_json_len: u64, out_json_ptr: ptr, out_cap: u64) -> u64 { return 0; }
+
+// Assemble the OpenAI Responses object into out (JSON text).
+fn forwardResponseObject(modelId_ptr: ptr, modelId_len: u64, text_ptr: ptr, text_len: u64, completed: bool, usage_json_ptr: ptr, usage_json_len: u64, has_usage: bool, restore: &ForwardResponseRestore, has_restore: bool, echo_json_ptr: ptr, echo_json_len: u64, has_echo: bool, out: &FaText) -> u64 {
+    let id = FaStr { bytes: [0u8; 4096], len: 0 };
+    forwardResponseId(&id);
+    let ip: ptr = fa_str_ptr(&id);
+    let root = fa_new_obj();
+    sa_json_object_set_string(root, STR_PTR("id"), STR_LEN("id"), ip, id.len);
+    sa_json_object_set_string(root, STR_PTR("object"), STR_LEN("object"), STR_PTR("response"), STR_LEN("response"));
+    sa_json_object_set_i64(root, STR_PTR("created_at"), STR_LEN("created_at"), (fa_now_ms() / 1000) as i64);
+    sa_json_object_set_string(root, STR_PTR("model"), STR_LEN("model"), modelId_ptr, modelId_len);
+    if completed {
+        sa_json_object_set_string(root, STR_PTR("status"), STR_LEN("status"), STR_PTR("completed"), STR_LEN("completed"));
+    } else {
+        sa_json_object_set_string(root, STR_PTR("status"), STR_LEN("status"), STR_PTR("failed"), STR_LEN("failed"));
+    };
+    // output
+    let output = fa_new_arr();
+    if completed {
+        let item = fa_new_obj();
+        sa_json_object_set_string(item, STR_PTR("type"), STR_LEN("type"), STR_PTR("message"), STR_LEN("message"));
+        let mid = FaStr { bytes: [0u8; 4096], len: 0 };
+        fa_push_str(&mid, ip, id.len);
+        fa_push_str(&mid, STR_PTR("-msg-0"), STR_LEN("-msg-0"));
+        sa_json_object_set_string(item, STR_PTR("id"), STR_LEN("id"), fa_str_ptr(&mid), mid.len);
+        sa_json_object_set_string(item, STR_PTR("status"), STR_LEN("status"), STR_PTR("completed"), STR_LEN("completed"));
+        sa_json_object_set_string(item, STR_PTR("role"), STR_LEN("role"), STR_PTR("assistant"), STR_LEN("assistant"));
+        let content = fa_new_arr();
+        let part = fa_new_obj();
+        sa_json_object_set_string(part, STR_PTR("type"), STR_LEN("type"), STR_PTR("output_text"), STR_LEN("output_text"));
+        sa_json_object_set_string(part, STR_PTR("text"), STR_LEN("text"), text_ptr, text_len);
+        let annotations = fa_new_arr();
+        sa_json_object_set_node(part, STR_PTR("annotations"), STR_LEN("annotations"), annotations);
+        fa_free_doc(annotations);
+        sa_json_array_push_node(content, part);
+        fa_free_doc(part);
+        sa_json_object_set_node(item, STR_PTR("content"), STR_LEN("content"), content);
+        fa_free_doc(content);
+        sa_json_array_push_node(output, item);
+        fa_free_doc(item);
+    };
+    sa_json_object_set_node(root, STR_PTR("output"), STR_LEN("output"), output);
+    fa_free_doc(output);
+    // parallel_tool_calls / tool_choice / tools / instructions
+    let parallel = false;
+    if has_restore {
+        if restore.has_parallel { parallel = restore.parallel_tool_calls; };
+    };
+    let parallel_u8: u8 = 0;
+    if parallel { parallel_u8 = 1; };
+    sa_json_object_set_bool(root, STR_PTR("parallel_tool_calls"), STR_LEN("parallel_tool_calls"), parallel_u8);
+    let tc_done = false;
+    if has_restore && restore.tool_choice_json_len > 0 {
+        fa_set_json_text(root, STR_PTR("tool_choice"), STR_LEN("tool_choice"), fa_restore_field_ptr(restore, 2), restore.tool_choice_json_len);
+        tc_done = true;
+    };
+    if !tc_done {
+        sa_json_object_set_string(root, STR_PTR("tool_choice"), STR_LEN("tool_choice"), STR_PTR("auto"), STR_LEN("auto"));
+    };
+    let tools_ok = false;
+    if has_restore && restore.tools_json_len > 0 {
+        let tdoc = fa_parse(fa_restore_field_ptr(restore, 1), restore.tools_json_len);
+        if tdoc != 0 {
+            if sa_json_kind(tdoc) == 6 { tools_ok = true; };
+            fa_free_doc(tdoc);
+        };
+    };
+    if tools_ok {
+        fa_set_json_text(root, STR_PTR("tools"), STR_LEN("tools"), fa_restore_field_ptr(restore, 1), restore.tools_json_len);
+    } else {
+        let empty = fa_new_arr();
+        sa_json_object_set_node(root, STR_PTR("tools"), STR_LEN("tools"), empty);
+        fa_free_doc(empty);
+    };
+    sa_json_object_set_null(root, STR_PTR("incomplete_details"), STR_LEN("incomplete_details"));
+    let ins_done = false;
+    if has_restore && restore.has_instructions && restore.instructions_json_len > 0 {
+        fa_set_json_text(root, STR_PTR("instructions"), STR_LEN("instructions"), fa_restore_field_ptr(restore, 0), restore.instructions_json_len);
+        ins_done = true;
+    };
+    if !ins_done {
+        sa_json_object_set_null(root, STR_PTR("instructions"), STR_LEN("instructions"));
+    };
+    sa_json_object_set_null(root, STR_PTR("previous_response_id"), STR_LEN("previous_response_id"));
+    // usage
+    if has_usage {
+        fa_set_json_text(root, STR_PTR("usage"), STR_LEN("usage"), usage_json_ptr, usage_json_len);
+    } else {
+        let usage = fa_new_obj();
+        let out_tokens: i64 = 0;
+        if completed { out_tokens = estimateForwardTokens(text_ptr, text_len); };
+        sa_json_object_set_i64(usage, STR_PTR("input_tokens"), STR_LEN("input_tokens"), 0);
+        sa_json_object_set_i64(usage, STR_PTR("output_tokens"), STR_LEN("output_tokens"), out_tokens);
+        sa_json_object_set_i64(usage, STR_PTR("total_tokens"), STR_LEN("total_tokens"), out_tokens);
+        sa_json_object_set_node(root, STR_PTR("usage"), STR_LEN("usage"), usage);
+        fa_free_doc(usage);
+    };
+    if has_echo {
+        fa_set_json_text(root, STR_PTR("forward_echo"), STR_LEN("forward_echo"), echo_json_ptr, echo_json_len);
+    };
+    fa_stringify_into(root, out);
+    fa_free_doc(root);
+    return out.len;
+}
+
+// JSON.stringify-equivalent length basis for the usage estimators: when the
+// original value is a JSON string, TS uses the raw string (chat) — callers
+// pass value JSON text; a string node decodes to its raw text.
+fn fa_usage_basis(value_json_ptr: ptr, value_json_len: u64, out: &FaText) -> void {
+    out.len = 0;
+    if value_json_len == 0 { return; };
+    let doc = fa_parse(value_json_ptr, value_json_len);
+    if doc == 0 {
+        fa_push(out, value_json_ptr, value_json_len);
+        return;
+    };
+    if sa_json_kind(doc) == 5 {
+        let np: ptr = sa_json_string_ptr(doc);
+        fa_push(out, np, sa_json_string_len(doc));
+    } else {
+        let sink = fa_stringify_into(doc, out);
+    };
+    fa_free_doc(doc);
+}
+
+fn forwardChatUsage(orig_json_ptr: ptr, orig_json_len: u64, result_ptr: ptr, result_len: u64, out_prompt: &i64, out_completion: &i64, out_total: &i64) -> i32 {
+    let basis = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_usage_basis(orig_json_ptr, orig_json_len, &basis);
+    let p = estimateForwardTokens(fa_text_ptr(&basis), basis.len);
+    let c = estimateForwardTokens(result_ptr, result_len);
+    *out_prompt = p;
+    *out_completion = c;
+    *out_total = p + c;
+    return 0;
+}
+
+fn forwardResponsesUsage(orig_json_ptr: ptr, orig_json_len: u64, instr_json_ptr: ptr, instr_json_len: u64, result_ptr: ptr, result_len: u64, out_input: &i64, out_output: &i64, out_total: &i64) -> i32 {
+    // estimate over JSON.stringify({input: orig ?? "", instructions: instr ?? ""})
+    let wrap = fa_new_obj();
+    if orig_json_len > 0 {
+        fa_set_json_text(wrap, STR_PTR("input"), STR_LEN("input"), orig_json_ptr, orig_json_len);
+    };
+    if orig_json_len == 0 {
+        sa_json_object_set_string(wrap, STR_PTR("input"), STR_LEN("input"), STR_PTR(""), STR_LEN(""));
+    };
+    if instr_json_len > 0 {
+        fa_set_json_text(wrap, STR_PTR("instructions"), STR_LEN("instructions"), instr_json_ptr, instr_json_len);
+    };
+    if instr_json_len == 0 {
+        sa_json_object_set_string(wrap, STR_PTR("instructions"), STR_LEN("instructions"), STR_PTR(""), STR_LEN(""));
+    };
+    let text = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_stringify_into(wrap, &text);
+    fa_free_doc(wrap);
+    let inp = estimateForwardTokens(fa_text_ptr(&text), text.len);
+    let outp = estimateForwardTokens(result_ptr, result_len);
+    *out_input = inp;
+    *out_output = outp;
+    *out_total = inp + outp;
+    return 0;
+}
+
+fn fa_usage_json3(k1_p: ptr, k1_l: u64, v1: i64, k2_p: ptr, k2_l: u64, v2: i64, v3: i64, out: &FaText) -> void {
+    let doc = fa_new_obj();
+    sa_json_object_set_i64(doc, k1_p, k1_l, v1);
+    sa_json_object_set_i64(doc, k2_p, k2_l, v2);
+    sa_json_object_set_i64(doc, STR_PTR("total_tokens"), STR_LEN("total_tokens"), v3);
+    fa_stringify_into(doc, out);
+    fa_free_doc(doc);
+}
+
+fn buildChatCompletionResponse(modelId_ptr: ptr, modelId_len: u64, cliText_ptr: ptr, cliText_len: u64, orig_json_ptr: ptr, orig_json_len: u64, out: &FaText) -> u64 {
+    let id = FaStr { bytes: [0u8; 4096], len: 0 };
+    forwardCompletionId(&id);
+    let root = fa_new_obj();
+    sa_json_object_set_string(root, STR_PTR("id"), STR_LEN("id"), fa_str_ptr(&id), id.len);
+    sa_json_object_set_string(root, STR_PTR("object"), STR_LEN("object"), STR_PTR("chat.completion"), STR_LEN("chat.completion"));
+    sa_json_object_set_i64(root, STR_PTR("created"), STR_LEN("created"), (fa_now_ms() / 1000) as i64);
+    sa_json_object_set_string(root, STR_PTR("model"), STR_LEN("model"), modelId_ptr, modelId_len);
+    let choices = fa_new_arr();
+    let choice = fa_new_obj();
+    sa_json_object_set_i64(choice, STR_PTR("index"), STR_LEN("index"), 0);
+    let message = fa_new_obj();
+    sa_json_object_set_string(message, STR_PTR("role"), STR_LEN("role"), STR_PTR("assistant"), STR_LEN("assistant"));
+    sa_json_object_set_string(message, STR_PTR("content"), STR_LEN("content"), cliText_ptr, cliText_len);
+    sa_json_object_set_node(choice, STR_PTR("message"), STR_LEN("message"), message);
+    fa_free_doc(message);
+    sa_json_object_set_string(choice, STR_PTR("finish_reason"), STR_LEN("finish_reason"), STR_PTR("stop"), STR_LEN("stop"));
+    sa_json_array_push_node(choices, choice);
+    fa_free_doc(choice);
+    sa_json_object_set_node(root, STR_PTR("choices"), STR_LEN("choices"), choices);
+    fa_free_doc(choices);
+    let p: i64 = 0;
+    let c: i64 = 0;
+    let t: i64 = 0;
+    forwardChatUsage(orig_json_ptr, orig_json_len, cliText_ptr, cliText_len, &p, &c, &t);
+    let usage = fa_new_obj();
+    sa_json_object_set_i64(usage, STR_PTR("prompt_tokens"), STR_LEN("prompt_tokens"), p);
+    sa_json_object_set_i64(usage, STR_PTR("completion_tokens"), STR_LEN("completion_tokens"), c);
+    sa_json_object_set_i64(usage, STR_PTR("total_tokens"), STR_LEN("total_tokens"), t);
+    sa_json_object_set_node(root, STR_PTR("usage"), STR_LEN("usage"), usage);
+    fa_free_doc(usage);
+    let echo = fa_new_obj();
+    let is_arr = false;
+    if orig_json_len > 0 {
+        let odoc = fa_parse(orig_json_ptr, orig_json_len);
+        if odoc != 0 {
+            is_arr = sa_json_kind(odoc) == 6;
+            fa_free_doc(odoc);
+        };
+    };
+    if is_arr {
+        fa_set_json_text(echo, STR_PTR("messages"), STR_LEN("messages"), orig_json_ptr, orig_json_len);
+    } else {
+        let empty = fa_new_arr();
+        sa_json_object_set_node(echo, STR_PTR("messages"), STR_LEN("messages"), empty);
+        fa_free_doc(empty);
+    };
+    sa_json_object_set_node(root, STR_PTR("forward_echo"), STR_LEN("forward_echo"), echo);
+    fa_free_doc(echo);
+    fa_stringify_into(root, out);
+    fa_free_doc(root);
+    return out.len;
+}
+
+// ---------------------------------------------------------------------------
+// Turn glue + resolve + handlers + sequential streams.
+// ---------------------------------------------------------------------------
 
 struct ForwardResponsesRun { modelId: [u8; 512], modelId_len: u64, route_json: [u8; 4096], route_json_len: u64, bridge_id: u64, prompt: [u8; 262144], prompt_len: u64, limit: i64, promptTokens: i64, restore: ForwardResponseRestore, echo_input_json: [u8; 65536], echo_input_json_len: u64, echo_instructions_json: [u8; 65536], echo_instructions_json_len: u64 }
-// DEFECT: async resolveForwardResponsesRun returning discriminated union {ok:true,run,stream}|{ok:false,response} -> status code + out params approximation [BLOCKED: body is a conversion-era comment skeleton (preset return). Handlers await resolveForwardResponsesRun and upstream fetch/Responses streaming (sa_http_client_* exists); no body is implemented.]
-fn resolveForwardResponsesRun(req: &Request, security: &Headers, deps: &ForwardChatDeps, body_json_ptr: ptr, body_json_len: u64, out_run: &ForwardResponsesRun, out_stream: &bool, out_resp: &Response) -> i32 {
-    // credential 401; model required 400; previous_response_id 400; empty prompt 400; await listInventory 500; parseForwardModelId try/catch + instanceof ForwardModelError loopback 400 else 404; acquire slot 429; await getBridge try/catch 502 / null 502
-    return 0;
-}
-// DEFECT: async handleForwardResponsesRequest Promise<Response> -> synchronous [BLOCKED: body is a conversion-era comment skeleton (preset return). Handlers await resolveForwardResponsesRun and upstream fetch/Responses streaming (sa_http_client_* exists); no body is implemented.]
-fn handleForwardResponsesRequest(req: &Request, url: &Url, security: &Headers, deps: &ForwardChatDeps, out: &Response) -> i32 {
-    // POST check 405; sharing 403; await request.json() try/catch 400; resolve run; stream branch; await runForwardTurn try/catch 502; finishReason!=stop -> 504/502; forwardJson(forwardResponseObject)
-    return 0;
-}
-fn forwardResponsesStream(req: &Request, security: &Headers, deps: &ForwardChatDeps, run: &ForwardResponsesRun, out: &Response) -> i32 {
-    // DEFECT: ReadableStream async start(controller) + setInterval heartbeat + TextEncoder + controller.enqueue/close + cancel() -> sequential write approximation, no real stream/timer
-    // DEFECT: closure releaseOnce / envelope capturing seq,responseId -> explicit state struct approximation (inlined here)
-    // DEFECT: onDelta callback (text,source) with sawDelta dedup -> function-pointer approximation
-    return 0;
-}
-fn forwardCompletionId(out_ptr: ptr, out_cap: u64) -> u64 { return 0; }
-// DEFECT: async handleForwardChatRequest Promise<Response> -> synchronous [BLOCKED: body is a conversion-era comment skeleton (preset return). Handlers await resolveForwardResponsesRun and upstream fetch/Responses streaming (sa_http_client_* exists); no body is implemented.]
-fn handleForwardChatRequest(req: &Request, url: &Url, security: &Headers, deps: &ForwardChatDeps, out: &Response) -> i32 {
-    // POST 405; sharing 403; credential 401; await json 400; model 400; prompt 400; inventory 500; parse route 400/404; slot 429; bridge 502; stream branch; await runForwardTurn 502; finishReason 504/502; forwardJson(buildChatCompletionResponse)
-    return 0;
-}
 struct ForwardStreamRun { modelId: [u8; 512], modelId_len: u64, route_json: [u8; 4096], route_json_len: u64, bridge_id: u64, prompt: [u8; 262144], prompt_len: u64, limit: i64, promptTokens: i64, includeUsage: bool, echoMessages_json: [u8; 262144], echoMessages_json_len: u64 }
-fn sseChunk(payload_json_ptr: ptr, payload_json_len: u64, out_ptr: ptr, out_cap: u64) -> u64 { return 0; }
-fn forwardChatStream(req: &Request, security: &Headers, deps: &ForwardChatDeps, run: &ForwardStreamRun, out: &Response) -> i32 {
-    // DEFECT: ReadableStream + setInterval heartbeat + closures baseChunk/send/releaseOnce + onDelta dedup -> sequential approximation
-    // DEFECT: object spread {...baseChunk({}, "stop"), forward_echo} -> JSON assembly approximation
+
+fn fa_itoa(v: i64, out: &FaStr) -> void {
+    out.len = 0;
+    if v == 0 {
+        fa_push_str(out, STR_PTR("0"), STR_LEN("0"));
+        return;
+    };
+    let neg = v < 0;
+    let x = v;
+    if neg { x = -v; };
+    let tmp: [u8; 24] = [0u8; 24];
+    let n: u64 = 0;
+    while x > 0 {
+        tmp[n] = (48 + (x % 10)) as u8;
+        n = n + 1;
+        x = x / 10;
+    }
+    if neg { fa_push_str(out, STR_PTR("-"), STR_LEN("-")); };
+    let i = n;
+    while i > 0 {
+        i = i - 1;
+        if out.len < 4096 { out.bytes[out.len] = tmp[i]; out.len = out.len + 1; };
+    }
+}
+
+fn fa_reason_name(code: u64, out_p: &ptr, out_l: &u64) -> void {
+    if code == 3 {
+        *out_p = STR_PTR("timeout");
+        *out_l = STR_LEN("timeout");
+    } else if code == 2 {
+        *out_p = STR_PTR("interrupted");
+        *out_l = STR_LEN("interrupted");
+    } else if code == 1 {
+        *out_p = STR_PTR("error");
+        *out_l = STR_LEN("error");
+    } else {
+        *out_p = STR_PTR("stop");
+        *out_l = STR_LEN("stop");
+    };
+}
+
+// Initialize a turn result to the neutral stop/empty state (the skeleton
+// provider leaves it untouched; a real provider overwrites it).
+fn fa_turn_result_init(r: &ForwardTurnResult) -> void {
+    r.route_len = 0;
+    r.thread_id_len = 0;
+    r.turn_id_len = 0;
+    r.text_len = 0;
+    r.finish_reason = 0;
+    r.has_error = false;
+    r.error_len = 0;
+    r.duration_ms = 0;
+    r.err_len = 0;
+}
+
+// Build the ForwardTurnInput from a serialized route + prompt and call
+// the provider. Returns the provider status (0 ok; nonzero = throw, with
+// the message taken from result.err / bridge.err by the caller).
+fn fa_run_turn(bridge_id: u64, route_json_p: ptr, route_json_l: u64, prompt_p: ptr, prompt_l: u64, deps: &ForwardChatDeps, req: &Request, result: &ForwardTurnResult) -> i32 {
+    let bridge = ForwardBridge { handle: bridge_id, resp: [0u8; 262144], resp_len: 0, err: [0u8; 1024], err_len: 0 };
+    let input = ForwardTurnInput {
+        route: [0u8; 1024], route_len: 0,
+        model: [0u8; 256], model_len: 0,
+        provider_id: [0u8; 256], provider_id_len: 0,
+        group_id: [0u8; 256], group_id_len: 0,
+        cli_backend: [0u8; 64], cli_backend_len: 0,
+        prompt: [0u8; 65536], prompt_len: 0,
+        cwd: [0u8; 1024], cwd_len: 0,
+        has_owner_id: false, owner_id: [0u8; 128], owner_id_len: 0,
+        has_timeout_ms: false, timeout_ms: 0,
+        on_delta_id: 0, signal_id: 0, has_signal: false,
+    };
+    // route fields from the serialized route JSON
+    let rdoc = fa_parse(route_json_p, route_json_l);
+    if rdoc != 0 {
+        let v = FaStr { bytes: [0u8; 4096], len: 0 };
+        if fa_node_string(rdoc, STR_PTR("model"), STR_LEN("model"), &v) {
+            let i: u64 = 0;
+            let vp: ptr = fa_str_ptr(&v);
+            while i < v.len { if i < 256 { input.model[i] = fa_byte(vp, i); }; i = i + 1; }
+            input.model_len = v.len;
+        };
+        if fa_node_string(rdoc, STR_PTR("providerId"), STR_LEN("providerId"), &v) {
+            let i: u64 = 0;
+            let vp: ptr = fa_str_ptr(&v);
+            while i < v.len { if i < 256 { input.provider_id[i] = fa_byte(vp, i); }; i = i + 1; }
+            input.provider_id_len = v.len;
+        };
+        if fa_node_string(rdoc, STR_PTR("groupId"), STR_LEN("groupId"), &v) {
+            let i: u64 = 0;
+            let vp: ptr = fa_str_ptr(&v);
+            while i < v.len { if i < 256 { input.group_id[i] = fa_byte(vp, i); }; i = i + 1; }
+            input.group_id_len = v.len;
+        };
+        if fa_node_string(rdoc, STR_PTR("cliBackend"), STR_LEN("cliBackend"), &v) {
+            let i: u64 = 0;
+            let vp: ptr = fa_str_ptr(&v);
+            while i < v.len { if i < 64 { input.cli_backend[i] = fa_byte(vp, i); }; i = i + 1; }
+            input.cli_backend_len = v.len;
+        };
+        fa_free_doc(rdoc);
+    };
+    let i: u64 = 0;
+    while i < route_json_l { if i < 1024 { input.route[i] = fa_byte(route_json_p, i); }; i = i + 1; }
+    input.route_len = route_json_l;
+    i = 0;
+    while i < prompt_l { if i < 65536 { input.prompt[i] = fa_byte(prompt_p, i); }; i = i + 1; }
+    input.prompt_len = prompt_l;
+    let cp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cp, &deps.cwd, 0);
+    i = 0;
+    while i < deps.cwd_len { if i < 1024 { input.cwd[i] = fa_byte(cp, i); }; i = i + 1; }
+    input.cwd_len = deps.cwd_len;
+    if deps.turnTimeoutMs > 0 {
+        input.has_timeout_ms = true;
+        input.timeout_ms = deps.turnTimeoutMs as u64;
+    };
+    if req.signal_aborted {
+        input.has_signal = true;
+        input.signal_id = 1;
+    };
+    fa_turn_result_init(result);
+    return runForwardTurn(&bridge, &input, result);
+}
+
+// Turn throw message: result.err, else bridge err field, else generic.
+fn fa_turn_throw_msg(result: &ForwardTurnResult, out: &FaStr) -> void {
+    out.len = 0;
+    if result.err_len > 0 {
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, &result.err, 0);
+        fa_push_str(out, p, result.err_len);
+        return;
+    };
+    fa_push_str(out, STR_PTR("forward turn failed"), STR_LEN("forward turn failed"));
+}
+
+// Non-stop finish mapping shared by both handlers.
+fn fa_finish_fail(result: &ForwardTurnResult, security: &Headers, out: &Response) -> i32 {
+    let status: i32 = 502;
+    if result.finish_reason == 3 { status = 504; };
+    let msg = FaText { bytes: [0u8; 262144], len: 0 };
+    if result.has_error && result.error_len > 0 {
+        let p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(p, &result.error, 0);
+        fa_push(&msg, p, result.error_len);
+    } else {
+        let rp: ptr = STR_PTR("");
+        let rl: u64 = 0;
+        fa_reason_name(result.finish_reason, &rp, &rl);
+        fa_push(&msg, STR_PTR("forward turn 未完成 ("), STR_LEN("forward turn 未完成 ("));
+        fa_push(&msg, rp, rl);
+        fa_push(&msg, STR_PTR(")"), STR_LEN(")"));
+    };
+    if status == 504 {
+        return forwardError(fa_text_ptr(&msg), msg.len, status, security, STR_PTR("timeout_error"), STR_LEN("timeout_error"), out);
+    };
+    return forwardError(fa_text_ptr(&msg), msg.len, status, security, STR_PTR("server_error"), STR_LEN("server_error"), out);
+}
+
+// ---------------------------------------------------------------------------
+// resolveForwardResponsesRun: 0 = ok (run + stream filled), 1 = fail
+// (out_resp carries the TS error response).
+// ---------------------------------------------------------------------------
+
+fn fa_fail(security: &Headers, msg_p: ptr, msg_l: u64, status: i32, type_p: ptr, type_l: u64, out: &Response) -> i32 {
+    forwardError(msg_p, msg_l, status, security, type_p, type_l, out);
+    return 1;
+}
+
+fn resolveForwardResponsesRun(req: &Request, security: &Headers, deps: &ForwardChatDeps, body_json_ptr: ptr, body_json_len: u64, out_run: &ForwardResponsesRun, out_stream: &bool, out_resp: &Response) -> i32 {
+    let tp: ptr = fa_chat_token_ptr(deps);
+    if !resolveForwardCredential(req, deps.remoteAddress_ptr, deps.remoteAddress_len, deps.has_remote, tp, deps.forwardToken_len) {
+        return fa_fail(security, STR_PTR("Invalid or missing forward API key"), STR_LEN("Invalid or missing forward API key"), 401, STR_PTR("authentication_error"), STR_LEN("authentication_error"), out_resp);
+    };
+    let body = fa_parse(body_json_ptr, body_json_len);
+    if body == 0 {
+        return fa_fail(security, STR_PTR("Invalid JSON body"), STR_LEN("Invalid JSON body"), 400, STR_PTR("invalid_request_error"), STR_LEN("invalid_request_error"), out_resp);
+    };
+    let model_raw = FaStr { bytes: [0u8; 4096], len: 0 };
+    fa_node_string(body, STR_PTR("model"), STR_LEN("model"), &model_raw);
+    let model_t = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_trimmed(fa_str_ptr(&model_raw), model_raw.len, &model_t);
+    if model_t.len == 0 {
+        fa_free_doc(body);
+        return fa_fail(security, STR_PTR("model is required (format {cli}-{provider}-{group}-{model})"), STR_LEN("model is required (format {cli}-{provider}-{group}-{model})"), 400, STR_PTR("invalid_request_error"), STR_LEN("invalid_request_error"), out_resp);
+    };
+    let prev = FaStr { bytes: [0u8; 4096], len: 0 };
+    if fa_node_string(body, STR_PTR("previous_response_id"), STR_LEN("previous_response_id"), &prev) {
+        let prev_t = FaText { bytes: [0u8; 262144], len: 0 };
+        fa_trimmed(fa_str_ptr(&prev), prev.len, &prev_t);
+        if prev_t.len > 0 {
+            fa_free_doc(body);
+            return fa_fail(security, STR_PTR("previous_response_id 续聊 v1 不支持 (无状态单次执行)"), STR_LEN("previous_response_id 续聊 v1 不支持 (无状态单次执行)"), 400, STR_PTR("invalid_request_error"), STR_LEN("invalid_request_error"), out_resp);
+        };
+    };
+    let input_text = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_node_text(body, STR_PTR("input"), STR_LEN("input"), &input_text);
+    let instr_text = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_node_text(body, STR_PTR("instructions"), STR_LEN("instructions"), &instr_text);
+    let prompt = FaText { bytes: [0u8; 262144], len: 0 };
+    responsesInputToPrompt(fa_text_ptr(&input_text), input_text.len, fa_text_ptr(&instr_text), instr_text.len, &prompt);
+    if prompt.len == 0 {
+        fa_free_doc(body);
+        return fa_fail(security, STR_PTR("input 为空或无文本内容"), STR_LEN("input 为空或无文本内容"), 400, STR_PTR("invalid_request_error"), STR_LEN("invalid_request_error"), out_resp);
+    };
+    let inv_doc: u64 = 0;
+    let inv_err = FaStr { bytes: [0u8; 4096], len: 0 };
+    if fa_host_list_inventory(&inv_doc, &inv_err) != 0 {
+        fa_free_doc(body);
+        fa_inventory_fail(security, &inv_err, out_resp);
+        return 1;
+    };
+    let parse_inv: u64 = 0;
+    let parse_count: u64 = 0;
+    toParseInventory(inv_doc, &parse_inv, &parse_count);
+    let route = ForwardRoute {
+        cliBackend: [0u8; 64], cliBackend_len: 0,
+        providerId: [0u8; 256], providerId_len: 0,
+        groupId: [0u8; 256], groupId_len: 0,
+        model: [0u8; 1024], model_len: 0,
+    };
+    let merr = ForwardModelError {
+        code: 0,
+        message: [0u8; 2048], message_len: 0,
+        name: [0u8; 32], name_len: 0,
+    };
+    let threw = false;
+    let mp: ptr = fa_text_ptr(&model_t);
+    parseForwardModelId(mp, model_t.len, parse_inv, &route, &merr, &threw);
+    if threw {
+        let ep: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ep, &merr.message, 0);
+        let code = merr.code;
+        let elen = merr.message_len;
+        fa_free_doc(body);
+        if code == 5 {
+            return fa_fail(security, ep, elen, 400, STR_PTR("loopback_not_allowed"), STR_LEN("loopback_not_allowed"), out_resp);
+        };
+        return fa_fail(security, ep, elen, 404, STR_PTR("model_not_found"), STR_LEN("model_not_found"), out_resp);
+    };
+    let limit: i64 = 4;
+    if deps.maxConcurrent > 0 { limit = deps.maxConcurrent; };
+    if !fa_acquire_slot(limit) {
+        let lv = FaStr { bytes: [0u8; 4096], len: 0 };
+        fa_itoa(limit, &lv);
+        let msg = FaText { bytes: [0u8; 262144], len: 0 };
+        fa_push(&msg, STR_PTR("转发并发已满 ("), STR_LEN("转发并发已满 ("));
+        fa_push(&msg, fa_str_ptr(&lv), lv.len);
+        fa_push(&msg, STR_PTR(" 路), 请稍后重试"), STR_LEN(" 路), 请稍后重试"));
+        fa_free_doc(body);
+        return fa_fail(security, fa_text_ptr(&msg), msg.len, 429, STR_PTR("rate_limit_error"), STR_LEN("rate_limit_error"), out_resp);
+    };
+    let bridge = ForwardBridge { handle: 0, resp: [0u8; 262144], resp_len: 0, err: [0u8; 1024], err_len: 0 };
+    let berr = FaStr { bytes: [0u8; 4096], len: 0 };
+    let bmode = fa_host_get_bridge(&bridge, &berr);
+    let cli_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cli_p, &route.cliBackend, 0);
+    if bmode == 2 {
+        fa_release_slot();
+        let msg = FaText { bytes: [0u8; 262144], len: 0 };
+        fa_push(&msg, STR_PTR("CLI 后端不可用 ("), STR_LEN("CLI 后端不可用 ("));
+        fa_push(&msg, cli_p, route.cliBackend_len);
+        fa_push(&msg, STR_PTR("): "), STR_LEN("): "));
+        fa_push(&msg, fa_str_ptr(&berr), berr.len);
+        fa_free_doc(body);
+        return fa_fail(security, fa_text_ptr(&msg), msg.len, 502, STR_PTR("server_error"), STR_LEN("server_error"), out_resp);
+    };
+    if bmode == 1 {
+        fa_release_slot();
+        let msg = FaText { bytes: [0u8; 262144], len: 0 };
+        fa_push(&msg, STR_PTR("CLI 后端未启用: "), STR_LEN("CLI 后端未启用: "));
+        fa_push(&msg, cli_p, route.cliBackend_len);
+        fa_free_doc(body);
+        return fa_fail(security, fa_text_ptr(&msg), msg.len, 502, STR_PTR("server_error"), STR_LEN("server_error"), out_resp);
+    };
+    // promptTokens over the full original input+instructions
+    let pt_in: i64 = 0;
+    let pt_out: i64 = 0;
+    let pt_tot: i64 = 0;
+    forwardResponsesUsage(fa_text_ptr(&input_text), input_text.len, fa_text_ptr(&instr_text), instr_text.len, STR_PTR(""), STR_LEN(""), &pt_in, &pt_out, &pt_tot);
+    // run fields
+    let i: u64 = 0;
+    while i < model_t.len { if i < 512 { out_run.modelId[i] = fa_byte(mp, i); }; i = i + 1; }
+    out_run.modelId_len = model_t.len;
+    let rdoc = fa_new_obj();
+    sa_json_object_set_string(rdoc, STR_PTR("cliBackend"), STR_LEN("cliBackend"), cli_p, route.cliBackend_len);
+    let pp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pp, &route.providerId, 0);
+    sa_json_object_set_string(rdoc, STR_PTR("providerId"), STR_LEN("providerId"), pp, route.providerId_len);
+    let gp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(gp, &route.groupId, 0);
+    sa_json_object_set_string(rdoc, STR_PTR("groupId"), STR_LEN("groupId"), gp, route.groupId_len);
+    let mop: ptr = PTR_NULL();
+    PTR_BYTE_ADD(mop, &route.model, 0);
+    sa_json_object_set_string(rdoc, STR_PTR("model"), STR_LEN("model"), mop, route.model_len);
+    let rtext = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_stringify_into(rdoc, &rtext);
+    fa_free_doc(rdoc);
+    i = 0;
+    let rp: ptr = fa_text_ptr(&rtext);
+    while i < rtext.len { if i < 4096 { out_run.route_json[i] = fa_byte(rp, i); }; i = i + 1; }
+    out_run.route_json_len = rtext.len;
+    out_run.bridge_id = bridge.handle;
+    i = 0;
+    let prp: ptr = fa_text_ptr(&prompt);
+    while i < prompt.len { if i < 262144 { out_run.prompt[i] = fa_byte(prp, i); }; i = i + 1; }
+    out_run.prompt_len = prompt.len;
+    out_run.limit = limit;
+    out_run.promptTokens = pt_in;
+    // restore (instructions key always present in the TS restore object)
+    out_run.restore.has_instructions = true;
+    let ins_node = fa_get(body, STR_PTR("instructions"), STR_LEN("instructions"));
+    let ins_text = FaText { bytes: [0u8; 262144], len: 0 };
+    if ins_node != 0 {
+        let sink1 = fa_stringify_into(ins_node, &ins_text);
+    } else {
+        fa_push(&ins_text, STR_PTR("null"), STR_LEN("null"));
+    };
+    i = 0;
+    let isp: ptr = fa_text_ptr(&ins_text);
+    while i < ins_text.len { if i < 65536 { out_run.restore.instructions_json[i] = fa_byte(isp, i); }; i = i + 1; }
+    out_run.restore.instructions_json_len = ins_text.len;
+    let tools_node = fa_get(body, STR_PTR("tools"), STR_LEN("tools"));
+    let tools_text = FaText { bytes: [0u8; 262144], len: 0 };
+    if tools_node != 0 {
+        let sink2 = fa_stringify_into(tools_node, &tools_text);
+    } else {
+        fa_push(&tools_text, STR_PTR("[]"), STR_LEN("[]"));
+    };
+    i = 0;
+    let tsp: ptr = fa_text_ptr(&tools_text);
+    while i < tools_text.len { if i < 65536 { out_run.restore.tools_json[i] = fa_byte(tsp, i); }; i = i + 1; }
+    out_run.restore.tools_json_len = tools_text.len;
+    let tc_node = fa_get(body, STR_PTR("tool_choice"), STR_LEN("tool_choice"));
+    let tc_text = FaText { bytes: [0u8; 262144], len: 0 };
+    if tc_node != 0 {
+        let sink3 = fa_stringify_into(tc_node, &tc_text);
+    } else {
+        fa_push(&tc_text, STR_PTR("\"auto\""), STR_LEN("\"auto\""));
+    };
+    i = 0;
+    let tcp: ptr = fa_text_ptr(&tc_text);
+    while i < tc_text.len { if i < 4096 { out_run.restore.tool_choice_json[i] = fa_byte(tcp, i); }; i = i + 1; }
+    out_run.restore.tool_choice_json_len = tc_text.len;
+    out_run.restore.has_parallel = true;
+    out_run.restore.parallel_tool_calls = false;
+    let par_node = fa_get(body, STR_PTR("parallel_tool_calls"), STR_LEN("parallel_tool_calls"));
+    if par_node != 0 {
+        if sa_json_kind(par_node) == 1 {
+            let pv: bool = false;
+            if sa_json_as_bool(par_node, &pv) == 0 { out_run.restore.parallel_tool_calls = pv; };
+        };
+    };
+    // echo
+    i = 0;
+    let eip: ptr = fa_text_ptr(&input_text);
+    if input_text.len == 0 {
+        out_run.echo_input_json[0] = 34;
+        out_run.echo_input_json[1] = 34;
+        out_run.echo_input_json_len = 2;
+    } else {
+        while i < input_text.len { if i < 65536 { out_run.echo_input_json[i] = fa_byte(eip, i); }; i = i + 1; }
+        out_run.echo_input_json_len = input_text.len;
+    };
+    i = 0;
+    let enp: ptr = fa_text_ptr(&ins_text);
+    while i < ins_text.len { if i < 65536 { out_run.echo_instructions_json[i] = fa_byte(enp, i); }; i = i + 1; }
+    out_run.echo_instructions_json_len = ins_text.len;
+    let stream_node = fa_get(body, STR_PTR("stream"), STR_LEN("stream"));
+    *out_stream = false;
+    if stream_node != 0 {
+        if sa_json_kind(stream_node) == 1 {
+            let sv: bool = false;
+            if sa_json_as_bool(stream_node, &sv) == 0 { *out_stream = sv; };
+        };
+    };
+    fa_free_doc(body);
     return 0;
+}
+
+// Build the forward_echo object text {input, instructions} from raw parts.
+fn fa_echo_text(input_p: ptr, input_l: u64, instr_p: ptr, instr_l: u64, out: &FaText) -> void {
+    out.len = 0;
+    fa_push(out, STR_PTR("{\"input\":"), STR_LEN("{\"input\":"));
+    fa_push(out, input_p, input_l);
+    fa_push(out, STR_PTR(",\"instructions\":"), STR_LEN(",\"instructions\":"));
+    fa_push(out, instr_p, instr_l);
+    fa_push(out, STR_PTR("}"), STR_LEN("}"));
+}
+
+fn fa_run_field_ptr(r: &ForwardResponsesRun, which: u64) -> ptr {
+    let p: ptr = PTR_NULL();
+    if which == 0 {
+        PTR_BYTE_ADD(p, &r.modelId, 0);
+    } else if which == 1 {
+        PTR_BYTE_ADD(p, &r.route_json, 0);
+    } else if which == 2 {
+        PTR_BYTE_ADD(p, &r.prompt, 0);
+    } else if which == 3 {
+        PTR_BYTE_ADD(p, &r.echo_input_json, 0);
+    } else {
+        PTR_BYTE_ADD(p, &r.echo_instructions_json, 0);
+    };
+    return p;
+}
+
+fn fa_result_text(result: &ForwardTurnResult, out: &FaText) -> void {
+    out.len = 0;
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &result.text, 0);
+    fa_push(out, p, result.text_len);
+}
+
+fn handleForwardResponsesRequest(req: &Request, url: &Url, security: &Headers, deps: &ForwardChatDeps, out: &Response) -> i32 {
+    if !fa_method_is(req, STR_PTR("POST"), STR_LEN("POST")) {
+        return fa_forward_error_default(STR_PTR("Only POST /v1/responses is supported"), STR_LEN("Only POST /v1/responses is supported"), 405, security, out);
+    };
+    if !deps.sharingEnabled { return forwardSharingDisabled(security, out); };
+    let bp: ptr = fa_req_body_ptr(req);
+    let body = fa_parse(bp, req.body_len);
+    if body == 0 {
+        return fa_forward_error_default(STR_PTR("Invalid JSON body"), STR_LEN("Invalid JSON body"), 400, security, out);
+    };
+    fa_free_doc(body);
+    let run = ForwardResponsesRun {
+        modelId: [0u8; 512], modelId_len: 0,
+        route_json: [0u8; 4096], route_json_len: 0,
+        bridge_id: 0,
+        prompt: [0u8; 262144], prompt_len: 0,
+        limit: 0, promptTokens: 0,
+        restore: ForwardResponseRestore { instructions_json: [0u8; 65536], instructions_json_len: 0, has_instructions: false, tools_json: [0u8; 65536], tools_json_len: 0, tool_choice_json: [0u8; 4096], tool_choice_json_len: 0, parallel_tool_calls: false, has_parallel: false },
+        echo_input_json: [0u8; 65536], echo_input_json_len: 0,
+        echo_instructions_json: [0u8; 65536], echo_instructions_json_len: 0,
+    };
+    let stream = false;
+    let rc = resolveForwardResponsesRun(req, security, deps, bp, req.body_len, &run, &stream, out);
+    if rc != 0 { return 0; };
+    if stream { return forwardResponsesStream(req, security, deps, &run, out); };
+    let result = ForwardTurnResult {
+        route: [0u8; 1024], route_len: 0,
+        thread_id: [0u8; 256], thread_id_len: 0,
+        turn_id: [0u8; 256], turn_id_len: 0,
+        text: [0u8; 262144], text_len: 0,
+        finish_reason: 0, has_error: false,
+        error: [0u8; 2048], error_len: 0,
+        duration_ms: 0,
+        err: [0u8; 1024], err_len: 0,
+    };
+    let trc = fa_run_turn(run.bridge_id, fa_run_field_ptr(&run, 1), run.route_json_len, fa_run_field_ptr(&run, 2), run.prompt_len, deps, req, &result);
+    if trc != 0 {
+        fa_release_slot();
+        let em = FaStr { bytes: [0u8; 4096], len: 0 };
+        fa_turn_throw_msg(&result, &em);
+        let msg = FaText { bytes: [0u8; 262144], len: 0 };
+        fa_push(&msg, STR_PTR("forward turn 启动失败: "), STR_LEN("forward turn 启动失败: "));
+        fa_push(&msg, fa_str_ptr(&em), em.len);
+        return forwardError(fa_text_ptr(&msg), msg.len, 502, security, STR_PTR("server_error"), STR_LEN("server_error"), out);
+    };
+    fa_release_slot();
+    if result.finish_reason != 0 { return fa_finish_fail(&result, security, out); };
+    let text = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_result_text(&result, &text);
+    // usage over the original body input/instructions
+    let body_doc = fa_parse(bp, req.body_len);
+    let in_text = FaText { bytes: [0u8; 262144], len: 0 };
+    let ins_text = FaText { bytes: [0u8; 262144], len: 0 };
+    if body_doc != 0 {
+        fa_node_text(body_doc, STR_PTR("input"), STR_LEN("input"), &in_text);
+        fa_node_text(body_doc, STR_PTR("instructions"), STR_LEN("instructions"), &ins_text);
+        fa_free_doc(body_doc);
+    };
+    let ui: i64 = 0;
+    let uo: i64 = 0;
+    let ut: i64 = 0;
+    forwardResponsesUsage(fa_text_ptr(&in_text), in_text.len, fa_text_ptr(&ins_text), ins_text.len, fa_text_ptr(&text), text.len, &ui, &uo, &ut);
+    let usage_text = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_usage_json3(STR_PTR("input_tokens"), STR_LEN("input_tokens"), ui, STR_PTR("output_tokens"), STR_LEN("output_tokens"), uo, ut, &usage_text);
+    let echo = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_echo_text(fa_run_field_ptr(&run, 3), run.echo_input_json_len, fa_run_field_ptr(&run, 4), run.echo_instructions_json_len, &echo);
+    let obj = FaText { bytes: [0u8; 262144], len: 0 };
+    forwardResponseObject(fa_run_field_ptr(&run, 0), run.modelId_len, fa_text_ptr(&text), text.len, true, fa_text_ptr(&usage_text), usage_text.len, true, &run.restore, true, fa_text_ptr(&echo), echo.len, true, &obj);
+    return forwardJson(fa_text_ptr(&obj), obj.len, 200, security, out);
+}
+
+// ---------------------------------------------------------------------------
+// Sequential SSE streams (see header for the model).
+// ---------------------------------------------------------------------------
+
+fn fa_sse_headers(out: &Response, security: &Headers) -> void {
+    out.status = 200;
+    out.is_stream = true;
+    out.body_len = 0;
+    fa_headers_copy(&out.headers, security);
+    fa_header_set(&out.headers, STR_PTR("Content-Type"), STR_LEN("Content-Type"), STR_PTR("text/event-stream; charset=utf-8"), STR_LEN("text/event-stream; charset=utf-8"));
+    fa_header_set(&out.headers, STR_PTR("Cache-Control"), STR_LEN("Cache-Control"), STR_PTR("no-cache"), STR_LEN("no-cache"));
+    fa_header_set(&out.headers, STR_PTR("Connection"), STR_LEN("Connection"), STR_PTR("keep-alive"), STR_LEN("keep-alive"));
+}
+
+fn fa_sse_envelope(out: &Response, seq: &u64, type_p: ptr, type_l: u64, extra_p: ptr, extra_l: u64) -> void {
+    let seq_now = *seq;
+    *seq = seq_now + 1;
+    let sv = FaStr { bytes: [0u8; 4096], len: 0 };
+    fa_itoa((*seq) as i64, &sv);
+    fa_resp_append(out, STR_PTR("event: "), STR_LEN("event: "));
+    fa_resp_append(out, type_p, type_l);
+    fa_resp_append(out, STR_PTR("\ndata: {\"type\":\""), STR_LEN("\ndata: {\"type\":\""));
+    fa_resp_append(out, type_p, type_l);
+    fa_resp_append(out, STR_PTR("\",\"sequence_number\":"), STR_LEN("\",\"sequence_number\":"));
+    fa_resp_append(out, fa_str_ptr(&sv), sv.len);
+    if extra_l > 2 {
+        // strip the outer braces of the extra object and splice its fields
+        let ip: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ip, extra_p, 1);
+        fa_resp_append(out, STR_PTR(","), STR_LEN(","));
+        fa_resp_append(out, ip, extra_l - 2);
+    };
+    fa_resp_append(out, STR_PTR("}\n\n"), STR_LEN("}\n\n"));
+}
+
+fn fa_sse_done(out: &Response) -> void {
+    fa_resp_append(out, STR_PTR("data: [DONE]\n\n"), STR_LEN("data: [DONE]\n\n"));
+}
+
+fn forwardResponsesStream(req: &Request, security: &Headers, deps: &ForwardChatDeps, run: &ForwardResponsesRun, out: &Response) -> i32 {
+    fa_sse_headers(out, security);
+    let id = FaStr { bytes: [0u8; 4096], len: 0 };
+    forwardResponseId(&id);
+    let ip: ptr = fa_str_ptr(&id);
+    let created = (fa_now_ms() / 1000) as i64;
+    let seq: u64 = 0;
+    // response.created
+    let created_doc = fa_new_obj();
+    let cresp = fa_new_obj();
+    sa_json_object_set_string(cresp, STR_PTR("id"), STR_LEN("id"), ip, id.len);
+    sa_json_object_set_string(cresp, STR_PTR("object"), STR_LEN("object"), STR_PTR("response"), STR_LEN("response"));
+    sa_json_object_set_i64(cresp, STR_PTR("created_at"), STR_LEN("created_at"), created);
+    sa_json_object_set_string(cresp, STR_PTR("model"), STR_LEN("model"), fa_run_field_ptr(run, 0), run.modelId_len);
+    sa_json_object_set_string(cresp, STR_PTR("status"), STR_LEN("status"), STR_PTR("in_progress"), STR_LEN("in_progress"));
+    let cempty = fa_new_arr();
+    sa_json_object_set_node(cresp, STR_PTR("output"), STR_LEN("output"), cempty);
+    fa_free_doc(cempty);
+    sa_json_object_set_node(created_doc, STR_PTR("response"), STR_LEN("response"), cresp);
+    fa_free_doc(cresp);
+    let ctext = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_stringify_into(created_doc, &ctext);
+    fa_free_doc(created_doc);
+    fa_sse_envelope(out, &seq, STR_PTR("response.created"), STR_LEN("response.created"), fa_text_ptr(&ctext), ctext.len);
+    // run the turn (sequential: no interleaved deltas from the provider)
+    let result = ForwardTurnResult {
+        route: [0u8; 1024], route_len: 0,
+        thread_id: [0u8; 256], thread_id_len: 0,
+        turn_id: [0u8; 256], turn_id_len: 0,
+        text: [0u8; 262144], text_len: 0,
+        finish_reason: 0, has_error: false,
+        error: [0u8; 2048], error_len: 0,
+        duration_ms: 0,
+        err: [0u8; 1024], err_len: 0,
+    };
+    let trc = fa_run_turn(run.bridge_id, fa_run_field_ptr(run, 1), run.route_json_len, fa_run_field_ptr(run, 2), run.prompt_len, deps, req, &result);
+    let text = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_result_text(&result, &text);
+    if trc == 0 && result.finish_reason == 0 {
+        if text.len > 0 {
+            let ddoc = fa_new_obj();
+            let mid = FaStr { bytes: [0u8; 4096], len: 0 };
+            fa_push_str(&mid, ip, id.len);
+            fa_push_str(&mid, STR_PTR("-msg-0"), STR_LEN("-msg-0"));
+            sa_json_object_set_string(ddoc, STR_PTR("item_id"), STR_LEN("item_id"), fa_str_ptr(&mid), mid.len);
+            sa_json_object_set_i64(ddoc, STR_PTR("output_index"), STR_LEN("output_index"), 0);
+            sa_json_object_set_string(ddoc, STR_PTR("delta"), STR_LEN("delta"), fa_text_ptr(&text), text.len);
+            let dtext = FaText { bytes: [0u8; 262144], len: 0 };
+            fa_stringify_into(ddoc, &dtext);
+            fa_free_doc(ddoc);
+            fa_sse_envelope(out, &seq, STR_PTR("response.output_text.delta"), STR_LEN("response.output_text.delta"), fa_text_ptr(&dtext), dtext.len);
+        };
+        let out_tokens = estimateForwardTokens(fa_text_ptr(&text), text.len);
+        let usage_text = FaText { bytes: [0u8; 262144], len: 0 };
+        fa_usage_json3(STR_PTR("input_tokens"), STR_LEN("input_tokens"), run.promptTokens, STR_PTR("output_tokens"), STR_LEN("output_tokens"), out_tokens, run.promptTokens + out_tokens, &usage_text);
+        let echo = FaText { bytes: [0u8; 262144], len: 0 };
+        fa_echo_text(fa_run_field_ptr(run, 3), run.echo_input_json_len, fa_run_field_ptr(run, 4), run.echo_instructions_json_len, &echo);
+        let obj = FaText { bytes: [0u8; 262144], len: 0 };
+        forwardResponseObject(fa_run_field_ptr(run, 0), run.modelId_len, fa_text_ptr(&text), text.len, true, fa_text_ptr(&usage_text), usage_text.len, true, &run.restore, true, fa_text_ptr(&echo), echo.len, true, &obj);
+        let wdoc = fa_new_obj();
+        fa_set_json_text(wdoc, STR_PTR("response"), STR_LEN("response"), fa_text_ptr(&obj), obj.len);
+        let wtext = FaText { bytes: [0u8; 262144], len: 0 };
+        fa_stringify_into(wdoc, &wtext);
+        fa_free_doc(wdoc);
+        fa_sse_envelope(out, &seq, STR_PTR("response.completed"), STR_LEN("response.completed"), fa_text_ptr(&wtext), wtext.len);
+    } else {
+        let emsg = FaText { bytes: [0u8; 262144], len: 0 };
+        if trc != 0 {
+            let em = FaStr { bytes: [0u8; 4096], len: 0 };
+            fa_turn_throw_msg(&result, &em);
+            fa_push(&emsg, fa_str_ptr(&em), em.len);
+        } else if result.has_error && result.error_len > 0 {
+            let ep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep, &result.error, 0);
+            fa_push(&emsg, ep, result.error_len);
+        } else {
+            let rp: ptr = STR_PTR("");
+            let rl: u64 = 0;
+            fa_reason_name(result.finish_reason, &rp, &rl);
+            fa_push(&emsg, rp, rl);
+        };
+        let fdoc = fa_new_obj();
+        let fresp = fa_new_obj();
+        sa_json_object_set_string(fresp, STR_PTR("id"), STR_LEN("id"), ip, id.len);
+        sa_json_object_set_string(fresp, STR_PTR("object"), STR_LEN("object"), STR_PTR("response"), STR_LEN("response"));
+        sa_json_object_set_i64(fresp, STR_PTR("created_at"), STR_LEN("created_at"), created);
+        sa_json_object_set_string(fresp, STR_PTR("model"), STR_LEN("model"), fa_run_field_ptr(run, 0), run.modelId_len);
+        sa_json_object_set_string(fresp, STR_PTR("status"), STR_LEN("status"), STR_PTR("failed"), STR_LEN("failed"));
+        let fempty = fa_new_arr();
+        sa_json_object_set_node(fresp, STR_PTR("output"), STR_LEN("output"), fempty);
+        fa_free_doc(fempty);
+        let ferr = fa_new_obj();
+        sa_json_object_set_string(ferr, STR_PTR("message"), STR_LEN("message"), fa_text_ptr(&emsg), emsg.len);
+        sa_json_object_set_node(fresp, STR_PTR("error"), STR_LEN("error"), ferr);
+        fa_free_doc(ferr);
+        sa_json_object_set_node(fdoc, STR_PTR("response"), STR_LEN("response"), fresp);
+        fa_free_doc(fresp);
+        let ftext = FaText { bytes: [0u8; 262144], len: 0 };
+        fa_stringify_into(fdoc, &ftext);
+        fa_free_doc(fdoc);
+        fa_sse_envelope(out, &seq, STR_PTR("response.failed"), STR_LEN("response.failed"), fa_text_ptr(&ftext), ftext.len);
+    };
+    fa_sse_done(out);
+    fa_release_slot();
+    return 0;
+}
+
+fn sseChunk(payload_json_ptr: ptr, payload_json_len: u64, out: &FaText) -> u64 {
+    out.len = 0;
+    fa_push(out, STR_PTR("data: "), STR_LEN("data: "));
+    fa_push(out, payload_json_ptr, payload_json_len);
+    fa_push(out, STR_PTR("\n\n"), STR_LEN("\n\n"));
+    return out.len;
+}
+
+// One chat.completion.chunk appended to the response body.
+fn fa_chat_chunk(out: &Response, id_p: ptr, id_l: u64, created: i64, model_p: ptr, model_l: u64, delta_json_p: ptr, delta_json_l: u64, has_finish: bool, finish_p: ptr, finish_l: u64, echo_json_p: ptr, echo_json_l: u64, has_echo: bool) -> void {
+    let root = fa_new_obj();
+    sa_json_object_set_string(root, STR_PTR("id"), STR_LEN("id"), id_p, id_l);
+    sa_json_object_set_string(root, STR_PTR("object"), STR_LEN("object"), STR_PTR("chat.completion.chunk"), STR_LEN("chat.completion.chunk"));
+    sa_json_object_set_i64(root, STR_PTR("created"), STR_LEN("created"), created);
+    sa_json_object_set_string(root, STR_PTR("model"), STR_LEN("model"), model_p, model_l);
+    let choices = fa_new_arr();
+    let choice = fa_new_obj();
+    sa_json_object_set_i64(choice, STR_PTR("index"), STR_LEN("index"), 0);
+    fa_set_json_text(choice, STR_PTR("delta"), STR_LEN("delta"), delta_json_p, delta_json_l);
+    if has_finish {
+        sa_json_object_set_string(choice, STR_PTR("finish_reason"), STR_LEN("finish_reason"), finish_p, finish_l);
+    } else {
+        sa_json_object_set_null(choice, STR_PTR("finish_reason"), STR_LEN("finish_reason"));
+    };
+    sa_json_array_push_node(choices, choice);
+    fa_free_doc(choice);
+    sa_json_object_set_node(root, STR_PTR("choices"), STR_LEN("choices"), choices);
+    fa_free_doc(choices);
+    if has_echo {
+        fa_set_json_text(root, STR_PTR("forward_echo"), STR_LEN("forward_echo"), echo_json_p, echo_json_l);
+    };
+    let text = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_stringify_into(root, &text);
+    fa_free_doc(root);
+    let chunk = FaText { bytes: [0u8; 262144], len: 0 };
+    sseChunk(fa_text_ptr(&text), text.len, &chunk);
+    fa_resp_append(out, fa_text_ptr(&chunk), chunk.len);
+}
+
+fn fa_stream_field_ptr(r: &ForwardStreamRun, which: u64) -> ptr {
+    let p: ptr = PTR_NULL();
+    if which == 0 {
+        PTR_BYTE_ADD(p, &r.modelId, 0);
+    } else if which == 1 {
+        PTR_BYTE_ADD(p, &r.route_json, 0);
+    } else if which == 2 {
+        PTR_BYTE_ADD(p, &r.prompt, 0);
+    } else {
+        PTR_BYTE_ADD(p, &r.echoMessages_json, 0);
+    };
+    return p;
+}
+
+fn forwardChatStream(req: &Request, security: &Headers, deps: &ForwardChatDeps, run: &ForwardStreamRun, out: &Response) -> i32 {
+    fa_sse_headers(out, security);
+    let created = (fa_now_ms() / 1000) as i64;
+    let cid = FaStr { bytes: [0u8; 4096], len: 0 };
+    forwardCompletionId(&cid);
+    let cip: ptr = fa_str_ptr(&cid);
+    let mp: ptr = fa_stream_field_ptr(run, 0);
+    fa_chat_chunk(out, cip, cid.len, created, mp, run.modelId_len, STR_PTR("{\"role\":\"assistant\"}"), STR_LEN("{\"role\":\"assistant\"}"), false, STR_PTR(""), STR_LEN(""), STR_PTR(""), STR_LEN(""), false);
+    let result = ForwardTurnResult {
+        route: [0u8; 1024], route_len: 0,
+        thread_id: [0u8; 256], thread_id_len: 0,
+        turn_id: [0u8; 256], turn_id_len: 0,
+        text: [0u8; 262144], text_len: 0,
+        finish_reason: 0, has_error: false,
+        error: [0u8; 2048], error_len: 0,
+        duration_ms: 0,
+        err: [0u8; 1024], err_len: 0,
+    };
+    let trc = fa_run_turn(run.bridge_id, fa_stream_field_ptr(run, 1), run.route_json_len, fa_stream_field_ptr(run, 2), run.prompt_len, deps, req, &result);
+    let text = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_result_text(&result, &text);
+    // echo object {messages: [...]} reused by the stop and usage chunks
+    let echo = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_push(&echo, STR_PTR("{\"messages\":"), STR_LEN("{\"messages\":"));
+    fa_push(&echo, fa_stream_field_ptr(run, 3), run.echoMessages_json_len);
+    fa_push(&echo, STR_PTR("}"), STR_LEN("}"));
+    if trc == 0 && result.finish_reason == 0 {
+        if text.len > 0 {
+            let ddoc = fa_new_obj();
+            sa_json_object_set_string(ddoc, STR_PTR("content"), STR_LEN("content"), fa_text_ptr(&text), text.len);
+            let dtext = FaText { bytes: [0u8; 262144], len: 0 };
+            fa_stringify_into(ddoc, &dtext);
+            fa_free_doc(ddoc);
+            fa_chat_chunk(out, cip, cid.len, created, mp, run.modelId_len, fa_text_ptr(&dtext), dtext.len, false, STR_PTR(""), STR_LEN(""), STR_PTR(""), STR_LEN(""), false);
+        };
+        fa_chat_chunk(out, cip, cid.len, created, mp, run.modelId_len, STR_PTR("{}"), STR_LEN("{}"), true, STR_PTR("stop"), STR_LEN("stop"), fa_text_ptr(&echo), echo.len, true);
+        if run.includeUsage {
+            let ct = estimateForwardTokens(fa_text_ptr(&text), text.len);
+            let uroot = fa_new_obj();
+            sa_json_object_set_string(uroot, STR_PTR("id"), STR_LEN("id"), cip, cid.len);
+            sa_json_object_set_string(uroot, STR_PTR("object"), STR_LEN("object"), STR_PTR("chat.completion.chunk"), STR_LEN("chat.completion.chunk"));
+            sa_json_object_set_i64(uroot, STR_PTR("created"), STR_LEN("created"), created);
+            sa_json_object_set_string(uroot, STR_PTR("model"), STR_LEN("model"), mp, run.modelId_len);
+            let nochoices = fa_new_arr();
+            sa_json_object_set_node(uroot, STR_PTR("choices"), STR_LEN("choices"), nochoices);
+            fa_free_doc(nochoices);
+            let usage = fa_new_obj();
+            sa_json_object_set_i64(usage, STR_PTR("prompt_tokens"), STR_LEN("prompt_tokens"), run.promptTokens);
+            sa_json_object_set_i64(usage, STR_PTR("completion_tokens"), STR_LEN("completion_tokens"), ct);
+            sa_json_object_set_i64(usage, STR_PTR("total_tokens"), STR_LEN("total_tokens"), run.promptTokens + ct);
+            sa_json_object_set_node(uroot, STR_PTR("usage"), STR_LEN("usage"), usage);
+            fa_free_doc(usage);
+            fa_set_json_text(uroot, STR_PTR("forward_echo"), STR_LEN("forward_echo"), fa_text_ptr(&echo), echo.len);
+            let utext = FaText { bytes: [0u8; 262144], len: 0 };
+            fa_stringify_into(uroot, &utext);
+            fa_free_doc(uroot);
+            let chunk = FaText { bytes: [0u8; 262144], len: 0 };
+            sseChunk(fa_text_ptr(&utext), utext.len, &chunk);
+            fa_resp_append(out, fa_text_ptr(&chunk), chunk.len);
+        };
+    } else {
+        let emsg = FaText { bytes: [0u8; 262144], len: 0 };
+        let etype = STR_PTR("server_error");
+        let etype_l = STR_LEN("server_error");
+        if trc != 0 {
+            let em = FaStr { bytes: [0u8; 4096], len: 0 };
+            fa_turn_throw_msg(&result, &em);
+            fa_push(&emsg, fa_str_ptr(&em), em.len);
+        } else if result.has_error && result.error_len > 0 {
+            let ep: ptr = PTR_NULL();
+            PTR_BYTE_ADD(ep, &result.error, 0);
+            fa_push(&emsg, ep, result.error_len);
+            if result.finish_reason == 3 { etype = STR_PTR("timeout_error"); etype_l = STR_LEN("timeout_error"); };
+        } else {
+            let rp: ptr = STR_PTR("");
+            let rl: u64 = 0;
+            fa_reason_name(result.finish_reason, &rp, &rl);
+            fa_push(&emsg, rp, rl);
+            if result.finish_reason == 3 { etype = STR_PTR("timeout_error"); etype_l = STR_LEN("timeout_error"); };
+        };
+        let edoc = fa_new_obj();
+        let eerr = fa_new_obj();
+        sa_json_object_set_string(eerr, STR_PTR("message"), STR_LEN("message"), fa_text_ptr(&emsg), emsg.len);
+        sa_json_object_set_string(eerr, STR_PTR("type"), STR_LEN("type"), etype, etype_l);
+        sa_json_object_set_node(edoc, STR_PTR("error"), STR_LEN("error"), eerr);
+        fa_free_doc(eerr);
+        let etext = FaText { bytes: [0u8; 262144], len: 0 };
+        fa_stringify_into(edoc, &etext);
+        fa_free_doc(edoc);
+        let chunk = FaText { bytes: [0u8; 262144], len: 0 };
+        sseChunk(fa_text_ptr(&etext), etext.len, &chunk);
+        fa_resp_append(out, fa_text_ptr(&chunk), chunk.len);
+    };
+    fa_sse_done(out);
+    fa_release_slot();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// handleForwardChatRequest: the TS ladder duplicated in source order
+// (credential check precedes body parsing here, unlike responses).
+// ---------------------------------------------------------------------------
+
+fn handleForwardChatRequest(req: &Request, url: &Url, security: &Headers, deps: &ForwardChatDeps, out: &Response) -> i32 {
+    if !fa_method_is(req, STR_PTR("POST"), STR_LEN("POST")) {
+        return fa_forward_error_default(STR_PTR("Only POST /v1/chat/completions is supported"), STR_LEN("Only POST /v1/chat/completions is supported"), 405, security, out);
+    };
+    if !deps.sharingEnabled { return forwardSharingDisabled(security, out); };
+    let tp: ptr = fa_chat_token_ptr(deps);
+    if !resolveForwardCredential(req, deps.remoteAddress_ptr, deps.remoteAddress_len, deps.has_remote, tp, deps.forwardToken_len) {
+        return forwardError(STR_PTR("Invalid or missing forward API key"), STR_LEN("Invalid or missing forward API key"), 401, security, STR_PTR("authentication_error"), STR_LEN("authentication_error"), out);
+    };
+    let bp: ptr = fa_req_body_ptr(req);
+    let body = fa_parse(bp, req.body_len);
+    if body == 0 {
+        return fa_forward_error_default(STR_PTR("Invalid JSON body"), STR_LEN("Invalid JSON body"), 400, security, out);
+    };
+    let model_raw = FaStr { bytes: [0u8; 4096], len: 0 };
+    fa_node_string(body, STR_PTR("model"), STR_LEN("model"), &model_raw);
+    let model_t = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_trimmed(fa_str_ptr(&model_raw), model_raw.len, &model_t);
+    if model_t.len == 0 {
+        fa_free_doc(body);
+        return fa_forward_error_default(STR_PTR("model is required (format {cli}-{provider}-{group}-{model})"), STR_LEN("model is required (format {cli}-{provider}-{group}-{model})"), 400, security, out);
+    };
+    let messages_text = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_node_text(body, STR_PTR("messages"), STR_LEN("messages"), &messages_text);
+    let prompt = FaText { bytes: [0u8; 262144], len: 0 };
+    chatMessagesToPrompt(fa_text_ptr(&messages_text), messages_text.len, &prompt);
+    if prompt.len == 0 {
+        fa_free_doc(body);
+        return fa_forward_error_default(STR_PTR("messages 为空或无文本内容"), STR_LEN("messages 为空或无文本内容"), 400, security, out);
+    };
+    let inv_doc: u64 = 0;
+    let inv_err = FaStr { bytes: [0u8; 4096], len: 0 };
+    if fa_host_list_inventory(&inv_doc, &inv_err) != 0 {
+        fa_free_doc(body);
+        return fa_inventory_fail(security, &inv_err, out);
+    };
+    let parse_inv: u64 = 0;
+    let parse_count: u64 = 0;
+    toParseInventory(inv_doc, &parse_inv, &parse_count);
+    let route = ForwardRoute {
+        cliBackend: [0u8; 64], cliBackend_len: 0,
+        providerId: [0u8; 256], providerId_len: 0,
+        groupId: [0u8; 256], groupId_len: 0,
+        model: [0u8; 1024], model_len: 0,
+    };
+    let merr = ForwardModelError {
+        code: 0,
+        message: [0u8; 2048], message_len: 0,
+        name: [0u8; 32], name_len: 0,
+    };
+    let threw = false;
+    let mp: ptr = fa_text_ptr(&model_t);
+    parseForwardModelId(mp, model_t.len, parse_inv, &route, &merr, &threw);
+    if threw {
+        let ep: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ep, &merr.message, 0);
+        let code = merr.code;
+        let elen = merr.message_len;
+        fa_free_doc(body);
+        if code == 5 {
+            return fa_fail(security, ep, elen, 400, STR_PTR("loopback_not_allowed"), STR_LEN("loopback_not_allowed"), out);
+        };
+        return fa_fail(security, ep, elen, 404, STR_PTR("model_not_found"), STR_LEN("model_not_found"), out);
+    };
+    let limit: i64 = 4;
+    if deps.maxConcurrent > 0 { limit = deps.maxConcurrent; };
+    if !fa_acquire_slot(limit) {
+        let lv = FaStr { bytes: [0u8; 4096], len: 0 };
+        fa_itoa(limit, &lv);
+        let msg = FaText { bytes: [0u8; 262144], len: 0 };
+        fa_push(&msg, STR_PTR("转发并发已满 ("), STR_LEN("转发并发已满 ("));
+        fa_push(&msg, fa_str_ptr(&lv), lv.len);
+        fa_push(&msg, STR_PTR(" 路), 请稍后重试"), STR_LEN(" 路), 请稍后重试"));
+        fa_free_doc(body);
+        return fa_fail(security, fa_text_ptr(&msg), msg.len, 429, STR_PTR("rate_limit_error"), STR_LEN("rate_limit_error"), out);
+    };
+    let bridge = ForwardBridge { handle: 0, resp: [0u8; 262144], resp_len: 0, err: [0u8; 1024], err_len: 0 };
+    let berr = FaStr { bytes: [0u8; 4096], len: 0 };
+    let bmode = fa_host_get_bridge(&bridge, &berr);
+    let cli_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cli_p, &route.cliBackend, 0);
+    if bmode == 2 {
+        fa_release_slot();
+        let msg = FaText { bytes: [0u8; 262144], len: 0 };
+        fa_push(&msg, STR_PTR("CLI 后端不可用 ("), STR_LEN("CLI 后端不可用 ("));
+        fa_push(&msg, cli_p, route.cliBackend_len);
+        fa_push(&msg, STR_PTR("): "), STR_LEN("): "));
+        fa_push(&msg, fa_str_ptr(&berr), berr.len);
+        fa_free_doc(body);
+        return fa_fail(security, fa_text_ptr(&msg), msg.len, 502, STR_PTR("server_error"), STR_LEN("server_error"), out);
+    };
+    if bmode == 1 {
+        fa_release_slot();
+        let msg = FaText { bytes: [0u8; 262144], len: 0 };
+        fa_push(&msg, STR_PTR("CLI 后端未启用: "), STR_LEN("CLI 后端未启用: "));
+        fa_push(&msg, cli_p, route.cliBackend_len);
+        fa_free_doc(body);
+        return fa_fail(security, fa_text_ptr(&msg), msg.len, 502, STR_PTR("server_error"), STR_LEN("server_error"), out);
+    };
+    // route JSON shared by the stream and non-stream paths
+    let rdoc = fa_new_obj();
+    sa_json_object_set_string(rdoc, STR_PTR("cliBackend"), STR_LEN("cliBackend"), cli_p, route.cliBackend_len);
+    let pp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pp, &route.providerId, 0);
+    sa_json_object_set_string(rdoc, STR_PTR("providerId"), STR_LEN("providerId"), pp, route.providerId_len);
+    let gp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(gp, &route.groupId, 0);
+    sa_json_object_set_string(rdoc, STR_PTR("groupId"), STR_LEN("groupId"), gp, route.groupId_len);
+    let mop: ptr = PTR_NULL();
+    PTR_BYTE_ADD(mop, &route.model, 0);
+    sa_json_object_set_string(rdoc, STR_PTR("model"), STR_LEN("model"), mop, route.model_len);
+    let rtext = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_stringify_into(rdoc, &rtext);
+    fa_free_doc(rdoc);
+    // stream branch
+    let stream_node = fa_get(body, STR_PTR("stream"), STR_LEN("stream"));
+    let want_stream = false;
+    if stream_node != 0 {
+        if sa_json_kind(stream_node) == 1 {
+            let sv: bool = false;
+            if sa_json_as_bool(stream_node, &sv) == 0 { want_stream = sv; };
+        };
+    };
+    if want_stream {
+        let run = ForwardStreamRun {
+            modelId: [0u8; 512], modelId_len: 0,
+            route_json: [0u8; 4096], route_json_len: 0,
+            bridge_id: 0,
+            prompt: [0u8; 262144], prompt_len: 0,
+            limit: 0, promptTokens: 0, includeUsage: false,
+            echoMessages_json: [0u8; 262144], echoMessages_json_len: 0,
+        };
+        let i: u64 = 0;
+        while i < model_t.len { if i < 512 { run.modelId[i] = fa_byte(mp, i); }; i = i + 1; }
+        run.modelId_len = model_t.len;
+        i = 0;
+        let rp: ptr = fa_text_ptr(&rtext);
+        while i < rtext.len { if i < 4096 { run.route_json[i] = fa_byte(rp, i); }; i = i + 1; }
+        run.route_json_len = rtext.len;
+        run.bridge_id = bridge.handle;
+        i = 0;
+        let prp: ptr = fa_text_ptr(&prompt);
+        while i < prompt.len { run.prompt[i] = fa_byte(prp, i); i = i + 1; }
+        run.prompt_len = prompt.len;
+        run.limit = limit;
+        run.promptTokens = estimateForwardTokens(fa_text_ptr(&messages_text), messages_text.len);
+        let so = fa_get(body, STR_PTR("stream_options"), STR_LEN("stream_options"));
+        if so != 0 {
+            if sa_json_kind(so) == 7 {
+                let iu = fa_get(so, STR_PTR("include_usage"), STR_LEN("include_usage"));
+                if iu != 0 {
+                    if sa_json_kind(iu) == 1 {
+                        let iv: bool = false;
+                        if sa_json_as_bool(iu, &iv) == 0 { run.includeUsage = iv; };
+                    };
+                };
+            };
+        };
+        let msgs_node = fa_get(body, STR_PTR("messages"), STR_LEN("messages"));
+        let echo_text = FaText { bytes: [0u8; 262144], len: 0 };
+        if msgs_node != 0 && sa_json_kind(msgs_node) == 6 {
+            let sink4 = fa_stringify_into(msgs_node, &echo_text);
+        } else {
+            fa_push(&echo_text, STR_PTR("[]"), STR_LEN("[]"));
+        };
+        i = 0;
+        let etp: ptr = fa_text_ptr(&echo_text);
+        while i < echo_text.len { run.echoMessages_json[i] = fa_byte(etp, i); i = i + 1; }
+        run.echoMessages_json_len = echo_text.len;
+        fa_free_doc(body);
+        return forwardChatStream(req, security, deps, &run, out);
+    };
+    fa_free_doc(body);
+    let result = ForwardTurnResult {
+        route: [0u8; 1024], route_len: 0,
+        thread_id: [0u8; 256], thread_id_len: 0,
+        turn_id: [0u8; 256], turn_id_len: 0,
+        text: [0u8; 262144], text_len: 0,
+        finish_reason: 0, has_error: false,
+        error: [0u8; 2048], error_len: 0,
+        duration_ms: 0,
+        err: [0u8; 1024], err_len: 0,
+    };
+    let rp2: ptr = fa_text_ptr(&rtext);
+    let prp2: ptr = fa_text_ptr(&prompt);
+    let trc = fa_run_turn(bridge.handle, rp2, rtext.len, prp2, prompt.len, deps, req, &result);
+    if trc != 0 {
+        fa_release_slot();
+        let em = FaStr { bytes: [0u8; 4096], len: 0 };
+        fa_turn_throw_msg(&result, &em);
+        let msg = FaText { bytes: [0u8; 262144], len: 0 };
+        fa_push(&msg, STR_PTR("forward turn 启动失败: "), STR_LEN("forward turn 启动失败: "));
+        fa_push(&msg, fa_str_ptr(&em), em.len);
+        return forwardError(fa_text_ptr(&msg), msg.len, 502, security, STR_PTR("server_error"), STR_LEN("server_error"), out);
+    };
+    fa_release_slot();
+    if result.finish_reason != 0 { return fa_finish_fail(&result, security, out); };
+    let text = FaText { bytes: [0u8; 262144], len: 0 };
+    fa_result_text(&result, &text);
+    let obj = FaText { bytes: [0u8; 262144], len: 0 };
+    buildChatCompletionResponse(mp, model_t.len, fa_text_ptr(&text), text.len, fa_text_ptr(&messages_text), messages_text.len, &obj);
+    return forwardJson(fa_text_ptr(&obj), obj.len, 200, security, out);
 }
