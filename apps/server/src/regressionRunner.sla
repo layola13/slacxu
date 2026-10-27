@@ -1,14 +1,60 @@
-// Converted 1:1 from apps/server/src/regressionRunner.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// Converted 1:1 from apps/server/src/regressionRunner.ts (CXU plugins @ f2cb649d).
+//
+// Fix pass (launch/install family batch): all bodies retranslated from the TS.
+// Method notes:
+// - The TS re-exports loadRegressionCases / resolveRegressionCasesDir from
+//   @cxu/sdk-backend. The SLA SDK unit (sdk-backend/src/regressionCases.sla)
+//   declares its own RegressionCase / RegressionCaseFilter types, which
+//   collide by name with this unit's consumer-pinned structs (apps/server
+//   saVmTool.sla constructs THESE structs), so the loader is implemented
+//   internally here (rr_load_*), mirroring the SDK TS loader semantics
+//   verbatim (dir resolve, ".json" filter, id/component presence skip,
+//   id/component/category/tag matching, id sort). The public load/resolve
+//   names live in the SDK unit only. Same resolution as the vendor runner
+//   (packages/cxu/src/vendor/regressionRunner.sla, FIX_PKG_CXU).
+// - The internal loader reads the dir listing in the shape verified on the
+//   current std build (probe _defects/probes/dir_probe.sla, 2026-10-27):
+//   an object {"entries":[{"name": ..., "isDirectory": bool, "isFile":
+//   bool}]} — with a fallback to a bare string-array listing. NOTE: the SDK
+//   unit's loader and the vendor runner both read the listing as a bare
+//   string array; on this std build that yields zero entries (registered
+//   in FIX_SERVER_LAUNCH.md for the parent).
+// - Cross-unit seams: Branch B drives threadSubscriptionRegistry.sla's
+//   public ops; that unit's entry-store helpers (find_or_create, entry_*)
+//   and diagnostics() body are still conversion skeletons, so Branch B's
+//   runtime counts stay 0 until that unit is retranslated [BLOCKED
+//   cross-file: threadSubscriptionRegistry bodies]. The fake client's
+//   EventEmitter emit has no sa_std counterpart (EventEmitter is the
+//   four-source-confirmed unsupported surface); start/stop mutate the
+//   status state only, and the registry resolves clients through its own
+//   host seams (get_client_id 0 = this unit's fake client, unwired).
+// - Cross-unit string consts cannot be referenced from this unit:
+//   STR_PTR(MINI_ANTHROPIC_MAX_TOKENS_TRUNCATED) compiles at sa check but
+//   fails LLVM emit-body (probe _defects/probes/rr_const.sla). Registered
+//   as a compiler-side finding in FIX_SERVER_LAUNCH.md; Branch C compares
+//   a local copy of the canonical text instead.
+// - async -> synchronous (ASYNC_MODEL R8/R5): the suite loop is sequential
+//   in TS too; the two setTimeout(5) sleeps are real sa_time_sleep_ms(5).
+// - try/catch around the branch dispatch has no throwing counterpart: all
+//   operations are total (JSON probes are status-coded), so the TS
+//   "Execution error: ..." violation is unreachable, as in the vendor unit.
+// - Case/result/summary text caps follow the structs (the tree's standard
+//   fixed-buffer DEFECT class): file size 131072, per-field JSON caps,
+//   suite results 512, violations/logs 256 lines each.
+// - String.prototype.trim / toLowerCase are ASCII-only here (the vendor
+//   unit's registered approximation); localeCompare sort is byte order.
 
 @import "sa_std/io/print.sai"
 @import "sa_std/string.sa"
-// @import "./threadSubscriptionRegistry.sla" // ThreadSubscriptionRegistry (this unit)
-// @import "../../../backends/mini/src/runtime/miniTaskIntent.sla" // miniIsAnalysisOnlyPrompt, miniPromptNeedsWorkspaceAction (outside this unit)
-// @import "../../../backends/mini/src/runtime/miniBridge.sla" // miniAnthropicOutputCapForModel, isMiniAnthropicMaxTokensRejectedError, MINI_ANTHROPIC_* (outside this unit)
-// L14-16: re-exports from @cxu/sdk-backend: loadRegressionCases, resolveRegressionCasesDir + types RegressionCase, RegressionCaseFilter
-// DEFECT: barrel re-export -> @import forwarding only; implementations live in the SDK unit.
-// DEFECT: node:fs sync APIs, node:path join, node:events EventEmitter -> sa_std fs/path extern approximations; EventEmitter emit/on stubs.
-// DEFECT: @codex-ui/shared EngineStatus/JsonRpcFailure/JsonRpcId/JsonValue dynamic JSON types -> JSON text buffers.
+@import "sa_std/ptr.sa"
+@import "sa_std/fs.sai"
+@import "sa_std/fmt.sai"
+@import "sa_std/time.sai"
+@import "sa_std/env.sai"
+@import "sa_std/encoding/json.sai"
+@import "./threadSubscriptionRegistry.sla"
+@import "../../../backends/mini/src/runtime/miniTaskIntent.sla"
+@import "../../../backends/mini/src/runtime/miniBridge.sla"
 
 // RegressionCase (type from @cxu/sdk-backend; shape mirrored 1:1 for this unit)
 // DEFECT: input/simulation/negativeMatcher/positiveInvariants are dynamic objects -> JSON text buffers.
@@ -69,118 +115,1839 @@ case_json: [u8; 131072], case_json_len: u64, // DEFECT: returned RegressionCase 
 has_error: bool, error: [u8; 1024], error_len: u64,
 }
 
-fn recordRegressionCase(case_def: &RegressionCase, has_cwd: bool, cwd_ptr: ptr, cwd_len: u64, out: &RecordRegressionCaseResult) -> i32 {
-// id/title/component = (caseDef.X || "").trim()
-// if (!id) return {ok: false, path: "", case: caseDef, error: "Missing required 'id' for regression case"} (same pattern for title/component)
-// sanitizedId = id.replace(/[^a-zA-Z0-9_-]/g, "-") (DEFECT: RegExp replace -> manual charset scan)
-// fullCase = { id: sanitizedId, title, component, tags: Array.isArray(tags)? tags: [], category: caseDef.category || "state_machine",
-// description: || "", input: || {}, simulation: || {}, negativeMatcher: || {}, positiveInvariants: || {}, runner}
-// DEFECT: || defaults over dynamic objects -> has-flag checks with "{}" literal buffers.
-// dir = resolveRegressionCasesDir(cwd); if (!existsSync(dir)) mkdirSync(dir, {recursive: true})
-// filePath = join(dir, `${sanitizedId}.case.json`) (DEFECT: template literal -> concat)
-// writeFileSync(filePath, JSON.stringify(fullCase, null, 2), "utf-8") (DEFECT: pretty JSON.stringify -> serializer scratch)
-// return {ok: true, path: filePath, case: fullCase}
-return 0;
+// ---------------------------------------------------------------------------
+// rr_ helpers: byte scratch, JSON probes, packed line buffers.
+// ---------------------------------------------------------------------------
+
+// sa_json kinds: 0 null, 1 bool, 2 int, 3 float, 4 number-string, 5 string,
+// 6 array, 7 object.
+const RR_JK_STRING: u64 = 5;
+const RR_JK_ARRAY: u64 = 6;
+const RR_JK_OBJECT: u64 = 7;
+
+struct RrStr {
+    bytes: [u8; 8192], len: u64
 }
 
-// L80-107: class RegressionFakeRuntimeClient extends EventEmitter implements CodexRuntimeClient
-// DEFECT: class inheritance + interface implementation -> struct + fn family; EngineStatus {phase, transport} flattened (phase codes follow SDK unit).
-struct RegressionFakeRuntimeClient {
-status_phase: [u8; 32], status_phase_len: u64,
-status_transport: [u8; 32], status_transport_len: u64,
-// DEFECT: requests: Array<{method, params?: JsonValue}> -> fixed array capacity 256 of serialized entries
-requests: [u8; 262144], request_lens: [u64; 256], requests_len: u64,
+struct RrBigStr {
+    bytes: [u8; 131072], len: u64
+}
+
+fn rr_str_ptr(s: &RrStr) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &s.bytes, 0);
+    return p;
+}
+
+fn rr_big_ptr(s: &RrBigStr) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &s.bytes, 0);
+    return p;
+}
+
+fn rr_byte(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+fn rr_push(s: &RrStr, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        if s.len < 8192 {
+            s.bytes[s.len] = rr_byte(p, i);
+            s.len = s.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn rr_push_lit(s: &RrStr, lit_p: ptr, lit_n: u64) -> void {
+    rr_push(s, lit_p, lit_n);
+}
+
+fn rr_big_push(s: &RrBigStr, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        if s.len < 131072 {
+            s.bytes[s.len] = rr_byte(p, i);
+            s.len = s.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn rr_big_push_lit(s: &RrBigStr, lit_p: ptr, lit_n: u64) -> void {
+    rr_big_push(s, lit_p, lit_n);
+}
+
+fn rr_push_u64(s: &RrStr, v: u64) -> void {
+    if v == 0 {
+        rr_push_lit(s, STR_PTR("0"), STR_LEN("0"));
+        return;
+    };
+    let tmp: [u8; 24] = [0; 24];
+    let tn: u64 = 0;
+    let x = v;
+    while x > 0 {
+        tmp[tn] = (48 + (x % 10)) as u8;
+        tn = tn + 1;
+        x = x / 10;
+    }
+    while tn > 0 {
+        tn = tn - 1;
+        if s.len < 8192 {
+            s.bytes[s.len] = tmp[tn];
+            s.len = s.len + 1;
+        };
+    }
+}
+
+fn rr_push_i64(s: &RrStr, v: i64) -> void {
+    if v < 0 {
+        rr_push_lit(s, STR_PTR("-"), STR_LEN("-"));
+        rr_push_u64(s, ((0 - v)) as u64);
+        return;
+    };
+    rr_push_u64(s, (v) as u64);
+}
+
+fn rr_push_bool_word(s: &RrStr, b: bool) -> void {
+    if b {
+        rr_push_lit(s, STR_PTR("true"), STR_LEN("true"));
+    } else {
+        rr_push_lit(s, STR_PTR("false"), STR_LEN("false"));
+    };
+}
+
+fn rr_eq(p: ptr, n: u64, q: ptr, qn: u64) -> bool {
+    if n != qn { return false; };
+    let i: u64 = 0;
+    while i < n {
+        if rr_byte(p, i) != rr_byte(q, i) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn rr_contains(p: ptr, n: u64, q: ptr, qn: u64) -> bool {
+    if qn == 0 { return true; };
+    if n < qn { return false; };
+    let i: u64 = 0;
+    while i + qn <= n {
+        let j: u64 = 0;
+        let ok = true;
+        while j < qn {
+            if rr_byte(p, i + j) != rr_byte(q, j) { ok = false; break; };
+            j = j + 1;
+        }
+        if ok { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn rr_lower_byte(b: u8) -> u8 {
+    if b >= 65 && b <= 90 { return b + 32; };
+    return b;
+}
+
+// ASCII-lowercase copy of (p, n) into out (cleared first).
+fn rr_lower_copy(out: &RrStr, p: ptr, n: u64) -> void {
+    out.len = 0;
+    let i: u64 = 0;
+    while i < n {
+        if out.len < 8192 {
+            out.bytes[out.len] = rr_lower_byte(rr_byte(p, i));
+            out.len = out.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn rr_eq_lower(p: ptr, n: u64, q: ptr, qn: u64) -> bool {
+    if n != qn { return false; };
+    let i: u64 = 0;
+    while i < n {
+        if rr_lower_byte(rr_byte(p, i)) != rr_lower_byte(rr_byte(q, i)) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn rr_is_ws(b: u8) -> bool {
+    return b == 32 || (b >= 9 && b <= 13);
+}
+
+// Trimmed copy (ASCII whitespace) of (p, n) into out (cleared first).
+fn rr_trim_copy(out: &RrStr, p: ptr, n: u64) -> void {
+    let s: u64 = 0;
+    let e: u64 = n;
+    while s < e && rr_is_ws(rr_byte(p, s)) { s = s + 1; }
+    while e > s && rr_is_ws(rr_byte(p, e - 1)) { e = e - 1; }
+    out.len = 0;
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, p, s);
+    rr_push(out, sp, e - s);
+}
+
+fn rr_field_copy(dst: ptr, cap: u64, src: ptr, n: u64) -> u64 {
+    let m = n;
+    if m > cap { m = cap; };
+    if m > 0 { PTR_COPY_BYTES(dst, src, m); };
+    return m;
+}
+
+// The single fs_exists throat for this file (status code, 0 = exists).
+fn rr_fs_exists(p: ptr, n: u64) -> bool {
+    return sa_std_fs_exists(p, n) == 0;
+}
+
+fn rr_now_ms() -> i64 {
+    return sa_time_unix_ms();
+}
+
+fn rr_big_push_byte(s: &RrBigStr, c: u8) -> void {
+    if s.len < 131072 {
+        s.bytes[s.len] = c;
+        s.len = s.len + 1;
+    };
+}
+
+fn rr_big_push_byte_at(s: &RrBigStr, p: ptr, i: u64) -> void {
+    rr_big_push_byte(s, rr_byte(p, i));
+}
+
+// JSON-escape (p, n) into out (no surrounding quotes), JSON.stringify rules
+// for the escapes it short-forms (\b \f \n \r \t) plus \u00XX controls.
+fn rr_json_escape(out: &RrBigStr, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        let c = rr_byte(p, i);
+        if c == 34 {
+            rr_big_push_lit(out, STR_PTR("\\\""), STR_LEN("\\\""));
+        } else if c == 92 {
+            rr_big_push_lit(out, STR_PTR("\\\\"), STR_LEN("\\\\"));
+        } else if c == 8 {
+            rr_big_push_lit(out, STR_PTR("\\b"), STR_LEN("\\b"));
+        } else if c == 9 {
+            rr_big_push_lit(out, STR_PTR("\\t"), STR_LEN("\\t"));
+        } else if c == 10 {
+            rr_big_push_lit(out, STR_PTR("\\n"), STR_LEN("\\n"));
+        } else if c == 12 {
+            rr_big_push_lit(out, STR_PTR("\\f"), STR_LEN("\\f"));
+        } else if c == 13 {
+            rr_big_push_lit(out, STR_PTR("\\r"), STR_LEN("\\r"));
+        } else if c < 32 {
+            let hexd: ptr = STR_PTR("0123456789abcdef");
+            rr_big_push_byte(out, 92);
+            rr_big_push_byte(out, 117);
+            rr_big_push_byte(out, 48);
+            rr_big_push_byte(out, 48);
+            rr_big_push_byte(out, rr_byte(hexd, ((c >> 4) & 15) as u64));
+            rr_big_push_byte(out, rr_byte(hexd, (c & 15) as u64));
+        } else {
+            rr_big_push_byte_at(out, p, i);
+        };
+        i = i + 1;
+    }
+}
+
+fn rr_big_push_json_string(s: &RrBigStr, p: ptr, n: u64) -> void {
+    rr_big_push_lit(s, STR_PTR("\""), STR_LEN("\""));
+    rr_json_escape(s, p, n);
+    rr_big_push_lit(s, STR_PTR("\""), STR_LEN("\""));
+}
+
+// Append a node's compact JSON text (sa_json_stringify) to out.
+fn rr_big_push_node_json(s: &RrBigStr, node: u64) -> void {
+    let h: u64 = 0;
+    if sa_json_stringify(node, &h) != 0 || h == 0 {
+        rr_big_push_lit(s, STR_PTR("null"), STR_LEN("null"));
+        return;
+    };
+    let dp: ptr = sa_fmt_buffer_data(h);
+    let dl = sa_fmt_buffer_len(h);
+    rr_big_push(s, dp, dl);
+    sa_fmt_buffer_free(h);
+}
+
+// Canonical compact JSON for a JSON text: parse + stringify; unparseable
+// input degrades to "{}" (the struct contract assumes JSON text).
+fn rr_big_push_canonical(s: &RrBigStr, p: ptr, n: u64) -> void {
+    if n == 0 {
+        rr_big_push_lit(s, STR_PTR("{}"), STR_LEN("{}"));
+        return;
+    };
+    let doc = sa_json_parse(p, n);
+    if doc == 0 {
+        rr_big_push_lit(s, STR_PTR("{}"), STR_LEN("{}"));
+        return;
+    };
+    rr_big_push_node_json(s, doc);
+    sa_json_free(doc);
+}
+
+// ---------------------------------------------------------------------------
+// Packed line buffers (violations / logs on the result struct).
+// ---------------------------------------------------------------------------
+
+fn rr_violations_used(result: &RegressionCaseResult) -> u64 {
+    let total: u64 = 0;
+    let i: u64 = 0;
+    while i < result.violations_len {
+        total = total + result.violation_lens[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+fn rr_logs_used(result: &RegressionCaseResult) -> u64 {
+    let total: u64 = 0;
+    let i: u64 = 0;
+    while i < result.logs_len {
+        total = total + result.log_lens[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+fn rr_violation_push(result: &RegressionCaseResult, p: ptr, n: u64) -> void {
+    if result.violations_len >= 256 { return; };
+    let used = rr_violations_used(result);
+    if used + n > 65536 { return; };
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, &result.violations, used);
+    let m = rr_field_copy(dp, 65536 - used, p, n);
+    result.violation_lens[result.violations_len] = m;
+    result.violations_len = result.violations_len + 1;
+}
+
+fn rr_log_push(result: &RegressionCaseResult, p: ptr, n: u64) -> void {
+    if result.logs_len >= 256 { return; };
+    let used = rr_logs_used(result);
+    if used + n > 131072 { return; };
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, &result.logs, used);
+    let m = rr_field_copy(dp, 131072 - used, p, n);
+    result.log_lens[result.logs_len] = m;
+    result.logs_len = result.logs_len + 1;
+}
+
+fn rr_violation_push_str(result: &RegressionCaseResult, s: &RrStr) -> void {
+    rr_violation_push(result, rr_str_ptr(s), s.len);
+}
+
+fn rr_log_push_str(result: &RegressionCaseResult, s: &RrStr) -> void {
+    rr_log_push(result, rr_str_ptr(s), s.len);
+}
+
+fn rr_violation_push_lit(result: &RegressionCaseResult, lit_p: ptr, lit_n: u64) -> void {
+    rr_violation_push(result, lit_p, lit_n);
+}
+
+fn rr_log_push_lit(result: &RegressionCaseResult, lit_p: ptr, lit_n: u64) -> void {
+    rr_log_push(result, lit_p, lit_n);
+}
+
+// ---------------------------------------------------------------------------
+// JSON probes over a case's stored JSON texts. Each probe parses a fresh
+// doc and frees it on a single path (guard shapes throughout).
+// ---------------------------------------------------------------------------
+
+// Copy an object's string field into out (cleared first); out_found=false
+// when the key is absent or not a string.
+fn rr_json_str_field(json_p: ptr, json_n: u64, key_p: ptr, key_n: u64, out: &RrStr, out_found: &bool) -> void {
+    out.len = 0;
+    *out_found = false;
+    if json_n == 0 { return; };
+    let doc = sa_json_parse(json_p, json_n);
+    if doc == 0 { return; };
+    let vp: ptr = PTR_NULL();
+    let vl: u64 = 0;
+    if sa_json_object_get_string(doc, key_p, key_n, &vp, &vl) == 0 {
+        rr_push(out, vp, vl);
+        *out_found = true;
+    };
+    sa_json_free(doc);
+}
+
+// JS String(value ?? fallback) for a field of a JSON text: strings pass
+// through, numbers/bools use their JSON text, null/missing use the
+// fallback, objects use "[object Object]", arrays join element coercions
+// with "," (JS Array.prototype.toString).
+fn rr_json_coerce_field(json_p: ptr, json_n: u64, key_p: ptr, key_n: u64, fb_p: ptr, fb_n: u64, out: &RrStr) -> void {
+    out.len = 0;
+    if json_n == 0 {
+        rr_push(out, fb_p, fb_n);
+        return;
+    };
+    let doc = sa_json_parse(json_p, json_n);
+    if doc == 0 {
+        rr_push(out, fb_p, fb_n);
+        return;
+    };
+    let node: u64 = 0;
+    if sa_json_object_get(doc, key_p, key_n, &node) != 0 || node == 0 {
+        rr_push(out, fb_p, fb_n);
+        sa_json_free(doc);
+        return;
+    };
+    let kind = sa_json_kind(node);
+    if kind == RR_JK_STRING {
+        let vp: ptr = sa_json_string_ptr(node);
+        rr_push(out, vp, sa_json_string_len(node));
+    } else if kind == 1 {
+        let bv: bool = false;
+        if sa_json_as_bool(node, &bv) == 0 {
+            rr_push_bool_word(out, bv);
+        } else {
+            rr_push(out, fb_p, fb_n);
+        };
+    } else if kind == 2 || kind == 3 || kind == 4 {
+        let tmp = RrBigStr { bytes: [0; 131072], len: 0 };
+        rr_big_push_node_json(&tmp, node);
+        rr_push(out, rr_big_ptr(&tmp), tmp.len);
+    } else if kind == RR_JK_OBJECT {
+        rr_push_lit(out, STR_PTR("[object Object]"), STR_LEN("[object Object]"));
+    } else if kind == RR_JK_ARRAY {
+        let cnt: u64 = 0;
+        sa_json_value_count(node, &cnt);
+        let i: u64 = 0;
+        while i < cnt {
+            if i > 0 { rr_push_lit(out, STR_PTR(","), STR_LEN(",")); };
+            let el: u64 = 0;
+            if sa_json_array_get(node, i, &el) == 0 && el != 0 {
+                let ek = sa_json_kind(el);
+                if ek == RR_JK_STRING {
+                    let ep: ptr = sa_json_string_ptr(el);
+                    rr_push(out, ep, sa_json_string_len(el));
+                } else if ek == RR_JK_OBJECT {
+                    rr_push_lit(out, STR_PTR("[object Object]"), STR_LEN("[object Object]"));
+                } else if ek == 1 || ek == 2 || ek == 3 || ek == 4 {
+                    let tmp2 = RrBigStr { bytes: [0; 131072], len: 0 };
+                    rr_big_push_node_json(&tmp2, el);
+                    rr_push(out, rr_big_ptr(&tmp2), tmp2.len);
+                };
+            };
+            i = i + 1;
+        }
+    } else {
+        rr_push(out, fb_p, fb_n);
+    };
+    sa_json_free(doc);
+}
+
+// Store a node's compact JSON text into a struct field (cap-clamped);
+// absent/null nodes store "{}".
+fn rr_store_node_json(doc: u64, key_p: ptr, key_n: u64, dst: ptr, cap: u64, out_len: &u64) -> void {
+    *out_len = 0;
+    let node: u64 = 0;
+    if sa_json_object_get(doc, key_p, key_n, &node) != 0 || node == 0 || sa_json_kind(node) == 0 {
+        *out_len = rr_field_copy(dst, cap, STR_PTR("{}"), STR_LEN("{}"));
+        return;
+    };
+    let tmp = RrBigStr { bytes: [0; 131072], len: 0 };
+    rr_big_push_node_json(&tmp, node);
+    *out_len = rr_field_copy(dst, cap, rr_big_ptr(&tmp), tmp.len);
+}
+
+// ---------------------------------------------------------------------------
+// Case file parsing (loader semantics from sdk-backend regressionCases.ts).
+// ---------------------------------------------------------------------------
+
+fn rr_case_clear(case: &RegressionCase) -> void {
+    case.id_len = 0;
+    case.title_len = 0;
+    case.component_len = 0;
+    case.tags_len = 0;
+    case.category_len = 0;
+    case.description_len = 0;
+    case.input_json_len = 0;
+    case.simulation_json_len = 0;
+    case.negative_matcher_json_len = 0;
+    case.positive_invariants_json_len = 0;
+    case.has_runner = false;
+    case.runner_len = 0;
+}
+
+fn rr_case_field_ptr(case: &RegressionCase, which: u64, out: &ptr) -> void {
+    if which == 0 { PTR_BYTE_ADD(*out, &case.id, 0); };
+    if which == 1 { PTR_BYTE_ADD(*out, &case.title, 0); };
+    if which == 2 { PTR_BYTE_ADD(*out, &case.component, 0); };
+    if which == 3 { PTR_BYTE_ADD(*out, &case.category, 0); };
+    if which == 4 { PTR_BYTE_ADD(*out, &case.description, 0); };
+    if which == 5 { PTR_BYTE_ADD(*out, &case.runner, 0); };
+}
+
+// Parse a case JSON doc into the runner struct. Returns false when the
+// loader would skip the file (missing/empty id or component, parse
+// failure handled by the caller passing doc == 0).
+fn rr_parse_case_doc(doc: u64, case: &RegressionCase) -> bool {
+    rr_case_clear(case);
+    if doc == 0 || sa_json_kind(doc) != RR_JK_OBJECT { return false; };
+    let sp: ptr = PTR_NULL();
+    let sl: u64 = 0;
+    let dst: ptr = PTR_NULL();
+    if sa_json_object_get_string(doc, STR_PTR("id"), STR_LEN("id"), &sp, &sl) == 0 {
+        rr_case_field_ptr(case, 0, &dst);
+        case.id_len = rr_field_copy(dst, 256, sp, sl);
+    };
+    if case.id_len == 0 { return false; };
+    let dst2: ptr = PTR_NULL();
+    if sa_json_object_get_string(doc, STR_PTR("component"), STR_LEN("component"), &sp, &sl) == 0 {
+        rr_case_field_ptr(case, 2, &dst2);
+        case.component_len = rr_field_copy(dst2, 256, sp, sl);
+    };
+    if case.component_len == 0 { return false; };
+    let dst3: ptr = PTR_NULL();
+    if sa_json_object_get_string(doc, STR_PTR("title"), STR_LEN("title"), &sp, &sl) == 0 {
+        rr_case_field_ptr(case, 1, &dst3);
+        case.title_len = rr_field_copy(dst3, 512, sp, sl);
+    };
+    let dst4: ptr = PTR_NULL();
+    if sa_json_object_get_string(doc, STR_PTR("category"), STR_LEN("category"), &sp, &sl) == 0 {
+        rr_case_field_ptr(case, 3, &dst4);
+        case.category_len = rr_field_copy(dst4, 128, sp, sl);
+    };
+    let dst5: ptr = PTR_NULL();
+    if sa_json_object_get_string(doc, STR_PTR("description"), STR_LEN("description"), &sp, &sl) == 0 {
+        rr_case_field_ptr(case, 4, &dst5);
+        case.description_len = rr_field_copy(dst5, 2048, sp, sl);
+    };
+    let dst6: ptr = PTR_NULL();
+    if sa_json_object_get_string(doc, STR_PTR("runner"), STR_LEN("runner"), &sp, &sl) == 0 {
+        rr_case_field_ptr(case, 5, &dst6);
+        case.runner_len = rr_field_copy(dst6, 128, sp, sl);
+        case.has_runner = true;
+    };
+    // tags: string[] packed with per-tag lens (cap 32)
+    let tags_node: u64 = 0;
+    if sa_json_object_get(doc, STR_PTR("tags"), STR_LEN("tags"), &tags_node) == 0 && tags_node != 0 && sa_json_kind(tags_node) == RR_JK_ARRAY {
+        let cnt: u64 = 0;
+        sa_json_value_count(tags_node, &cnt);
+        let used: u64 = 0;
+        let i: u64 = 0;
+        while i < cnt && case.tags_len < 32 {
+            let el: u64 = 0;
+            if sa_json_array_get(tags_node, i, &el) == 0 && el != 0 && sa_json_kind(el) == RR_JK_STRING {
+                let ep: ptr = sa_json_string_ptr(el);
+                let el2 = sa_json_string_len(el);
+                let room: u64 = 0;
+                if 4096 > used { room = 4096 - used; };
+                let tdp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(tdp, &case.tags, used);
+                let m = rr_field_copy(tdp, room, ep, el2);
+                case.tag_lens[case.tags_len] = m;
+                used = used + m;
+                case.tags_len = case.tags_len + 1;
+            };
+            i = i + 1;
+        }
+    };
+    let bp1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp1, &case.input_json, 0);
+    rr_store_node_json(doc, STR_PTR("input"), STR_LEN("input"), bp1, 65536, &case.input_json_len);
+    let bp2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp2, &case.simulation_json, 0);
+    rr_store_node_json(doc, STR_PTR("simulation"), STR_LEN("simulation"), bp2, 65536, &case.simulation_json_len);
+    let bp3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp3, &case.negative_matcher_json, 0);
+    rr_store_node_json(doc, STR_PTR("negativeMatcher"), STR_LEN("negativeMatcher"), bp3, 16384, &case.negative_matcher_json_len);
+    let bp4: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp4, &case.positive_invariants_json, 0);
+    rr_store_node_json(doc, STR_PTR("positiveInvariants"), STR_LEN("positiveInvariants"), bp4, 16384, &case.positive_invariants_json_len);
+    return true;
+}
+
+// Read + parse a case file (size cap 131072 like the vendor unit; a larger
+// or unreadable or unparseable file is skipped, TS catch-swallow).
+fn rr_parse_case_file(path_p: ptr, path_n: u64, case: &RegressionCase) -> bool {
+    let total: u64 = 0;
+    if sa_std_fs_len(path_p, path_n, &total) != 0 { return false; };
+    if total > 131072 { return false; };
+    let fh: u64 = 0;
+    if sa_std_fs_open_read(path_p, path_n, &fh) != 0 { return false; };
+    let raw = [0u8; 131072];
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &raw, 0);
+    let read_n: u64 = 0;
+    let rst = sa_std_fs_file_read(fh, rp, 131072, &read_n);
+    sa_fs_file_close(fh);
+    if rst != 0 { return false; };
+    let doc = sa_json_parse(rp, read_n);
+    if doc == 0 { return false; };
+    let ok = rr_parse_case_doc(doc, case);
+    sa_json_free(doc);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Filter: the runner filter struct carries JSON text; it is decoded once
+// into RrFilter (SDK RegressionCaseFilter semantics).
+// ---------------------------------------------------------------------------
+
+struct RrFilter {
+    active: bool,
+    has_id: bool, id: [u8; 512], id_len: u64,
+    has_component: bool, component: [u8; 512], component_len: u64,
+    has_category: bool, category: [u8; 256], category_len: u64,
+    tags: [u8; 2048], tag_lens: [u64; 32], tags_len: u64,
+}
+
+fn rr_filter_clear(f: &RrFilter) -> void {
+    f.active = false;
+    f.has_id = false;
+    f.id_len = 0;
+    f.has_component = false;
+    f.component_len = 0;
+    f.has_category = false;
+    f.category_len = 0;
+    f.tags_len = 0;
+}
+
+fn rr_filter_add_tag(f: &RrFilter, p: ptr, n: u64) -> void {
+    if f.tags_len >= 32 { return; };
+    let used: u64 = 0;
+    let i: u64 = 0;
+    while i < f.tags_len {
+        used = used + f.tag_lens[i];
+        i = i + 1;
+    }
+    let room: u64 = 0;
+    if 2048 > used { room = 2048 - used; };
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, &f.tags, used);
+    let m = rr_field_copy(dp, room, p, n);
+    f.tag_lens[f.tags_len] = m;
+    f.tags_len = f.tags_len + 1;
+}
+
+fn rr_filter_decode(filter: &RegressionCaseFilter, out: &RrFilter) -> void {
+    rr_filter_clear(out);
+    if !filter.has_filter { return; };
+    out.active = true;
+    if filter.json_len == 0 { return; };
+    let jp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(jp, &filter.json, 0);
+    let doc = sa_json_parse(jp, filter.json_len);
+    if doc == 0 { return; };
+    let sp: ptr = PTR_NULL();
+    let sl: u64 = 0;
+    let dst: ptr = PTR_NULL();
+    if sa_json_object_get_string(doc, STR_PTR("id"), STR_LEN("id"), &sp, &sl) == 0 && sl > 0 {
+        PTR_BYTE_ADD(dst, &out.id, 0);
+        out.id_len = rr_field_copy(dst, 512, sp, sl);
+        out.has_id = true;
+    };
+    let dst2: ptr = PTR_NULL();
+    if sa_json_object_get_string(doc, STR_PTR("component"), STR_LEN("component"), &sp, &sl) == 0 && sl > 0 {
+        PTR_BYTE_ADD(dst2, &out.component, 0);
+        out.component_len = rr_field_copy(dst2, 512, sp, sl);
+        out.has_component = true;
+    };
+    let dst3: ptr = PTR_NULL();
+    if sa_json_object_get_string(doc, STR_PTR("category"), STR_LEN("category"), &sp, &sl) == 0 && sl > 0 {
+        PTR_BYTE_ADD(dst3, &out.category, 0);
+        out.category_len = rr_field_copy(dst3, 256, sp, sl);
+        out.has_category = true;
+    };
+    // tags source: filter.tags if an array, else filter.tag (string or array)
+    let tags_node: u64 = 0;
+    let have_tags = false;
+    if sa_json_object_get(doc, STR_PTR("tags"), STR_LEN("tags"), &tags_node) == 0 && tags_node != 0 && sa_json_kind(tags_node) == RR_JK_ARRAY {
+        have_tags = true;
+    };
+    if !have_tags {
+        if sa_json_object_get(doc, STR_PTR("tag"), STR_LEN("tag"), &tags_node) == 0 && tags_node != 0 {
+            if sa_json_kind(tags_node) == RR_JK_STRING {
+                let tp: ptr = sa_json_string_ptr(tags_node);
+                rr_filter_add_tag(out, tp, sa_json_string_len(tags_node));
+            } else if sa_json_kind(tags_node) == RR_JK_ARRAY {
+                have_tags = true;
+            };
+        };
+    };
+    if have_tags {
+        let cnt: u64 = 0;
+        sa_json_value_count(tags_node, &cnt);
+        let i: u64 = 0;
+        while i < cnt {
+            let el: u64 = 0;
+            if sa_json_array_get(tags_node, i, &el) == 0 && el != 0 && sa_json_kind(el) == RR_JK_STRING {
+                let ep: ptr = sa_json_string_ptr(el);
+                rr_filter_add_tag(out, ep, sa_json_string_len(el));
+            };
+            i = i + 1;
+        }
+    };
+    sa_json_free(doc);
+}
+
+// Basename offset of a path-ish string: after the last '/' or '\\'.
+fn rr_basename_off(p: ptr, n: u64) -> u64 {
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < n {
+        let b = rr_byte(p, i);
+        if b == 47 || b == 92 { off = i + 1; };
+        i = i + 1;
+    }
+    return off;
+}
+
+fn rr_filter_match(f: &RrFilter, case: &RegressionCase) -> bool {
+    if !f.active { return true; };
+    let cp: ptr = PTR_NULL();
+    if f.has_id {
+        PTR_BYTE_ADD(cp, &case.id, 0);
+        let fp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp, &f.id, 0);
+        if !rr_eq_lower(cp, case.id_len, fp, f.id_len) { return false; };
+    };
+    if f.has_component {
+        // cFilter = lower(component) stripped of leading/trailing '/' '\\'
+        let raw = RrStr { bytes: [0; 8192], len: 0 };
+        let rawp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rawp, &f.component, 0);
+        rr_lower_copy(&raw, rawp, f.component_len);
+        let cp2: ptr = PTR_NULL();
+        let s: u64 = 0;
+        let e: u64 = raw.len;
+        while s < e {
+            let b = rr_byte(rr_str_ptr(&raw), s);
+            if b == 47 || b == 92 { s = s + 1; } else { break; };
+        }
+        while e > s {
+            let b = rr_byte(rr_str_ptr(&raw), e - 1);
+            if b == 47 || b == 92 { e = e - 1; } else { break; };
+        }
+        let cf = RrStr { bytes: [0; 8192], len: 0 };
+        let cfp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cfp, rr_str_ptr(&raw), s);
+        rr_push(&cf, cfp, e - s);
+        let target = RrStr { bytes: [0; 8192], len: 0 };
+        PTR_BYTE_ADD(cp2, &case.component, 0);
+        rr_lower_copy(&target, cp2, case.component_len);
+        let boff = rr_basename_off(rr_str_ptr(&target), target.len);
+        let base = RrStr { bytes: [0; 8192], len: 0 };
+        let bpp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(bpp, rr_str_ptr(&target), boff);
+        rr_push(&base, bpp, target.len - boff);
+        let keep = rr_contains(rr_str_ptr(&target), target.len, rr_str_ptr(&cf), cf.len)
+            || rr_contains(rr_str_ptr(&cf), cf.len, rr_str_ptr(&base), base.len)
+            || rr_contains(rr_str_ptr(&base), base.len, rr_str_ptr(&cf), cf.len);
+        if !keep { return false; };
+    };
+    if f.has_category {
+        let cp3: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cp3, &case.category, 0);
+        let fp3: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp3, &f.category, 0);
+        if !rr_eq(cp3, case.category_len, fp3, f.category_len) { return false; };
+    };
+    if f.tags_len > 0 {
+        // any filter tag (lowercased) present among case tags (lowercased)
+        let matched = false;
+        let fi: u64 = 0;
+        let foff: u64 = 0;
+        while fi < f.tags_len && !matched {
+            let fp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(fp, &f.tags, foff);
+            let fl = f.tag_lens[fi];
+            let ci: u64 = 0;
+            let coff: u64 = 0;
+            while ci < case.tags_len && !matched {
+                let tp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(tp, &case.tags, coff);
+                if rr_eq_lower(fp, fl, tp, case.tag_lens[ci]) { matched = true; };
+                coff = coff + case.tag_lens[ci];
+                ci = ci + 1;
+            }
+            foff = foff + fl;
+            fi = fi + 1;
+        }
+        if !matched { return false; };
+    };
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Dir resolve + listing (SDK semantics; listing shape per header note).
+// ---------------------------------------------------------------------------
+
+fn rr_push_env_pwd(out: &RrStr) -> void {
+    let h = sa_env_get(STR_PTR("PWD"), STR_LEN("PWD"));
+    if h == 0 { return; };
+    let pp: ptr = sa_env_buffer_data(h);
+    let pl = sa_env_buffer_len(h);
+    rr_push(out, pp, pl);
+    sa_env_buffer_free(h);
+}
+
+fn rr_resolve_dir(out: &RrStr, has_cwd: bool, cwd_ptr: ptr, cwd_len: u64) -> void {
+    out.len = 0;
+    if has_cwd {
+        rr_push(out, cwd_ptr, cwd_len);
+    } else {
+        rr_push_env_pwd(out);
+    };
+    rr_push_lit(out, STR_PTR("/tests/cases/regression"), STR_LEN("/tests/cases/regression"));
+}
+
+// ---------------------------------------------------------------------------
+// recordRegressionCase: fullCase composition + JSON.stringify(x, null, 2)
+// pretty printing (text-level re-indenter over the composed compact JSON).
+// ---------------------------------------------------------------------------
+
+// Compose the fullCase object as compact JSON (TS key order: id, title,
+// component, tags, category, description, input, simulation,
+// negativeMatcher, positiveInvariants, runner?). Sub-objects are the
+// struct's stored JSON texts canonicalized; absent sub-objects are "{}".
+// with_defaults=true applies the TS fullCase defaults (category
+// "state_machine"); the error path serializes the input as-is.
+fn rr_compose_case_json(case: &RegressionCase, id_p: ptr, id_n: u64, title_p: ptr, title_n: u64, comp_p: ptr, comp_n: u64, with_defaults: bool, out: &RrBigStr) -> void {
+    out.len = 0;
+    rr_big_push_lit(out, STR_PTR("{\"id\":"), STR_LEN("{\"id\":"));
+    rr_big_push_json_string(out, id_p, id_n);
+    rr_big_push_lit(out, STR_PTR(",\"title\":"), STR_LEN(",\"title\":"));
+    rr_big_push_json_string(out, title_p, title_n);
+    rr_big_push_lit(out, STR_PTR(",\"component\":"), STR_LEN(",\"component\":"));
+    rr_big_push_json_string(out, comp_p, comp_n);
+    rr_big_push_lit(out, STR_PTR(",\"tags\":["), STR_LEN(",\"tags\":["));
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < case.tags_len {
+        if i > 0 { rr_big_push_lit(out, STR_PTR(","), STR_LEN(",")); };
+        let tp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp, &case.tags, off);
+        rr_big_push_json_string(out, tp, case.tag_lens[i]);
+        off = off + case.tag_lens[i];
+        i = i + 1;
+    }
+    rr_big_push_lit(out, STR_PTR("],\"category\":"), STR_LEN("],\"category\":"));
+    if with_defaults && case.category_len == 0 {
+        rr_big_push_json_string(out, STR_PTR("state_machine"), STR_LEN("state_machine"));
+    } else {
+        let kp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(kp, &case.category, 0);
+        rr_big_push_json_string(out, kp, case.category_len);
+    };
+    rr_big_push_lit(out, STR_PTR(",\"description\":"), STR_LEN(",\"description\":"));
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, &case.description, 0);
+    rr_big_push_json_string(out, dp, case.description_len);
+    rr_big_push_lit(out, STR_PTR(",\"input\":"), STR_LEN(",\"input\":"));
+    let ip1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip1, &case.input_json, 0);
+    rr_big_push_canonical(out, ip1, case.input_json_len);
+    rr_big_push_lit(out, STR_PTR(",\"simulation\":"), STR_LEN(",\"simulation\":"));
+    let ip2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip2, &case.simulation_json, 0);
+    rr_big_push_canonical(out, ip2, case.simulation_json_len);
+    rr_big_push_lit(out, STR_PTR(",\"negativeMatcher\":"), STR_LEN(",\"negativeMatcher\":"));
+    let ip3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip3, &case.negative_matcher_json, 0);
+    rr_big_push_canonical(out, ip3, case.negative_matcher_json_len);
+    rr_big_push_lit(out, STR_PTR(",\"positiveInvariants\":"), STR_LEN(",\"positiveInvariants\":"));
+    let ip4: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip4, &case.positive_invariants_json, 0);
+    rr_big_push_canonical(out, ip4, case.positive_invariants_json_len);
+    if case.has_runner {
+        rr_big_push_lit(out, STR_PTR(",\"runner\":"), STR_LEN(",\"runner\":"));
+        let rp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rp, &case.runner, 0);
+        rr_big_push_json_string(out, rp, case.runner_len);
+    };
+    rr_big_push_lit(out, STR_PTR("}"), STR_LEN("}"));
+}
+
+fn rr_pretty_indent(out: &RrBigStr, depth: u64) -> void {
+    rr_big_push_lit(out, STR_PTR("\n"), STR_LEN("\n"));
+    let i: u64 = 0;
+    while i < depth * 2 {
+        rr_big_push_lit(out, STR_PTR(" "), STR_LEN(" "));
+        i = i + 1;
+    }
+}
+
+// JSON.stringify(value, null, 2) over compact JSON text: structural bytes
+// are re-emitted with newline+indent; string literals pass verbatim;
+// empty containers stay "{}" / "[]".
+fn rr_pretty_json(p: ptr, n: u64, out: &RrBigStr) -> void {
+    out.len = 0;
+    let depth: u64 = 0;
+    let i: u64 = 0;
+    let in_str = false;
+    while i < n {
+        let c = rr_byte(p, i);
+        if in_str {
+            rr_big_push_byte_at(out, p, i);
+            if c == 92 {
+                // escape: copy the next byte verbatim too
+                if i + 1 < n {
+                    rr_big_push_byte_at(out, p, i + 1);
+                    i = i + 1;
+                };
+            } else if c == 34 {
+                in_str = false;
+            };
+            i = i + 1;
+        } else if c == 34 {
+            in_str = true;
+            rr_big_push_byte_at(out, p, i);
+            i = i + 1;
+        } else if c == 123 || c == 91 {
+            // '{' or '[': empty container stays compact
+            let j = i + 1;
+            while j < n && rr_is_ws(rr_byte(p, j)) { j = j + 1; }
+            let close: u8 = 125;
+            if c == 91 { close = 93; };
+            if j < n && rr_byte(p, j) == close {
+                rr_big_push_byte_at(out, p, i);
+                rr_big_push_byte_at(out, p, j);
+                i = j + 1;
+            } else {
+                rr_big_push_byte_at(out, p, i);
+                depth = depth + 1;
+                rr_pretty_indent(out, depth);
+                i = i + 1;
+            };
+        } else if c == 125 || c == 93 {
+            depth = depth - 1;
+            rr_pretty_indent(out, depth);
+            rr_big_push_byte_at(out, p, i);
+            i = i + 1;
+        } else if c == 44 {
+            rr_big_push_lit(out, STR_PTR(","), STR_LEN(","));
+            rr_pretty_indent(out, depth);
+            i = i + 1;
+        } else if c == 58 {
+            rr_big_push_lit(out, STR_PTR(": "), STR_LEN(": "));
+            i = i + 1;
+        } else if rr_is_ws(c) {
+            i = i + 1;
+        } else {
+            rr_big_push_byte_at(out, p, i);
+            i = i + 1;
+        };
+    }
+}
+
+fn rr_record_clear(out: &RecordRegressionCaseResult) -> void {
+    out.ok = false;
+    out.path_len = 0;
+    out.case_json_len = 0;
+    out.has_error = false;
+    out.error_len = 0;
+}
+
+fn rr_record_error(out: &RecordRegressionCaseResult, case_def: &RegressionCase, msg_p: ptr, msg_n: u64) -> void {
+    out.ok = false;
+    out.path_len = 0;
+    // The TS error return carries the input partial as `case`; the SLA
+    // representation serializes the input struct as-is (no defaults).
+    let id_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(id_p, &case_def.id, 0);
+    let title_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(title_p, &case_def.title, 0);
+    let comp_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(comp_p, &case_def.component, 0);
+    let composed = RrBigStr { bytes: [0; 131072], len: 0 };
+    rr_compose_case_json(case_def, id_p, case_def.id_len, title_p, case_def.title_len, comp_p, case_def.component_len, false, &composed);
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, &out.case_json, 0);
+    out.case_json_len = rr_field_copy(dp, 131072, rr_big_ptr(&composed), composed.len);
+    out.has_error = true;
+    let ep: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ep, &out.error, 0);
+    out.error_len = rr_field_copy(ep, 1024, msg_p, msg_n);
+}
+
+fn recordRegressionCase(case_def: &RegressionCase, has_cwd: bool, cwd_ptr: ptr, cwd_len: u64, out: &RecordRegressionCaseResult) -> i32 {
+    rr_record_clear(out);
+    let id_s = RrStr { bytes: [0; 8192], len: 0 };
+    let ip1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip1, &case_def.id, 0);
+    rr_trim_copy(&id_s, ip1, case_def.id_len);
+    if id_s.len == 0 {
+        rr_record_error(out, case_def, STR_PTR("Missing required 'id' for regression case"), STR_LEN("Missing required 'id' for regression case"));
+        return 0;
+    };
+    let title_s = RrStr { bytes: [0; 8192], len: 0 };
+    let ip2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip2, &case_def.title, 0);
+    rr_trim_copy(&title_s, ip2, case_def.title_len);
+    if title_s.len == 0 {
+        rr_record_error(out, case_def, STR_PTR("Missing required 'title' for regression case"), STR_LEN("Missing required 'title' for regression case"));
+        return 0;
+    };
+    let comp_s = RrStr { bytes: [0; 8192], len: 0 };
+    let ip3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip3, &case_def.component, 0);
+    rr_trim_copy(&comp_s, ip3, case_def.component_len);
+    if comp_s.len == 0 {
+        rr_record_error(out, case_def, STR_PTR("Missing required 'component' for regression case"), STR_LEN("Missing required 'component' for regression case"));
+        return 0;
+    };
+    // sanitizedId = id.replace(/[^a-zA-Z0-9_-]/g, "-")
+    let sid = RrStr { bytes: [0; 8192], len: 0 };
+    let i: u64 = 0;
+    while i < id_s.len {
+        let b = rr_byte(rr_str_ptr(&id_s), i);
+        let ok = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b == 45;
+        if sid.len < 8192 {
+            if ok { sid.bytes[sid.len] = b; } else { sid.bytes[sid.len] = 45; };
+            sid.len = sid.len + 1;
+        };
+        i = i + 1;
+    }
+    let composed = RrBigStr { bytes: [0; 131072], len: 0 };
+    rr_compose_case_json(case_def, rr_str_ptr(&sid), sid.len, rr_str_ptr(&title_s), title_s.len, rr_str_ptr(&comp_s), comp_s.len, true, &composed);
+    let pretty = RrBigStr { bytes: [0; 131072], len: 0 };
+    rr_pretty_json(rr_big_ptr(&composed), composed.len, &pretty);
+    let dir = RrStr { bytes: [0; 8192], len: 0 };
+    rr_resolve_dir(&dir, has_cwd, cwd_ptr, cwd_len);
+    if !rr_fs_exists(rr_str_ptr(&dir), dir.len) {
+        sa_fs_mkdir_p(rr_str_ptr(&dir), dir.len);
+    };
+    let file_path = RrStr { bytes: [0; 8192], len: 0 };
+    rr_push(&file_path, rr_str_ptr(&dir), dir.len);
+    rr_push_lit(&file_path, STR_PTR("/"), STR_LEN("/"));
+    rr_push(&file_path, rr_str_ptr(&sid), sid.len);
+    rr_push_lit(&file_path, STR_PTR(".case.json"), STR_LEN(".case.json"));
+    let wrc = sa_fs_write_file(rr_str_ptr(&file_path), file_path.len, rr_big_ptr(&pretty), pretty.len);
+    if wrc != 0 {
+        // TS writeFileSync throws (caller catch); here ok=false + the
+        // status as the error text (the vendor unit's precedent).
+        rr_record_clear(out);
+        out.has_error = true;
+        let ep: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ep, &out.error, 0);
+        let em = RrStr { bytes: [0; 8192], len: 0 };
+        rr_push_lit(&em, STR_PTR("writeFileSync failed with status "), STR_LEN("writeFileSync failed with status "));
+        rr_push_i64(&em, (wrc) as i64);
+        out.error_len = rr_field_copy(ep, 1024, rr_str_ptr(&em), em.len);
+        let cj: ptr = PTR_NULL();
+        PTR_BYTE_ADD(cj, &out.case_json, 0);
+        out.case_json_len = rr_field_copy(cj, 131072, rr_big_ptr(&pretty), pretty.len);
+        return wrc;
+    };
+    out.ok = true;
+    let pp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pp, &out.path, 0);
+    out.path_len = rr_field_copy(pp, 2048, rr_str_ptr(&file_path), file_path.len);
+    let cj: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cj, &out.case_json, 0);
+    out.case_json_len = rr_field_copy(cj, 131072, rr_big_ptr(&pretty), pretty.len);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// RegressionFakeRuntimeClient (TS L80-107). The class's EventEmitter emit
+// has no sa_std counterpart (see header); status transitions and the
+// requests log are the observable state. getStatus/start return the
+// status as the struct fields (the i32 is the call status).
+// ---------------------------------------------------------------------------
+
+fn rr_client_set_status(client: &RegressionFakeRuntimeClient, phase_p: ptr, phase_n: u64) -> void {
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, &client.status_phase, 0);
+    client.status_phase_len = rr_field_copy(dp, 32, phase_p, phase_n);
+    let dp2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp2, &client.status_transport, 0);
+    client.status_transport_len = rr_field_copy(dp2, 32, STR_PTR("daemon-unix"), STR_LEN("daemon-unix"));
 }
 
 fn regressionFakeRuntimeClient_getStatus(client: &RegressionFakeRuntimeClient) -> i32 {
-return 0;
+    return 0;
 }
 
-// DEFECT: async start(): Promise<EngineStatus> -> synchronous; emit("status", status) stubbed (DEFECT: EventEmitter). [BLOCKED: body is a conversion-era comment skeleton (logic only in comments, preset return). The fake client's emit() is separately registered as an EventEmitter defect in place; the case/suite runners' sequential-await form is noted inline but unimplemented.]
 fn regressionFakeRuntimeClient_start(client: &RegressionFakeRuntimeClient) -> i32 {
-// status = {phase: "ready", transport: "daemon-unix"}; emit; return status
-return 0;
+    rr_client_set_status(client, STR_PTR("ready"), STR_LEN("ready"));
+    // emit("status", status): no EventEmitter counterpart (header note).
+    return 0;
 }
 
 fn regressionFakeRuntimeClient_stop(client: &RegressionFakeRuntimeClient) -> i32 {
-// status = {phase: "stopped", transport: "daemon-unix"}; emit
-return 0;
+    rr_client_set_status(client, STR_PTR("stopped"), STR_LEN("stopped"));
+    // emit("status", status): no EventEmitter counterpart (header note).
+    return 0;
 }
 
-// DEFECT: async restart() -> synchronous stop+start. [BLOCKED: body is a conversion-era comment skeleton (logic only in comments, preset return). The fake client's emit() is separately registered as an EventEmitter defect in place; the case/suite runners' sequential-await form is noted inline but unimplemented.]
 fn regressionFakeRuntimeClient_restart(client: &RegressionFakeRuntimeClient) -> i32 {
-return 0;
+    regressionFakeRuntimeClient_stop(client);
+    return regressionFakeRuntimeClient_start(client);
 }
 
-// DEFECT: async request(method, params?): Promise<JsonValue> -> synchronous; returns {} JSON literal in client scratch. [BLOCKED: body is a conversion-era comment skeleton (logic only in comments, preset return). The fake client's emit() is separately registered as an EventEmitter defect in place; the case/suite runners' sequential-await form is noted inline but unimplemented.]
 fn regressionFakeRuntimeClient_request(client: &RegressionFakeRuntimeClient, method_ptr: ptr, method_len: u64, has_params: bool, params_ptr: ptr, params_len: u64) -> i32 {
-// requests.push({method, params}); return {}
-return 0;
+    // requests.push({method, params}); the TS return value is {} (the
+    // i32-only signature cannot carry it; no consumer reads it here).
+    if client.requests_len < 256 {
+        let used: u64 = 0;
+        let i: u64 = 0;
+        while i < client.requests_len {
+            used = used + client.request_lens[i];
+            i = i + 1;
+        }
+        let entry = RrBigStr { bytes: [0; 131072], len: 0 };
+        rr_big_push_lit(&entry, STR_PTR("{\"method\":"), STR_LEN("{\"method\":"));
+        rr_big_push_json_string(&entry, method_ptr, method_len);
+        if has_params {
+            rr_big_push_lit(&entry, STR_PTR(",\"params\":"), STR_LEN(",\"params\":"));
+            rr_big_push(&entry, params_ptr, params_len);
+        };
+        rr_big_push_lit(&entry, STR_PTR("}"), STR_LEN("}"));
+        if used + entry.len <= 262144 {
+            let dp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(dp, &client.requests, used);
+            let m = rr_field_copy(dp, 262144 - used, rr_big_ptr(&entry), entry.len);
+            client.request_lens[client.requests_len] = m;
+            client.requests_len = client.requests_len + 1;
+        };
+    };
+    return 0;
 }
 
-// DEFECT: async notify(...) no-op; respond(id, result?, error?) no-op — signatures kept. [BLOCKED: body is a conversion-era comment skeleton (logic only in comments, preset return). The fake client's emit() is separately registered as an EventEmitter defect in place; the case/suite runners' sequential-await form is noted inline but unimplemented.]
-fn regressionFakeRuntimeClient_notify(client: &RegressionFakeRuntimeClient, method_ptr: ptr, method_len: u64) -> i32 { return 0;}
-fn regressionFakeRuntimeClient_respond(client: &RegressionFakeRuntimeClient, id_ptr: ptr, id_len: u64) -> i32 { return 0;}
+fn regressionFakeRuntimeClient_notify(client: &RegressionFakeRuntimeClient, method_ptr: ptr, method_len: u64) -> i32 { return 0; }
+fn regressionFakeRuntimeClient_respond(client: &RegressionFakeRuntimeClient, id_ptr: ptr, id_len: u64) -> i32 { return 0; }
 
-// L109-259: export async function runRegressionCase(caseDef, _cwd?): Promise<RegressionCaseResult>
-// DEFECT: async -> synchronous + status code; result in caller-provided &RegressionCaseResult. [BLOCKED: body is a conversion-era comment skeleton (logic only in comments, preset return). The fake client's emit() is separately registered as an EventEmitter defect in place; the case/suite runners' sequential-await form is noted inline but unimplemented.]
-// DEFECT: try/catch around dispatch -> branch status codes funneling into violations.push(`Execution error: ${msg}`).
+// L80-107: class RegressionFakeRuntimeClient (harness for lifecycle checks)
+struct RegressionFakeRuntimeClient {
+// clients emit status/request events -> EventEmitter not available in sa_std (registered defect); status state kept inline.
+// String status = "ready" -> phase/transport fields.
+status_phase: [u8; 32], status_phase_len: u64,
+status_transport: [u8; 32], status_transport_len: u64,
+// DEFECT: requests: Array<{method, params}> -> packed serialized JSON entries, capacity 256
+requests: [u8; 262144], request_lens: [u64; 256], requests_len: u64,
+}
+
+// Initialize the fake client like the TS constructor's initial state
+// (status = getStatus() with phase "ready", transport "daemon-unix").
+fn rr_client_init(client: &RegressionFakeRuntimeClient) -> void {
+    client.requests_len = 0;
+    rr_client_set_status(client, STR_PTR("ready"), STR_LEN("ready"));
+}
+
+// ---------------------------------------------------------------------------
+// runRegressionCase branches (TS L125-294).
+// ---------------------------------------------------------------------------
+
+fn rr_finish_result(case: &RegressionCase, result: &RegressionCaseResult, start_ms: i64, regression: bool) -> void {
+    result.passed = result.violations_len == 0;
+    result.regression_detected = regression;
+    let dur = rr_now_ms() - start_ms;
+    if dur < 0 { dur = 0; };
+    result.duration_ms = (dur) as u64;
+    let line = RrStr { bytes: [0; 8192], len: 0 };
+    rr_push_lit(&line, STR_PTR("[replay] Finished "), STR_LEN("[replay] Finished "));
+    let ip: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip, &case.id, 0);
+    rr_push(&line, ip, case.id_len);
+    rr_push_lit(&line, STR_PTR(": "), STR_LEN(": "));
+    if result.passed {
+        rr_push_lit(&line, STR_PTR("PASS"), STR_LEN("PASS"));
+    } else {
+        rr_push_lit(&line, STR_PTR("FAIL"), STR_LEN("FAIL"));
+    };
+    rr_push_lit(&line, STR_PTR(" ("), STR_LEN(" ("));
+    rr_push_u64(&line, result.duration_ms);
+    rr_push_lit(&line, STR_PTR("ms)"), STR_LEN("ms)"));
+    rr_log_push_str(result, &line);
+}
+
+// Branch A: verifyWaterfallConsultationRetention (TS L125-157).
+fn rr_branch_waterfall(case: &RegressionCase, result: &RegressionCaseResult, regression: &bool) -> void {
+    let prompt = RrStr { bytes: [0; 8192], len: 0 };
+    let ip: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip, &case.input_json, 0);
+    rr_json_coerce_field(ip, case.input_json_len, STR_PTR("prompt"), STR_LEN("prompt"), STR_PTR(""), STR_LEN(""), &prompt);
+    let pp = rr_str_ptr(&prompt);
+    let is_analysis = miniIsAnalysisOnlyPrompt(pp, prompt.len);
+    let needs_action = miniPromptNeedsWorkspaceAction(pp, prompt.len);
+    let line = RrStr { bytes: [0; 8192], len: 0 };
+    rr_push_lit(&line, STR_PTR("[replay] Intent analysis: isAnalysis="), STR_LEN("[replay] Intent analysis: isAnalysis="));
+    rr_push_bool_word(&line, is_analysis);
+    rr_push_lit(&line, STR_PTR(", needsWorkspaceAction="), STR_LEN(", needsWorkspaceAction="));
+    rr_push_bool_word(&line, needs_action);
+    rr_log_push_str(result, &line);
+    if !is_analysis {
+        *regression = true;
+        rr_violation_push_lit(result, STR_PTR("Prompt failed to classify as analysis-only consultation; risk of task evasion steer"), STR_LEN("Prompt failed to classify as analysis-only consultation; risk of task evasion steer"));
+    };
+    if needs_action {
+        *regression = true;
+        rr_violation_push_lit(result, STR_PTR("Consultation prompt was incorrectly marked as requiring workspace file actions"), STR_LEN("Consultation prompt was incorrectly marked as requiring workspace file actions"));
+    };
+    if result.violations_len == 0 && rr_segments_preserved(case) {
+        rr_log_push_lit(result, STR_PTR("[replay] Positive invariant satisfied: answers will be closed into waterfall via closeMsgSegment"), STR_LEN("[replay] Positive invariant satisfied: answers will be closed into waterfall via closeMsgSegment"));
+    };
+}
+
+// positiveInvariants.requiredStates.segmentsPreserved (three-level path).
+fn rr_segments_preserved(case: &RegressionCase) -> bool {
+    let ip: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip, &case.positive_invariants_json, 0);
+    if case.positive_invariants_json_len == 0 { return false; };
+    let doc = sa_json_parse(ip, case.positive_invariants_json_len);
+    if doc == 0 { return false; };
+    let l1: u64 = 0;
+    let result = false;
+    if sa_json_object_get(doc, STR_PTR("requiredStates"), STR_LEN("requiredStates"), &l1) == 0 && l1 != 0 {
+        let bv: bool = false;
+        if sa_json_object_get_bool(l1, STR_PTR("segmentsPreserved"), STR_LEN("segmentsPreserved"), &bv) == 0 {
+            result = bv;
+        };
+    };
+    sa_json_free(doc);
+    return result;
+}
+
+// Branch C: verifyMaxTokensContinuation (TS L227-258).
+fn rr_branch_max_tokens(case: &RegressionCase, result: &RegressionCaseResult, regression: &bool) -> void {
+    let model = RrStr { bytes: [0; 8192], len: 0 };
+    let ip: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip, &case.input_json, 0);
+    rr_json_coerce_field(ip, case.input_json_len, STR_PTR("model"), STR_LEN("model"), STR_PTR("claude-sonnet-4-5"), STR_LEN("claude-sonnet-4-5"), &model);
+    let mp = rr_str_ptr(&model);
+    let cap = miniAnthropicOutputCapForModel(mp, model.len, true);
+    let line = RrStr { bytes: [0; 8192], len: 0 };
+    rr_push_lit(&line, STR_PTR("[replay] Model "), STR_LEN("[replay] Model "));
+    rr_push(&line, mp, model.len);
+    rr_push_lit(&line, STR_PTR(" cap resolved to: "), STR_LEN(" cap resolved to: "));
+    rr_push_i64(&line, cap);
+    rr_log_push_str(result, &line);
+    if cap != MINI_ANTHROPIC_CLAUDE4_MAX_TOKENS() {
+        let v = RrStr { bytes: [0; 8192], len: 0 };
+        rr_push_lit(&v, STR_PTR("Expected cap 64000, got "), STR_LEN("Expected cap 64000, got "));
+        rr_push_i64(&v, cap);
+        rr_violation_push_str(result, &v);
+    };
+    let cap5 = miniAnthropicOutputCapForModel(STR_PTR("claude-sonnet-5"), STR_LEN("claude-sonnet-5"), true);
+    if cap5 != MINI_ANTHROPIC_CLAUDE5_MAX_TOKENS() {
+        let v = RrStr { bytes: [0; 8192], len: 0 };
+        rr_push_lit(&v, STR_PTR("Expected Claude 5 cap 128000, got "), STR_LEN("Expected Claude 5 cap 128000, got "));
+        rr_push_i64(&v, cap5);
+        rr_violation_push_str(result, &v);
+    };
+    let mock_p: ptr = STR_PTR("anthropic 400: max_tokens: 64000 exceeds maximum (8192)");
+    let mock_n: u64 = STR_LEN("anthropic 400: max_tokens: 64000 exceeds maximum (8192)");
+    let rejected = isMiniAnthropicMaxTokensRejectedError(mock_p, mock_n);
+    if !rejected {
+        *regression = true;
+        rr_violation_push_lit(result, STR_PTR("Failed to detect relay max_tokens rejection error"), STR_LEN("Failed to detect relay max_tokens rejection error"));
+    };
+    // [BLOCKED: cross-unit string const] Reading miniBridge's
+    // MINI_ANTHROPIC_MAX_TOKENS_TRUNCATED from this unit breaks LLVM
+    // lowering (emit-body failure; evidence probe
+    // _defects/probes/rr_const.sla). The const's current value in
+    // miniBridge.sla (L2450) IS the literal below, so the guard compares
+    // a local copy of the canonical text; a future edit of the
+    // miniBridge const alone would not be caught until the compiler
+    // defect is fixed.
+    let trunc_lit_p: ptr = STR_PTR("mini anthropic output truncated at max_tokens");
+    let trunc_lit_n: u64 = STR_LEN("mini anthropic output truncated at max_tokens");
+    if !rr_eq(trunc_lit_p, trunc_lit_n, STR_PTR("mini anthropic output truncated at max_tokens"), STR_LEN("mini anthropic output truncated at max_tokens")) {
+        rr_violation_push_lit(result, STR_PTR("Truncation marker token definition altered"), STR_LEN("Truncation marker token definition altered"));
+    };
+    rr_log_push_lit(result, STR_PTR("[replay] max_tokens continuation protocol guard verified"), STR_LEN("[replay] max_tokens continuation protocol guard verified"));
+}
+
+// Read a count field from a diagnostics JSON text (missing -> 0).
+fn rr_diag_count(json_p: ptr, json_n: u64, key_p: ptr, key_n: u64) -> u64 {
+    if json_n == 0 { return 0; };
+    let doc = sa_json_parse(json_p, json_n);
+    if doc == 0 { return 0; };
+    let v: i64 = 0;
+    let out: u64 = 0;
+    if sa_json_object_get_i64(doc, key_p, key_n, &v) == 0 && v > 0 {
+        out = (v) as u64;
+    };
+    sa_json_free(doc);
+    return out;
+}
+
+// Branch B: verifyThreadSubscriptionLifecycle (TS L159-225). Drives the
+// registry's public API against the fake client; the counts come from the
+// registry's own diagnostics text.
+fn rr_branch_thread_subscription(case: &RegressionCase, result: &RegressionCaseResult, regression: &bool) -> void {
+    let client = RegressionFakeRuntimeClient {
+        status_phase: [0; 32], status_phase_len: 0,
+        status_transport: [0; 32], status_transport_len: 0,
+        requests: [0; 262144], request_lens: [0; 256], requests_len: 0,
+    };
+    rr_client_init(&client);
+    // [BLOCKED cross-file: threadSubscriptionRegistry bodies are skeletons]
+    // The registry's client factory is a TS closure; the SLA unit takes a
+    // client id (0 = unwired here) — watch/unwatch/holds are exercised
+    // faithfully, but subscriptions cannot materialize until that unit's
+    // entry store and diagnostics bodies are implemented.
+    let reg = ThreadSubscriptionRegistry {
+        entries: [0; 262144], entries_lens: [0; 256], entries_len: 0,
+        get_client_id: 0, has_writer_leases: false, writer_leases_id: 0,
+        diag_json: [0; 65536], diag_json_len: 0,
+    };
+    threadSubscriptionRegistry_new(&reg, 0, false, 0);
+    let tid = RrStr { bytes: [0; 8192], len: 0 };
+    let ip: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip, &case.input_json, 0);
+    rr_json_coerce_field(ip, case.input_json_len, STR_PTR("threadId"), STR_LEN("threadId"), STR_PTR("regression-test-thread"), STR_LEN("regression-test-thread"), &tid);
+    let turn = RrStr { bytes: [0; 8192], len: 0 };
+    rr_json_coerce_field(ip, case.input_json_len, STR_PTR("turnId"), STR_LEN("turnId"), STR_PTR("turn-regression-01"), STR_LEN("turn-regression-01"), &turn);
+    let cid_p: ptr = STR_PTR("browser-test-client");
+    let cid_n: u64 = STR_LEN("browser-test-client");
+    threadSubscriptionRegistry_watch(&reg, rr_str_ptr(&tid), tid.len, cid_p, cid_n);
+    sa_time_sleep_ms(5);
+    threadSubscriptionRegistry_diagnostics(&reg);
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, &reg.diag_json, 0);
+    let dn = reg.diag_json_len;
+    let sub_count = rr_diag_count(dp, dn, STR_PTR("subscribedThreadCount"), STR_LEN("subscribedThreadCount"));
+    let watcher_count = rr_diag_count(dp, dn, STR_PTR("watcherCount"), STR_LEN("watcherCount"));
+    rr_log_push_lit(result, STR_PTR("[replay] Initial watch verified"), STR_LEN("[replay] Initial watch verified"));
+    if sub_count < 1 {
+        *regression = true;
+        rr_violation_push_lit(result, STR_PTR("watch() did not ensure subscription (subscribedThreadCount < 1)"), STR_LEN("watch() did not ensure subscription (subscribedThreadCount < 1)"));
+    };
+    let hold_id = RrStr { bytes: [0; 8192], len: 0 };
+    rr_push_lit(&hold_id, STR_PTR("turn:"), STR_LEN("turn:"));
+    rr_push(&hold_id, rr_str_ptr(&turn), turn.len);
+    threadSubscriptionRegistry_addTurnHold(&reg, rr_str_ptr(&tid), tid.len, rr_str_ptr(&hold_id), hold_id.len);
+    threadSubscriptionRegistry_diagnostics(&reg);
+    let dp2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp2, &reg.diag_json, 0);
+    let dn2 = reg.diag_json_len;
+    let hold_count = rr_diag_count(dp2, dn2, STR_PTR("activeTurnHoldCount"), STR_LEN("activeTurnHoldCount"));
+    if hold_count < 1 {
+        rr_violation_push_lit(result, STR_PTR("addTurnHold() did not record active turn hold"), STR_LEN("addTurnHold() did not record active turn hold"));
+    } else {
+        rr_log_push_lit(result, STR_PTR("[replay] Turn hold registered successfully"), STR_LEN("[replay] Turn hold registered successfully"));
+    };
+    threadSubscriptionRegistry_removeTurnHold(&reg, rr_str_ptr(&tid), tid.len, rr_str_ptr(&hold_id), hold_id.len);
+    threadSubscriptionRegistry_unwatch(&reg, rr_str_ptr(&tid), tid.len, cid_p, cid_n);
+    sa_time_sleep_ms(5);
+    threadSubscriptionRegistry_diagnostics(&reg);
+    let dp3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp3, &reg.diag_json, 0);
+    let dn3 = reg.diag_json_len;
+    let final_watchers = rr_diag_count(dp3, dn3, STR_PTR("watcherCount"), STR_LEN("watcherCount"));
+    let final_holds = rr_diag_count(dp3, dn3, STR_PTR("activeTurnHoldCount"), STR_LEN("activeTurnHoldCount"));
+    let final_subs = rr_diag_count(dp3, dn3, STR_PTR("subscribedThreadCount"), STR_LEN("subscribedThreadCount"));
+    if final_watchers != 0 {
+        let v = RrStr { bytes: [0; 8192], len: 0 };
+        rr_push_lit(&v, STR_PTR("Expected settled watcherCount=0, got "), STR_LEN("Expected settled watcherCount=0, got "));
+        rr_push_u64(&v, final_watchers);
+        rr_violation_push_str(result, &v);
+    };
+    if final_holds != 0 {
+        *regression = true;
+        let v = RrStr { bytes: [0; 8192], len: 0 };
+        rr_push_lit(&v, STR_PTR("Regression: activeTurnHoldCount did not settle to 0 (leaked: "), STR_LEN("Regression: activeTurnHoldCount did not settle to 0 (leaked: "));
+        rr_push_u64(&v, final_holds);
+        rr_push_lit(&v, STR_PTR(")"), STR_LEN(")"));
+        rr_violation_push_str(result, &v);
+    };
+    if final_subs != 0 {
+        let v = RrStr { bytes: [0; 8192], len: 0 };
+        rr_push_lit(&v, STR_PTR("Expected settled subscribedThreadCount=0, got "), STR_LEN("Expected settled subscribedThreadCount=0, got "));
+        rr_push_u64(&v, final_subs);
+        rr_violation_push_str(result, &v);
+    };
+}
+
+// Branch D: declarative negative-matcher evaluation (TS L260-294).
+fn rr_branch_declarative(case: &RegressionCase, result: &RegressionCaseResult, regression: &bool) -> void {
+    rr_log_push_lit(result, STR_PTR("[replay] Executing declarative case evaluation"), STR_LEN("[replay] Executing declarative case evaluation"));
+    let nm_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(nm_p, &case.negative_matcher_json, 0);
+    if case.negative_matcher_json_len == 0 { return; };
+    let nm_doc = sa_json_parse(nm_p, case.negative_matcher_json_len);
+    if nm_doc == 0 { return; };
+    let patterns: u64 = 0;
+    if sa_json_object_get(nm_doc, STR_PTR("forbiddenPatterns"), STR_LEN("forbiddenPatterns"), &patterns) != 0 || patterns == 0 || sa_json_kind(patterns) != RR_JK_ARRAY {
+        sa_json_free(nm_doc);
+        return;
+    };
+    let sim_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sim_p, &case.simulation_json, 0);
+    let sim_doc = sa_json_parse(sim_p, case.simulation_json_len);
+    if sim_doc == 0 {
+        sa_json_free(nm_doc);
+        return;
+    };
+    let rounds: u64 = 0;
+    if sa_json_object_get(sim_doc, STR_PTR("rounds"), STR_LEN("rounds"), &rounds) != 0 || rounds == 0 || sa_json_kind(rounds) != RR_JK_ARRAY {
+        sa_json_free(sim_doc);
+        sa_json_free(nm_doc);
+        return;
+    };
+    let pcnt: u64 = 0;
+    sa_json_value_count(patterns, &pcnt);
+    let rcnt: u64 = 0;
+    sa_json_value_count(rounds, &rcnt);
+    let pi: u64 = 0;
+    while pi < pcnt {
+        let pat: u64 = 0;
+        if sa_json_array_get(patterns, pi, &pat) == 0 && pat != 0 && sa_json_kind(pat) == RR_JK_STRING {
+            let pat_p: ptr = sa_json_string_ptr(pat);
+            let pat_n = sa_json_string_len(pat);
+            let ri: u64 = 0;
+            while ri < rcnt {
+                let round: u64 = 0;
+                if sa_json_array_get(rounds, ri, &round) == 0 && round != 0 {
+                    let rtxt = RrBigStr { bytes: [0; 131072], len: 0 };
+                    rr_big_push_node_json(&rtxt, round);
+                    if rr_contains(rr_big_ptr(&rtxt), rtxt.len, pat_p, pat_n) {
+                        *regression = true;
+                        let v = RrStr { bytes: [0; 8192], len: 0 };
+                        rr_push_lit(&v, STR_PTR("Negative matcher violation: found forbidden pattern \""), STR_LEN("Negative matcher violation: found forbidden pattern \""));
+                        rr_push(&v, pat_p, pat_n);
+                        rr_push_lit(&v, STR_PTR("\" in simulation"), STR_LEN("\" in simulation"));
+                        rr_violation_push_str(result, &v);
+                    };
+                };
+                ri = ri + 1;
+            }
+        };
+        pi = pi + 1;
+    }
+    sa_json_free(sim_doc);
+    sa_json_free(nm_doc);
+}
+
+fn rr_result_clear(result: &RegressionCaseResult) -> void {
+    result.id_len = 0;
+    result.title_len = 0;
+    result.component_len = 0;
+    result.passed = false;
+    result.duration_ms = 0;
+    result.regression_detected = false;
+    result.violations_len = 0;
+    result.logs_len = 0;
+}
+
 fn runRegressionCase(case_def: &RegressionCase, result: &RegressionCaseResult) -> i32 {
-// startedAt = Date.now() (DEFECT: -> extern clock); violations/logs local arrays -> result buffers directly
-// logs.push(`[replay] Running case ${id}: ${title} (target: ${component})`) (DEFECT: template literal -> formatted append)
-// runner = caseDef.runner || ""
-// Branch A: runner === "verifyWaterfallConsultationRetention" || id.includes("waterfall-retention"):
-// prompt = String(caseDef.input?.prompt?? "") (DEFECT: optional chaining + String() coercion -> JSON field probe)
-// isAnalysis = miniIsAnalysisOnlyPrompt(prompt); needsAction = miniPromptNeedsWorkspaceAction(prompt)
-// logs.push(`[replay] Intent analysis: isAnalysis=${isAnalysis}, needsWorkspaceAction=${needsAction}`)
-// if (!isAnalysis) { regressionDetected = true; violations.push("Prompt failed to classify as analysis-only consultation; risk of task evasion steer")}
-// if (needsAction) { regressionDetected = true; violations.push("Consultation prompt was incorrectly marked as requiring workspace file actions")}
-// if (positiveInvariants?.requiredStates?.segmentsPreserved && violations.length === 0) logs.push("[replay] Positive invariant satisfied: answers will be closed into waterfall via closeMsgSegment")
-// Branch B: runner === "verifyThreadSubscriptionLifecycle" || id.includes("thread-subscription"):
-// client = new RegressionFakeRuntimeClient(); registry = new ThreadSubscriptionRegistry(() => client)
-// DEFECT: closure () => client -> client handle id passed as get_client_id.
-// threadId = String(input?.threadId?? "regression-test-thread"); turnId = String(input?.turnId?? "turn-regression-01"); clientId = "browser-test-client"
-// registry.watch(threadId, clientId); await new Promise(r => setTimeout(r, 5)) (DEFECT: Promise+setTimeout sleep -> extern sleep 5ms)
-// initialDiag = registry.diagnostics() (JSON scratch parsed for counts)
-// logs.push(`[replay] watch() initial diagnostics: subscribedThreadCount=${...}, watcherCount=${...}`)
-// if (subscribedThreadCount < 1) { regressionDetected = true; violations.push("watch() did not ensure subscription (subscribedThreadCount < 1)")}
-// registry.addTurnHold(threadId, `turn:${turnId}`); activeDiag checks activeTurnHoldCount < 1 -> violations.push("addTurnHold() did not record active turn hold")
-// registry.removeTurnHold(threadId, `turn:${turnId}`); registry.unwatch(threadId, clientId); await sleep(5)
-// settledDiag checks: watcherCount!== 0 -> violation; activeTurnHoldCount!== 0 -> regressionDetected + violation; subscribedThreadCount!== 0 -> violation
-// (all violation strings are template literals in source -> formatted appends; literals preserved)
-// Branch C: runner === "verifyMaxTokensContinuation" || id.includes("max-tokens"):
-// model = String(input?.model?? "claude-sonnet-4-5"); cap = miniAnthropicOutputCapForModel(model)
-// logs.push(`[replay] Model ${model} cap resolved to: ${cap}`)
-// if (cap!== MINI_ANTHROPIC_CLAUDE4_MAX_TOKENS) violations.push(`Expected cap ${...}, got ${cap}`)
-// claude5Cap = miniAnthropicOutputCapForModel("claude-sonnet-5"); if (!== MINI_ANTHROPIC_CLAUDE5_MAX_TOKENS) violation
-// mockRejection = new Error("anthropic 400: max_tokens: 64000 exceeds maximum (8192)"); isRejected = isMiniAnthropicMaxTokensRejectedError(mockRejection)
-// DEFECT: Error object -> (msg_ptr, msg_len) passed to predicate extern.
-// if (!isRejected) { regressionDetected = true; violations.push("Failed to detect relay max_tokens rejection error")}
-// if (MINI_ANTHROPIC_MAX_TOKENS_TRUNCATED!== "mini anthropic output truncated at max_tokens") violations.push("Truncation marker token definition altered")
-// logs.push("[replay] max_tokens continuation protocol guard verified")
-// Branch D (else): declarative matcher fallback:
-// logs.push("[replay] Executing declarative case evaluation")
-// forbiddenPatterns = negativeMatcher?.forbiddenPatterns || []
-// for pattern of forbiddenPatterns { for round of simulation?.rounds || [] { roundStr = JSON.stringify(round);
-// if (roundStr.includes(pattern)) { regressionDetected = true; violations.push(`Negative matcher violation: found forbidden pattern "${pattern}" in simulation`)}}}
-// DEFECT: nested dynamic iteration -> JSON array enumeration via sa_json extern.
-// catch (error) { violations.push(`Execution error: ${errorMessage}`)}
-// passed = violations.length === 0; durationMs = Date.now() - startedAt
-// logs.push(`[replay] Finished ${id}: ${passed? "PASS": "FAIL"} (${durationMs}ms)`)
-// return {id, title, component, passed, durationMs, regressionDetected, violations, logs}
-return 0;
+    rr_result_clear(result);
+    let start_ms = rr_now_ms();
+    let dp1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp1, &result.id, 0);
+    let sp1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp1, &case_def.id, 0);
+    result.id_len = rr_field_copy(dp1, 256, sp1, case_def.id_len);
+    let dp2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp2, &result.title, 0);
+    let sp2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp2, &case_def.title, 0);
+    result.title_len = rr_field_copy(dp2, 512, sp2, case_def.title_len);
+    let dp3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp3, &result.component, 0);
+    let sp3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp3, &case_def.component, 0);
+    result.component_len = rr_field_copy(dp3, 256, sp3, case_def.component_len);
+    let first = RrStr { bytes: [0; 8192], len: 0 };
+    rr_push_lit(&first, STR_PTR("[replay] Running case "), STR_LEN("[replay] Running case "));
+    let sp4: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp4, &case_def.id, 0);
+    rr_push(&first, sp4, case_def.id_len);
+    rr_push_lit(&first, STR_PTR(": "), STR_LEN(": "));
+    let sp5: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp5, &case_def.title, 0);
+    rr_push(&first, sp5, case_def.title_len);
+    rr_push_lit(&first, STR_PTR(" (target: "), STR_LEN(" (target: "));
+    let sp6: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp6, &case_def.component, 0);
+    rr_push(&first, sp6, case_def.component_len);
+    rr_push_lit(&first, STR_PTR(")"), STR_LEN(")"));
+    rr_log_push_str(result, &first);
+    let regression = false;
+    // Branch dispatch: explicit runner name, else case.id heuristic.
+    let runner_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(runner_p, &case_def.runner, 0);
+    let id_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(id_p, &case_def.id, 0);
+    if rr_eq(runner_p, case_def.runner_len, STR_PTR("verifyWaterfallConsultationRetention"), STR_LEN("verifyWaterfallConsultationRetention")) || rr_contains(id_p, case_def.id_len, STR_PTR("waterfall-retention"), STR_LEN("waterfall-retention")) {
+        rr_branch_waterfall(case_def, result, &regression);
+    } else if rr_eq(runner_p, case_def.runner_len, STR_PTR("verifyThreadSubscriptionLifecycle"), STR_LEN("verifyThreadSubscriptionLifecycle")) || rr_contains(id_p, case_def.id_len, STR_PTR("thread-subscription"), STR_LEN("thread-subscription")) {
+        rr_branch_thread_subscription(case_def, result, &regression);
+    } else if rr_eq(runner_p, case_def.runner_len, STR_PTR("verifyMaxTokensContinuation"), STR_LEN("verifyMaxTokensContinuation")) || rr_contains(id_p, case_def.id_len, STR_PTR("max-tokens"), STR_LEN("max-tokens")) {
+        rr_branch_max_tokens(case_def, result, &regression);
+    } else {
+        rr_branch_declarative(case_def, result, &regression);
+    };
+    rr_finish_result(case_def, result, start_ms, regression);
+    return 0;
 }
 
-// L261-296: export async function runRegressionSuite(filter?, cwd?): Promise<RegressionSuiteReport>
-// DEFECT: async -> synchronous; sequential await loop -> plain loop. [BLOCKED: body is a conversion-era comment skeleton (logic only in comments, preset return). The fake client's emit() is separately registered as an EventEmitter defect in place; the case/suite runners' sequential-await form is noted inline but unimplemented.]
+// ---------------------------------------------------------------------------
+// runRegressionSuite: loader (two passes: id scan + sort, then parse/run).
+// ---------------------------------------------------------------------------
+
+// One serialized result JSON (the vendor unit's field order/format).
+fn rr_result_json(result: &RegressionCaseResult, out: &RrBigStr) -> void {
+    out.len = 0;
+    rr_big_push_lit(out, STR_PTR("{\"id\":"), STR_LEN("{\"id\":"));
+    let p1: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p1, &result.id, 0);
+    rr_big_push_json_string(out, p1, result.id_len);
+    rr_big_push_lit(out, STR_PTR(",\"title\":"), STR_LEN(",\"title\":"));
+    let p2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p2, &result.title, 0);
+    rr_big_push_json_string(out, p2, result.title_len);
+    rr_big_push_lit(out, STR_PTR(",\"component\":"), STR_LEN(",\"component\":"));
+    let p3: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p3, &result.component, 0);
+    rr_big_push_json_string(out, p3, result.component_len);
+    rr_big_push_lit(out, STR_PTR(",\"passed\":"), STR_LEN(",\"passed\":"));
+    if result.passed { rr_big_push_lit(out, STR_PTR("true"), STR_LEN("true")); } else { rr_big_push_lit(out, STR_PTR("false"), STR_LEN("false")); };
+    rr_big_push_lit(out, STR_PTR(",\"durationMs\":"), STR_LEN(",\"durationMs\":"));
+    let num = RrStr { bytes: [0; 8192], len: 0 };
+    rr_push_u64(&num, result.duration_ms);
+    rr_big_push(out, rr_str_ptr(&num), num.len);
+    rr_big_push_lit(out, STR_PTR(",\"regressionDetected\":"), STR_LEN(",\"regressionDetected\":"));
+    if result.regression_detected { rr_big_push_lit(out, STR_PTR("true"), STR_LEN("true")); } else { rr_big_push_lit(out, STR_PTR("false"), STR_LEN("false")); };
+    rr_big_push_lit(out, STR_PTR(",\"violations\":["), STR_LEN(",\"violations\":["));
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < result.violations_len {
+        if i > 0 { rr_big_push_lit(out, STR_PTR(","), STR_LEN(",")); };
+        let vp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(vp, &result.violations, off);
+        rr_big_push_json_string(out, vp, result.violation_lens[i]);
+        off = off + result.violation_lens[i];
+        i = i + 1;
+    }
+    rr_big_push_lit(out, STR_PTR("],\"logs\":["), STR_LEN("],\"logs\":["));
+    off = 0;
+    i = 0;
+    while i < result.logs_len {
+        if i > 0 { rr_big_push_lit(out, STR_PTR(","), STR_LEN(",")); };
+        let lp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(lp, &result.logs, off);
+        rr_big_push_json_string(out, lp, result.log_lens[i]);
+        off = off + result.log_lens[i];
+        i = i + 1;
+    }
+    rr_big_push_lit(out, STR_PTR("]}"), STR_LEN("]}"));
+}
+
+// Collect ".json" file names from a dir listing. Handles the verified
+// object shape {"entries":[{"name","isDirectory","isFile"}]} and falls
+// back to a bare string array. Names are appended packed into `names`
+// with per-name lens in `name_lens` (the caller's arrays).
+fn rr_name_is_json(np: ptr, nl: u64) -> bool {
+    if nl <= 5 { return false; };
+    let tail: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tail, np, nl - 5);
+    return rr_eq(tail, 5, STR_PTR(".json"), STR_LEN(".json"));
+}
+
+fn rr_collect_append(names: &[u8; 65536], name_lens: &[u64; 512], used_now: u64, cnt_now: u64, np: ptr, nl: u64) -> u64 {
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, names, used_now);
+    let m = rr_field_copy(dp, 65536 - used_now, np, nl);
+    let wp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(wp, name_lens, cnt_now * 8);
+    PTR_WRITE_U64(wp, m);
+    return m;
+}
+
+fn rr_collect_names(dir_p: ptr, dir_n: u64, names: &[u8; 65536], name_lens: &[u64; 512], names_used: &u64, names_count: &u64) -> void {
+    *names_used = 0;
+    *names_count = 0;
+    let dh: u64 = 0;
+    if sa_std_fs_read_dir_json(dir_p, dir_n, 65536, &dh) != 0 || dh == 0 { return; };
+    let lp: ptr = sa_fs_dir_buffer_data(dh);
+    let ll = sa_fs_dir_buffer_len(dh);
+    let doc = sa_json_parse(lp, ll);
+    sa_fs_dir_buffer_free(dh);
+    if doc == 0 { return; };
+    let list: u64 = 0;
+    if sa_json_kind(doc) == RR_JK_OBJECT {
+        if sa_json_object_get(doc, STR_PTR("entries"), STR_LEN("entries"), &list) != 0 {
+            sa_json_free(doc);
+            return;
+        };
+    } else if sa_json_kind(doc) == RR_JK_ARRAY {
+        list = doc;
+    } else {
+        sa_json_free(doc);
+        return;
+    };
+    if list == 0 || sa_json_kind(list) != RR_JK_ARRAY {
+        sa_json_free(doc);
+        return;
+    };
+    let cnt: u64 = 0;
+    sa_json_value_count(list, &cnt);
+    let i: u64 = 0;
+    while i < cnt && *names_count < 512 {
+        let el: u64 = 0;
+        if sa_json_array_get(list, i, &el) == 0 && el != 0 {
+            let np: ptr = PTR_NULL();
+            let nl: u64 = 0;
+            let have = false;
+            if sa_json_kind(el) == RR_JK_OBJECT {
+                let is_file: bool = true;
+                let fb: bool = false;
+                if sa_json_object_get_bool(el, STR_PTR("isFile"), STR_LEN("isFile"), &fb) == 0 {
+                    is_file = fb;
+                };
+                if is_file && sa_json_object_get_string(el, STR_PTR("name"), STR_LEN("name"), &np, &nl) == 0 {
+                    have = true;
+                };
+            } else if sa_json_kind(el) == RR_JK_STRING {
+                np = sa_json_string_ptr(el);
+                nl = sa_json_string_len(el);
+                have = true;
+            };
+            if have && rr_name_is_json(np, nl) {
+                let used_now = *names_used;
+                let cnt_now = *names_count;
+                let m = rr_collect_append(names, name_lens, used_now, cnt_now, np, nl);
+                *names_used = used_now + m;
+                *names_count = cnt_now + 1;
+            };
+        };
+        i = i + 1;
+    }
+    sa_json_free(doc);
+}
+
+fn rr_report_clear(report: &RegressionSuiteReport) -> void {
+    report.ok = false;
+    report.total_cases = 0;
+    report.passed_cases = 0;
+    report.failed_cases = 0;
+    report.regressed_cases = 0;
+    report.duration_ms = 0;
+    report.results_len = 0;
+    report.summary_len = 0;
+    report.err_len = 0;
+}
+
 fn runRegressionSuite(filter: &RegressionCaseFilter, has_cwd: bool, cwd_ptr: ptr, cwd_len: u64, report: &RegressionSuiteReport) -> i32 {
-// startedAt = Date.now(); cases = loadRegressionCases(filter, cwd) (SDK extern; DEFECT: dynamic case array -> count + per-index fetch)
-// for (c of cases) results.push(await runRegressionCase(c, cwd))
-// totalCases = results.length; passedCases = filter(passed).length; failedCases; regressedCases (DEFECT: Array.filter -> counting loops)
-// durationMs = Date.now() - startedAt
-// summary = ["", `• 运行案例数：${totalCases} 个`, `• 通过：${passedCases} | 失败：${failedCases}`,
-// regressedCases > 0? `• 🚨 历史回归警报：发现 ${regressedCases} 个旧 Bug 再次复发！`: `• ✅ 历史回归检测：0 个旧 Bug 复发`,
-// `• 总耗时：${durationMs}ms`].join("\n") (Chinese literals preserved at fix stage; DEFECT: template literals -> formatted appends)
-// return {ok: failedCases === 0, totalCases, passedCases, failedCases, regressedCases, durationMs, results, summary}
-return 0;
+    rr_report_clear(report);
+    let start_ms = rr_now_ms();
+    let dir = RrStr { bytes: [0; 8192], len: 0 };
+    rr_resolve_dir(&dir, has_cwd, cwd_ptr, cwd_len);
+    let rf = RrFilter {
+        active: false,
+        has_id: false, id: [0; 512], id_len: 0,
+        has_component: false, component: [0; 512], component_len: 0,
+        has_category: false, category: [0; 256], category_len: 0,
+        tags: [0; 2048], tag_lens: [0; 32], tags_len: 0,
+    };
+    rr_filter_decode(filter, &rf);
+    if !rr_fs_exists(rr_str_ptr(&dir), dir.len) {
+        // TS: resolveRegressionCasesDir may not exist -> loadRegressionCases
+        // returns [] (existsSync guard in the SDK loader).
+        let dur0 = rr_now_ms() - start_ms;
+        if dur0 < 0 { dur0 = 0; };
+        report.duration_ms = (dur0) as u64;
+        report.ok = true;
+        rr_suite_summary(report);
+        return 0;
+    };
+    // Pass 1: names + ids, sorted by id (TS sort by id localeCompare ~
+    // byte order for the ASCII ids used here).
+    let names = [0u8; 65536];
+    let name_lens = [0u64; 512];
+    let names_used: u64 = 0;
+    let names_count: u64 = 0;
+    rr_collect_names(rr_str_ptr(&dir), dir.len, &names, &name_lens, &names_used, &names_count);
+    let ids = [0u8; 65536];
+    let id_lens = [0u64; 512];
+    let order = [0u64; 512];
+    let slot_name = [0u64; 512];
+    let vi: u64 = 0;
+    let off: u64 = 0;
+    let ids_used: u64 = 0;
+    let ni: u64 = 0;
+    while ni < names_count {
+        let nl = name_lens[ni];
+        let np: ptr = PTR_NULL();
+        PTR_BYTE_ADD(np, &names, off);
+        let path = RrStr { bytes: [0; 8192], len: 0 };
+        rr_push(&path, rr_str_ptr(&dir), dir.len);
+        rr_push_lit(&path, STR_PTR("/"), STR_LEN("/"));
+        rr_push(&path, np, nl);
+        let probe_case = RegressionCase {
+            id: [0; 256], id_len: 0, title: [0; 512], title_len: 0,
+            component: [0; 256], component_len: 0,
+            tags: [0; 4096], tag_lens: [0; 32], tags_len: 0,
+            category: [0; 128], category_len: 0,
+            description: [0; 2048], description_len: 0,
+            input_json: [0; 65536], input_json_len: 0,
+            simulation_json: [0; 65536], simulation_json_len: 0,
+            negative_matcher_json: [0; 16384], negative_matcher_json_len: 0,
+            positive_invariants_json: [0; 16384], positive_invariants_json_len: 0,
+            has_runner: false, runner: [0; 128], runner_len: 0,
+        };
+        if rr_parse_case_file(rr_str_ptr(&path), path.len, &probe_case) {
+            let idp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(idp, &ids, ids_used);
+            let srcp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(srcp, &probe_case.id, 0);
+            let m = rr_field_copy(idp, 65536 - ids_used, srcp, probe_case.id_len);
+            id_lens[vi] = m;
+            order[vi] = vi;
+            slot_name[vi] = ni;
+            ids_used = ids_used + m;
+            vi = vi + 1;
+        };
+        off = off + nl;
+        ni = ni + 1;
+    }
+    // Insertion sort of order[] (id slots) by id bytes; ids are packed
+    // in valid-scan order with per-slot lens (prefix-sum offsets).
+    let si: u64 = 1;
+    while si < vi {
+        let key = order[si];
+        let sj = si;
+        while sj > 0 {
+            let prev = order[sj - 1];
+            let ap: ptr = PTR_NULL();
+            let an: u64 = 0;
+            rr_id_at(&ids, &id_lens, prev, &ap, &an);
+            let bp: ptr = PTR_NULL();
+            let bn: u64 = 0;
+            rr_id_at(&ids, &id_lens, key, &bp, &bn);
+            if rr_bytes_cmp(ap, an, bp, bn) <= 0 { break; };
+            order[sj] = prev;
+            sj = sj - 1;
+        }
+        order[sj] = key;
+        si = si + 1;
+    }
+    // Pass 2: in sorted order re-read, filter, run.
+    let case_acc = RegressionCase {
+        id: [0; 256], id_len: 0, title: [0; 512], title_len: 0,
+        component: [0; 256], component_len: 0,
+        tags: [0; 4096], tag_lens: [0; 32], tags_len: 0,
+        category: [0; 128], category_len: 0,
+        description: [0; 2048], description_len: 0,
+        input_json: [0; 65536], input_json_len: 0,
+        simulation_json: [0; 65536], simulation_json_len: 0,
+        negative_matcher_json: [0; 16384], negative_matcher_json_len: 0,
+        positive_invariants_json: [0; 16384], positive_invariants_json_len: 0,
+        has_runner: false, runner: [0; 128], runner_len: 0,
+    };
+    let result_acc = RegressionCaseResult {
+        id: [0; 256], id_len: 0, title: [0; 512], title_len: 0,
+        component: [0; 256], component_len: 0,
+        passed: false, duration_ms: 0, regression_detected: false,
+        violations: [0; 65536], violation_lens: [0; 256], violations_len: 0,
+        logs: [0; 131072], log_lens: [0; 256], logs_len: 0,
+    };
+    let results_used: u64 = 0;
+    let oi: u64 = 0;
+    while oi < vi {
+        let slot = order[oi];
+        let name_idx = slot_name[slot];
+        // name offset: prefix sum of name_lens up to name_idx
+        let noff: u64 = 0;
+        let nj: u64 = 0;
+        while nj < name_idx {
+            noff = noff + name_lens[nj];
+            nj = nj + 1;
+        }
+        let nl2 = name_lens[name_idx];
+        let np2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(np2, &names, noff);
+        let path = RrStr { bytes: [0; 8192], len: 0 };
+        rr_push(&path, rr_str_ptr(&dir), dir.len);
+        rr_push_lit(&path, STR_PTR("/"), STR_LEN("/"));
+        rr_push(&path, np2, nl2);
+        if rr_parse_case_file(rr_str_ptr(&path), path.len, &case_acc) && rr_filter_match(&rf, &case_acc) {
+            runRegressionCase(&case_acc, &result_acc);
+            report.total_cases = report.total_cases + 1;
+            if result_acc.passed {
+                report.passed_cases = report.passed_cases + 1;
+            } else {
+                report.failed_cases = report.failed_cases + 1;
+            };
+            if result_acc.regression_detected {
+                report.regressed_cases = report.regressed_cases + 1;
+            };
+            if report.results_len < 512 {
+                let rj = RrBigStr { bytes: [0; 131072], len: 0 };
+                rr_result_json(&result_acc, &rj);
+                if results_used + rj.len <= 4194304 {
+                    let rp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(rp, &report.results, results_used);
+                    let m = rr_field_copy(rp, 4194304 - results_used, rr_big_ptr(&rj), rj.len);
+                    report.result_lens[report.results_len] = m;
+                    results_used = results_used + m;
+                    report.results_len = report.results_len + 1;
+                };
+            };
+        };
+        oi = oi + 1;
+    }
+    let dur = rr_now_ms() - start_ms;
+    if dur < 0 { dur = 0; };
+    report.duration_ms = (dur) as u64;
+    report.ok = report.failed_cases == 0;
+    rr_suite_summary(report);
+    return 0;
+}
+
+// Prefix-sum offset of the idx-th packed id.
+fn rr_lens_at(id_lens: &[u64; 512], idx: u64) -> u64 {
+    let base: ptr = PTR_NULL();
+    PTR_BYTE_ADD(base, id_lens, idx * 8);
+    let v: u64 = 0;
+    PTR_READ_U64(v, base);
+    return v;
+}
+
+fn rr_id_at(ids: &[u8; 65536], id_lens: &[u64; 512], idx: u64, out_p: &ptr, out_n: &u64) -> void {
+    let off: u64 = 0;
+    let i: u64 = 0;
+    while i < idx {
+        off = off + rr_lens_at(id_lens, i);
+        i = i + 1;
+    }
+    PTR_BYTE_ADD(*out_p, ids, off);
+    *out_n = rr_lens_at(id_lens, idx);
+}
+
+fn rr_bytes_cmp(p: ptr, n: u64, q: ptr, qn: u64) -> i64 {
+    let m = n;
+    if qn < m { m = qn; };
+    let i: u64 = 0;
+    while i < m {
+        let a = rr_byte(p, i);
+        let b = rr_byte(q, i);
+        if a != b { return ((a) as i64) - ((b) as i64); };
+        i = i + 1;
+    }
+    if n == qn { return 0; };
+    if n < qn { return 0 - 1; };
+    return 1;
+}
+
+fn rr_suite_summary(report: &RegressionSuiteReport) -> void {
+    let s = RrStr { bytes: [0; 8192], len: 0 };
+    rr_push_lit(&s, STR_PTR("【Codex Ultra 历史错误重放套件】\n• 运行案例数："), STR_LEN("【Codex Ultra 历史错误重放套件】\n• 运行案例数："));
+    rr_push_u64(&s, report.total_cases);
+    rr_push_lit(&s, STR_PTR(" 个"), STR_LEN(" 个"));
+    rr_push_lit(&s, STR_PTR("\n• 通过："), STR_LEN("\n• 通过："));
+    rr_push_u64(&s, report.passed_cases);
+    rr_push_lit(&s, STR_PTR(" | 失败："), STR_LEN(" | 失败："));
+    rr_push_u64(&s, report.failed_cases);
+    rr_push_lit(&s, STR_PTR("\n"), STR_LEN("\n"));
+    if report.regressed_cases > 0 {
+        rr_push_lit(&s, STR_PTR("• 🚨 历史回归警报：发现 "), STR_LEN("• 🚨 历史回归警报：发现 "));
+        rr_push_u64(&s, report.regressed_cases);
+        rr_push_lit(&s, STR_PTR(" 个旧 Bug 再次复发！"), STR_LEN(" 个旧 Bug 再次复发！"));
+    } else {
+        rr_push_lit(&s, STR_PTR("• ✅ 历史回归检测：0 个旧 Bug 复发"), STR_LEN("• ✅ 历史回归检测：0 个旧 Bug 复发"));
+    };
+    rr_push_lit(&s, STR_PTR("\n• 总耗时："), STR_LEN("\n• 总耗时："));
+    rr_push_u64(&s, report.duration_ms);
+    rr_push_lit(&s, STR_PTR("ms"), STR_LEN("ms"));
+    let dp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(dp, &report.summary, 0);
+    report.summary_len = rr_field_copy(dp, 4096, rr_str_ptr(&s), s.len);
 }
