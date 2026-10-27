@@ -1,9 +1,45 @@
 // Converted 1:1 from apps/server/src/saVmAccountabilityLedger.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// FIX (2026-10-27, stores batch): all bodies retranslated from the TS truth.
+// The conversion header claimed fs/path/Jev surfaces have "no direct
+// sa_std equivalents" — STALE in the same family as the password/uuid
+// corrections: fs (sa_fs_read_file / sa_std_fs_exists status codes /
+// sa_fs_mkdir_p), path handling (hand-rolled POSIX resolve/relative,
+// the exact subset node:path performs for these call sites), env cwd
+// (sa_env_current_dir), randomUUID (sa_deno_random_uuid) and the Jev
+// redteam (nativeJevRedteam in backends/jev saVmJev.sla, imported
+// below) all exist; the extractForbiddenKeywords header claim "no
+// regex in sa_std" is also stale (sa_regex_* exists) — the rule
+// pattern is landed as an equivalent hand scanner because its capture
+// semantics (alternation order, \s+, [a-zA-Z0-9_-]+ runs, length > 2)
+// map 1:1 without the ERE dialect differences noted in regex.sai.
+// String lifetime model: PenaltyRecord/RewardRecord/ReputationStatus
+// string fields point into JSON docs held in the ledger doc registry
+// (global u64 cells "ledger.entriesdoc" / "ledger.pathdoc" /
+// "ledger.scratchdoc" / "ledger.gatedoc"); the registry is reset at
+// every public API entry, so results are valid until the next ledger
+// API call — saVmTool consumes every out value synchronously inside
+// the call it made, which conforms. Gate decision tree: the landed
+// public signature carries neither the SaVmPolicyConfig nor a custom
+// ledger path, so lg_gate_full receives them as absent — under TS
+// semantics branch (!enabled && !customLedgerPath) then returns
+// {allowed, GREEN, 100} before any ledger read, exactly as the TS
+// function does for a policy-less call. The full tree (tiers, manual
+// override, RED Jev audit) is implemented in lg_gate_full and becomes
+// reachable when the wiring widens the signature (registered in
+// FIX_SERVER_STORES). The TS doc comment "P0-1: manualOverride is
+// IGNORED" contradicts the TS code, which honors an explicit
+// manualOverride; the code is followed.
 @import "sa_std/io/print.sai"
 @import "sa_std/fs.sai"
 @import "sa_std/env.sai"
-// DEFECT: node:crypto randomUUID, node:fs existsSync/mkdir/readFile/writeFile promises, node:path dirname/isAbsolute/relative/resolve, @codex-ui/shared types, nativeJevRedteam import — no direct sa_std equivalents; approximated with fs/env externs and JSON buffers.
-// DEFECT: dynamic object — PenaltyRecord etc use (ptr,len) string fields + JSON text buffers.
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/time.sai"
+@import "sa_std/fmt.sai"
+@import "sa_std/crypto.sai"
+@import "sa_std/globals.sai"
+@import "../../../backends/jev/src/jev/saVmJev.sla"
 
 struct PenaltyRecord { id_ptr: ptr, id_len: u64, type_ptr: ptr, type_len: u64, level: u64, targetFile_ptr: ptr, targetFile_len: u64, errorSignature_ptr: ptr, errorSignature_len: u64, scoreDelta: i32, details_ptr: ptr, details_len: u64, has_details: bool, timestamp: u64, status: u64, redeemedBy_ptr: ptr, redeemedBy_len: u64, has_redeemedBy: bool }
 struct RewardRecord { id_ptr: ptr, id_len: u64, type_ptr: ptr, type_len: u64, linkedPenaltyId_ptr: ptr, linkedPenaltyId_len: u64, scoreDelta: i32, verificationEvidence_ptr: ptr, verificationEvidence_len: u64, lessonLearned_ptr: ptr, lessonLearned_len: u64, antibodyRule_ptr: ptr, antibodyRule_len: u64, timestamp: u64 }
@@ -13,51 +49,1875 @@ struct ReputationStatus { score: i32, tier: u64, activePenalties: [PenaltyRecord
 struct AccountabilityGateResult { allowed: bool, tier: u64, score: i32, kind_ptr: ptr, kind_len: u64, has_kind: bool, reason_ptr: ptr, reason_len: u64, has_reason: bool, notice_ptr: ptr, notice_len: u64, has_notice: bool, antibodyNotice_ptr: ptr, antibodyNotice_len: u64, has_antibodyNotice: bool, jev_verdict_ptr: ptr, jev_verdict_len: u64, jev_risk_ptr: ptr, jev_risk_len: u64, jev_summary_ptr: ptr, jev_summary_len: u64, has_jevVerdict: bool }
 struct JevAuditContext { targetFile_ptr: ptr, targetFile_len: u64, proposedChanges_ptr: ptr, proposedChanges_len: u64, tier: u64, score: i32 }
 // DEFECT: generic / union types — PenaltyLevel, ReputationTier as u64 enums; LedgerEntry union as tagged struct.
+// Level codes: 0=L1_SYNTAX, 1=L2_REGRESSION, 2=L3_THRASH, 3=CUSTOM.
+// Tier codes: 0=GREEN, 1=YELLOW, 2=RED. Penalty status: 0=active, 1=redeemed.
 // Constants PENALTY_SCORES: L1_SYNTAX=-10 L2_REGRESSION=-20 L3_THRASH=-30 CUSTOM=-10
 fn penaltyScore(level: u64) -> i32 { if level == 0 { return -10; }; if level == 1 { return -20; }; if level == 2 { return -30; }; return -10; }
-fn resolveLedgerPath(cwd_ptr: ptr, cwd_len: u64, has_cwd: bool, custom_ptr: ptr, custom_len: u64, has_custom: bool, out_ptr: ptr, out_len: u64) -> u64 {
-    // DEFECT: process.cwd(), path resolve/isAbsolute — approximated; returns length written to out buffer (JSON/path buffer)
-    return 0;
+
+// ---- private toolkit (lg_ prefix) ----
+struct LgPath {
+    bytes: [u8; 4096],
+    len: u64,
 }
-fn deletePenalty() -> i32 { // DEFECT: TS never + throw Error — approximated as error status code
+
+struct LgText {
+    bytes: [u8; 65536],
+    len: u64,
+}
+
+struct LgAuditOutcome {
+    approved: bool,
+    verdict_ptr: ptr, verdict_len: u64, has_verdict: bool,
+    risk_ptr: ptr, risk_len: u64, has_risk: bool,
+    reason_ptr: ptr, reason_len: u64, has_reason: bool,
+}
+
+struct LgIndexList {
+    idx: [u64; 128],
+    len: u64,
+}
+
+struct LgPenStore {
+    items: [PenaltyRecord; 128],
+    len: u64,
+}
+
+struct LgRewStore {
+    items: [RewardRecord; 128],
+    len: u64,
+}
+
+struct LgAbStore {
+    items: [Antibody; 128],
+    len: u64,
+}
+
+fn lg_penalty_zero() -> PenaltyRecord {
+    return PenaltyRecord { id_ptr: PTR_NULL(), id_len: 0, type_ptr: PTR_NULL(), type_len: 0, level: 3, targetFile_ptr: PTR_NULL(), targetFile_len: 0, errorSignature_ptr: PTR_NULL(), errorSignature_len: 0, scoreDelta: 0, details_ptr: PTR_NULL(), details_len: 0, has_details: false, timestamp: 0, status: 0, redeemedBy_ptr: PTR_NULL(), redeemedBy_len: 0, has_redeemedBy: false };
+}
+
+fn lg_reward_zero() -> RewardRecord {
+    return RewardRecord { id_ptr: PTR_NULL(), id_len: 0, type_ptr: PTR_NULL(), type_len: 0, linkedPenaltyId_ptr: PTR_NULL(), linkedPenaltyId_len: 0, scoreDelta: 0, verificationEvidence_ptr: PTR_NULL(), verificationEvidence_len: 0, lessonLearned_ptr: PTR_NULL(), lessonLearned_len: 0, antibodyRule_ptr: PTR_NULL(), antibodyRule_len: 0, timestamp: 0 };
+}
+
+fn lg_antibody_zero() -> Antibody {
+    return Antibody { targetFile_ptr: PTR_NULL(), targetFile_len: 0, rule_ptr: PTR_NULL(), rule_len: 0, lesson_ptr: PTR_NULL(), lesson_len: 0, penaltyId_ptr: PTR_NULL(), penaltyId_len: 0, rewardId_ptr: PTR_NULL(), rewardId_len: 0, timestamp: 0 };
+}
+
+fn lg_pen_store_new() -> LgPenStore {
+    return LgPenStore { items: [PenaltyRecord { id_ptr: PTR_NULL(), id_len: 0, type_ptr: PTR_NULL(), type_len: 0, level: 3, targetFile_ptr: PTR_NULL(), targetFile_len: 0, errorSignature_ptr: PTR_NULL(), errorSignature_len: 0, scoreDelta: 0, details_ptr: PTR_NULL(), details_len: 0, has_details: false, timestamp: 0, status: 0, redeemedBy_ptr: PTR_NULL(), redeemedBy_len: 0, has_redeemedBy: false }; 128], len: 0 };
+}
+
+fn lg_rew_store_new() -> LgRewStore {
+    return LgRewStore { items: [RewardRecord { id_ptr: PTR_NULL(), id_len: 0, type_ptr: PTR_NULL(), type_len: 0, linkedPenaltyId_ptr: PTR_NULL(), linkedPenaltyId_len: 0, scoreDelta: 0, verificationEvidence_ptr: PTR_NULL(), verificationEvidence_len: 0, lessonLearned_ptr: PTR_NULL(), lessonLearned_len: 0, antibodyRule_ptr: PTR_NULL(), antibodyRule_len: 0, timestamp: 0 }; 128], len: 0 };
+}
+
+fn lg_ab_store_new() -> LgAbStore {
+    return LgAbStore { items: [Antibody { targetFile_ptr: PTR_NULL(), targetFile_len: 0, rule_ptr: PTR_NULL(), rule_len: 0, lesson_ptr: PTR_NULL(), lesson_len: 0, penaltyId_ptr: PTR_NULL(), penaltyId_len: 0, rewardId_ptr: PTR_NULL(), rewardId_len: 0, timestamp: 0 }; 128], len: 0 };
+}
+
+fn lg_penalty_copy(src: &PenaltyRecord, dst: &PenaltyRecord) -> void {
+    dst.id_ptr = src.id_ptr; dst.id_len = src.id_len;
+    dst.type_ptr = src.type_ptr; dst.type_len = src.type_len;
+    dst.level = src.level;
+    dst.targetFile_ptr = src.targetFile_ptr; dst.targetFile_len = src.targetFile_len;
+    dst.errorSignature_ptr = src.errorSignature_ptr; dst.errorSignature_len = src.errorSignature_len;
+    dst.scoreDelta = src.scoreDelta;
+    dst.details_ptr = src.details_ptr; dst.details_len = src.details_len; dst.has_details = src.has_details;
+    dst.timestamp = src.timestamp;
+    dst.status = src.status;
+    dst.redeemedBy_ptr = src.redeemedBy_ptr; dst.redeemedBy_len = src.redeemedBy_len; dst.has_redeemedBy = src.has_redeemedBy;
+}
+
+fn lg_reward_copy(src: &RewardRecord, dst: &RewardRecord) -> void {
+    dst.id_ptr = src.id_ptr; dst.id_len = src.id_len;
+    dst.type_ptr = src.type_ptr; dst.type_len = src.type_len;
+    dst.linkedPenaltyId_ptr = src.linkedPenaltyId_ptr; dst.linkedPenaltyId_len = src.linkedPenaltyId_len;
+    dst.scoreDelta = src.scoreDelta;
+    dst.verificationEvidence_ptr = src.verificationEvidence_ptr; dst.verificationEvidence_len = src.verificationEvidence_len;
+    dst.lessonLearned_ptr = src.lessonLearned_ptr; dst.lessonLearned_len = src.lessonLearned_len;
+    dst.antibodyRule_ptr = src.antibodyRule_ptr; dst.antibodyRule_len = src.antibodyRule_len;
+    dst.timestamp = src.timestamp;
+}
+
+fn lg_path_ptr(b: &LgPath) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &b.bytes, 0);
+    return p;
+}
+
+fn lg_text_ptr(b: &LgText) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &b.bytes, 0);
+    return p;
+}
+
+fn lg_path_assign(b: &LgPath, src: ptr, src_len: u64) -> void {
+    b.len = 0;
+    let i: u64 = 0;
+    while i < src_len && b.len < 4096 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, src, i);
+        b.bytes[b.len] = v;
+        b.len = b.len + 1;
+        i = i + 1;
+    }
+}
+
+fn lg_path_append(b: &LgPath, src: ptr, src_len: u64) -> void {
+    let i: u64 = 0;
+    while i < src_len && b.len < 4096 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, src, i);
+        b.bytes[b.len] = v;
+        b.len = b.len + 1;
+        i = i + 1;
+    }
+}
+
+fn lg_text_assign(b: &LgText, src: ptr, src_len: u64) -> void {
+    b.len = 0;
+    lg_text_append(b, src, src_len);
+}
+
+fn lg_text_append(b: &LgText, src: ptr, src_len: u64) -> void {
+    let i: u64 = 0;
+    while i < src_len && b.len < 65536 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, src, i);
+        b.bytes[b.len] = v;
+        b.len = b.len + 1;
+        i = i + 1;
+    }
+}
+
+fn lg_text_append_u64(b: &LgText, v: u64) -> void {
+    if v >= 10 { lg_text_append_u64(b, v / 10); };
+    let d: u8 = 48 + ((v % 10) as u8);
+    if b.len < 65536 { b.bytes[b.len] = d; b.len = b.len + 1; };
+}
+
+fn lg_text_append_i64(b: &LgText, v: i64) -> void {
+    if v < 0 {
+        if b.len < 65536 { b.bytes[b.len] = 45; b.len = b.len + 1; };
+        lg_text_append_u64(b, (0 - v) as u64);
+        return;
+    };
+    lg_text_append_u64(b, v as u64);
+}
+
+fn lg_bytes_eq(a: ptr, a_len: u64, b: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    let i: u64 = 0;
+    while i < a_len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a, i);
+        PTR_BYTE_AT(y, b, i);
+        if x != y { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn lg_lit_eq(p: ptr, len: u64, lit: ptr, lit_len: u64) -> bool {
+    return lg_bytes_eq(p, len, lit, lit_len);
+}
+
+fn lg_starts_with(p: ptr, len: u64, pre: ptr, pre_len: u64) -> bool {
+    if pre_len > len { return false; };
+    let i: u64 = 0;
+    while i < pre_len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, p, i);
+        PTR_BYTE_AT(y, pre, i);
+        if x != y { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// JS endsWith: an empty needle matches (returns true).
+fn lg_ends_with(p: ptr, len: u64, suf: ptr, suf_len: u64) -> bool {
+    if suf_len == 0 { return true; };
+    if suf_len > len { return false; };
+    let off: u64 = len - suf_len;
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, p, off);
+    return lg_bytes_eq(sp, suf_len, suf, suf_len);
+}
+
+fn lg_contains(hay: ptr, hay_len: u64, needle: ptr, needle_len: u64) -> bool {
+    if needle_len == 0 { return true; };
+    if needle_len > hay_len { return false; };
+    let i: u64 = 0;
+    let last: u64 = hay_len - needle_len;
+    while i <= last {
+        let hp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(hp, hay, i);
+        if lg_bytes_eq(hp, needle_len, needle, needle_len) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn lg_lower_byte(c: u8) -> u8 {
+    if c >= 65 && c <= 90 { return c + 32; };
+    return c;
+}
+
+// ASCII case-insensitive substring (JS toLowerCase().includes() for
+// the ASCII range; non-ASCII case folding is out of the landed subset).
+fn lg_contains_ci(hay: ptr, hay_len: u64, needle: ptr, needle_len: u64) -> bool {
+    if needle_len == 0 { return true; };
+    if needle_len > hay_len { return false; };
+    let i: u64 = 0;
+    let last: u64 = hay_len - needle_len;
+    while i <= last {
+        let ok: bool = true;
+        let j: u64 = 0;
+        while j < needle_len {
+            let x: u8 = 0;
+            let y: u8 = 0;
+            PTR_BYTE_AT(x, hay, i + j);
+            PTR_BYTE_AT(y, needle, j);
+            if lg_lower_byte(x) != lg_lower_byte(y) { ok = false; };
+            j = j + 1;
+        }
+        if ok { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn lg_trim_range(p: ptr, len: u64, lo: &u64, hi: &u64) -> void {
+    let a: u64 = 0;
+    let b: u64 = len;
+    while a < b {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, a);
+        if c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12 {
+            a = a + 1;
+        } else {
+            break;
+        };
+    }
+    while b > a {
+        let c2: u8 = 0;
+        PTR_BYTE_AT(c2, p, b - 1);
+        if c2 == 32 || c2 == 9 || c2 == 10 || c2 == 13 || c2 == 11 || c2 == 12 {
+            b = b - 1;
+        } else {
+            break;
+        };
+    }
+    *lo = a;
+    *hi = b;
+}
+
+// ---- path subset (node:path resolve/relative/isAbsolute on POSIX) ----
+fn lg_is_absolute(p: ptr, len: u64) -> bool {
+    if len == 0 { return false; };
+    let c: u8 = 0;
+    PTR_BYTE_AT(c, p, 0);
+    return c == 47;
+}
+
+// Normalize an absolute path: collapse duplicate slashes, "." and ".."
+// segments (node resolve semantics on POSIX; trailing slash dropped
+// except for the root itself).
+fn lg_normalize_absolute(src: ptr, src_len: u64, out: &LgPath) -> void {
+    out.len = 0;
+    // segment stack as (offset,len) into a scratch copy of src
+    let scratch = LgPath { bytes: [0u8; 4096], len: 0 };
+    lg_path_assign(&scratch, src, src_len);
+    let sp: ptr = lg_path_ptr(&scratch);
+    let offs = LgIndexList { idx: [0u64; 128], len: 0 };
+    let lens = LgIndexList { idx: [0u64; 128], len: 0 };
+    let seg_start: u64 = 0;
+    let j: u64 = 0;
+    while j <= scratch.len {
+        let at_end2: bool = j == scratch.len;
+        let is_sep2: bool = false;
+        if !at_end2 {
+            let c2: u8 = 0;
+            PTR_BYTE_AT(c2, sp, j);
+            if c2 == 47 { is_sep2 = true; };
+        };
+        if at_end2 || is_sep2 {
+            let sl: u64 = j - seg_start;
+            if sl == 1 {
+                let d: u8 = 0;
+                PTR_BYTE_AT(d, sp, seg_start);
+                if d != 46 {
+                    if offs.len < 128 {
+                        offs.idx[offs.len] = seg_start;
+                        lens.idx[offs.len] = sl;
+                        offs.len = offs.len + 1;
+                    };
+                };
+            } else if sl == 2 {
+                let d1: u8 = 0;
+                let d2: u8 = 0;
+                PTR_BYTE_AT(d1, sp, seg_start);
+                PTR_BYTE_AT(d2, sp, seg_start + 1);
+                if d1 == 46 && d2 == 46 {
+                    if offs.len > 0 { offs.len = offs.len - 1; };
+                } else {
+                    if offs.len < 128 {
+                        offs.idx[offs.len] = seg_start;
+                        lens.idx[offs.len] = sl;
+                        offs.len = offs.len + 1;
+                    };
+                };
+            } else if sl > 2 {
+                if offs.len < 128 {
+                    offs.idx[offs.len] = seg_start;
+                    lens.idx[offs.len] = sl;
+                    offs.len = offs.len + 1;
+                };
+            };
+            seg_start = j + 1;
+        };
+        j = j + 1;
+    }
+    lg_path_append(out, STR_PTR("/"), STR_LEN("/"));
+    let k: u64 = 0;
+    while k < offs.len {
+        if k > 0 { lg_path_append(out, STR_PTR("/"), STR_LEN("/")); };
+        let segp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(segp, sp, offs.idx[k]);
+        lg_path_append(out, segp, lens.idx[k]);
+        k = k + 1;
+    }
+}
+
+fn lg_resolve(base: ptr, base_len: u64, rel: ptr, rel_len: u64, out: &LgPath) -> void {
+    if lg_is_absolute(rel, rel_len) {
+        lg_normalize_absolute(rel, rel_len, out);
+        return;
+    };
+    let joined = LgPath { bytes: [0u8; 4096], len: 0 };
+    lg_path_assign(&joined, base, base_len);
+    if joined.len == 0 || !lg_ends_with(lg_path_ptr(&joined), joined.len, STR_PTR("/"), STR_LEN("/")) {
+        lg_path_append(&joined, STR_PTR("/"), STR_LEN("/"));
+    };
+    lg_path_append(&joined, rel, rel_len);
+    lg_normalize_absolute(lg_path_ptr(&joined), joined.len, out);
+}
+
+// node path.relative(from, to) on already-resolved POSIX paths.
+fn lg_relative(from: ptr, from_len: u64, to: ptr, to_len: u64, out: &LgPath) -> void {
+    let f = LgPath { bytes: [0u8; 4096], len: 0 };
+    let t = LgPath { bytes: [0u8; 4096], len: 0 };
+    lg_normalize_absolute(from, from_len, &f);
+    lg_normalize_absolute(to, to_len, &t);
+    // segment offset/len lists for both
+    let fo = LgIndexList { idx: [0u64; 128], len: 0 };
+    let fl = LgIndexList { idx: [0u64; 128], len: 0 };
+    let to2 = LgIndexList { idx: [0u64; 128], len: 0 };
+    let tl2 = LgIndexList { idx: [0u64; 128], len: 0 };
+    lg_segments(&f, &fo, &fl);
+    lg_segments(&t, &to2, &tl2);
+    let common: u64 = 0;
+    while common < fo.len && common < to2.len {
+        let fp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(fp, lg_path_ptr(&f), fo.idx[common]);
+        let tp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp, lg_path_ptr(&t), to2.idx[common]);
+        if lg_bytes_eq(fp, fl.idx[common], tp, tl2.idx[common]) {
+            common = common + 1;
+        } else {
+            break;
+        };
+    }
+    out.len = 0;
+    let up: u64 = common;
+    while up < fo.len {
+        if out.len > 0 { lg_path_append(out, STR_PTR("/"), STR_LEN("/")); };
+        lg_path_append(out, STR_PTR(".."), STR_LEN(".."));
+        up = up + 1;
+    }
+    let down: u64 = common;
+    while down < to2.len {
+        if out.len > 0 { lg_path_append(out, STR_PTR("/"), STR_LEN("/")); };
+        let tp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp2, lg_path_ptr(&t), to2.idx[down]);
+        lg_path_append(out, tp2, tl2.idx[down]);
+        down = down + 1;
+    }
+}
+
+fn lg_segments(p: &LgPath, offs: &LgIndexList, lens: &LgIndexList) -> void {
+    offs.len = 0;
+    lens.len = 0;
+    let pp: ptr = lg_path_ptr(p);
+    let seg_start: u64 = 0;
+    let j: u64 = 0;
+    while j <= p.len {
+        let at_end: bool = j == p.len;
+        let is_sep: bool = false;
+        if !at_end {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, pp, j);
+            if c == 47 { is_sep = true; };
+        };
+        if at_end || is_sep {
+            if j > seg_start && offs.len < 128 {
+                offs.idx[offs.len] = seg_start;
+                lens.idx[offs.len] = j - seg_start;
+                offs.len = offs.len + 1;
+            };
+            seg_start = j + 1;
+        };
+        j = j + 1;
+    }
+}
+
+fn lg_dirname(p: ptr, len: u64, out: &LgPath) -> void {
+    // node dirname: strip trailing slashes, cut after last '/'
+    let end: u64 = len;
+    while end > 1 {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, end - 1);
+        if c == 47 { end = end - 1; } else { break; };
+    }
+    let idx: u64 = end;
+    let found: bool = false;
+    while idx > 0 {
+        let c2: u8 = 0;
+        PTR_BYTE_AT(c2, p, idx - 1);
+        if c2 == 47 { found = true; break; };
+        idx = idx - 1;
+    }
+    if !found {
+        lg_path_assign(out, STR_PTR("."), STR_LEN("."));
+        return;
+    };
+    if idx == 1 {
+        lg_path_assign(out, STR_PTR("/"), STR_LEN("/"));
+        return;
+    };
+    lg_path_assign(out, p, idx - 1);
+}
+
+fn lg_process_cwd(out: &LgPath) -> bool {
+    let buf: u64 = sa_env_current_dir();
+    if buf == 0 { return false; };
+    let p: ptr = sa_env_buffer_data(buf);
+    let l: u64 = sa_env_buffer_len(buf);
+    lg_path_assign(out, p, l);
+    return true;
+}
+
+// ---- doc registry ----
+fn lg_cell_get(name: ptr, name_len: u64) -> u64 {
+    let v: u64 = 0;
+    let st: i32 = sa_global_u64_get(name, name_len, &v);
+    return v;
+}
+
+fn lg_cell_set(name: ptr, name_len: u64, v: u64) -> void {
+    let st: i32 = sa_global_u64_set(name, name_len, v);
+}
+
+// Reset one registry doc cell: free the old doc, install a fresh one
+// of the given seed text ("{}" / "[]") and return it.
+fn lg_cell_reset_doc(name: ptr, name_len: u64, seed: ptr, seed_len: u64) -> u64 {
+    let old: u64 = lg_cell_get(name, name_len);
+    if old != 0 {
+        let ig: i32 = sa_json_free(old);
+    };
+    let doc: u64 = sa_json_parse(seed, seed_len);
+    lg_cell_set(name, name_len, doc);
+    return doc;
+}
+
+fn lg_registry_reset() -> void {
+    let a: u64 = lg_cell_reset_doc(STR_PTR("ledger.entriesdoc"), STR_LEN("ledger.entriesdoc"), STR_PTR("[]"), STR_LEN("[]"));
+    let b: u64 = lg_cell_reset_doc(STR_PTR("ledger.pathdoc"), STR_LEN("ledger.pathdoc"), STR_PTR("{}"), STR_LEN("{}"));
+    let c: u64 = lg_cell_reset_doc(STR_PTR("ledger.scratchdoc"), STR_LEN("ledger.scratchdoc"), STR_PTR("{}"), STR_LEN("{}"));
+    let d: u64 = lg_cell_reset_doc(STR_PTR("ledger.gatedoc"), STR_LEN("ledger.gatedoc"), STR_PTR("{}"), STR_LEN("{}"));
+    let e: u64 = lg_cell_reset_doc(STR_PTR("ledger.jevdoc"), STR_LEN("ledger.jevdoc"), STR_PTR("{}"), STR_LEN("{}"));
+}
+
+fn lg_entries_doc() -> u64 {
+    return lg_cell_get(STR_PTR("ledger.entriesdoc"), STR_LEN("ledger.entriesdoc"));
+}
+
+fn lg_scratch_doc() -> u64 {
+    return lg_cell_get(STR_PTR("ledger.scratchdoc"), STR_LEN("ledger.scratchdoc"));
+}
+
+fn lg_gate_doc() -> u64 {
+    return lg_cell_get(STR_PTR("ledger.gatedoc"), STR_LEN("ledger.gatedoc"));
+}
+
+// Set a string field on a doc and return the stored (ptr, len).
+fn lg_doc_str(doc: u64, key: ptr, key_len: u64, val: ptr, val_len: u64, out_p: &ptr, out_l: &u64) -> void {
+    let st: i32 = sa_json_object_set_string(doc, key, key_len, val, val_len);
+    let node: u64 = 0;
+    let gst: i32 = sa_json_object_get(doc, key, key_len, &node);
+    if node != 0 {
+        let sp: ptr = sa_json_string_ptr(node);
+        *out_p = sp;
+        *out_l = sa_json_string_len(node);
+        return;
+    };
+    *out_p = val;
+    *out_l = val_len;
+}
+
+// ---- sa_json read helpers ----
+fn lg_jget(doc: u64, key: ptr, key_len: u64) -> u64 {
+    if doc == 0 { return 0; };
+    let node: u64 = 0;
+    let st: i32 = sa_json_object_get(doc, key, key_len, &node);
+    if st != 0 { return 0; };
+    return node;
+}
+
+fn lg_jstr(node: u64, out_p: &ptr, out_l: &u64) -> bool {
+    *out_l = 0;
+    if node == 0 { return false; };
+    if sa_json_kind(node) != 5 { return false; };
+    let sp: ptr = sa_json_string_ptr(node);
+    *out_p = sp;
+    *out_l = sa_json_string_len(node);
+    return true;
+}
+
+fn lg_jget_str(doc: u64, key: ptr, key_len: u64, out_p: &ptr, out_l: &u64) -> bool {
+    return lg_jstr(lg_jget(doc, key, key_len), out_p, out_l);
+}
+
+fn lg_jget_i64(doc: u64, key: ptr, key_len: u64, out_v: &i64) -> bool {
+    let node: u64 = lg_jget(doc, key, key_len);
+    if node == 0 { return false; };
+    let v: i64 = 0;
+    if sa_json_as_i64(node, &v) == 0 {
+        *out_v = v;
+        return true;
+    };
+    let f: f64 = 0.0;
+    if sa_json_as_f64(node, &f) == 0 {
+        *out_v = f as i64;
+        return true;
+    };
+    return false;
+}
+
+fn lg_arr_len(doc: u64) -> u64 {
+    if doc == 0 { return 0; };
+    let n: u64 = 0;
+    let st: i32 = sa_json_value_count(doc, &n);
+    if st != 0 { return 0; };
+    return n;
+}
+
+fn lg_arr_at(doc: u64, idx: u64) -> u64 {
+    if doc == 0 { return 0; };
+    let node: u64 = 0;
+    let st: i32 = sa_json_array_get(doc, idx, &node);
+    if st != 0 { return 0; };
+    return node;
+}
+
+fn lg_level_code(name_p: ptr, name_l: u64) -> u64 {
+    if lg_lit_eq(name_p, name_l, STR_PTR("L1_SYNTAX"), STR_LEN("L1_SYNTAX")) { return 0; };
+    if lg_lit_eq(name_p, name_l, STR_PTR("L2_REGRESSION"), STR_LEN("L2_REGRESSION")) { return 1; };
+    if lg_lit_eq(name_p, name_l, STR_PTR("L3_THRASH"), STR_LEN("L3_THRASH")) { return 2; };
+    return 3;
+}
+
+fn lg_level_name(code: u64, out: &LgPath) -> void {
+    out.len = 0;
+    if code == 0 { lg_path_assign(out, STR_PTR("L1_SYNTAX"), STR_LEN("L1_SYNTAX")); return; };
+    if code == 1 { lg_path_assign(out, STR_PTR("L2_REGRESSION"), STR_LEN("L2_REGRESSION")); return; };
+    if code == 2 { lg_path_assign(out, STR_PTR("L3_THRASH"), STR_LEN("L3_THRASH")); return; };
+    lg_path_assign(out, STR_PTR("CUSTOM"), STR_LEN("CUSTOM"));
+}
+
+fn lg_tier_name(code: u64, out: &LgPath) -> void {
+    out.len = 0;
+    if code == 0 { lg_path_assign(out, STR_PTR("GREEN"), STR_LEN("GREEN")); return; };
+    if code == 1 { lg_path_assign(out, STR_PTR("YELLOW"), STR_LEN("YELLOW")); return; };
+    lg_path_assign(out, STR_PTR("RED"), STR_LEN("RED"));
+}
+
+// ================= TS module functions =================
+
+// Reshaped (internal; no external callers): the landed (out_ptr,
+// out_len) form cannot be implemented in SLA surface syntax — no
+// corpus-implemented fn stores bytes through a raw ptr param; the
+// house norm is a struct-owned buffer out (cf. rpg_JsonBuf, StrBuf).
+fn resolveLedgerPath(cwd_ptr: ptr, cwd_len: u64, has_cwd: bool, custom_ptr: ptr, custom_len: u64, has_custom: bool, out: &LgPath) -> u64 {
+    // if (customPath && customPath.trim()): absolute -> resolve(custom);
+    // else resolve(cwd ?? process.cwd(), custom)
+    // default: resolve(cwd ?? process.cwd(), ".codex-ultra/ledger/penalties.jsonl")
+    let resolved = LgPath { bytes: [0u8; 4096], len: 0 };
+    let use_custom: bool = false;
+    if has_custom {
+        let lo: u64 = 0;
+        let hi: u64 = 0;
+        lg_trim_range(custom_ptr, custom_len, &lo, &hi);
+        if hi > lo { use_custom = true; };
+    };
+    if use_custom {
+        if lg_is_absolute(custom_ptr, custom_len) {
+            lg_normalize_absolute(custom_ptr, custom_len, &resolved);
+        } else {
+            let base = LgPath { bytes: [0u8; 4096], len: 0 };
+            if has_cwd {
+                lg_path_assign(&base, cwd_ptr, cwd_len);
+            } else {
+                let ok: bool = lg_process_cwd(&base);
+            };
+            lg_resolve(lg_path_ptr(&base), base.len, custom_ptr, custom_len, &resolved);
+        };
+    } else {
+        let base2 = LgPath { bytes: [0u8; 4096], len: 0 };
+        if has_cwd {
+            lg_path_assign(&base2, cwd_ptr, cwd_len);
+        } else {
+            let ok2: bool = lg_process_cwd(&base2);
+        };
+        lg_resolve(lg_path_ptr(&base2), base2.len, STR_PTR(".codex-ultra/ledger/penalties.jsonl"), STR_LEN(".codex-ultra/ledger/penalties.jsonl"), &resolved);
+    };
+    lg_path_assign(out, lg_path_ptr(&resolved), resolved.len);
+    return out.len;
+}
+
+fn deletePenalty() -> i32 { // TS: throw new Error("Immutable Ledger Violation: Historical penalties cannot be deleted or pruned.") — never-returning; landed as the distinct -1 status.
     return -1;
 }
-fn clearLedger() -> i32 { // DEFECT: TS never + throw
+fn clearLedger() -> i32 { // TS: throw new Error("Immutable Ledger Violation: Clearing the accountability ledger is strictly forbidden.") — landed as -1.
     return -1;
 }
-fn normalizeTargetFilePath(target_ptr: ptr, target_len: u64, cwd_ptr: ptr, cwd_len: u64, out_ptr: ptr) -> u64 { return target_len; }
-fn readLedgerEntries(ledgerPath_ptr: ptr, ledgerPath_len: u64, out: &LedgerEntry) -> i32 { // DEFECT: async Promise<LedgerEntry[]>, JSON.parse per line, try/catch — sync approximation, JSON text buffer [BLOCKED: body is a conversion-era skeleton stub. Awaited ops are fs read/append of the ledger file and, for runJevSupervisoryAudit/evaluateRedemptionWithJev, the Jev audit HTTP call; no body is implemented.]
+
+// Reshaped (internal): out is a struct-owned LgPath (see
+// resolveLedgerPath note); returns out.len.
+fn normalizeTargetFilePath(target_ptr: ptr, target_len: u64, cwd_ptr: ptr, cwd_len: u64, out: &LgPath) -> u64 {
+    // resolved = isAbsolute(target) ? resolve(target) : resolve(cwd, target)
+    // rel = relative(cwd, resolved) with \ -> /
+    // return rel && !rel.startsWith("..") ? rel : resolved with \ -> /
+    let resolved = LgPath { bytes: [0u8; 4096], len: 0 };
+    if lg_is_absolute(target_ptr, target_len) {
+        lg_normalize_absolute(target_ptr, target_len, &resolved);
+    } else {
+        lg_resolve(cwd_ptr, cwd_len, target_ptr, target_len, &resolved);
+    };
+    let rel = LgPath { bytes: [0u8; 4096], len: 0 };
+    lg_relative(cwd_ptr, cwd_len, lg_path_ptr(&resolved), resolved.len, &rel);
+    let chosen = LgPath { bytes: [0u8; 4096], len: 0 };
+    let use_rel: bool = false;
+    if rel.len > 0 && !lg_starts_with(lg_path_ptr(&rel), rel.len, STR_PTR(".."), STR_LEN("..")) {
+        use_rel = true;
+    };
+    if use_rel {
+        lg_path_assign(&chosen, lg_path_ptr(&rel), rel.len);
+    } else {
+        lg_path_assign(&chosen, lg_path_ptr(&resolved), resolved.len);
+    };
+    // replace(/\\/g, "/")
+    let cp: ptr = lg_path_ptr(&chosen);
+    let k: u64 = 0;
+    while k < chosen.len {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, cp, k);
+        if c == 92 { chosen.bytes[k] = 47; };
+        k = k + 1;
+    }
+    lg_path_assign(out, cp, chosen.len);
+    return out.len;
+}
+
+// Reshaped (internal; no external callers): the landed single-entry
+// out could not express LedgerEntry[]; entries are returned as a
+// sa_json array doc installed in the registry entries cell.
+fn readLedgerEntries(ledgerPath_ptr: ptr, ledgerPath_len: u64, out_doc: &u64) -> i32 {
+    let arr: u64 = lg_cell_reset_doc(STR_PTR("ledger.entriesdoc"), STR_LEN("ledger.entriesdoc"), STR_PTR("[]"), STR_LEN("[]"));
+    *out_doc = arr;
+    // if (!existsSync(ledgerPath)) return []
+    if sa_std_fs_exists(ledgerPath_ptr, ledgerPath_len) != 0 { return 0; };
+    let handle: u64 = 0;
+    let rst: i32 = sa_std_fs_read_file(ledgerPath_ptr, ledgerPath_len, 268435456, &handle);
+    if rst != 0 || handle == 0 { return 0; };
+    let data: ptr = sa_fs_read_buffer_data(handle);
+    let dlen: u64 = sa_fs_read_buffer_len(handle);
+    let start: u64 = 0;
+    let i: u64 = 0;
+    while i <= dlen {
+        let at_end: bool = i == dlen;
+        let is_nl: bool = false;
+        if !at_end {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, data, i);
+            if c == 10 { is_nl = true; };
+        };
+        if at_end || is_nl {
+            let seg_len: u64 = i - start;
+            if seg_len > 0 {
+                let lc: u8 = 0;
+                let lp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(lp, data, start + seg_len - 1);
+                PTR_BYTE_AT(lc, lp, 0);
+                if lc == 13 { seg_len = seg_len - 1; };
+            };
+            // line = segment trimmed (TS: split -> map(trim) -> filter(Boolean))
+            let lo: u64 = 0;
+            let hi: u64 = 0;
+            let segp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(segp, data, start);
+            lg_trim_range(segp, seg_len, &lo, &hi);
+            if hi > lo {
+                let tp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(tp, segp, lo);
+                let doc: u64 = sa_json_parse(tp, hi - lo);
+                if doc != 0 {
+                    let tp2: ptr = PTR_NULL();
+                    let tl2: u64 = 0;
+                    if lg_jget_str(doc, STR_PTR("type"), STR_LEN("type"), &tp2, &tl2) {
+                        if lg_lit_eq(tp2, tl2, STR_PTR("penalty"), STR_LEN("penalty")) || lg_lit_eq(tp2, tl2, STR_PTR("reward"), STR_LEN("reward")) {
+                            let pst: i32 = sa_json_array_push_node(arr, doc);
+                        };
+                    };
+                };
+            };
+            start = i + 1;
+        };
+        i = i + 1;
+    }
+    let ff: i32 = sa_fs_read_buffer_free(handle);
     return 0;
 }
-fn appendLedgerEntry(entry: &LedgerEntry, ledgerPath_ptr: ptr, ledgerPath_len: u64) -> i32 { // DEFECT: async, mkdir recursive, writeFile flag a [BLOCKED: body is a conversion-era skeleton stub. Awaited ops are fs read/append of the ledger file and, for runJevSupervisoryAudit/evaluateRedemptionWithJev, the Jev audit HTTP call; no body is implemented.]
+
+// Serialize a PenaltyRecord into a JSON doc in TS field order
+// (JSON.stringify(record)): id, type, level, targetFile,
+// errorSignature, scoreDelta, details?, timestamp, status, redeemedBy?
+fn lg_penalty_doc(pen: &PenaltyRecord, out_doc: &u64) -> void {
+    let doc: u64 = sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+    let s1: i32 = sa_json_object_set_string(doc, STR_PTR("id"), STR_LEN("id"), pen.id_ptr, pen.id_len);
+    let s2: i32 = sa_json_object_set_string(doc, STR_PTR("type"), STR_LEN("type"), pen.type_ptr, pen.type_len);
+    let lname = LgPath { bytes: [0u8; 4096], len: 0 };
+    lg_level_name(pen.level, &lname);
+    let s3: i32 = sa_json_object_set_string(doc, STR_PTR("level"), STR_LEN("level"), lg_path_ptr(&lname), lname.len);
+    let s4: i32 = sa_json_object_set_string(doc, STR_PTR("targetFile"), STR_LEN("targetFile"), pen.targetFile_ptr, pen.targetFile_len);
+    let s5: i32 = sa_json_object_set_string(doc, STR_PTR("errorSignature"), STR_LEN("errorSignature"), pen.errorSignature_ptr, pen.errorSignature_len);
+    let s6: i32 = sa_json_object_set_i64(doc, STR_PTR("scoreDelta"), STR_LEN("scoreDelta"), pen.scoreDelta as i64);
+    if pen.has_details {
+        let s7: i32 = sa_json_object_set_string(doc, STR_PTR("details"), STR_LEN("details"), pen.details_ptr, pen.details_len);
+    };
+    let s8: i32 = sa_json_object_set_i64(doc, STR_PTR("timestamp"), STR_LEN("timestamp"), pen.timestamp as i64);
+    if pen.status == 0 {
+        let s9: i32 = sa_json_object_set_string(doc, STR_PTR("status"), STR_LEN("status"), STR_PTR("active"), STR_LEN("active"));
+    } else {
+        let s9b: i32 = sa_json_object_set_string(doc, STR_PTR("status"), STR_LEN("status"), STR_PTR("redeemed"), STR_LEN("redeemed"));
+    };
+    if pen.has_redeemedBy {
+        let s10: i32 = sa_json_object_set_string(doc, STR_PTR("redeemedBy"), STR_LEN("redeemedBy"), pen.redeemedBy_ptr, pen.redeemedBy_len);
+    };
+    *out_doc = doc;
+}
+
+fn lg_reward_doc(rew: &RewardRecord, out_doc: &u64) -> void {
+    let doc: u64 = sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+    let s1: i32 = sa_json_object_set_string(doc, STR_PTR("id"), STR_LEN("id"), rew.id_ptr, rew.id_len);
+    let s2: i32 = sa_json_object_set_string(doc, STR_PTR("type"), STR_LEN("type"), rew.type_ptr, rew.type_len);
+    let s3: i32 = sa_json_object_set_string(doc, STR_PTR("linkedPenaltyId"), STR_LEN("linkedPenaltyId"), rew.linkedPenaltyId_ptr, rew.linkedPenaltyId_len);
+    let s4: i32 = sa_json_object_set_i64(doc, STR_PTR("scoreDelta"), STR_LEN("scoreDelta"), rew.scoreDelta as i64);
+    let s5: i32 = sa_json_object_set_string(doc, STR_PTR("verificationEvidence"), STR_LEN("verificationEvidence"), rew.verificationEvidence_ptr, rew.verificationEvidence_len);
+    let s6: i32 = sa_json_object_set_string(doc, STR_PTR("lessonLearned"), STR_LEN("lessonLearned"), rew.lessonLearned_ptr, rew.lessonLearned_len);
+    let s7: i32 = sa_json_object_set_string(doc, STR_PTR("antibodyRule"), STR_LEN("antibodyRule"), rew.antibodyRule_ptr, rew.antibodyRule_len);
+    let s8: i32 = sa_json_object_set_i64(doc, STR_PTR("timestamp"), STR_LEN("timestamp"), rew.timestamp as i64);
+    *out_doc = doc;
+}
+
+fn appendLedgerEntry(entry: &LedgerEntry, ledgerPath_ptr: ptr, ledgerPath_len: u64) -> i32 {
+    // dir = dirname(ledgerPath); if (!existsSync(dir)) await mkdir(dir, { recursive: true })
+    let dir = LgPath { bytes: [0u8; 4096], len: 0 };
+    lg_dirname(ledgerPath_ptr, ledgerPath_len, &dir);
+    if sa_std_fs_exists(lg_path_ptr(&dir), dir.len) != 0 {
+        let mst: i32 = sa_fs_mkdir_p(lg_path_ptr(&dir), dir.len);
+    };
+    let doc: u64 = 0;
+    if entry.kind == 0 {
+        lg_penalty_doc(&entry.penalty, &doc);
+    } else {
+        lg_reward_doc(&entry.reward, &doc);
+    };
+    if doc == 0 { return 1; };
+    let buf: u64 = 0;
+    let sst: i32 = sa_json_stringify(doc, &buf);
+    if sst != 0 || buf == 0 { return 1; };
+    let bp: ptr = sa_json_buffer_data(buf);
+    let bl: u64 = sa_json_buffer_len(buf);
+    let line = LgText { bytes: [0u8; 65536], len: 0 };
+    lg_text_append(&line, bp, bl);
+    lg_text_append(&line, STR_PTR("\n"), STR_LEN("\n"));
+    let bf: i32 = sa_json_buffer_free(buf);
+    let df: i32 = sa_json_free(doc);
+    // await writeFile(ledgerPath, line, { flag: "a" })
+    let fh: u64 = 0;
+    let ost: i32 = sa_std_fs_open_write(ledgerPath_ptr, ledgerPath_len, 0, &fh);
+    if ost != 0 || fh == 0 { return ost; };
+    let pos: u64 = 0;
+    let kst: i32 = sa_std_fs_file_seek(fh, 2, 0, &pos);
+    let wst: i32 = sa_std_fs_file_write_all_at(fh, lg_text_ptr(&line), line.len, pos);
+    let cst: i32 = sa_std_close(fh);
+    return wst;
+}
+
+// Read one entry doc into a PenaltyRecord (fields alias the doc).
+fn lg_entry_penalty(doc: u64, pen: &PenaltyRecord) -> void {
+    pen.id_ptr = PTR_NULL(); pen.id_len = 0;
+    let a: bool = lg_jget_str(doc, STR_PTR("id"), STR_LEN("id"), &pen.id_ptr, &pen.id_len);
+    pen.type_ptr = PTR_NULL(); pen.type_len = 0;
+    let b: bool = lg_jget_str(doc, STR_PTR("type"), STR_LEN("type"), &pen.type_ptr, &pen.type_len);
+    let lp: ptr = PTR_NULL();
+    let ll: u64 = 0;
+    pen.level = 3;
+    if lg_jget_str(doc, STR_PTR("level"), STR_LEN("level"), &lp, &ll) {
+        pen.level = lg_level_code(lp, ll);
+    };
+    pen.targetFile_ptr = PTR_NULL(); pen.targetFile_len = 0;
+    let c: bool = lg_jget_str(doc, STR_PTR("targetFile"), STR_LEN("targetFile"), &pen.targetFile_ptr, &pen.targetFile_len);
+    pen.errorSignature_ptr = PTR_NULL(); pen.errorSignature_len = 0;
+    let d: bool = lg_jget_str(doc, STR_PTR("errorSignature"), STR_LEN("errorSignature"), &pen.errorSignature_ptr, &pen.errorSignature_len);
+    let dv: i64 = 0;
+    if lg_jget_i64(doc, STR_PTR("scoreDelta"), STR_LEN("scoreDelta"), &dv) {
+        pen.scoreDelta = dv as i32;
+    } else {
+        pen.scoreDelta = 0;
+    };
+    pen.details_ptr = PTR_NULL(); pen.details_len = 0;
+    pen.has_details = lg_jget_str(doc, STR_PTR("details"), STR_LEN("details"), &pen.details_ptr, &pen.details_len);
+    let tv: i64 = 0;
+    if lg_jget_i64(doc, STR_PTR("timestamp"), STR_LEN("timestamp"), &tv) {
+        pen.timestamp = tv as u64;
+    } else {
+        pen.timestamp = 0;
+    };
+    pen.status = 0;
+    pen.redeemedBy_ptr = PTR_NULL(); pen.redeemedBy_len = 0;
+    pen.has_redeemedBy = lg_jget_str(doc, STR_PTR("redeemedBy"), STR_LEN("redeemedBy"), &pen.redeemedBy_ptr, &pen.redeemedBy_len);
+}
+
+fn lg_entry_reward(doc: u64, rew: &RewardRecord) -> void {
+    rew.id_ptr = PTR_NULL(); rew.id_len = 0;
+    let a: bool = lg_jget_str(doc, STR_PTR("id"), STR_LEN("id"), &rew.id_ptr, &rew.id_len);
+    rew.type_ptr = PTR_NULL(); rew.type_len = 0;
+    let b: bool = lg_jget_str(doc, STR_PTR("type"), STR_LEN("type"), &rew.type_ptr, &rew.type_len);
+    rew.linkedPenaltyId_ptr = PTR_NULL(); rew.linkedPenaltyId_len = 0;
+    let c: bool = lg_jget_str(doc, STR_PTR("linkedPenaltyId"), STR_LEN("linkedPenaltyId"), &rew.linkedPenaltyId_ptr, &rew.linkedPenaltyId_len);
+    let dv: i64 = 0;
+    if lg_jget_i64(doc, STR_PTR("scoreDelta"), STR_LEN("scoreDelta"), &dv) {
+        rew.scoreDelta = dv as i32;
+    } else {
+        rew.scoreDelta = 0;
+    };
+    rew.verificationEvidence_ptr = PTR_NULL(); rew.verificationEvidence_len = 0;
+    let d: bool = lg_jget_str(doc, STR_PTR("verificationEvidence"), STR_LEN("verificationEvidence"), &rew.verificationEvidence_ptr, &rew.verificationEvidence_len);
+    rew.lessonLearned_ptr = PTR_NULL(); rew.lessonLearned_len = 0;
+    let e: bool = lg_jget_str(doc, STR_PTR("lessonLearned"), STR_LEN("lessonLearned"), &rew.lessonLearned_ptr, &rew.lessonLearned_len);
+    rew.antibodyRule_ptr = PTR_NULL(); rew.antibodyRule_len = 0;
+    let f: bool = lg_jget_str(doc, STR_PTR("antibodyRule"), STR_LEN("antibodyRule"), &rew.antibodyRule_ptr, &rew.antibodyRule_len);
+    let tv: i64 = 0;
+    if lg_jget_i64(doc, STR_PTR("timestamp"), STR_LEN("timestamp"), &tv) {
+        rew.timestamp = tv as u64;
+    } else {
+        rew.timestamp = 0;
+    };
+}
+
+// Reshaped (internal): takes the entries array doc (was text ptr/len).
+// Fixed 128-slot arrays: counts and score are computed over ALL
+// entries; the arrays carry the first 128 penalties/antibodies
+// (registered cap; TS arrays are unbounded).
+fn computeReputationStatus(entries_doc: u64, ledgerPath_ptr: ptr, ledgerPath_len: u64, out: &ReputationStatus) -> void {
+    // pathdoc carries the ledgerPath string storage for out.
+    let pathdoc: u64 = lg_cell_get(STR_PTR("ledger.pathdoc"), STR_LEN("ledger.pathdoc"));
+    if pathdoc == 0 {
+        pathdoc = lg_cell_reset_doc(STR_PTR("ledger.pathdoc"), STR_LEN("ledger.pathdoc"), STR_PTR("{}"), STR_LEN("{}"));
+    };
+    let pp: ptr = PTR_NULL();
+    let pl: u64 = 0;
+    lg_doc_str(pathdoc, STR_PTR("path"), STR_LEN("path"), ledgerPath_ptr, ledgerPath_len, &pp, &pl);
+    out.ledgerPath_ptr = pp;
+    out.ledgerPath_len = pl;
+    out.activePenalties_len = 0;
+    out.redeemedPenalties_len = 0;
+    out.antibodies_len = 0;
+    out.totalPenaltiesCount = 0;
+    out.totalRewardsCount = 0;
+    // penalty map: first-seen order, later duplicates replace in place
+    let pen_store = lg_pen_store_new();
+    let rew_store = lg_rew_store_new();
+    let total_penalties: u64 = 0;
+    let total_rewards: u64 = 0;
+    let n: u64 = lg_arr_len(entries_doc);
+    let i: u64 = 0;
+    while i < n {
+        let edoc: u64 = lg_arr_at(entries_doc, i);
+        if edoc != 0 {
+            let tp: ptr = PTR_NULL();
+            let tl: u64 = 0;
+            if lg_jget_str(edoc, STR_PTR("type"), STR_LEN("type"), &tp, &tl) {
+                if lg_lit_eq(tp, tl, STR_PTR("penalty"), STR_LEN("penalty")) {
+                    total_penalties = total_penalties + 1;
+                    let pen = lg_penalty_zero();
+                    lg_entry_penalty(edoc, &pen);
+                    pen.status = 0; // map insert forces "active"
+                    // find existing id slot
+                    let slot: u64 = pen_store.len;
+                    let j: u64 = 0;
+                    while j < pen_store.len {
+                        let cur = pen_store.items[j];
+                        if lg_bytes_eq(cur.id_ptr, cur.id_len, pen.id_ptr, pen.id_len) { slot = j; };
+                        j = j + 1;
+                    }
+                    if slot < 128 {
+                        pen_store.items[slot] = pen;
+                        if slot == pen_store.len && pen_store.len < 128 { pen_store.len = pen_store.len + 1; };
+                    };
+                } else if lg_lit_eq(tp, tl, STR_PTR("reward"), STR_LEN("reward")) {
+                    total_rewards = total_rewards + 1;
+                    if rew_store.len < 128 {
+                        let rew = lg_reward_zero();
+                        lg_entry_reward(edoc, &rew);
+                        rew_store.items[rew_store.len] = rew;
+                        rew_store.len = rew_store.len + 1;
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    // rewards pass: mark redeemed, collect valid ids + antibodies
+    let ab_store = lg_ab_store_new();
+    let valid_flags = LgIndexList { idx: [0u64; 128], len: 0 };
+    let r: u64 = 0;
+    while r < rew_store.len {
+        let rew2 = rew_store.items[r];
+        if rew2.linkedPenaltyId_len > 0 {
+            let j2: u64 = 0;
+            while j2 < pen_store.len {
+                let cur2 = pen_store.items[j2];
+                if lg_bytes_eq(cur2.id_ptr, cur2.id_len, rew2.linkedPenaltyId_ptr, rew2.linkedPenaltyId_len) {
+                    pen_store.items[j2].status = 1;
+                    pen_store.items[j2].redeemedBy_ptr = rew2.id_ptr;
+                    pen_store.items[j2].redeemedBy_len = rew2.id_len;
+                    pen_store.items[j2].has_redeemedBy = true;
+                    valid_flags.idx[r] = 1;
+                    if ab_store.len < 128 {
+                        let ab = Antibody { targetFile_ptr: cur2.targetFile_ptr, targetFile_len: cur2.targetFile_len, rule_ptr: rew2.antibodyRule_ptr, rule_len: rew2.antibodyRule_len, lesson_ptr: rew2.lessonLearned_ptr, lesson_len: rew2.lessonLearned_len, penaltyId_ptr: cur2.id_ptr, penaltyId_len: cur2.id_len, rewardId_ptr: rew2.id_ptr, rewardId_len: rew2.id_len, timestamp: rew2.timestamp };
+                        ab_store.items[ab_store.len] = ab;
+                        ab_store.len = ab_store.len + 1;
+                    };
+                };
+                j2 = j2 + 1;
+            }
+        };
+        r = r + 1;
+    }
+    // totals + score (over ALL stored penalties / valid rewards;
+    // entries beyond the 128 cap are excluded from scoring as well
+    // as from the arrays — registered cap deviation).
+    let pen_delta: i64 = 0;
+    let k: u64 = 0;
+    while k < pen_store.len {
+        let cur3 = pen_store.items[k];
+        pen_delta = pen_delta + (cur3.scoreDelta as i64);
+        if cur3.status == 0 {
+            if out.activePenalties_len < 128 {
+                out.activePenalties[out.activePenalties_len] = cur3;
+                out.activePenalties_len = out.activePenalties_len + 1;
+            };
+        } else {
+            if out.redeemedPenalties_len < 128 {
+                out.redeemedPenalties[out.redeemedPenalties_len] = cur3;
+                out.redeemedPenalties_len = out.redeemedPenalties_len + 1;
+            };
+        };
+        k = k + 1;
+    }
+    let rew_delta: i64 = 0;
+    let r2: u64 = 0;
+    while r2 < rew_store.len {
+        if valid_flags.idx[r2] == 1 {
+            let cur4 = rew_store.items[r2];
+            rew_delta = rew_delta + (cur4.scoreDelta as i64);
+        };
+        r2 = r2 + 1;
+    }
+    let a2: u64 = 0;
+    while a2 < ab_store.len {
+        out.antibodies[a2] = ab_store.items[a2];
+        a2 = a2 + 1;
+    }
+    out.antibodies_len = ab_store.len;
+    out.totalPenaltiesCount = total_penalties;
+    out.totalRewardsCount = total_rewards;
+    let raw: i64 = 100 + pen_delta + rew_delta;
+    if raw < 0 { raw = 0; };
+    if raw > 100 { raw = 100; };
+    out.score = raw as i32;
+    if raw < 50 { out.tier = 2; } else if raw < 80 { out.tier = 1; } else { out.tier = 0; };
+}
+
+fn getReputationStatus(cwd_ptr: ptr, cwd_len: u64, custom_ptr: ptr, custom_len: u64, out: &ReputationStatus) -> i32 {
+    lg_registry_reset();
+    let path = LgPath { bytes: [0u8; 4096], len: 0 };
+    let plen: u64 = resolveLedgerPath(cwd_ptr, cwd_len, cwd_len > 0, custom_ptr, custom_len, custom_len > 0, &path);
+    let entries: u64 = 0;
+    let rst: i32 = readLedgerEntries(lg_path_ptr(&path), path.len, &entries);
+    computeReputationStatus(entries, lg_path_ptr(&path), path.len, out);
     return 0;
 }
-fn computeReputationStatus(entries_ptr: ptr, entries_len: u64, ledgerPath_ptr: ptr, ledgerPath_len: u64, out: &ReputationStatus) -> void {
-    // 1:1 logic: penaltyMap Map<string,PenaltyRecord> -> fixed arrays; rewards loop marks redeemed, builds antibodies, orphan rewards ignored; score=clamp(100+penaltyDelta+validRewardDelta,0,100); tier GREEN>=80 YELLOW>=50 else RED
-    // DEFECT: Map/Set, Array.from/filter, spread {...entry} — approximated with fixed arrays + len fields
-    out.score = 100; out.tier = 0;
+
+// Generate `pen_<ts>_<uuid8>` / `rew_<ts>_<uuid8>` into the scratch
+// doc field and return its stored (ptr, len).
+fn lg_gen_id(prefix: ptr, prefix_len: u64, ts: u64, key: ptr, key_len: u64, out_p: &ptr, out_l: &u64) -> void {
+    let text = LgText { bytes: [0u8; 65536], len: 0 };
+    lg_text_append(&text, prefix, prefix_len);
+    lg_text_append_u64(&text, ts);
+    lg_text_append(&text, STR_PTR("_"), STR_LEN("_"));
+    let uuid_buf: u64 = sa_deno_random_uuid();
+    if uuid_buf != 0 {
+        let up: ptr = sa_fmt_buffer_data(uuid_buf);
+        let ul: u64 = sa_fmt_buffer_len(uuid_buf);
+        if ul > 8 { ul = 8; };
+        lg_text_append(&text, up, ul);
+        let uf: i32 = sa_fmt_buffer_free(uuid_buf);
+    };
+    let doc: u64 = lg_scratch_doc();
+    lg_doc_str(doc, key, key_len, lg_text_ptr(&text), text.len, out_p, out_l);
 }
-fn getReputationStatus(cwd_ptr: ptr, cwd_len: u64, custom_ptr: ptr, custom_len: u64, out: &ReputationStatus) -> i32 { // DEFECT: async [BLOCKED: body is a conversion-era skeleton stub. Awaited ops are fs read/append of the ledger file and, for runJevSupervisoryAudit/evaluateRedemptionWithJev, the Jev audit HTTP call; no body is implemented.]
+
+fn recordPenalty(target_ptr: ptr, target_len: u64, level: u64, sig_ptr: ptr, sig_len: u64, has_delta: bool, delta: i32, out: &PenaltyRecord, status: &ReputationStatus) -> i32 {
+    // Landed signature carries no cwd/customLedgerPath/details (the
+    // saVmTool bridge does not forward them — registered): cwd is
+    // process.cwd(), the ledger path is the default, details absent.
+    lg_registry_reset();
+    let cwd = LgPath { bytes: [0u8; 4096], len: 0 };
+    let cok: bool = lg_process_cwd(&cwd);
+    let path = LgPath { bytes: [0u8; 4096], len: 0 };
+    let plen: u64 = resolveLedgerPath(lg_path_ptr(&cwd), cwd.len, true, PTR_NULL(), 0, false, &path);
+    let normalized = LgPath { bytes: [0u8; 4096], len: 0 };
+    let nlen: u64 = normalizeTargetFilePath(target_ptr, target_len, lg_path_ptr(&cwd), cwd.len, &normalized);
+    // scoreDelta = input.scoreDelta ?? PENALTY_SCORES[level] ?? -10;
+    // > 0 -> negate; == 0 -> -10
+    let score_delta: i32 = delta;
+    if !has_delta { score_delta = penaltyScore(level); };
+    if score_delta > 0 { score_delta = 0 - score_delta; };
+    if score_delta == 0 { score_delta = -10; };
+    let scratch: u64 = lg_scratch_doc();
+    // normalized target + trimmed signature are stored in the scratch
+    // doc so the out record's pointers outlive this frame.
+    let tf_p: ptr = PTR_NULL();
+    let tf_l: u64 = 0;
+    lg_doc_str(scratch, STR_PTR("targetFile"), STR_LEN("targetFile"), lg_path_ptr(&normalized), normalized.len, &tf_p, &tf_l);
+    let lo: u64 = 0;
+    let hi: u64 = 0;
+    lg_trim_range(sig_ptr, sig_len, &lo, &hi);
+    let sig_t: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sig_t, sig_ptr, lo);
+    let sg_p: ptr = PTR_NULL();
+    let sg_l: u64 = 0;
+    lg_doc_str(scratch, STR_PTR("errorSignature"), STR_LEN("errorSignature"), sig_t, hi - lo, &sg_p, &sg_l);
+    let ts_id: u64 = sa_time_unix_ms() as u64;
+    let id_p: ptr = PTR_NULL();
+    let id_l: u64 = 0;
+    lg_gen_id(STR_PTR("pen_"), STR_LEN("pen_"), ts_id, STR_PTR("id"), STR_LEN("id"), &id_p, &id_l);
+    let ts_now: u64 = sa_time_unix_ms() as u64;
+    let rec = lg_penalty_zero();
+    rec.id_ptr = id_p; rec.id_len = id_l;
+    rec.type_ptr = STR_PTR("penalty"); rec.type_len = STR_LEN("penalty");
+    rec.level = level;
+    rec.targetFile_ptr = tf_p; rec.targetFile_len = tf_l;
+    rec.errorSignature_ptr = sg_p; rec.errorSignature_len = sg_l;
+    rec.scoreDelta = score_delta;
+    rec.timestamp = ts_now;
+    rec.status = 0;
+    lg_penalty_copy(&rec, out);
+    let entry = LedgerEntry { kind: 0, penalty: rec, reward: lg_reward_zero() };
+    let ast: i32 = appendLedgerEntry(&entry, lg_path_ptr(&path), path.len);
+    if ast != 0 { return ast; };
+    let entries: u64 = 0;
+    let rst: i32 = readLedgerEntries(lg_path_ptr(&path), path.len, &entries);
+    computeReputationStatus(entries, lg_path_ptr(&path), path.len, status);
     return 0;
 }
-fn recordPenalty(target_ptr: ptr, target_len: u64, level: u64, sig_ptr: ptr, sig_len: u64, has_delta: bool, delta: i32, out: &PenaltyRecord, status: &ReputationStatus) -> i32 { // DEFECT: async, Date.now(), randomUUID().slice(0,8), optional fields, template string id pen_<ts>_<uuid> [BLOCKED: body is a conversion-era skeleton stub. Awaited ops are fs read/append of the ledger file and, for runJevSupervisoryAudit/evaluateRedemptionWithJev, the Jev audit HTTP call; no body is implemented.]
+
+// Reshaped (internal): the landed (evidence_len, lesson_len, rule_len)
+// form cannot run the TS keyword check; takes the texts. Reason text
+// returns via (ptr, len) pointing at a literal or the scratch doc.
+// Length checks use byte length (TS: UTF-16 code units — equal for
+// ASCII, registered).
+fn evaluateRedemptionWithJev(evidence_ptr: ptr, evidence_len: u64, lesson_ptr: ptr, lesson_len: u64, rule_ptr: ptr, rule_len: u64, approved_out: &bool, reason_p: &ptr, reason_l: &u64) -> i32 {
+    *approved_out = false;
+    *reason_p = PTR_NULL();
+    *reason_l = 0;
+    if evidence_len < 10 {
+        *reason_p = STR_PTR("Evidence is too brief; provide concrete test output or verification proof.");
+        *reason_l = STR_LEN("Evidence is too brief; provide concrete test output or verification proof.");
+        return 0;
+    };
+    if lesson_len < 5 {
+        *reason_p = STR_PTR("Lesson learned must describe what went wrong and how it was resolved.");
+        *reason_l = STR_LEN("Lesson learned must describe what went wrong and how it was resolved.");
+        return 0;
+    };
+    if rule_len < 5 {
+        *reason_p = STR_PTR("Antibody rule must be an actionable rule to avoid repeating the mistake.");
+        *reason_l = STR_LEN("Antibody rule must be an actionable rule to avoid repeating the mistake.");
+        return 0;
+    };
+    let found: bool = false;
+    if lg_contains_ci(evidence_ptr, evidence_len, STR_PTR("pass"), STR_LEN("pass")) { found = true; };
+    if lg_contains_ci(evidence_ptr, evidence_len, STR_PTR("ok"), STR_LEN("ok")) { found = true; };
+    if lg_contains_ci(evidence_ptr, evidence_len, STR_PTR("success"), STR_LEN("success")) { found = true; };
+    if lg_contains_ci(evidence_ptr, evidence_len, STR_PTR("clean"), STR_LEN("clean")) { found = true; };
+    if lg_contains_ci(evidence_ptr, evidence_len, STR_PTR("fixed"), STR_LEN("fixed")) { found = true; };
+    if lg_contains_ci(evidence_ptr, evidence_len, STR_PTR("0 error"), STR_LEN("0 error")) { found = true; };
+    if lg_contains_ci(evidence_ptr, evidence_len, STR_PTR("test"), STR_LEN("test")) { found = true; };
+    if lg_contains_ci(evidence_ptr, evidence_len, STR_PTR("verified"), STR_LEN("verified")) { found = true; };
+    if lg_contains_ci(evidence_ptr, evidence_len, STR_PTR("passed"), STR_LEN("passed")) { found = true; };
+    if !found {
+        *reason_p = STR_PTR("Evidence lacks confirmation of successful test or clean verification (e.g. 'passed', 'clean', '0 errors').");
+        *reason_l = STR_LEN("Evidence lacks confirmation of successful test or clean verification (e.g. 'passed', 'clean', '0 errors').");
+        return 0;
+    };
+    *approved_out = true;
     return 0;
 }
-fn submitRedemption(penaltyId_ptr: ptr, penaltyId_len: u64, evidence_ptr: ptr, evidence_len: u64, lesson_ptr: ptr, lesson_len: u64, rule_ptr: ptr, rule_len: u64, out_reward: &RewardRecord, status: &ReputationStatus) -> i32 { // DEFECT: async, JevAuditFunction callback/Promise, find() closures [BLOCKED: body is a conversion-era skeleton stub. Awaited ops are fs read/append of the ledger file and, for runJevSupervisoryAudit/evaluateRedemptionWithJev, the Jev audit HTTP call; no body is implemented.]
+
+// i32 landing: 0 = ok:true (reward filled); 1 = ok:false (status
+// filled with statusBefore). The TS error text has no channel in the
+// landed signature (registered): rejection causes are, in TS order,
+// already-redeemed / not-found / empty evidence / empty lesson /
+// empty rule / Jev rejection (`JEV autonomous supervisor rejected
+// redemption: ${reason}`).
+fn submitRedemption(penaltyId_ptr: ptr, penaltyId_len: u64, evidence_ptr: ptr, evidence_len: u64, lesson_ptr: ptr, lesson_len: u64, rule_ptr: ptr, rule_len: u64, out_reward: &RewardRecord, status: &ReputationStatus) -> i32 {
+    lg_registry_reset();
+    let cwd = LgPath { bytes: [0u8; 4096], len: 0 };
+    let cok: bool = lg_process_cwd(&cwd);
+    let path = LgPath { bytes: [0u8; 4096], len: 0 };
+    let plen: u64 = resolveLedgerPath(lg_path_ptr(&cwd), cwd.len, true, PTR_NULL(), 0, false, &path);
+    let entries: u64 = 0;
+    let rst: i32 = readLedgerEntries(lg_path_ptr(&path), path.len, &entries);
+    // statusBefore is computed directly into the out struct: every
+    // rejection path returns it unchanged, as in TS.
+    computeReputationStatus(entries, lg_path_ptr(&path), path.len, status);
+    // find target in activePenalties
+    let target_idx: u64 = status.activePenalties_len;
+    let i: u64 = 0;
+    while i < status.activePenalties_len {
+        let p = status.activePenalties[i];
+        if lg_bytes_eq(p.id_ptr, p.id_len, penaltyId_ptr, penaltyId_len) { target_idx = i; };
+        i = i + 1;
+    }
+    if target_idx >= status.activePenalties_len {
+        return 1; // already redeemed or not found (see header note)
+    };
+    let target = status.activePenalties[target_idx];
+    // trims
+    let elo: u64 = 0;
+    let ehi: u64 = 0;
+    lg_trim_range(evidence_ptr, evidence_len, &elo, &ehi);
+    let llo: u64 = 0;
+    let lhi: u64 = 0;
+    lg_trim_range(lesson_ptr, lesson_len, &llo, &lhi);
+    let rlo: u64 = 0;
+    let rhi: u64 = 0;
+    lg_trim_range(rule_ptr, rule_len, &rlo, &rhi);
+    if ehi <= elo { return 1; };
+    if lhi <= llo { return 1; };
+    if rhi <= rlo { return 1; };
+    let ev_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ev_p, evidence_ptr, elo);
+    let ls_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ls_p, lesson_ptr, llo);
+    let ru_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ru_p, rule_ptr, rlo);
+    let approved: bool = false;
+    let rsn_p: ptr = PTR_NULL();
+    let rsn_l: u64 = 0;
+    let est: i32 = evaluateRedemptionWithJev(ev_p, ehi - elo, ls_p, lhi - llo, ru_p, rhi - rlo, &approved, &rsn_p, &rsn_l);
+    if !approved { return 1; };
+    // reward record (strings staged in the scratch doc)
+    let scratch: u64 = lg_scratch_doc();
+    let ev2_p: ptr = PTR_NULL();
+    let ev2_l: u64 = 0;
+    lg_doc_str(scratch, STR_PTR("verificationEvidence"), STR_LEN("verificationEvidence"), ev_p, ehi - elo, &ev2_p, &ev2_l);
+    let ls2_p: ptr = PTR_NULL();
+    let ls2_l: u64 = 0;
+    lg_doc_str(scratch, STR_PTR("lessonLearned"), STR_LEN("lessonLearned"), ls_p, lhi - llo, &ls2_p, &ls2_l);
+    let ru2_p: ptr = PTR_NULL();
+    let ru2_l: u64 = 0;
+    lg_doc_str(scratch, STR_PTR("antibodyRule"), STR_LEN("antibodyRule"), ru_p, rhi - rlo, &ru2_p, &ru2_l);
+    let lk_p: ptr = PTR_NULL();
+    let lk_l: u64 = 0;
+    lg_doc_str(scratch, STR_PTR("linkedPenaltyId"), STR_LEN("linkedPenaltyId"), target.id_ptr, target.id_len, &lk_p, &lk_l);
+    let ts_id: u64 = sa_time_unix_ms() as u64;
+    let id_p: ptr = PTR_NULL();
+    let id_l: u64 = 0;
+    lg_gen_id(STR_PTR("rew_"), STR_LEN("rew_"), ts_id, STR_PTR("id"), STR_LEN("id"), &id_p, &id_l);
+    let ts_now: u64 = sa_time_unix_ms() as u64;
+    let delta_abs: i32 = target.scoreDelta;
+    if delta_abs < 0 { delta_abs = 0 - delta_abs; };
+    let rew = lg_reward_zero();
+    rew.id_ptr = id_p; rew.id_len = id_l;
+    rew.type_ptr = STR_PTR("reward"); rew.type_len = STR_LEN("reward");
+    rew.linkedPenaltyId_ptr = lk_p; rew.linkedPenaltyId_len = lk_l;
+    rew.scoreDelta = delta_abs;
+    rew.verificationEvidence_ptr = ev2_p; rew.verificationEvidence_len = ev2_l;
+    rew.lessonLearned_ptr = ls2_p; rew.lessonLearned_len = ls2_l;
+    rew.antibodyRule_ptr = ru2_p; rew.antibodyRule_len = ru2_l;
+    rew.timestamp = ts_now;
+    lg_reward_copy(&rew, out_reward);
+    let entry = LedgerEntry { kind: 1, penalty: lg_penalty_zero(), reward: rew };
+    let ast: i32 = appendLedgerEntry(&entry, lg_path_ptr(&path), path.len);
+    if ast != 0 { return ast; };
+    let entries2: u64 = 0;
+    let rst2: i32 = readLedgerEntries(lg_path_ptr(&path), path.len, &entries2);
+    computeReputationStatus(entries2, lg_path_ptr(&path), path.len, status);
     return 0;
 }
-fn formatAntibodyNotice(target_ptr: ptr, target_len: u64, status: &ReputationStatus, out_ptr: ptr) -> u64 { // returns len or 0 for null; DEFECT: string|null, filter closures, template literals, join
+
+// Build the notice text; returns out.len (0 = TS null).
+fn lg_format_notice(target_ptr: ptr, target_len: u64, status: &ReputationStatus, out: &LgText) -> u64 {
+    out.len = 0;
+    // normalized = targetFile.replace(/\\/g, "/")
+    let normalized = LgText { bytes: [0u8; 65536], len: 0 };
+    lg_text_append(&normalized, target_ptr, target_len);
+    let np: ptr = lg_text_ptr(&normalized);
+    let k: u64 = 0;
+    while k < normalized.len {
+        if normalized.bytes[k] == 92 { normalized.bytes[k] = 47; };
+        k = k + 1;
+    }
+    // matching antibodies
+    let ab_idx = LgIndexList { idx: [0u64; 128], len: 0 };
+    let a: u64 = 0;
+    while a < status.antibodies_len {
+        let ab = status.antibodies[a];
+        if lg_bytes_eq(ab.targetFile_ptr, ab.targetFile_len, np, normalized.len) || lg_ends_with(np, normalized.len, ab.targetFile_ptr, ab.targetFile_len) || lg_ends_with(ab.targetFile_ptr, ab.targetFile_len, np, normalized.len) {
+            if ab_idx.len < 128 { ab_idx.idx[ab_idx.len] = a; ab_idx.len = ab_idx.len + 1; };
+        };
+        a = a + 1;
+    }
+    let pen_idx = LgIndexList { idx: [0u64; 128], len: 0 };
+    let p2: u64 = 0;
+    while p2 < status.activePenalties_len {
+        let pn = status.activePenalties[p2];
+        if lg_bytes_eq(pn.targetFile_ptr, pn.targetFile_len, np, normalized.len) || lg_ends_with(np, normalized.len, pn.targetFile_ptr, pn.targetFile_len) || lg_ends_with(pn.targetFile_ptr, pn.targetFile_len, np, normalized.len) {
+            if pen_idx.len < 128 { pen_idx.idx[pen_idx.len] = p2; pen_idx.len = pen_idx.len + 1; };
+        };
+        p2 = p2 + 1;
+    }
+    if ab_idx.len > 0 {
+        lg_text_append(out, STR_PTR("[ANTIBODY IMMUNITY ACTIVE: "), STR_LEN("[ANTIBODY IMMUNITY ACTIVE: "));
+        lg_text_append_u64(out, ab_idx.len);
+        lg_text_append(out, STR_PTR(" rule(s) for "), STR_LEN(" rule(s) for "));
+        lg_text_append(out, target_ptr, target_len);
+        lg_text_append(out, STR_PTR("]"), STR_LEN("]"));
+        let q: u64 = 0;
+        while q < ab_idx.len {
+            let ab2 = status.antibodies[ab_idx.idx[q]];
+            lg_text_append(out, STR_PTR("\n• Rule: \""), STR_LEN("\n• Rule: \""));
+            lg_text_append(out, ab2.rule_ptr, ab2.rule_len);
+            lg_text_append(out, STR_PTR("\" (Learned from: "), STR_LEN("\" (Learned from: "));
+            lg_text_append(out, ab2.lesson_ptr, ab2.lesson_len);
+            lg_text_append(out, STR_PTR(")"), STR_LEN(")"));
+            q = q + 1;
+        }
+    };
+    if pen_idx.len > 0 {
+        if out.len > 0 { lg_text_append(out, STR_PTR("\n"), STR_LEN("\n")); };
+        lg_text_append(out, STR_PTR("[ACTIVE PENALTY WARNING: "), STR_LEN("[ACTIVE PENALTY WARNING: "));
+        lg_text_append_u64(out, pen_idx.len);
+        lg_text_append(out, STR_PTR(" unredeemed penalty(s)]"), STR_LEN(" unredeemed penalty(s)]"));
+        let q2: u64 = 0;
+        while q2 < pen_idx.len {
+            let pn2 = status.activePenalties[pen_idx.idx[q2]];
+            let lname = LgPath { bytes: [0u8; 4096], len: 0 };
+            lg_level_name(pn2.level, &lname);
+            lg_text_append(out, STR_PTR("\n• ["), STR_LEN("\n• ["));
+            lg_text_append(out, pn2.id_ptr, pn2.id_len);
+            lg_text_append(out, STR_PTR("] "), STR_LEN("] "));
+            lg_text_append(out, lg_path_ptr(&lname), lname.len);
+            lg_text_append(out, STR_PTR(" ("), STR_LEN(" ("));
+            lg_text_append_i64(out, pn2.scoreDelta as i64);
+            lg_text_append(out, STR_PTR(" pts): "), STR_LEN(" pts): "));
+            lg_text_append(out, pn2.errorSignature_ptr, pn2.errorSignature_len);
+            q2 = q2 + 1;
+        }
+        let tname = LgPath { bytes: [0u8; 4096], len: 0 };
+        lg_tier_name(status.tier, &tname);
+        lg_text_append(out, STR_PTR("\n• Current Reputation: "), STR_LEN("\n• Current Reputation: "));
+        lg_text_append_i64(out, status.score as i64);
+        lg_text_append(out, STR_PTR("/100 [Tier: "), STR_LEN("/100 [Tier: "));
+        lg_text_append(out, lg_path_ptr(&tname), tname.len);
+        lg_text_append(out, STR_PTR("]"), STR_LEN("]"));
+    };
+    return out.len;
+}
+
+// Reshaped (internal): out is a struct-owned LgText (see
+// resolveLedgerPath note); returns out.len, 0 = TS null.
+fn formatAntibodyNotice(target_ptr: ptr, target_len: u64, status: &ReputationStatus, out: &LgText) -> u64 {
+    return lg_format_notice(target_ptr, target_len, status, out);
+}
+
+// ---- extractForbiddenKeywordsFromRule: hand scanner equivalent to
+// /(?:do not|never|avoid|forbidden to)\s+([a-zA-Z0-9_\-]+)/gi ----
+// Captures are (offset, len) pairs into the rule text.
+struct LgKwList {
+    offs: LgIndexList,
+    lens: LgIndexList,
+}
+
+fn lg_is_space(c: u8) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12;
+}
+
+fn lg_is_word_char(c: u8) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 || c == 45;
+}
+
+// Case-insensitive literal match at position i.
+fn lg_match_ci_at(p: ptr, len: u64, i: u64, lit: ptr, lit_len: u64) -> bool {
+    if i + lit_len > len { return false; };
+    let j: u64 = 0;
+    while j < lit_len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, p, i + j);
+        PTR_BYTE_AT(y, lit, j);
+        if lg_lower_byte(x) != y { return false; };
+        j = j + 1;
+    }
+    return true;
+}
+
+// Trigger length at position i (alternation order as in the regex),
+// or 0 when no trigger matches there.
+fn lg_trigger_len_at(p: ptr, len: u64, i: u64) -> u64 {
+    if lg_match_ci_at(p, len, i, STR_PTR("do not"), STR_LEN("do not")) { return 6; };
+    if lg_match_ci_at(p, len, i, STR_PTR("never"), STR_LEN("never")) { return 5; };
+    if lg_match_ci_at(p, len, i, STR_PTR("avoid"), STR_LEN("avoid")) { return 5; };
+    if lg_match_ci_at(p, len, i, STR_PTR("forbidden to"), STR_LEN("forbidden to")) { return 12; };
     return 0;
 }
-fn checkAccountabilityWriteGate(target_ptr: ptr, target_len: u64, proposed_ptr: ptr, proposed_len: u64, manualOverride: bool, out: &AccountabilityGateResult) -> i32 { // DEFECT: async, SaVmPolicyConfig dynamic object, optional chaining, JEV audit await [BLOCKED: body is a conversion-era skeleton stub. Awaited ops are fs read/append of the ledger file and, for runJevSupervisoryAudit/evaluateRedemptionWithJev, the Jev audit HTTP call; no body is implemented.]
-    out.allowed = true; out.tier = 0; out.score = 100; return 0;
+
+fn lg_forbidden_keywords(rule_ptr: ptr, rule_len: u64, out: &LgKwList) -> void {
+    out.offs.len = 0;
+    out.lens.len = 0;
+    let i: u64 = 0;
+    while i < rule_len {
+        let t: u64 = lg_trigger_len_at(rule_ptr, rule_len, i);
+        if t == 0 {
+            i = i + 1;
+        } else {
+            let j: u64 = i + t;
+            let has_ws: bool = false;
+            if j < rule_len {
+                let c0: u8 = 0;
+                PTR_BYTE_AT(c0, rule_ptr, j);
+                if lg_is_space(c0) { has_ws = true; };
+            };
+            if !has_ws {
+                i = i + 1;
+            } else {
+                while j < rule_len {
+                    let c1: u8 = 0;
+                    PTR_BYTE_AT(c1, rule_ptr, j);
+                    if lg_is_space(c1) { j = j + 1; } else { break; };
+                }
+                let k: u64 = j;
+                while k < rule_len {
+                    let c2: u8 = 0;
+                    PTR_BYTE_AT(c2, rule_ptr, k);
+                    if lg_is_word_char(c2) { k = k + 1; } else { break; };
+                }
+                if k > j {
+                    if k - j > 2 && out.offs.len < 128 {
+                        out.offs.idx[out.offs.len] = j;
+                        out.lens.idx[out.lens.len] = k - j;
+                        out.offs.len = out.offs.len + 1;
+                        out.lens.len = out.lens.len + 1;
+                    };
+                    i = k;
+                } else {
+                    i = i + 1;
+                };
+            };
+        };
+    }
 }
-fn runJevSupervisoryAudit(ctx: &JevAuditContext, approved_out: &bool) -> i32 { // DEFECT: async, customJevAuditor callback, nativeJevRedteam await, JSON.parse stdout, try/catch fail-closed [BLOCKED: body is a conversion-era skeleton stub. Awaited ops are fs read/append of the ledger file and, for runJevSupervisoryAudit/evaluateRedemptionWithJev, the Jev audit HTTP call; no body is implemented.]
+
+// Reshaped (internal): out is a struct-owned LgText holding the
+// keywords joined with "\n" (a list encoding the landed signature
+// could not express); returns bytes written.
+fn extractForbiddenKeywordsFromRule(rule_ptr: ptr, rule_len: u64, out: &LgText, out_count: &u64) -> u64 {
+    let kws = LgKwList { offs: LgIndexList { idx: [0u64; 128], len: 0 }, lens: LgIndexList { idx: [0u64; 128], len: 0 } };
+    lg_forbidden_keywords(rule_ptr, rule_len, &kws);
+    out.len = 0;
+    let i: u64 = 0;
+    while i < kws.offs.len {
+        if i > 0 { lg_text_append(out, STR_PTR("\n"), STR_LEN("\n")); };
+        let kp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(kp, rule_ptr, kws.offs.idx[i]);
+        lg_text_append(out, kp, kws.lens.idx[i]);
+        i = i + 1;
+    }
+    *out_count = kws.offs.len;
+    return out.len;
+}
+
+// ---- Jev supervisory audit ----
+// Reshaped (internal): the landed (ctx, approved_out) form could not
+// carry the TS result {approved, verdict, risk, reason} nor the
+// penalty/antibody lists; lists arrive as index lists into `status`
+// (the gate applies its filter/fallback), the outcome lands in
+// LgAuditOutcome. The TS customJevAuditor callback has no channel in
+// any landed signature — host seam (registered): SLA fn-pointer
+// params can only forward a caller's own fn-ref verbatim, and no
+// wiring supplies one.
+fn runJevSupervisoryAudit(ctx: &JevAuditContext, status: &ReputationStatus, pen_idx: &LgIndexList, ab_idx: &LgIndexList, cwd_ptr: ptr, cwd_len: u64, out: &LgAuditOutcome) -> i32 {
+    out.approved = false;
+    out.verdict_ptr = PTR_NULL(); out.verdict_len = 0; out.has_verdict = false;
+    out.risk_ptr = PTR_NULL(); out.risk_len = 0; out.has_risk = false;
+    out.reason_ptr = PTR_NULL(); out.reason_len = 0; out.has_reason = false;
+    let gdoc: u64 = lg_gate_doc();
+    let target_p: ptr = ctx.targetFile_ptr;
+    let target_l: u64 = ctx.targetFile_len;
+    let prop_p: ptr = ctx.proposedChanges_ptr;
+    let prop_l: u64 = ctx.proposedChanges_len;
+    // 1. antibody rule violations
+    let a: u64 = 0;
+    while a < ab_idx.len {
+        let ab = status.antibodies[ab_idx.idx[a]];
+        let kws = LgKwList { offs: LgIndexList { idx: [0u64; 128], len: 0 }, lens: LgIndexList { idx: [0u64; 128], len: 0 } };
+        lg_forbidden_keywords(ab.rule_ptr, ab.rule_len, &kws);
+        let q: u64 = 0;
+        while q < kws.offs.len {
+            let kp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(kp, ab.rule_ptr, kws.offs.idx[q]);
+            let kl: u64 = kws.lens.idx[q];
+            if lg_contains_ci(prop_p, prop_l, kp, kl) {
+                let text = LgText { bytes: [0u8; 65536], len: 0 };
+                lg_text_append(&text, STR_PTR("Proposed change triggers active antibody rule \""), STR_LEN("Proposed change triggers active antibody rule \""));
+                lg_text_append(&text, ab.rule_ptr, ab.rule_len);
+                lg_text_append(&text, STR_PTR("\" on "), STR_LEN("\" on "));
+                lg_text_append(&text, target_p, target_l);
+                lg_text_append(&text, STR_PTR(". Matched pattern: \""), STR_LEN(". Matched pattern: \""));
+                lg_text_append(&text, kp, kl);
+                lg_text_append(&text, STR_PTR("\"."), STR_LEN("\"."));
+                lg_doc_str(gdoc, STR_PTR("audit_reason"), STR_LEN("audit_reason"), lg_text_ptr(&text), text.len, &out.reason_ptr, &out.reason_len);
+                out.has_reason = true;
+                out.verdict_ptr = STR_PTR("stop"); out.verdict_len = STR_LEN("stop"); out.has_verdict = true;
+                out.risk_ptr = STR_PTR("antibody_violation"); out.risk_len = STR_LEN("antibody_violation"); out.has_risk = true;
+                return 0;
+            };
+            q = q + 1;
+        }
+        a = a + 1;
+    }
+    // 2. penalty error-signature repetition (case-sensitive includes)
+    let p2: u64 = 0;
+    while p2 < pen_idx.len {
+        let pen = status.activePenalties[pen_idx.idx[p2]];
+        if pen.errorSignature_len > 0 && lg_contains(prop_p, prop_l, pen.errorSignature_ptr, pen.errorSignature_len) {
+            let text2 = LgText { bytes: [0u8; 65536], len: 0 };
+            lg_text_append(&text2, STR_PTR("Proposed change still contains the unresolved error signature: \""), STR_LEN("Proposed change still contains the unresolved error signature: \""));
+            lg_text_append(&text2, pen.errorSignature_ptr, pen.errorSignature_len);
+            lg_text_append(&text2, STR_PTR("\"."), STR_LEN("\"."));
+            lg_doc_str(gdoc, STR_PTR("audit_reason"), STR_LEN("audit_reason"), lg_text_ptr(&text2), text2.len, &out.reason_ptr, &out.reason_len);
+            out.has_reason = true;
+            out.verdict_ptr = STR_PTR("stop"); out.verdict_len = STR_LEN("stop"); out.has_verdict = true;
+            out.risk_ptr = STR_PTR("penalty_repetition"); out.risk_len = STR_LEN("penalty_repetition"); out.has_risk = true;
+            return 0;
+        };
+        p2 = p2 + 1;
+    }
+    // 3. empty / destructive truncate
+    let lo: u64 = 0;
+    let hi: u64 = 0;
+    lg_trim_range(prop_p, prop_l, &lo, &hi);
+    if hi <= lo {
+        let text3 = LgText { bytes: [0u8; 65536], len: 0 };
+        lg_text_append(&text3, STR_PTR("Proposed change would result in an empty file on "), STR_LEN("Proposed change would result in an empty file on "));
+        lg_text_append(&text3, target_p, target_l);
+        lg_text_append(&text3, STR_PTR("."), STR_LEN("."));
+        lg_doc_str(gdoc, STR_PTR("audit_reason"), STR_LEN("audit_reason"), lg_text_ptr(&text3), text3.len, &out.reason_ptr, &out.reason_len);
+        out.has_reason = true;
+        out.verdict_ptr = STR_PTR("stop"); out.verdict_len = STR_LEN("stop"); out.has_verdict = true;
+        out.risk_ptr = STR_PTR("data_loss"); out.risk_len = STR_LEN("data_loss"); out.has_risk = true;
+        return 0;
+    };
+    // 4. online JEV redteam (fail-closed)
+    let context = LgText { bytes: [0u8; 65536], len: 0 };
+    lg_text_append(&context, STR_PTR("Target: "), STR_LEN("Target: "));
+    lg_text_append(&context, target_p, target_l);
+    lg_text_append(&context, STR_PTR("\nProposed Changes:\n"), STR_LEN("\nProposed Changes:\n"));
+    let slice_len: u64 = prop_l;
+    if slice_len > 1500 { slice_len = 1500; };
+    lg_text_append(&context, prop_p, slice_len);
+    lg_text_append(&context, STR_PTR("\n\nHistorical Penalties:\n"), STR_LEN("\n\nHistorical Penalties:\n"));
+    if pen_idx.len == 0 {
+        lg_text_append(&context, STR_PTR("None"), STR_LEN("None"));
+    } else {
+        let q3: u64 = 0;
+        while q3 < pen_idx.len {
+            if q3 > 0 { lg_text_append(&context, STR_PTR("; "), STR_LEN("; ")); };
+            let pen3 = status.activePenalties[pen_idx.idx[q3]];
+            let lname = LgPath { bytes: [0u8; 4096], len: 0 };
+            lg_level_name(pen3.level, &lname);
+            lg_text_append(&context, lg_path_ptr(&lname), lname.len);
+            lg_text_append(&context, STR_PTR(": "), STR_LEN(": "));
+            lg_text_append(&context, pen3.errorSignature_ptr, pen3.errorSignature_len);
+            q3 = q3 + 1;
+        }
+    };
+    lg_text_append(&context, STR_PTR("\n\nActive Antibodies:\n"), STR_LEN("\n\nActive Antibodies:\n"));
+    if ab_idx.len == 0 {
+        lg_text_append(&context, STR_PTR("None"), STR_LEN("None"));
+    } else {
+        let q4: u64 = 0;
+        while q4 < ab_idx.len {
+            if q4 > 0 { lg_text_append(&context, STR_PTR("; "), STR_LEN("; ")); };
+            let ab4 = status.antibodies[ab_idx.idx[q4]];
+            lg_text_append(&context, ab4.rule_ptr, ab4.rule_len);
+            q4 = q4 + 1;
+        }
+    };
+    let target_text = LgText { bytes: [0u8; 65536], len: 0 };
+    lg_text_append(&target_text, STR_PTR("Audit modification on "), STR_LEN("Audit modification on "));
+    lg_text_append(&target_text, target_p, target_l);
+    lg_text_append(&target_text, STR_PTR(" under RED reputation scrutiny"), STR_LEN(" under RED reputation scrutiny"));
+    // Build the JevRunInput exactly as saVmTool's jev_call does:
+    // json_bytes carries {"target","context"}; the typed question /
+    // context fields mirror it.
+    let jdoc: u64 = sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+    let js1: i32 = sa_json_object_set_string(jdoc, STR_PTR("target"), STR_LEN("target"), lg_text_ptr(&target_text), target_text.len);
+    let js2: i32 = sa_json_object_set_string(jdoc, STR_PTR("context"), STR_LEN("context"), lg_text_ptr(&context), context.len);
+    let jbuf: u64 = 0;
+    let jst: i32 = sa_json_stringify(jdoc, &jbuf);
+    let state = JevModuleState { shared: JevSharedConfig { baseUrl_bytes: [0u8; 1024], baseUrl_len: 0, has_baseUrl: false, apiKey_bytes: [0u8; 1024], apiKey_len: 0, has_apiKey: false, model_bytes: [0u8; 512], model_len: 0, has_model: false, providerId_bytes: [0u8; 512], providerId_len: 0, has_providerId: false, groupId_bytes: [0u8; 512], groupId_len: 0, has_groupId: false, bridgeProtocol_bytes: [0u8; 256], bridgeProtocol_len: 0, has_bridgeProtocol: false, minIntervalMs: 0, has_minIntervalMs: false, throttleEnabled: false, has_throttleEnabled: false, maxQueueLength: 0, has_maxQueueLength: false }, has_shared: false, relay_executor_id: 0, has_relay_executor: false, jevWaiting: 0, jevLastStartAt: 0, slot_held: false, min_interval_override: 0, has_min_interval_override: false, max_queue_override: 0, has_max_queue_override: false, throttle_enabled_override: false, has_throttle_enabled_override: false };
+    jev_module_state_init(&state);
+    let ji = JevRunInput { json_bytes: [0u8; 262144], json_len: 0, question_bytes: [0u8; 16384], question_len: 0, has_question: false, options_bytes: [0u8; 65536], options_len: 0, options_kind: 0, has_options: false, criteria_bytes: [0u8; 65536], criteria_len: 0, criteria_kind: 0, has_criteria: false, checks_bytes: [0u8; 65536], checks_len: 0, checks_kind: 0, has_checks: false, context_bytes: [0u8; 16384], context_len: 0, has_context: false, content_bytes: [0u8; 16384], content_len: 0, has_content: false, patch_bytes: [0u8; 65536], patch_len: 0, has_patch: false };
+    if jst == 0 && jbuf != 0 {
+        let jp: ptr = sa_json_buffer_data(jbuf);
+        let jl: u64 = sa_json_buffer_len(jbuf);
+        let m: u64 = jl;
+        if m > 262144 { m = 262144; };
+        let kk: u64 = 0;
+        while kk < m {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, jp, kk);
+            ji.json_bytes[kk] = b;
+            kk = kk + 1;
+        }
+        ji.json_len = m;
+        let bf: i32 = sa_json_buffer_free(jbuf);
+    };
+    let qm: u64 = target_text.len;
+    if qm > 16384 { qm = 16384; };
+    let tp5: ptr = lg_text_ptr(&target_text);
+    let k5: u64 = 0;
+    while k5 < qm {
+        let b5: u8 = 0;
+        PTR_BYTE_AT(b5, tp5, k5);
+        ji.question_bytes[k5] = b5;
+        k5 = k5 + 1;
+    }
+    ji.question_len = qm;
+    ji.has_question = true;
+    let cm: u64 = context.len;
+    if cm > 16384 { cm = 16384; };
+    let cp5: ptr = lg_text_ptr(&context);
+    let k6: u64 = 0;
+    while k6 < cm {
+        let b6: u8 = 0;
+        PTR_BYTE_AT(b6, cp5, k6);
+        ji.context_bytes[k6] = b6;
+        k6 = k6 + 1;
+    }
+    ji.context_len = cm;
+    ji.has_context = true;
+    let pcfg = JevPolicyConfig { json_bytes: [0u8; 65536], json_len: 0 };
+    let jr = JevRunResult { ok: false, kind_bytes: [0u8; 64], kind_len: 0, exitCode: 0, stdout_bytes: [0u8; 262144], stdout_len: 0, stderr_bytes: [0u8; 16384], stderr_len: 0, has_violation_event: false, violation_reason_bytes: [0u8; 16384], violation_reason_len: 0, has_violation: false, durationMs: 0 };
+    let now_ms: u64 = sa_time_unix_ms() as u64;
+    let st: i32 = nativeJevRedteam(&state, &ji, &pcfg, cwd_ptr, cwd_len, now_ms, &jr);
+    if st != 0 {
+        // TS: the await throws -> catch -> jev_unreachable deny.
+        // Message: the result's stderr text (kind text when empty).
+        let msg_p: ptr = PTR_NULL();
+        let msg_l: u64 = 0;
+        PTR_BYTE_ADD(msg_p, &jr.stderr_bytes, 0);
+        msg_l = jr.stderr_len;
+        if msg_l == 0 {
+            PTR_BYTE_ADD(msg_p, &jr.kind_bytes, 0);
+            msg_l = jr.kind_len;
+        };
+        let text4 = LgText { bytes: [0u8; 65536], len: 0 };
+        lg_text_append(&text4, STR_PTR("JEV supervisor unreachable for "), STR_LEN("JEV supervisor unreachable for "));
+        lg_text_append(&text4, target_p, target_l);
+        lg_text_append(&text4, STR_PTR(" under RED tier scrutiny ("), STR_LEN(" under RED tier scrutiny ("));
+        lg_text_append(&text4, msg_p, msg_l);
+        lg_text_append(&text4, STR_PTR("). Deny by default; retry when JEV is reachable."), STR_LEN("). Deny by default; retry when JEV is reachable."));
+        lg_doc_str(gdoc, STR_PTR("audit_reason"), STR_LEN("audit_reason"), lg_text_ptr(&text4), text4.len, &out.reason_ptr, &out.reason_len);
+        out.has_reason = true;
+        out.verdict_ptr = STR_PTR("stop"); out.verdict_len = STR_LEN("stop"); out.has_verdict = true;
+        out.risk_ptr = STR_PTR("jev_unreachable"); out.risk_len = STR_LEN("jev_unreachable"); out.has_risk = true;
+        return 0;
+    };
+    if !jr.ok {
+        let text5 = LgText { bytes: [0u8; 65536], len: 0 };
+        lg_text_append(&text5, STR_PTR("JEV supervisor unavailable (ok=false) for "), STR_LEN("JEV supervisor unavailable (ok=false) for "));
+        lg_text_append(&text5, target_p, target_l);
+        lg_text_append(&text5, STR_PTR(" under RED tier scrutiny. Deny by default; fix underlying issue and retry with JEV reachable."), STR_LEN(" under RED tier scrutiny. Deny by default; fix underlying issue and retry with JEV reachable."));
+        lg_doc_str(gdoc, STR_PTR("audit_reason"), STR_LEN("audit_reason"), lg_text_ptr(&text5), text5.len, &out.reason_ptr, &out.reason_len);
+        out.has_reason = true;
+        out.verdict_ptr = STR_PTR("stop"); out.verdict_len = STR_LEN("stop"); out.has_verdict = true;
+        out.risk_ptr = STR_PTR("jev_unavailable"); out.risk_len = STR_LEN("jev_unavailable"); out.has_risk = true;
+        return 0;
+    };
+    // parsed = JSON.parse(redteamResult.stdout) — a parse failure
+    // throws in TS and lands in the same unreachable deny; the V8
+    // SyntaxError text cannot be reproduced, the registered
+    // approximation names the cause instead.
+    let op: ptr = PTR_NULL();
+    PTR_BYTE_ADD(op, &jr.stdout_bytes, 0);
+    let parsed: u64 = sa_json_parse(op, jr.stdout_len);
+    if parsed == 0 {
+        let text6 = LgText { bytes: [0u8; 65536], len: 0 };
+        lg_text_append(&text6, STR_PTR("JEV supervisor unreachable for "), STR_LEN("JEV supervisor unreachable for "));
+        lg_text_append(&text6, target_p, target_l);
+        lg_text_append(&text6, STR_PTR(" under RED tier scrutiny (JEV redteam returned unparseable output). Deny by default; retry when JEV is reachable."), STR_LEN(" under RED tier scrutiny (JEV redteam returned unparseable output). Deny by default; retry when JEV is reachable."));
+        lg_doc_str(gdoc, STR_PTR("audit_reason"), STR_LEN("audit_reason"), lg_text_ptr(&text6), text6.len, &out.reason_ptr, &out.reason_len);
+        out.has_reason = true;
+        out.verdict_ptr = STR_PTR("stop"); out.verdict_len = STR_LEN("stop"); out.has_verdict = true;
+        out.risk_ptr = STR_PTR("jev_unreachable"); out.risk_len = STR_LEN("jev_unreachable"); out.has_risk = true;
+        return 0;
+    };
+    // keep the parsed doc in the registry so verdict/risk/summary
+    // pointers stay valid until the next ledger API call
+    let old_jev: u64 = lg_cell_get(STR_PTR("ledger.jevdoc"), STR_LEN("ledger.jevdoc"));
+    if old_jev != 0 {
+        let ig: i32 = sa_json_free(old_jev);
+    };
+    lg_cell_set(STR_PTR("ledger.jevdoc"), STR_LEN("ledger.jevdoc"), parsed);
+    let v_p: ptr = PTR_NULL();
+    let v_l: u64 = 0;
+    let has_v: bool = lg_jget_str(parsed, STR_PTR("verdict"), STR_LEN("verdict"), &v_p, &v_l);
+    let r_p: ptr = PTR_NULL();
+    let r_l: u64 = 0;
+    let has_r: bool = lg_jget_str(parsed, STR_PTR("primary_risk"), STR_LEN("primary_risk"), &r_p, &r_l);
+    let s_p: ptr = PTR_NULL();
+    let s_l: u64 = 0;
+    let has_s: bool = lg_jget_str(parsed, STR_PTR("summary"), STR_LEN("summary"), &s_p, &s_l);
+    if has_v && lg_lit_eq(v_p, v_l, STR_PTR("stop"), STR_LEN("stop")) {
+        out.verdict_ptr = v_p; out.verdict_len = v_l; out.has_verdict = true;
+        if has_r { out.risk_ptr = r_p; out.risk_len = r_l; out.has_risk = true; };
+        if has_s {
+            out.reason_ptr = s_p; out.reason_len = s_l; out.has_reason = true;
+        } else {
+            let text7 = LgText { bytes: [0u8; 65536], len: 0 };
+            lg_text_append(&text7, STR_PTR("JEV redteam deemed change too risky: "), STR_LEN("JEV redteam deemed change too risky: "));
+            if has_r {
+                lg_text_append(&text7, r_p, r_l);
+            } else {
+                lg_text_append(&text7, STR_PTR("undefined"), STR_LEN("undefined"));
+            };
+            lg_doc_str(gdoc, STR_PTR("audit_reason"), STR_LEN("audit_reason"), lg_text_ptr(&text7), text7.len, &out.reason_ptr, &out.reason_len);
+            out.has_reason = true;
+        };
+        return 0;
+    };
+    out.approved = true;
+    if has_v {
+        out.verdict_ptr = v_p; out.verdict_len = v_l;
+    } else {
+        out.verdict_ptr = STR_PTR("proceed"); out.verdict_len = STR_LEN("proceed");
+    };
+    out.has_verdict = true;
+    if has_r { out.risk_ptr = r_p; out.risk_len = r_l; out.has_risk = true; };
     return 0;
 }
-fn evaluateRedemptionWithJev(evidence_len: u64, lesson_len: u64, rule_len: u64, approved_out: &bool) -> i32 { // DEFECT: async; passingKeywords some/includes closure approximated loop [BLOCKED: body is a conversion-era skeleton stub. Awaited ops are fs read/append of the ledger file and, for runJevSupervisoryAudit/evaluateRedemptionWithJev, the Jev audit HTTP call; no body is implemented.]
+
+// ---- write gate ----
+// Full TS gate tree. cfg_state encodes accountabilityConfig
+// presence + enabled: 0 = no config (undefined), 1 = config present
+// with enabled === false, 2 = enabled truthy, 3 = config present with
+// enabled undefined. manual = caller flag OR config.manualOverride.
+fn lg_gate_full(target_ptr: ptr, target_len: u64, proposed_ptr: ptr, proposed_len: u64, manual_in: bool, cfg_state: u64, policy_manual: bool, policy_ledger_ptr: ptr, policy_ledger_len: u64, has_policy_ledger: bool, custom_ptr: ptr, custom_len: u64, has_custom: bool, out: &AccountabilityGateResult) -> i32 {
+    lg_registry_reset();
+    out.allowed = false;
+    out.tier = 0; out.score = 0;
+    out.notice_ptr = PTR_NULL(); out.notice_len = 0; out.has_notice = false;
+    out.kind_ptr = PTR_NULL(); out.kind_len = 0; out.has_kind = false;
+    out.reason_ptr = PTR_NULL(); out.reason_len = 0; out.has_reason = false;
+    out.antibodyNotice_ptr = PTR_NULL(); out.antibodyNotice_len = 0; out.has_antibodyNotice = false;
+    out.jev_verdict_ptr = PTR_NULL(); out.jev_verdict_len = 0; out.has_jevVerdict = false;
+    // (a) config present && enabled === false
+    if cfg_state == 1 {
+        out.allowed = true; out.tier = 0; out.score = 100;
+        return 0;
+    };
+    // (b) !config?.enabled && !customLedgerPath
+    if cfg_state != 2 && !has_custom {
+        out.allowed = true; out.tier = 0; out.score = 100;
+        return 0;
+    };
+    let gdoc: u64 = lg_gate_doc();
+    let cwd = LgPath { bytes: [0u8; 4096], len: 0 };
+    let cok: bool = lg_process_cwd(&cwd);
+    let lp_p: ptr = policy_ledger_ptr;
+    let lp_l: u64 = policy_ledger_len;
+    let lp_has: bool = has_policy_ledger;
+    if has_custom { lp_p = custom_ptr; lp_l = custom_len; lp_has = true; };
+    let path = LgPath { bytes: [0u8; 4096], len: 0 };
+    let plen: u64 = resolveLedgerPath(lg_path_ptr(&cwd), cwd.len, true, lp_p, lp_l, lp_has, &path);
+    let entries: u64 = 0;
+    let rst: i32 = readLedgerEntries(lg_path_ptr(&path), path.len, &entries);
+    let status = ReputationStatus { score: 0, tier: 0, activePenalties: [PenaltyRecord { id_ptr: PTR_NULL(), id_len: 0, type_ptr: PTR_NULL(), type_len: 0, level: 3, targetFile_ptr: PTR_NULL(), targetFile_len: 0, errorSignature_ptr: PTR_NULL(), errorSignature_len: 0, scoreDelta: 0, details_ptr: PTR_NULL(), details_len: 0, has_details: false, timestamp: 0, status: 0, redeemedBy_ptr: PTR_NULL(), redeemedBy_len: 0, has_redeemedBy: false }; 128], activePenalties_len: 0, redeemedPenalties: [PenaltyRecord { id_ptr: PTR_NULL(), id_len: 0, type_ptr: PTR_NULL(), type_len: 0, level: 3, targetFile_ptr: PTR_NULL(), targetFile_len: 0, errorSignature_ptr: PTR_NULL(), errorSignature_len: 0, scoreDelta: 0, details_ptr: PTR_NULL(), details_len: 0, has_details: false, timestamp: 0, status: 0, redeemedBy_ptr: PTR_NULL(), redeemedBy_len: 0, has_redeemedBy: false }; 128], redeemedPenalties_len: 0, antibodies: [Antibody { targetFile_ptr: PTR_NULL(), targetFile_len: 0, rule_ptr: PTR_NULL(), rule_len: 0, lesson_ptr: PTR_NULL(), lesson_len: 0, penaltyId_ptr: PTR_NULL(), penaltyId_len: 0, rewardId_ptr: PTR_NULL(), rewardId_len: 0, timestamp: 0 }; 128], antibodies_len: 0, totalPenaltiesCount: 0, totalRewardsCount: 0, ledgerPath_ptr: PTR_NULL(), ledgerPath_len: 0 };
+    computeReputationStatus(entries, lg_path_ptr(&path), path.len, &status);
+    let normalized = LgPath { bytes: [0u8; 4096], len: 0 };
+    let nlen: u64 = normalizeTargetFilePath(target_ptr, target_len, lg_path_ptr(&cwd), cwd.len, &normalized);
+    // antibodyNotice = formatAntibodyNotice(normalizedFile, status)
+    let notice_text = LgText { bytes: [0u8; 65536], len: 0 };
+    let nl: u64 = lg_format_notice(lg_path_ptr(&normalized), normalized.len, &status, &notice_text);
+    if nl > 0 {
+        lg_doc_str(gdoc, STR_PTR("antibodyNotice"), STR_LEN("antibodyNotice"), lg_text_ptr(&notice_text), notice_text.len, &out.antibodyNotice_ptr, &out.antibodyNotice_len);
+        out.has_antibodyNotice = true;
+    };
+    // (d) manualOverride
+    if manual_in || policy_manual {
+        let text = LgText { bytes: [0u8; 65536], len: 0 };
+        lg_text_append(&text, STR_PTR("[ACCOUNTABILITY MANUAL OVERRIDE] User manual takeover active; JEV gate bypassed for "), STR_LEN("[ACCOUNTABILITY MANUAL OVERRIDE] User manual takeover active; JEV gate bypassed for "));
+        lg_text_append(&text, lg_path_ptr(&normalized), normalized.len);
+        lg_text_append(&text, STR_PTR("."), STR_LEN("."));
+        lg_doc_str(gdoc, STR_PTR("notice"), STR_LEN("notice"), lg_text_ptr(&text), text.len, &out.notice_ptr, &out.notice_len);
+        out.has_notice = true;
+        out.allowed = true; out.tier = status.tier; out.score = status.score;
+        return 0;
+    };
+    // (e) GREEN
+    if status.tier == 0 {
+        out.allowed = true; out.tier = 0; out.score = status.score;
+        return 0;
+    };
+    // (f) YELLOW
+    if status.tier == 1 {
+        let text2 = LgText { bytes: [0u8; 65536], len: 0 };
+        lg_text_append(&text2, STR_PTR("[ACCOUNTABILITY NOTICE: YELLOW TIER ("), STR_LEN("[ACCOUNTABILITY NOTICE: YELLOW TIER ("));
+        lg_text_append_i64(&text2, status.score as i64);
+        lg_text_append(&text2, STR_PTR("/100)] Exercise heightened caution on "), STR_LEN("/100)] Exercise heightened caution on "));
+        lg_text_append(&text2, lg_path_ptr(&normalized), normalized.len);
+        lg_text_append(&text2, STR_PTR("."), STR_LEN("."));
+        lg_doc_str(gdoc, STR_PTR("notice"), STR_LEN("notice"), lg_text_ptr(&text2), text2.len, &out.notice_ptr, &out.notice_len);
+        out.has_notice = true;
+        out.allowed = true; out.tier = 1; out.score = status.score;
+        return 0;
+    };
+    // (g) RED: filtered lists with full-list fallback
+    let pen_idx = LgIndexList { idx: [0u64; 128], len: 0 };
+    let pi: u64 = 0;
+    while pi < status.activePenalties_len {
+        let pn = status.activePenalties[pi];
+        if lg_bytes_eq(pn.targetFile_ptr, pn.targetFile_len, lg_path_ptr(&normalized), normalized.len) || lg_ends_with(lg_path_ptr(&normalized), normalized.len, pn.targetFile_ptr, pn.targetFile_len) || lg_ends_with(pn.targetFile_ptr, pn.targetFile_len, lg_path_ptr(&normalized), normalized.len) {
+            pen_idx.idx[pen_idx.len] = pi; pen_idx.len = pen_idx.len + 1;
+        };
+        pi = pi + 1;
+    }
+    if pen_idx.len == 0 {
+        let pj: u64 = 0;
+        while pj < status.activePenalties_len { pen_idx.idx[pj] = pj; pj = pj + 1; }
+        pen_idx.len = status.activePenalties_len;
+    };
+    let ab_idx = LgIndexList { idx: [0u64; 128], len: 0 };
+    let ai: u64 = 0;
+    while ai < status.antibodies_len {
+        let ab = status.antibodies[ai];
+        if lg_bytes_eq(ab.targetFile_ptr, ab.targetFile_len, lg_path_ptr(&normalized), normalized.len) || lg_ends_with(lg_path_ptr(&normalized), normalized.len, ab.targetFile_ptr, ab.targetFile_len) || lg_ends_with(ab.targetFile_ptr, ab.targetFile_len, lg_path_ptr(&normalized), normalized.len) {
+            ab_idx.idx[ab_idx.len] = ai; ab_idx.len = ab_idx.len + 1;
+        };
+        ai = ai + 1;
+    }
+    if ab_idx.len == 0 {
+        let aj: u64 = 0;
+        while aj < status.antibodies_len { ab_idx.idx[aj] = aj; aj = aj + 1; }
+        ab_idx.len = status.antibodies_len;
+    };
+    let actx = JevAuditContext { targetFile_ptr: target_ptr, targetFile_len: target_len, proposedChanges_ptr: proposed_ptr, proposedChanges_len: proposed_len, tier: status.tier, score: status.score };
+    let audit = LgAuditOutcome { approved: false, verdict_ptr: PTR_NULL(), verdict_len: 0, has_verdict: false, risk_ptr: PTR_NULL(), risk_len: 0, has_risk: false, reason_ptr: PTR_NULL(), reason_len: 0, has_reason: false };
+    let ast2: i32 = runJevSupervisoryAudit(&actx, &status, &pen_idx, &ab_idx, lg_path_ptr(&cwd), cwd.len, &audit);
+    if !audit.approved {
+        out.allowed = false; out.tier = 2; out.score = status.score;
+        out.kind_ptr = STR_PTR("capability_denied"); out.kind_len = STR_LEN("capability_denied"); out.has_kind = true;
+        let text3 = LgText { bytes: [0u8; 65536], len: 0 };
+        lg_text_append(&text3, STR_PTR("[JEV HIGH-RISK GATEWAY REJECTION]: JEV supervisor blocked write on "), STR_LEN("[JEV HIGH-RISK GATEWAY REJECTION]: JEV supervisor blocked write on "));
+        lg_text_append(&text3, lg_path_ptr(&normalized), normalized.len);
+        lg_text_append(&text3, STR_PTR(" under RED tier scrutiny (Score: "), STR_LEN(" under RED tier scrutiny (Score: "));
+        lg_text_append_i64(&text3, status.score as i64);
+        lg_text_append(&text3, STR_PTR("/100).\nReason: "), STR_LEN("/100).\nReason: "));
+        if audit.has_reason {
+            lg_text_append(&text3, audit.reason_ptr, audit.reason_len);
+        } else {
+            lg_text_append(&text3, STR_PTR("High risk of recurring error or regression"), STR_LEN("High risk of recurring error or regression"));
+        };
+        lg_text_append(&text3, STR_PTR("\nVerdict: "), STR_LEN("\nVerdict: "));
+        lg_text_append(&text3, audit.verdict_ptr, audit.verdict_len);
+        if audit.has_risk {
+            lg_text_append(&text3, STR_PTR(" (Risk: "), STR_LEN(" (Risk: "));
+            lg_text_append(&text3, audit.risk_ptr, audit.risk_len);
+            lg_text_append(&text3, STR_PTR(")"), STR_LEN(")"));
+        };
+        lg_text_append(&text3, STR_PTR("\n\nNotice: Historical penalties are permanent. Fix the underlying issue and submit verified evidence to recover reputation."), STR_LEN("\n\nNotice: Historical penalties are permanent. Fix the underlying issue and submit verified evidence to recover reputation."));
+        lg_doc_str(gdoc, STR_PTR("reason"), STR_LEN("reason"), lg_text_ptr(&text3), text3.len, &out.reason_ptr, &out.reason_len);
+        out.has_reason = true;
+        if audit.has_verdict {
+            lg_doc_str(gdoc, STR_PTR("jevVerdict"), STR_LEN("jevVerdict"), audit.verdict_ptr, audit.verdict_len, &out.jev_verdict_ptr, &out.jev_verdict_len);
+            out.has_jevVerdict = true;
+        };
+        if audit.has_risk {
+            lg_doc_str(gdoc, STR_PTR("jevRisk"), STR_LEN("jevRisk"), audit.risk_ptr, audit.risk_len, &out.jev_risk_ptr, &out.jev_risk_len);
+        };
+        if audit.has_reason {
+            lg_doc_str(gdoc, STR_PTR("jevSummary"), STR_LEN("jevSummary"), audit.reason_ptr, audit.reason_len, &out.jev_summary_ptr, &out.jev_summary_len);
+        };
+        return 0;
+    };
+    // RED approve
+    let text4 = LgText { bytes: [0u8; 65536], len: 0 };
+    lg_text_append(&text4, STR_PTR("[JEV SUPERVISOR GATE: PASSED] JEV autonomous supervisor approved modification on "), STR_LEN("[JEV SUPERVISOR GATE: PASSED] JEV autonomous supervisor approved modification on "));
+    lg_text_append(&text4, lg_path_ptr(&normalized), normalized.len);
+    lg_text_append(&text4, STR_PTR(" under RED tier scrutiny (Verdict: "), STR_LEN(" under RED tier scrutiny (Verdict: "));
+    lg_text_append(&text4, audit.verdict_ptr, audit.verdict_len);
+    lg_text_append(&text4, STR_PTR(")."), STR_LEN(")."));
+    lg_doc_str(gdoc, STR_PTR("notice"), STR_LEN("notice"), lg_text_ptr(&text4), text4.len, &out.notice_ptr, &out.notice_len);
+    out.has_notice = true;
+    out.allowed = true; out.tier = 2; out.score = status.score;
+    if audit.has_verdict {
+        lg_doc_str(gdoc, STR_PTR("jevVerdict"), STR_LEN("jevVerdict"), audit.verdict_ptr, audit.verdict_len, &out.jev_verdict_ptr, &out.jev_verdict_len);
+        out.has_jevVerdict = true;
+    };
+    if audit.has_risk {
+        lg_doc_str(gdoc, STR_PTR("jevRisk"), STR_LEN("jevRisk"), audit.risk_ptr, audit.risk_len, &out.jev_risk_ptr, &out.jev_risk_len);
+    };
     return 0;
 }
-fn extractForbiddenKeywordsFromRule(rule_ptr: ptr, rule_len: u64, out_ptr: ptr) -> u64 { // DEFECT: RegExp /(?:do not|never|avoid|forbidden to)\s+([a-zA-Z0-9_\-]+)/gi + RegExpExecArray loop — no regex in sa_std
-    return 0;
+
+// Locked public signature: the landed form carries no
+// accountabilityConfig / customLedgerPath, so the TS tree always
+// exits at branch (b) — exactly what the saVmTool bridge observes
+// (it never passes a config). lg_gate_full above implements the
+// whole tree for the day the wiring widens the signature; the
+// registration is recorded in FIX_SERVER_STORES.md.
+fn checkAccountabilityWriteGate(target_ptr: ptr, target_len: u64, proposed_ptr: ptr, proposed_len: u64, manualOverride: bool, out: &AccountabilityGateResult) -> i32 {
+    return lg_gate_full(target_ptr, target_len, proposed_ptr, proposed_len, manualOverride, 0, false, PTR_NULL(), 0, false, PTR_NULL(), 0, false, out);
 }
