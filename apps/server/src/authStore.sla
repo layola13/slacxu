@@ -1,23 +1,46 @@
-// Converted 1:1 from apps/server/src/authStore.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
-// NOTE: single-file sequential conversion of the 1,285-line auth store.
-// TS imports: node:crypto (createHmac, randomBytes, randomUUID, timingSafeEqual),
-// node:fs sync fns, node:os homedir, node:path (dirname, join),
-// ./runtime/database RuntimeDatabase, ./runtime/password (hashPassword, verifyPassword),
-// @codex-ui/shared (AuthUser, AuthUserRole, AuthUserStatus, MemberCapabilities, PermissionPresetId),
-// ./localDatabase (LocalDatabase, codexUiDataDir). Re-exports AuthUser etc. (L14).
-// JWT (HS256, hand-rolled) + HMAC + Buffer base64url have no direct sa_std
-// surface yet; carried as byte-buffer helpers with DEFECT markers.
+// Converted 1:1 from apps/server/src/authStore.ts (CXU plugins @ f2cb649d).
+// FIX (stores batch): full body retranslation. The skeleton header's
+// claims are stale and are corrected here: JWT/HMAC DO have sa_std
+// surfaces (crypto.sai sa_hmac_sha256_hex, sa_crypto_random_bytes,
+// sa_deno_random_uuid — base64url is hand-rolled, no std surface),
+// bcrypt is wired via runtime/password.sla (sa_bcrypt_*), the DB
+// handle is a plugin_sqlite connection (sa_std/plugin_sqlite.sa
+// facade, the LocalDatabase seam registered below), and fs/env/time
+// all exist in sa_std.
+// Landed-model notes (registered in _defects/FIX_SERVER_STORES.md):
+// - AuthStore.db is the wiring layer's plugin_sqlite connection
+//   handle; AuthStore_new with has_database=false (or fromEnv with
+//   database=0) leaves db=0 and DB methods fail closed — the TS
+//   default `new LocalDatabase()` has no landed channel.
+// - TS throws land on the i32 status channel (0 ok, 1 thrown) with
+//   the message in the module last-error doc, readable via
+//   AuthStore_takeLastError (additive accessor). bool fns keep the
+//   TS null semantics.
+// - getUsageSummary's day boundaries use UTC midnight (sa_std time
+//   getters are UTC); TS uses local-timezone midnight. toISOString
+//   day keys are UTC in both.
+// - String results that TS returns by value ride the module scratch
+//   doc ("authstore.scratch") and are valid until the next
+//   authStore call that writes the same field (ledger model).
 
 @import "sa_std/io/print.sai"
 @import "sa_std/string.sa"
-// @import "./localDatabase.sla"     // LocalDatabase, codexUiDataDir
-// @import "./runtime/database.sla"  // RuntimeDatabase
-// @import "./runtime/password.sla"  // hashPassword, verifyPassword
+@import "sa_std/ptr.sa"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/env.sai"
+@import "sa_std/time.sai"
+@import "sa_std/crypto.sai"
+@import "sa_std/fmt.sai"
+@import "sa_std/globals.sai"
+@import "sa_std/plugin_sqlite.sa"
+@import "./runtime/password.sla"
+@import "../../../sdk-backend/src/dataDir.sla"
 
 // ---- src/authStore.ts:16-20 — interface LoginResult ----
 struct LoginResult {
     token: [u8; 1024], token_len: u64,
-    user_json: u64,          // AuthUser as JSON handle // DEFECT: dynamic object (shared type)
+    user_json: u64,          // AuthUser as JSON handle
     expiresAt: u64,          // number (epoch ms)
 }
 
@@ -96,565 +119,3166 @@ struct JwtPayload {
     exp: u64,
 }
 
-// ---- L93-98 — const PERMISSION_RANK: Record<PermissionPresetId, number> ----
-// DEFECT: Record keyed by string union -> fn lookup.
+// ---- L93-98 — const PERMISSION_RANK ----
 fn PERMISSION_RANK(permission_ptr: ptr, permission_len: u64) -> i64 {
-    // readonlyAsk->0, workspaceAsk->1, fullAsk->2, dangerBypass->3; unknown -> -1
+    if au_eq(permission_ptr, permission_len, STR_PTR("readonlyAsk"), STR_LEN("readonlyAsk")) { return 0; };
+    if au_eq(permission_ptr, permission_len, STR_PTR("workspaceAsk"), STR_LEN("workspaceAsk")) { return 1; };
+    if au_eq(permission_ptr, permission_len, STR_PTR("fullAsk"), STR_LEN("fullAsk")) { return 2; };
+    if au_eq(permission_ptr, permission_len, STR_PTR("dangerBypass"), STR_LEN("dangerBypass")) { return 3; };
     return -1;
 }
 
-// ---- L100-105 — class AuthStore (fields + constructor) ----
-// DEFECT: class -> struct + fn family with &AuthStore first param.
-struct AuthStore {
-    db: u64,               // RuntimeDatabase handle
-    config: AuthConfig,
+// ---- au_ text toolkit ----
+struct AuText { bytes: [u8; 65536], len: u64 }
+struct AuSmall { bytes: [u8; 8192], len: u64 }
+struct AuPath { bytes: [u8; 4096], len: u64 }
+
+fn au_text_ptr(t: &AuText) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &t.bytes, 0);
+    return p;
 }
 
-fn AuthStore_new(out: &AuthStore, database: u64, has_database: bool, config: &AuthConfig, has_config: bool) -> void {
-    // constructor(database = new LocalDatabase(), config = configFromEnv())
-    // this.db = database.connection; this.config = config;
-    // mkdirSync(this.config.membersRoot, {recursive:true, mode:0o700}) // DEFECT: node:fs sync API -> sa_std_fs approx
+fn au_small_ptr(t: &AuSmall) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &t.bytes, 0);
+    return p;
 }
 
-// ---- L107-121 — static fromEnv(env = process.env, database): AuthStore|null ----
-fn AuthStore_fromEnv(env_json: u64, database: u64, out: &AuthStore) -> bool {
-    // mode = env.CODEX_UI_AUTH?.trim().toLowerCase() // DEFECT: process.env
-    // if mode===undefined: try { if /codex-standalone(\.exe)?$/i.test(process.execPath ?? "") mode="off"; } catch {} // DEFECT: RegExp + process.execPath + try/catch
-    // mode = mode ?? "1"
-    // if mode==="0"||"false"||"off"||"local-token" return false(null)
-    // out = new AuthStore(database, configFromEnv(env)); return true
+fn au_path_ptr(t: &AuPath) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &t.bytes, 0);
+    return p;
+}
+
+fn au_append(dst: &AuText, p: ptr, len: u64) -> void {
+    let i: u64 = 0;
+    while i < len {
+        if dst.len < 65536 {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, p, i);
+            dst.bytes[dst.len] = b;
+            dst.len = dst.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn au_append_small(dst: &AuSmall, p: ptr, len: u64) -> void {
+    let i: u64 = 0;
+    while i < len {
+        if dst.len < 8192 {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, p, i);
+            dst.bytes[dst.len] = b;
+            dst.len = dst.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn au_append_path(dst: &AuPath, p: ptr, len: u64) -> void {
+    let i: u64 = 0;
+    while i < len {
+        if dst.len < 4096 {
+            let b: u8 = 0;
+            PTR_BYTE_AT(b, p, i);
+            dst.bytes[dst.len] = b;
+            dst.len = dst.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn au_byte(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+fn au_lower(c: u8) -> u8 {
+    if c >= 65 && c <= 90 { return c + 32; };
+    return c;
+}
+
+fn au_eq(p: ptr, len: u64, q: ptr, qlen: u64) -> bool {
+    if len != qlen { return false; };
+    let i: u64 = 0;
+    while i < len {
+        if au_byte(p, i) != au_byte(q, i) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn au_starts_with(p: ptr, len: u64, pre: ptr, pre_len: u64) -> bool {
+    if pre_len > len { return false; };
+    let j: u64 = 0;
+    while j < pre_len {
+        if au_byte(p, j) != au_byte(pre, j) { return false; };
+        j = j + 1;
+    }
+    return true;
+}
+
+fn au_ends_with_ci(p: ptr, len: u64, suf: ptr, suf_len: u64) -> bool {
+    if suf_len > len { return false; };
+    let off: u64 = len - suf_len;
+    let j: u64 = 0;
+    while j < suf_len {
+        if au_lower(au_byte(p, off + j)) != au_lower(au_byte(suf, j)) { return false; };
+        j = j + 1;
+    }
+    return true;
+}
+
+fn au_trim_range(p: ptr, len: u64, lo: &u64, hi: &u64) -> void {
+    let a: u64 = 0;
+    let b: u64 = len;
+    while a < b {
+        let c: u8 = au_byte(p, a);
+        if c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12 { a = a + 1; } else { break; };
+    }
+    while b > a {
+        let c2: u8 = au_byte(p, b - 1);
+        if c2 == 32 || c2 == 9 || c2 == 10 || c2 == 13 || c2 == 11 || c2 == 12 { b = b - 1; } else { break; };
+    }
+    *lo = a;
+    *hi = b;
+}
+
+// ---- JSON helpers ----
+fn au_parse(p: ptr, len: u64) -> u64 {
+    if len == 0 { return 0; };
+    return sa_json_parse(p, len);
+}
+
+fn au_jget(node: u64, key_p: ptr, key_l: u64) -> u64 {
+    if node == 0 { return 0; };
+    let out: u64 = 0;
+    let st: i32 = sa_json_object_get(node, key_p, key_l, &out);
+    if st != 0 { return 0; };
+    return out;
+}
+
+fn au_jstr(node: u64, out_p: &ptr, out_l: &u64) -> bool {
+    *out_p = PTR_NULL();
+    *out_l = 0;
+    if node == 0 || sa_json_kind(node) != 5 { return false; };
+    *out_p = sa_json_string_ptr(node);
+    *out_l = sa_json_string_len(node);
+    return true;
+}
+
+fn au_field_str(node: u64, key_p: ptr, key_l: u64, out_p: &ptr, out_l: &u64) -> bool {
+    return au_jstr(au_jget(node, key_p, key_l), out_p, out_l);
+}
+
+fn au_field_num(node: u64, key_p: ptr, key_l: u64, out_v: &f64) -> bool {
+    let v: u64 = au_jget(node, key_p, key_l);
+    if v == 0 { return false; };
+    let k: u32 = sa_json_kind(v);
+    if k != 2 && k != 3 { return false; };
+    let st: i32 = sa_json_as_f64(v, out_v);
+    return st == 0;
+}
+
+fn au_field_bool(node: u64, key_p: ptr, key_l: u64) -> bool {
+    let v: u64 = au_jget(node, key_p, key_l);
+    if v == 0 || sa_json_kind(v) != 1 { return false; };
+    let b: u64 = 0;
+    let st: i32 = sa_json_as_bool(v, &b);
+    return st == 0 && b != 0;
+}
+
+// scratch doc for string results (valid until the next write of the
+// same field)
+fn au_scratch() -> u64 {
+    let doc: u64 = 0;
+    let st: i32 = sa_global_u64_get(STR_PTR("authstore.scratch"), STR_LEN("authstore.scratch"), &doc);
+    if st == 0 && doc != 0 { return doc; };
+    let fresh: u64 = sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+    let sst: i32 = sa_global_u64_set(STR_PTR("authstore.scratch"), STR_LEN("authstore.scratch"), fresh);
+    return fresh;
+}
+
+fn au_doc_str(key_p: ptr, key_l: u64, val_p: ptr, val_l: u64, out_p: &ptr, out_l: &u64) -> void {
+    let doc: u64 = au_scratch();
+    *out_p = PTR_NULL();
+    *out_l = 0;
+    if doc == 0 { return; };
+    let st: i32 = sa_json_object_set_string(doc, key_p, key_l, val_p, val_l);
+    au_field_str(doc, key_p, key_l, out_p, out_l);
+}
+
+// last-error channel for TS throws
+fn au_throw(msg_p: ptr, msg_l: u64) -> i32 {
+    let doc: u64 = sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if doc != 0 {
+        let s1: i32 = sa_json_object_set_string(doc, STR_PTR("error"), STR_LEN("error"), msg_p, msg_l);
+        let old: u64 = 0;
+        let gst: i32 = sa_global_u64_get(STR_PTR("authstore.lasterror"), STR_LEN("authstore.lasterror"), &old);
+        if gst == 0 && old != 0 {
+            let f: i32 = sa_json_free(old);
+        };
+        let sst: i32 = sa_global_u64_set(STR_PTR("authstore.lasterror"), STR_LEN("authstore.lasterror"), doc);
+    };
+    return 1;
+}
+
+fn AuthStore_takeLastError(out_json: &u64) -> bool {
+    let doc: u64 = 0;
+    let st: i32 = sa_global_u64_get(STR_PTR("authstore.lasterror"), STR_LEN("authstore.lasterror"), &doc);
+    *out_json = doc;
+    return st == 0 && doc != 0;
+}
+
+// ---- sqlite wrappers (one macro per fn: macro temp names key on
+// the out-variable names — the agy pattern) ----
+fn au_exec(db: u64, sql_p: ptr, sql_l: u64) -> i32 {
+    if db == 0 { return 1; };
+    let st: u64 = 0;
+    SA_SQLITE_EXEC(st, db, sql_p, sql_l);
+    return st as i32;
+}
+
+fn au_prepare(db: u64, sql_p: ptr, sql_l: u64) -> u64 {
+    if db == 0 { return 0; };
+    let st: u64 = 0;
+    let stmt: u64 = 0;
+    SA_SQLITE_PREPARE(st, stmt, db, sql_p, sql_l);
+    return stmt;
+}
+
+fn au_bind_text(stmt: u64, idx: u64, val_p: ptr, val_l: u64) -> void {
+    let st: u64 = 0;
+    SA_SQLITE_BIND_TEXT(st, stmt, idx, val_p, val_l);
+}
+
+fn au_bind_int(stmt: u64, idx: u64, value: i64) -> void {
+    let st: u64 = 0;
+    let v: u64 = value as u64;
+    SA_SQLITE_BIND_INT(st, stmt, idx, v);
+}
+
+fn au_bind_double(stmt: u64, idx: u64, value: f64) -> void {
+    let st: u64 = 0;
+    SA_SQLITE_BIND_DOUBLE(st, stmt, idx, value);
+}
+
+fn au_bind_null(stmt: u64, idx: u64) -> void {
+    let st: u64 = 0;
+    SA_SQLITE_BIND_NULL(st, stmt, idx);
+}
+
+// Step once; on a row, out_doc receives the parsed row object
+// (columns by name). Caller frees the doc.
+fn au_step_row(stmt: u64, out_doc: &u64) -> bool {
+    *out_doc = 0;
+    let st: u64 = 0;
+    let ready: u64 = 0;
+    let rp: ptr = PTR_NULL();
+    let rl: u64 = 0;
+    SA_SQLITE_STEP_JSON(st, ready, rp, rl, stmt);
+    if ready == 0 { return false; };
+    *out_doc = sa_json_parse(rp, rl);
+    return *out_doc != 0;
+}
+
+fn au_step_once(stmt: u64) -> void {
+    let st: u64 = 0;
+    let ready: u64 = 0;
+    let rp: ptr = PTR_NULL();
+    let rl: u64 = 0;
+    SA_SQLITE_STEP_JSON(st, ready, rp, rl, stmt);
+}
+
+fn au_finalize(stmt: u64) -> void {
+    if stmt == 0 { return; };
+    let st: u64 = 0;
+    SA_SQLITE_FINALIZE(st, stmt);
+}
+
+// prepare + step + finalize for run()-style statements
+fn au_run(db: u64, sql_p: ptr, sql_l: u64) -> u64 {
+    let stmt: u64 = au_prepare(db, sql_p, sql_l);
+    if stmt == 0 { return 0; };
+    au_step_once(stmt);
+    au_finalize(stmt);
+    return stmt;
+}
+
+// ---- row -> UserRow ----
+fn au_col_text(row: u64, key_p: ptr, key_l: u64, out_p: &ptr, out_l: &u64) -> bool {
+    return au_field_str(row, key_p, key_l, out_p, out_l);
+}
+
+fn au_col_f64(row: u64, key_p: ptr, key_l: u64) -> f64 {
+    let v: f64 = 0.0;
+    if au_field_num(row, key_p, key_l, &v) { return v; };
+    return 0.0;
+}
+
+fn au_col_i64(row: u64, key_p: ptr, key_l: u64) -> i64 {
+    let v: u64 = au_jget(row, key_p, key_l);
+    if v == 0 { return 0; };
+    let k: u32 = sa_json_kind(v);
+    if k != 2 && k != 3 { return 0; };
+    let out: i64 = 0;
+    let st: i32 = sa_json_as_i64(v, &out);
+    if st != 0 { return 0; };
+    return out;
+}
+
+fn au_col_is_null(row: u64, key_p: ptr, key_l: u64) -> bool {
+    let v: u64 = au_jget(row, key_p, key_l);
+    if v == 0 { return true; };
+    return sa_json_kind(v) == 0;
+}
+
+// field readers by code (arrays cannot be passed generically)
+fn au_row_field(row: &UserRow, code: u64, out_p: &ptr, out_l: &u64) -> void {
+    *out_p = PTR_NULL();
+    *out_l = 0;
+    if code == 0 { PTR_BYTE_ADD(*out_p, &row.id, 0); *out_l = row.id_len; };
+    if code == 1 { PTR_BYTE_ADD(*out_p, &row.email, 0); *out_l = row.email_len; };
+    if code == 2 { PTR_BYTE_ADD(*out_p, &row.username, 0); *out_l = row.username_len; };
+    if code == 3 { PTR_BYTE_ADD(*out_p, &row.password_hash, 0); *out_l = row.password_hash_len; };
+    if code == 4 { PTR_BYTE_ADD(*out_p, &row.role, 0); *out_l = row.role_len; };
+    if code == 5 { PTR_BYTE_ADD(*out_p, &row.status, 0); *out_l = row.status_len; };
+    if code == 6 { PTR_BYTE_ADD(*out_p, &row.max_permission, 0); *out_l = row.max_permission_len; };
+    if code == 7 { PTR_BYTE_ADD(*out_p, &row.workspace_root, 0); *out_l = row.workspace_root_len; };
+    if code == 8 { PTR_BYTE_ADD(*out_p, &row.notes, 0); *out_l = row.notes_len; };
+    if code == 9 { PTR_BYTE_ADD(*out_p, &row.totp_secret, 0); *out_l = row.totp_secret_len; };
+}
+
+fn au_cfg_field(cfg: &AuthConfig, code: u64, out_p: &ptr, out_l: &u64) -> void {
+    *out_p = PTR_NULL();
+    *out_l = 0;
+    if code == 0 { PTR_BYTE_ADD(*out_p, &cfg.jwtSecret, 0); *out_l = cfg.jwtSecret_len; };
+    if code == 1 { PTR_BYTE_ADD(*out_p, &cfg.adminEmail, 0); *out_l = cfg.adminEmail_len; };
+    if code == 2 { PTR_BYTE_ADD(*out_p, &cfg.adminPassword, 0); *out_l = cfg.adminPassword_len; };
+    if code == 3 { PTR_BYTE_ADD(*out_p, &cfg.membersRoot, 0); *out_l = cfg.membersRoot_len; };
+}
+
+fn au_fill_user_row(row: u64, out: &UserRow) -> void {
+    let p: ptr = PTR_NULL();
+    let l: u64 = 0;
+    out.id_len = 0;
+    if au_col_text(row, STR_PTR("id"), STR_LEN("id"), &p, &l) {
+        let i: u64 = 0;
+        while i < l && i < 64 { out.id[i] = au_byte(p, i); i = i + 1; }
+        out.id_len = i;
+    };
+    out.email_len = 0;
+    if au_col_text(row, STR_PTR("email"), STR_LEN("email"), &p, &l) {
+        let i: u64 = 0;
+        while i < l && i < 320 { out.email[i] = au_byte(p, i); i = i + 1; }
+        out.email_len = i;
+    };
+    out.username_len = 0;
+    if au_col_text(row, STR_PTR("username"), STR_LEN("username"), &p, &l) {
+        let i: u64 = 0;
+        while i < l && i < 256 { out.username[i] = au_byte(p, i); i = i + 1; }
+        out.username_len = i;
+    };
+    out.password_hash_len = 0;
+    if au_col_text(row, STR_PTR("password_hash"), STR_LEN("password_hash"), &p, &l) {
+        let i: u64 = 0;
+        while i < l && i < 512 { out.password_hash[i] = au_byte(p, i); i = i + 1; }
+        out.password_hash_len = i;
+    };
+    out.role_len = 0;
+    if au_col_text(row, STR_PTR("role"), STR_LEN("role"), &p, &l) {
+        let i: u64 = 0;
+        while i < l && i < 16 { out.role[i] = au_byte(p, i); i = i + 1; }
+        out.role_len = i;
+    };
+    out.status_len = 0;
+    if au_col_text(row, STR_PTR("status"), STR_LEN("status"), &p, &l) {
+        let i: u64 = 0;
+        while i < l && i < 16 { out.status[i] = au_byte(p, i); i = i + 1; }
+        out.status_len = i;
+    };
+    out.balance = au_col_f64(row, STR_PTR("balance"), STR_LEN("balance"));
+    out.concurrency = au_col_i64(row, STR_PTR("concurrency"), STR_LEN("concurrency"));
+    out.max_permission_len = 0;
+    if au_col_text(row, STR_PTR("max_permission"), STR_LEN("max_permission"), &p, &l) {
+        let i: u64 = 0;
+        while i < l && i < 32 { out.max_permission[i] = au_byte(p, i); i = i + 1; }
+        out.max_permission_len = i;
+    };
+    out.allow_write = au_col_i64(row, STR_PTR("allow_write"), STR_LEN("allow_write"));
+    out.allow_network = au_col_i64(row, STR_PTR("allow_network"), STR_LEN("allow_network"));
+    out.allow_danger_bypass = au_col_i64(row, STR_PTR("allow_danger_bypass"), STR_LEN("allow_danger_bypass"));
+    out.workspace_root_len = 0;
+    if au_col_text(row, STR_PTR("workspace_root"), STR_LEN("workspace_root"), &p, &l) {
+        let i: u64 = 0;
+        while i < l && i < 512 { out.workspace_root[i] = au_byte(p, i); i = i + 1; }
+        out.workspace_root_len = i;
+    };
+    out.notes_len = 0;
+    if au_col_text(row, STR_PTR("notes"), STR_LEN("notes"), &p, &l) {
+        let i: u64 = 0;
+        while i < l && i < 1024 { out.notes[i] = au_byte(p, i); i = i + 1; }
+        out.notes_len = i;
+    };
+    out.totp_secret_len = 0;
+    if au_col_text(row, STR_PTR("totp_secret"), STR_LEN("totp_secret"), &p, &l) {
+        let i: u64 = 0;
+        while i < l && i < 256 { out.totp_secret[i] = au_byte(p, i); i = i + 1; }
+        out.totp_secret_len = i;
+    };
+    out.totp_enabled = au_col_i64(row, STR_PTR("totp_enabled"), STR_LEN("totp_enabled"));
+    out.has_totp_enabled_at = !au_col_is_null(row, STR_PTR("totp_enabled_at"), STR_LEN("totp_enabled_at"));
+    out.totp_enabled_at = au_col_i64(row, STR_PTR("totp_enabled_at"), STR_LEN("totp_enabled_at"));
+    out.created_at = au_col_i64(row, STR_PTR("created_at"), STR_LEN("created_at")) as u64;
+    out.updated_at = au_col_i64(row, STR_PTR("updated_at"), STR_LEN("updated_at")) as u64;
+    out.has_deleted_at = !au_col_is_null(row, STR_PTR("deleted_at"), STR_LEN("deleted_at"));
+    out.deleted_at = au_col_i64(row, STR_PTR("deleted_at"), STR_LEN("deleted_at")) as u64;
+}
+
+// ---- authStore.ts:1133-1149 — authUserFromRow ----
+fn authUserFromRow(row: &UserRow, out_json: &u64) -> void {
+    let doc: u64 = sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+    *out_json = doc;
+    if doc == 0 { return; };
+    let p: ptr = PTR_NULL();
+    let l: u64 = 0;
+    au_row_field(row, 0, &p, &l);
+    let s1: i32 = sa_json_object_set_string(doc, STR_PTR("id"), STR_LEN("id"), p, l);
+    au_row_field(row, 1, &p, &l);
+    let s2: i32 = sa_json_object_set_string(doc, STR_PTR("email"), STR_LEN("email"), p, l);
+    au_row_field(row, 2, &p, &l);
+    let s3: i32 = sa_json_object_set_string(doc, STR_PTR("username"), STR_LEN("username"), p, l);
+    au_row_field(row, 4, &p, &l);
+    let s4: i32 = sa_json_object_set_string(doc, STR_PTR("role"), STR_LEN("role"), p, l);
+    au_row_field(row, 5, &p, &l);
+    let s5: i32 = sa_json_object_set_string(doc, STR_PTR("status"), STR_LEN("status"), p, l);
+    let s6: i32 = sa_json_object_set_f64(doc, STR_PTR("balance"), STR_LEN("balance"), row.balance);
+    let s7: i32 = sa_json_object_set_i64(doc, STR_PTR("concurrency"), STR_LEN("concurrency"), row.concurrency);
+    au_row_field(row, 6, &p, &l);
+    let s8: i32 = sa_json_object_set_string(doc, STR_PTR("maxPermission"), STR_LEN("maxPermission"), p, l);
+    let s9: i32 = sa_json_object_set_bool(doc, STR_PTR("allowWrite"), STR_LEN("allowWrite"), row.allow_write != 0);
+    let s10: i32 = sa_json_object_set_bool(doc, STR_PTR("allowNetwork"), STR_LEN("allowNetwork"), row.allow_network != 0);
+    let s11: i32 = sa_json_object_set_bool(doc, STR_PTR("allowDangerBypass"), STR_LEN("allowDangerBypass"), row.allow_danger_bypass != 0);
+    au_row_field(row, 7, &p, &l);
+    let s12: i32 = sa_json_object_set_string(doc, STR_PTR("workspaceRoot"), STR_LEN("workspaceRoot"), p, l);
+    au_row_field(row, 8, &p, &l);
+    let s13: i32 = sa_json_object_set_string(doc, STR_PTR("notes"), STR_LEN("notes"), p, l);
+    let s14: i32 = sa_json_object_set_bool(doc, STR_PTR("totpEnabled"), STR_LEN("totpEnabled"), row.totp_enabled != 0);
+}
+
+// ---- path helpers (join = normalize, POSIX subset) ----
+fn au_seg_eq(p: ptr, a: u64, b: u64, lit_p: ptr, lit_l: u64) -> bool {
+    if b - a != lit_l { return false; };
+    let j: u64 = 0;
+    while j < lit_l {
+        if au_byte(p, a + j) != au_byte(lit_p, j) { return false; };
+        j = j + 1;
+    }
+    return true;
+}
+
+fn au_path_normalize(p: ptr, len: u64, out: &AuPath) -> void {
+    let rooted: bool = len > 0 && au_byte(p, 0) == 47;
+    out.len = 0;
+    if rooted { out.bytes[0] = 47; out.len = 1; };
+    let i: u64 = 0;
+    while i < len {
+        while i < len && au_byte(p, i) == 47 { i = i + 1; }
+        if i >= len { break; };
+        let start: u64 = i;
+        while i < len && au_byte(p, i) != 47 { i = i + 1; }
+        if au_seg_eq(p, start, i, STR_PTR("."), STR_LEN(".")) { continue; };
+        if au_seg_eq(p, start, i, STR_PTR(".."), STR_LEN("..")) {
+            if out.len > 1 || (out.len == 1 && !rooted) {
+                let j: u64 = out.len;
+                while j > 0 {
+                    j = j - 1;
+                    if out.bytes[j] == 47 { break; };
+                }
+                if rooted || j > 0 { out.len = j; } else { out.len = 0; };
+                if !rooted && out.len == 0 {
+                    // stack empty: keep ".." for relative paths
+                    au_append_path(out, STR_PTR(".."), STR_LEN(".."));
+                    continue;
+                };
+                if rooted && out.len == 0 { out.len = 1; };
+                if out.len > 0 && out.bytes[out.len - 1] == 47 && out.len > 1 { out.len = out.len - 1; };
+                continue;
+            };
+            au_append_path(out, STR_PTR(".."), STR_LEN(".."));
+            continue;
+        };
+        if out.len > 0 && !(out.len == 1 && rooted) { au_append_path(out, STR_PTR("/"), STR_LEN("/")); };
+        let k: u64 = start;
+        while k < i {
+            if out.len < 4096 {
+                out.bytes[out.len] = au_byte(p, k);
+                out.len = out.len + 1;
+            };
+            k = k + 1;
+        }
+    }
+    if out.len == 0 && !rooted { au_append_path(out, STR_PTR("."), STR_LEN(".")); };
+}
+
+fn au_path_join2(a_p: ptr, a_l: u64, b_p: ptr, b_l: u64, out: &AuPath) -> void {
+    let cat = AuPath { bytes: [0; 4096], len: 0 };
+    au_append_path(&cat, a_p, a_l);
+    au_append_path(&cat, STR_PTR("/"), STR_LEN("/"));
+    au_append_path(&cat, b_p, b_l);
+    au_path_normalize(au_path_ptr(&cat), cat.len, out);
+}
+
+fn au_path_join3(a_p: ptr, a_l: u64, b_p: ptr, b_l: u64, c_p: ptr, c_l: u64, out: &AuPath) -> void {
+    let t = AuPath { bytes: [0; 4096], len: 0 };
+    au_path_join2(a_p, a_l, b_p, b_l, &t);
+    au_path_join2(au_path_ptr(&t), t.len, c_p, c_l, out);
+}
+
+fn au_dirname(p: ptr, len: u64, out: &AuPath) -> void {
+    let n = AuPath { bytes: [0; 4096], len: 0 };
+    au_path_normalize(p, len, &n);
+    let np: ptr = au_path_ptr(&n);
+    let idx: u64 = n.len;
+    let found: bool = false;
+    while idx > 0 {
+        idx = idx - 1;
+        if au_byte(np, idx) == 47 { found = true; break; };
+    }
+    out.len = 0;
+    if !found {
+        au_append_path(out, STR_PTR("."), STR_LEN("."));
+        return;
+    };
+    if idx == 0 {
+        au_append_path(out, STR_PTR("/"), STR_LEN("/"));
+        return;
+    };
+    au_append_path(out, np, idx);
+}
+
+fn au_fs_exists(p: ptr, len: u64) -> bool {
+    return sa_std_fs_exists(p, len) == 0;
+}
+
+fn au_mkdir_p(p: ptr, len: u64) -> void {
+    let st: i32 = sa_fs_mkdir_p(p, len);
+}
+
+// ---- random helpers ----
+fn au_hex_digit(v: u8) -> u8 {
+    if v < 10 { return 48 + v; };
+    return 87 + v;
+}
+
+fn au_random_hex(nbytes: u64, out: &AuText) -> void {
+    let raw: [u8; 64] = [0; 64];
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &raw, 0);
+    let st: i32 = sa_crypto_random_bytes(rp, nbytes);
+    let i: u64 = 0;
+    while i < nbytes {
+        let b: u8 = raw[i];
+        if out.len < 65534 {
+            out.bytes[out.len] = au_hex_digit(b / 16);
+            out.len = out.len + 1;
+            out.bytes[out.len] = au_hex_digit(b % 16);
+            out.len = out.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn au_random_uuid(out: &AuText) -> void {
+    let buf: u64 = sa_deno_random_uuid();
+    if buf == 0 { return; };
+    let bp: ptr = sa_fmt_buffer_data(buf);
+    let bl: u64 = sa_fmt_buffer_len(buf);
+    au_append(out, bp, bl);
+    let f: i32 = sa_fmt_buffer_free(buf);
+}
+
+fn au_home_dir(out: &AuText) -> void {
+    let buf: u64 = sa_env_home_dir();
+    if buf == 0 { return; };
+    let bp: ptr = sa_env_buffer_data(buf);
+    let bl: u64 = sa_env_buffer_len(buf);
+    au_append(out, bp, bl);
+}
+
+// dataDir via the SDK fn (env comes from the real environment —
+// registered seam when an env_json doc is in play)
+fn au_data_dir(out: &AuPath) -> void {
+    let home = AuText { bytes: [0; 65536], len: 0 };
+    au_home_dir(&home);
+    let pb = PathBuf { bytes: [0; 4096], len: 0 };
+    let st: i32 = codexUiDataDir(au_text_ptr(&home), home.len, &pb);
+    let pp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pp, &pb.bytes, 0);
+    au_append_path(out, pp, pb.len);
+}
+
+// ---- base64url + JWT (authStore.ts:1151-1238) ----
+fn au_b64_char(v: u8) -> u8 {
+    if v < 26 { return 65 + v; };
+    if v < 52 { return 97 + (v - 26); };
+    if v < 62 { return 48 + (v - 52); };
+    if v == 62 { return 45; };
+    return 95;
+}
+
+fn au_b64url_encode(p: ptr, len: u64, out: &AuText) -> void {
+    let i: u64 = 0;
+    while i + 3 <= len {
+        let b0: u64 = au_byte(p, i) as u64;
+        let b1: u64 = au_byte(p, i + 1) as u64;
+        let b2: u64 = au_byte(p, i + 2) as u64;
+        let n: u64 = (b0 * 65536) + (b1 * 256) + b2;
+        if out.len < 65532 {
+            out.bytes[out.len] = au_b64_char(((n / 262144) % 64) as u8);
+            out.bytes[out.len + 1] = au_b64_char(((n / 4096) % 64) as u8);
+            out.bytes[out.len + 2] = au_b64_char(((n / 64) % 64) as u8);
+            out.bytes[out.len + 3] = au_b64_char((n % 64) as u8);
+            out.len = out.len + 4;
+        };
+        i = i + 3;
+    }
+    let rem: u64 = len - i;
+    if rem == 1 {
+        let b0: u64 = au_byte(p, i) as u64;
+        let n: u64 = b0 * 65536;
+        if out.len < 65534 {
+            out.bytes[out.len] = au_b64_char(((n / 262144) % 64) as u8);
+            out.bytes[out.len + 1] = au_b64_char(((n / 4096) % 64) as u8);
+            out.len = out.len + 2;
+        };
+    };
+    if rem == 2 {
+        let b0: u64 = au_byte(p, i) as u64;
+        let b1: u64 = au_byte(p, i + 1) as u64;
+        let n: u64 = (b0 * 65536) + (b1 * 256);
+        if out.len < 65533 {
+            out.bytes[out.len] = au_b64_char(((n / 262144) % 64) as u8);
+            out.bytes[out.len + 1] = au_b64_char(((n / 4096) % 64) as u8);
+            out.bytes[out.len + 2] = au_b64_char(((n / 64) % 64) as u8);
+            out.len = out.len + 3;
+        };
+    };
+}
+
+fn au_b64_val(c: u8, out_v: &u64) -> bool {
+    if c >= 65 && c <= 90 { *out_v = (c - 65) as u64; return true; };
+    if c >= 97 && c <= 122 { *out_v = (c - 97 + 26) as u64; return true; };
+    if c >= 48 && c <= 57 { *out_v = (c - 48 + 52) as u64; return true; };
+    if c == 45 { *out_v = 62; return true; };
+    if c == 95 { *out_v = 63; return true; };
     return false;
 }
 
-// ---- L123-175 — initialize(): Promise<void> ---- // DEFECT: async [BLOCKED: body is a conversion-era comment skeleton (preset return, logic only in comments). Its awaits target verifyPassword/hashPassword (blocked at runtime/password.sla) and this store's own read/write layer (also skeleton); body retranslation required.]
-fn AuthStore_initialize(s: &AuthStore) -> i32 {
-    // db.exec(CREATE TABLE IF NOT EXISTS users (... full DDL + CHECK constraints, source L125-152 ...);
-    //   CREATE UNIQUE INDEX users_email_active_idx ON users(email) WHERE deleted_at IS NULL;
-    //   CREATE INDEX users_status_idx; CREATE INDEX users_deleted_at_idx;
-    //   CREATE TABLE thread_owners + index; CREATE TABLE balance_ledger + index)
-    // try { db.prepare("ALTER TABLE balance_ledger ADD COLUMN reference_id TEXT NOT NULL DEFAULT ''").run(); } catch {} // already exists // DEFECT: try/catch
-    // db.exec(CREATE UNIQUE INDEX balance_ledger_reference_idx ON balance_ledger(user_id, reference_id) WHERE reference_id <> '')
-    // await ensureDefaultAdmin()
-    return 0;
+fn au_b64url_decode(p: ptr, len: u64, out: &AuText) -> bool {
+    let acc: u64 = 0;
+    let nbits: u64 = 0;
+    let i: u64 = 0;
+    while i < len {
+        let c: u8 = au_byte(p, i);
+        if c == 61 { break; };
+        let v: u64 = 0;
+        if !au_b64_val(c, &v) { return false; };
+        acc = (acc * 64) + v;
+        nbits = nbits + 6;
+        if nbits >= 8 {
+            nbits = nbits - 8;
+            let byte: u8 = ((acc / (1 << nbits)) % 256) as u8;
+            if out.len < 65536 {
+                out.bytes[out.len] = byte;
+                out.len = out.len + 1;
+            };
+            acc = acc % (1 << nbits);
+        };
+        i = i + 1;
+    }
+    return true;
 }
 
-// ---- L177-209 — login(email, password): Promise<LoginResult|null> ---- // DEFECT: async [BLOCKED: body is a conversion-era comment skeleton (preset return, logic only in comments). Its awaits target verifyPassword/hashPassword (blocked at runtime/password.sla) and this store's own read/write layer (also skeleton); body retranslation required.]
-fn AuthStore_login(s: &AuthStore, email_ptr: ptr, email_len: u64, password_ptr: ptr, password_len: u64, out: &LoginResult) -> bool {
-    // normalizedEmail=normalizeEmail(email); if !normalizedEmail || !password return false(null)
-    // user=db.prepare("SELECT * FROM users WHERE email = ? AND deleted_at IS NULL LIMIT 1").get(normalizedEmail) as UserRow|undefined // DEFECT: cast
-    // if !user || user.status!=="active" return false
-    // if !(await verifyPassword(password, user.password_hash)) return false // DEFECT: async password verify [BLOCKED: body is a conversion-era comment skeleton (preset return, logic only in comments). Its awaits target verifyPassword/hashPassword (blocked at runtime/password.sla) and this store's own read/write layer (also skeleton); body retranslation required.]
-    // now=floor(Date.now()/1000); exp=now + config.tokenExpireHours*3600
-    // token=signJwt({sub:user.id, email, role, sid:randomBytes(8).toString("hex"), iat:now, exp}, config.jwtSecret) // DEFECT: randomBytes hex
-    // ts=Date.now(); UPDATE users SET last_login_at=?, last_active_at=?, updated_at=? WHERE id=?
-    // out={token, user:authUserFromRow(user), expiresAt:exp*1000}; return true
-    return false;
+fn au_hex_val(c: u8) -> i64 {
+    if c >= 48 && c <= 57 { return (c - 48) as i64; };
+    if c >= 97 && c <= 102 { return (c - 97 + 10) as i64; };
+    if c >= 65 && c <= 70 { return (c - 65 + 10) as i64; };
+    return -1;
 }
 
-// ---- L211-226 — getUserByToken(token): Promise<AuthUser|null> ---- // DEFECT: async (declared async, body sync) [BLOCKED: body is a conversion-era comment skeleton (preset return, logic only in comments). Its awaits target verifyPassword/hashPassword (blocked at runtime/password.sla) and this store's own read/write layer (also skeleton); body retranslation required.]
-fn AuthStore_getUserByToken(s: &AuthStore, token_ptr: ptr, token_len: u64, has_token: bool, out_json: &u64) -> bool {
-    // claims = token ? verifyJwt(token, config.jwtSecret) : null; if !claims return false
-    // user=SELECT * WHERE id=claims.sub AND deleted_at IS NULL; if !user || status!=="active"
-    //   || user.email!==claims.email || user.role!==claims.role return false
-    // UPDATE users SET last_active_at=Date.now() WHERE id; out=authUserFromRow(user); return true
-    return false;
+// hmac(value, secret) -> base64url(HMAC-SHA256) via the std hex form
+fn hmac(value_ptr: ptr, value_len: u64, secret_ptr: ptr, secret_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    *out_ptr = PTR_NULL();
+    *out_len = 0;
+    let hexbuf: [u8; 64] = [0; 64];
+    let hp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(hp, &hexbuf, 0);
+    let hl: u64 = 0;
+    let st: i32 = sa_hmac_sha256_hex(secret_ptr, secret_len, value_ptr, value_len, hp, 64, &hl);
+    if st != 0 || hl != 64 { return; };
+    let raw: [u8; 32] = [0; 32];
+    let i: u64 = 0;
+    while i < 32 {
+        let hi: i64 = au_hex_val(hexbuf[i * 2]);
+        let lo: i64 = au_hex_val(hexbuf[(i * 2) + 1]);
+        if hi < 0 || lo < 0 { return; };
+        raw[i] = ((hi * 16) + lo) as u8;
+        i = i + 1;
+    }
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &raw, 0);
+    let enc = AuText { bytes: [0; 65536], len: 0 };
+    au_b64url_encode(rp, 32, &enc);
+    au_doc_str(STR_PTR("hmac"), STR_LEN("hmac"), au_text_ptr(&enc), enc.len, out_ptr, out_len);
 }
 
-// ---- L228-234 — listUsers(): AuthUser[] (sync) ----
-fn AuthStore_listUsers(s: &AuthStore, out_json: &u64) -> void {
-    // rows=SELECT * FROM users WHERE deleted_at IS NULL ORDER BY created_at ASC .all() as UserRow[]
-    // return rows.map(authUserFromRow) // DEFECT: map with fn reference
+fn base64UrlJson(value_json: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    *out_ptr = PTR_NULL();
+    *out_len = 0;
+    if value_json == 0 { return; };
+    let buf: u64 = 0;
+    if sa_json_stringify(value_json, &buf) != 0 || buf == 0 { return; };
+    let bp: ptr = sa_json_buffer_data(buf);
+    let bl: u64 = sa_json_buffer_len(buf);
+    let enc = AuText { bytes: [0; 65536], len: 0 };
+    au_b64url_encode(bp, bl, &enc);
+    let f: i32 = sa_json_buffer_free(buf);
+    au_doc_str(STR_PTR("b64json"), STR_LEN("b64json"), au_text_ptr(&enc), enc.len, out_ptr, out_len);
 }
 
-// ---- L236-242 — getUser(id): AuthUser|null (sync) ----
-fn AuthStore_getUser(s: &AuthStore, id_ptr: ptr, id_len: u64, out_json: &u64) -> bool {
-    // row=SELECT * WHERE id=? AND deleted_at IS NULL LIMIT 1; return row ? authUserFromRow(row)(true) : false(null)
-    return false;
+fn parseBase64UrlJson(value_ptr: ptr, value_len: u64, out_json: &u64) -> bool {
+    *out_json = 0;
+    let dec = AuText { bytes: [0; 65536], len: 0 };
+    if !au_b64url_decode(value_ptr, value_len, &dec) { return false; };
+    let doc: u64 = sa_json_parse(au_text_ptr(&dec), dec.len);
+    if doc == 0 { return false; };
+    let k: u32 = sa_json_kind(doc);
+    if k != 7 && k != 6 {
+        let f: i32 = sa_json_free(doc);
+        return false;
+    };
+    *out_json = doc;
+    return true;
 }
 
-// ---- L244-293 — createUser(input: CreateMemberInput): Promise<AuthUser> ---- // DEFECT: async [BLOCKED: body is a conversion-era comment skeleton (preset return, logic only in comments). Its awaits target verifyPassword/hashPassword (blocked at runtime/password.sla) and this store's own read/write layer (also skeleton); body retranslation required.]
-fn AuthStore_createUser(s: &AuthStore, input: &CreateMemberInput, out_json: &u64) -> i32 {
-    // email=normalizeEmail(input.email); if !email throw "Invalid email"
-    // if !input.password || length<8 throw "Password must be at least 8 characters"
-    // existing=SELECT id WHERE email=? AND deleted_at IS NULL; if existing throw "Email already exists"
-    // id=randomUUID(); now=Date.now() // DEFECT: randomUUID
-    // role = input.role==="admin" ? "admin" : "user"; status = input.status==="disabled" ? "disabled" : "active"
-    // maxPermission=normalizePermission(input.maxPermission, role==="admin" ? "dangerBypass" : "workspaceAsk")
-    // allowWrite = input.allowWrite ?? maxPermission!=="readonlyAsk"
-    // allowNetwork = input.allowNetwork ?? false
-    // allowDangerBypass = input.allowDangerBypass ?? (role==="admin" && maxPermission==="dangerBypass")
-    // workspaceRoot=join(config.membersRoot, id, "workspace"); mkdirSync(workspaceRoot,{recursive:true,mode:0o700})
-    // hash=await hashPassword(input.password) // DEFECT: async [BLOCKED: body is a conversion-era comment skeleton (preset return, logic only in comments). Its awaits target verifyPassword/hashPassword (blocked at runtime/password.sla) and this store's own read/write layer (also skeleton); body retranslation required.]
-    // INSERT INTO users (16 cols) VALUES (...): username=(input.username ?? "").trim()
-    //   || (role==="admin" ? "Admin" : email.split("@")[0] || "member"), // DEFECT: split/index
-    //   balance=Number(input.balance ?? 0), concurrency=min(100,max(1,floor(input.concurrency ?? 5))),
-    //   flags ?1:0, notes=input.notes ?? "", now, now
-    // created=getUser(id); if !created throw "Failed to create user"; return created
-    return 0;
+// constant-time compare; no early exit on content
+fn safeEqual(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    let diff: u64 = 0;
+    let i: u64 = 0;
+    while i < a_len {
+        let x: u64 = au_byte(a_ptr, i) as u64;
+        let y: u64 = au_byte(b_ptr, i) as u64;
+        diff = diff | (x ^ y);
+        i = i + 1;
+    }
+    return diff == 0;
 }
 
-// ---- L295-357 — updateUser(id, input: UpdateMemberInput): Promise<AuthUser> ---- // DEFECT: async [BLOCKED: body is a conversion-era comment skeleton (preset return, logic only in comments). Its awaits target verifyPassword/hashPassword (blocked at runtime/password.sla) and this store's own read/write layer (also skeleton); body retranslation required.]
-fn AuthStore_updateUser(s: &AuthStore, id_ptr: ptr, id_len: u64, input: &UpdateMemberInput, out_json: &u64) -> i32 {
-    // existing=SELECT * WHERE id AND not deleted; if !existing throw "User not found"
-    // email = input.email!==undefined ? normalizeEmail(input.email) : existing.email; if !email throw "Invalid email"
-    // if email!==existing.email: clash=SELECT id WHERE email AND not deleted AND id!=?; if clash throw "Email already exists"
-    // role=input.role ?? existing.role; status=input.status ?? existing.status
-    // maxPermission=normalizePermission(input.maxPermission ?? existing.max_permission, existing.max_permission)
-    // allowWrite=input.allowWrite ?? Boolean(existing.allow_write); allowNetwork/allowDangerBypass likewise
-    // passwordHash=existing.password_hash; if input.password { len<8 -> throw; passwordHash=await hashPassword(...) } // DEFECT: async [BLOCKED: body is a conversion-era comment skeleton (preset return, logic only in comments). Its awaits target verifyPassword/hashPassword (blocked at runtime/password.sla) and this store's own read/write layer (also skeleton); body retranslation required.]
-    // UPDATE users SET email,username,password_hash,role,status,balance,concurrency,max_permission,
-    //   allow_write,allow_network,allow_danger_bypass,notes,updated_at WHERE id
-    //   (username: input.username!==undefined ? trim : existing; balance Number(input.balance ?? existing.balance);
-    //    concurrency clamped 1..100 floor; notes: input.notes!==undefined ? it : existing.notes; Date.now())
-    // if role!=="admin" && existing.role==="admin" ensureAtLeastOneAdmin(id)
-    // if status==="disabled" && existing.role==="admin" ensureAtLeastOneAdmin(id)
-    // updated=getUser(id); if !updated throw "User not found after update"; return updated
-    return 0;
+fn au_jwt_payload_fill(payload: &JwtPayload, sub_p: ptr, sub_l: u64, email_p: ptr, email_l: u64, role_p: ptr, role_l: u64, sid_p: ptr, sid_l: u64, iat: u64, exp: u64) -> void {
+    payload.sub_len = 0;
+    let i: u64 = 0;
+    while i < sub_l && i < 64 { payload.sub[i] = au_byte(sub_p, i); i = i + 1; }
+    payload.sub_len = i;
+    payload.email_len = 0;
+    i = 0;
+    while i < email_l && i < 320 { payload.email[i] = au_byte(email_p, i); i = i + 1; }
+    payload.email_len = i;
+    payload.role_len = 0;
+    i = 0;
+    while i < role_l && i < 16 { payload.role[i] = au_byte(role_p, i); i = i + 1; }
+    payload.role_len = i;
+    payload.sid_len = 0;
+    i = 0;
+    while i < sid_l && i < 32 { payload.sid[i] = au_byte(sid_p, i); i = i + 1; }
+    payload.sid_len = i;
+    payload.iat = iat;
+    payload.exp = exp;
 }
 
-// ---- L359-368 — softDeleteUser(id): void ----
-fn AuthStore_softDeleteUser(s: &AuthStore, id_ptr: ptr, id_len: u64) -> i32 {
-    // existing=getUser(id); if !existing throw "User not found"
-    // if existing.role==="admin" ensureAtLeastOneAdmin(id)
-    // UPDATE users SET deleted_at=Date.now(), updated_at=Date.now(), status='disabled' WHERE id=?
-    return 0;
+fn signJwt(payload: &JwtPayload, secret_ptr: ptr, secret_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    *out_ptr = PTR_NULL();
+    *out_len = 0;
+    let header: u64 = sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if header == 0 { return; };
+    let h1: i32 = sa_json_object_set_string(header, STR_PTR("alg"), STR_LEN("alg"), STR_PTR("HS256"), STR_LEN("HS256"));
+    let h2: i32 = sa_json_object_set_string(header, STR_PTR("typ"), STR_LEN("typ"), STR_PTR("JWT"), STR_LEN("JWT"));
+    let body: u64 = sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if body == 0 { return; };
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, &payload.sub, 0);
+    let s1: i32 = sa_json_object_set_string(body, STR_PTR("sub"), STR_LEN("sub"), sp, payload.sub_len);
+    let ep: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ep, &payload.email, 0);
+    let s2: i32 = sa_json_object_set_string(body, STR_PTR("email"), STR_LEN("email"), ep, payload.email_len);
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &payload.role, 0);
+    let s3: i32 = sa_json_object_set_string(body, STR_PTR("role"), STR_LEN("role"), rp, payload.role_len);
+    let ip: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ip, &payload.sid, 0);
+    let s4: i32 = sa_json_object_set_string(body, STR_PTR("sid"), STR_LEN("sid"), ip, payload.sid_len);
+    let s5: i32 = sa_json_object_set_i64(body, STR_PTR("iat"), STR_LEN("iat"), payload.iat as i64);
+    let s6: i32 = sa_json_object_set_i64(body, STR_PTR("exp"), STR_LEN("exp"), payload.exp as i64);
+    let hb_p: ptr = PTR_NULL();
+    let hb_l: u64 = 0;
+    base64UrlJson(header, &hb_p, &hb_l);
+    let hf: i32 = sa_json_free(header);
+    // copy header b64 into a local (base64UrlJson reuses the scratch field)
+    let hb = AuText { bytes: [0; 65536], len: 0 };
+    au_append(&hb, hb_p, hb_l);
+    let pb_p: ptr = PTR_NULL();
+    let pb_l: u64 = 0;
+    base64UrlJson(body, &pb_p, &pb_l);
+    let bf: i32 = sa_json_free(body);
+    let unsigned = AuText { bytes: [0; 65536], len: 0 };
+    au_append(&unsigned, au_text_ptr(&hb), hb.len);
+    au_append(&unsigned, STR_PTR("."), STR_LEN("."));
+    au_append(&unsigned, pb_p, pb_l);
+    let sig_p: ptr = PTR_NULL();
+    let sig_l: u64 = 0;
+    hmac(au_text_ptr(&unsigned), unsigned.len, secret_ptr, secret_len, &sig_p, &sig_l);
+    if sig_l == 0 { return; };
+    au_append(&unsigned, STR_PTR("."), STR_LEN("."));
+    au_append(&unsigned, sig_p, sig_l);
+    au_doc_str(STR_PTR("jwt"), STR_LEN("jwt"), au_text_ptr(&unsigned), unsigned.len, out_ptr, out_len);
 }
 
-// ---- L370-~380 — assertCanStartTurn(user): void ----
-fn AuthStore_assertCanStartTurn(s: &AuthStore, user_json: u64) -> i32 {
-    // if user.role==="admin" return 0; if user.balance<=0 throw "Insufficient balance. Ask an admin to allocate credit."
-    return 0;
+fn verifyJwt(token_ptr: ptr, token_len: u64, secret_ptr: ptr, secret_len: u64, out: &JwtPayload) -> bool {
+    // split into exactly 3 non-empty parts
+    let d1: i64 = -1;
+    let d2: i64 = -1;
+    let i: u64 = 0;
+    while i < token_len {
+        if au_byte(token_ptr, i) == 46 {
+            if d1 < 0 { d1 = i as i64; } else {
+                if d2 < 0 { d2 = i as i64; } else { return false; };
+            };
+        };
+        i = i + 1;
+    }
+    if d1 <= 0 || d2 < 0 { return false; };
+    let u1: u64 = d1 as u64;
+    let u2: u64 = d2 as u64;
+    if u2 <= u1 + 1 || u2 + 1 >= token_len { return false; };
+    let sig_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sig_p, token_ptr, u2 + 1);
+    let sig_l: u64 = token_len - (u2 + 1);
+    let exp_p: ptr = PTR_NULL();
+    let exp_l: u64 = 0;
+    hmac(token_ptr, u2, secret_ptr, secret_len, &exp_p, &exp_l);
+    if exp_l == 0 || !safeEqual(sig_p, sig_l, exp_p, exp_l) { return false; };
+    let header: u64 = 0;
+    if !parseBase64UrlJson(token_ptr, u1, &header) { return false; };
+    let alg_p: ptr = PTR_NULL();
+    let alg_l: u64 = 0;
+    let alg_has: bool = au_field_str(header, STR_PTR("alg"), STR_LEN("alg"), &alg_p, &alg_l);
+    let alg_ok: bool = alg_has && au_eq(alg_p, alg_l, STR_PTR("HS256"), STR_LEN("HS256"));
+    let hf: i32 = sa_json_free(header);
+    if !alg_ok { return false; };
+    let mid_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(mid_p, token_ptr, u1 + 1);
+    let body: u64 = 0;
+    if !parseBase64UrlJson(mid_p, u2 - u1 - 1, &body) { return false; };
+    let sub_p: ptr = PTR_NULL();
+    let sub_l: u64 = 0;
+    let email_p: ptr = PTR_NULL();
+    let email_l: u64 = 0;
+    let role_p: ptr = PTR_NULL();
+    let role_l: u64 = 0;
+    let sid_p: ptr = PTR_NULL();
+    let sid_l: u64 = 0;
+    let ok: bool = au_field_str(body, STR_PTR("sub"), STR_LEN("sub"), &sub_p, &sub_l);
+    if !au_field_str(body, STR_PTR("email"), STR_LEN("email"), &email_p, &email_l) { ok = false; };
+    if !au_field_str(body, STR_PTR("role"), STR_LEN("role"), &role_p, &role_l) { ok = false; };
+    let role_ok: bool = au_eq(role_p, role_l, STR_PTR("admin"), STR_LEN("admin")) || au_eq(role_p, role_l, STR_PTR("user"), STR_LEN("user"));
+    if !role_ok { ok = false; };
+    if !au_field_str(body, STR_PTR("sid"), STR_LEN("sid"), &sid_p, &sid_l) { ok = false; };
+    let iat_v: f64 = 0.0;
+    let exp_v: f64 = 0.0;
+    let nums_ok: bool = au_field_num(body, STR_PTR("iat"), STR_LEN("iat"), &iat_v) && au_field_num(body, STR_PTR("exp"), STR_LEN("exp"), &exp_v);
+    let bf: i32 = sa_json_free(body);
+    if !ok || !nums_ok { return false; };
+    let now_s: u64 = (sa_time_unix_ms() / 1000) as u64;
+    if !(exp_v > (now_s as f64)) { return false; };
+    au_jwt_payload_fill(out, sub_p, sub_l, email_p, email_l, role_p, role_l, sid_p, sid_l, iat_v as u64, exp_v as u64);
+    return true;
 }
 
-// ---- L~382-458 — debitBalance(userId, amount, meta?): AuthUser ----
-fn AuthStore_debitBalance(s: &AuthStore, userId_ptr: ptr, userId_len: u64, amount: f64, meta_json: u64, has_meta: bool, out_json: &u64) -> i32 {
-    // meta?: {reason?, threadId?, method?, referenceId?} as JSON // DEFECT: optional object param -> JSON + has flag
-    // if !(amount>0) || !Number.isFinite(amount) throw "Debit amount must be positive"
-    // referenceId=meta?.referenceId?.trim() ?? ""
-    // existing=SELECT * WHERE id AND not deleted; if !existing throw "User not found"
-    // if referenceId: alreadyDebited=SELECT 1 FROM balance_ledger WHERE user_id=? AND reference_id=?;
-    //   if alreadyDebited return authUserFromRow(existing)   (idempotency)
-    // if existing.role==="admin" return authUserFromRow(existing)  (admins never auto-debited)
-    // db.exec("BEGIN IMMEDIATE"); try {
-    //   locked=re-SELECT; if !locked throw "User not found"
-    //   next=Number(locked.balance)-amount; if next<0 throw "Insufficient balance"
-    //   UPDATE balance; INSERT INTO balance_ledger (id=randomUUID(), delta=-amount, operation='debit',
-    //     reason=meta?.reason ?? "usage", threadId ?? "", method ?? "", referenceId, now)
-    //   COMMIT } catch (error) { ROLLBACK; // DEFECT: try/catch
-    //   if referenceId && now-debited-check hits: current=getUser(userId); if current return current; throw error }
-    // updated=getUser(userId); if !updated throw "User not found after debit"; return updated
-    return 0;
-}
-
-// ---- L~460-505 — adjustBalance(userId, amount, operation: "set"|"add"|"subtract", notes=""): AuthUser ----
-fn AuthStore_adjustBalance(s: &AuthStore, userId_ptr: ptr, userId_len: u64, amount: f64, operation: u64, notes_ptr: ptr, notes_len: u64, out_json: &u64) -> i32 {
-    // operation: 0=set, 1=add, 2=subtract (string union -> enum code) // DEFECT: union literal type
-    // if !isFinite(amount) throw "Invalid amount"
-    // if (add|subtract) && !(amount>0) throw "Amount must be > 0 for add/subtract"
-    // if set && amount<0 throw "Balance cannot be negative"
-    // existing lookup -> throw "User not found"; current=Number(balance)
-    // next = set?amount : add?current+amount : current-amount; if next<0 throw "Balance cannot be negative"
-    // UPDATE balance; INSERT ledger (delta=next-current, operation, reason=notes || `admin ${operation}`, method='admin')
-    // updated=getUser; if !updated throw "User not found after balance update"; return updated
-    return 0;
-}
-
-// ---- listBalanceLedger(userId, limit=50): Array<Record<string,unknown>> ---- // DEFECT: dynamic object rows
-fn AuthStore_listBalanceLedger(s: &AuthStore, userId_ptr: ptr, userId_len: u64, limit: f64, out_json: &u64) -> void {
-    // rows=SELECT id,user_id,delta,balance_after,operation,reason,thread_id,method,reference_id,created_at
-    //   FROM balance_ledger WHERE user_id=? ORDER BY created_at DESC LIMIT ? .all(userId, max(1,min(200,floor(limit))))
-    // return rows (JSON array)
-}
-
-// ---- listBalanceLedgerForAdmin(limit=100, userId?): Array<Record<string,unknown>> ---- // DEFECT: dynamic object
-fn AuthStore_listBalanceLedgerForAdmin(s: &AuthStore, limit: f64, userId_ptr: ptr, userId_len: u64, has_userId: bool, out_json: &u64) -> void {
-    // lim=max(1,min(500,floor(limit))); if userId return listBalanceLedger(userId, lim)
-    // rows=SELECT l.*, u.email as user_email FROM balance_ledger l LEFT JOIN users u ON u.id=l.user_id
-    //   ORDER BY l.created_at DESC LIMIT ? (JOIN query preserved)
-}
-
-// ---- getUsageSummary(options?): {balance,totalDebit,totalCredit,turnCount,todayDebit,periodDays,daily,byOperation,topUsers?} ----
-// DEFECT: anonymous object return type + options object -> out struct of JSON buffers.
+// ---- L105-111 — interface UsageSummary ----
 struct UsageSummary {
-    balance: f64, has_balance: bool, // number|null
+    balance: f64, has_balance: bool, // number | null
     totalDebit: f64,
     totalCredit: f64,
     turnCount: u64,
     todayDebit: f64,
     periodDays: u64,
-    daily_json: u64,        // Array<{date,debit,credit,turns}> // DEFECT: dynamic object
-    byOperation_json: u64,  // Array<{operation,count,total}>
-    topUsers_json: u64, has_topUsers: bool, // Array<{userId,email,debit,turns}>|undefined
-}
-fn AuthStore_getUsageSummary(s: &AuthStore, options_json: u64, has_options: bool, out: &UsageSummary) -> void {
-    // days=max(1,min(90,floor(options?.days ?? 7))); since=Date.now()-days*86400_000
-    // dayStart=new Date(); dayStart.setHours(0,0,0,0); todayStart=dayStart.getTime() // DEFECT: Date object mutation -> epoch arithmetic approx
-    // userId=options?.userId; balance = userId ? (getUser -> Number(balance) | null) : null
-    // whereUser = userId ? "AND user_id = ?" : ""; paramsBase = userId ? [since,userId] : [since]
-    //   // DEFECT: SQL string interpolation of ${whereUser} + spread .get(...paramsBase) // DEFECT: spread call args
-    // totals=SELECT SUM(CASE WHEN delta<0 THEN -delta ELSE 0 END) total_debit, ... turn_count FROM balance_ledger WHERE created_at>=? ${whereUser}
-    // today=SELECT ... today_debit WHERE created_at>=todayStart ${whereUser}
-    // rows=SELECT created_at,delta,operation ... ORDER BY created_at ASC .all(...paramsBase)
-    // byDay=new Map(); for i=days-1 downto 0: d=new Date(); setHours(0,0,0,0); d.setDate(d.getDate()-i);
-    //   key=d.toISOString().slice(0,10); byDay.set(key,{debit:0,credit:0,turns:0}) // DEFECT: Map + Date/ISO string
-    // for row of rows: key=new Date(row.created_at).toISOString().slice(0,10); bucket=get ?? {0,0,0};
-    //   delta<0 -> debit+=-delta; delta>0 -> credit+=delta; operation==="debit" -> turns+=1; set(key,bucket)
-    // daily=[...byDay.entries()].map(([date,v]) => ({date, ...v})) // DEFECT: spread entries + object spread
-    // byOpRows=SELECT operation, COUNT(*), SUM(ABS(delta)) ... GROUP BY operation ORDER BY total DESC
-    // if options?.isAdmin && !userId: topUsers=SELECT ... GROUP BY user_id ORDER BY debit DESC LIMIT 10 .map(Number coercions)
-    // return {balance, totalDebit:Number(...)||0, ..., daily, byOperation: byOpRows.map(...), topUsers}
+    daily_json: u64,       // Array<{ date, debit, credit, turns }> as JSON handle
+    byOperation_json: u64, // Array<{ operation, count, total }> as JSON handle
+    topUsers_json: u64, has_topUsers: bool, // Array<{ userId, email, debit, turns }> | undefined
 }
 
-// ---- enforceMemberRpc(user, method, params: unknown): Record<string,unknown> ---- // DEFECT: unknown/dynamic object
-fn AuthStore_enforceMemberRpc(s: &AuthStore, user_json: u64, method_ptr: ptr, method_len: u64, params_json: u64, out_json: &u64) -> i32 {
-    // record=asRecord(params)
-    // if user.role!=="admin":
-    //   if isAdminOnlyMethod(method) throw `Admin only: ${method}`
-    //   if method==="thread/start"||"turn/start" return enforcePermissionParams(user, method, params)
-    //   return clampPathsForMember(record, user.workspaceRoot)
-    // if method==="thread/start"||"turn/start" return enforcePermissionParams(...)
-    // return record
-    return 0;
+// ---- L1133 — interface SandboxOverrides (returned by permissionToSandbox) ----
+struct SandboxOverrides {
+    sandbox: [u8; 32], sandbox_len: u64,           // SandboxMode
+    approvalPolicy: [u8; 32], approvalPolicy_len: u64, // AskForApproval
+    sandboxPolicy_json: u64,                        // SandboxPolicy as JSON handle
 }
 
-// ---- claimThread(threadId, userId): void ----
-fn AuthStore_claimThread(s: &AuthStore, threadId_ptr: ptr, threadId_len: u64, userId_ptr: ptr, userId_len: u64) -> i32 {
-    // if !threadId || !userId return 0
-    // existing=SELECT user_id FROM thread_owners WHERE thread_id=?; if existing:
-    //   if existing.user_id!==userId throw "Thread belongs to another member"; return 0
-    // INSERT INTO thread_owners (thread_id, user_id, created_at) VALUES (?,?,Date.now())
-    return 0;
+// ---- L93-96 — class AuthStore (db from LocalDatabase.db) ----
+struct AuthStore {
+    db: u64, // LocalDatabase.db (better-sqlite3 handle)
+    config: AuthConfig,
 }
 
-// ---- ownsThread(threadId, userId): boolean ----
-fn AuthStore_ownsThread(s: &AuthStore, threadId_ptr: ptr, threadId_len: u64, userId_ptr: ptr, userId_len: u64) -> bool {
-    // existing lookup; if !existing return true; return existing.user_id===userId
-    return false;
+// ---- env access (env_json doc fields, or the real environment) ----
+fn au_env_present(env_json: u64, key_p: ptr, key_l: u64, out: &AuText) -> bool {
+    out.len = 0;
+    if env_json != 0 {
+        let p: ptr = PTR_NULL();
+        let l: u64 = 0;
+        if !au_field_str(env_json, key_p, key_l, &p, &l) { return false; };
+        au_append(out, p, l);
+        return true;
+    };
+    if sa_env_has(key_p, key_l) == 0 { return false; };
+    let buf: u64 = sa_env_get(key_p, key_l);
+    if buf == 0 { return true; };
+    let bp: ptr = sa_env_buffer_data(buf);
+    let bl: u64 = sa_env_buffer_len(buf);
+    au_append(out, bp, bl);
+    return true;
 }
 
-// ---- threadOwnerId(threadId): string|null ----
-fn AuthStore_threadOwnerId(s: &AuthStore, threadId_ptr: ptr, threadId_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
-    // return existing?.user_id ?? null(false)
-    return false;
+fn au_env_chain(env_json: u64, k1_p: ptr, k1_l: u64, k2_p: ptr, k2_l: u64, out: &AuText) -> bool {
+    if au_env_present(env_json, k1_p, k1_l, out) { return true; };
+    return au_env_present(env_json, k2_p, k2_l, out);
 }
 
-// ---- listThreadIdsForUser(userId): string[] ----
-fn AuthStore_listThreadIdsForUser(s: &AuthStore, userId_ptr: ptr, userId_len: u64, out_json: &u64) -> void {
-    // rows=SELECT thread_id FROM thread_owners WHERE user_id=? ORDER BY created_at DESC; return rows.map(r=>r.thread_id)
+// ---- JS Number() subset (decimal/hex/octal/binary/Infinity) ----
+fn au_pow10(v: f64, e: i64) -> f64 {
+    let r: f64 = v;
+    let n: i64 = e;
+    while n > 0 { r = r * 10.0; n = n - 1; }
+    while n < 0 { r = r / 10.0; n = n + 1; }
+    return r;
 }
 
-// ---- enforcePermissionParams(user, method, params: unknown): Record<string,unknown> ---- // DEFECT: dynamic object
-fn AuthStore_enforcePermissionParams(s: &AuthStore, user_json: u64, method_ptr: ptr, method_len: u64, params_json: u64, out_json: &u64) -> i32 {
-    // record=asRecord(params); if method not thread/start|turn/start return record
-    // requested=inferRequestedPermission(record); allowed=clampPermission(requested, user)
-    // cwd=coerceWorkspaceCwd(stringValue(record.cwd), user.workspaceRoot, user.role==="admin")
-    // if user.role!=="admin":
-    //   if !user.allowDangerBypass && (allowed==="dangerBypass" || requested==="dangerBypass")
-    //     throw "Member policy forbids dangerously-bypass-approvals-and-sandbox"
-    //   if !pathAllowed(cwd, user.workspaceRoot) throw `Workspace path outside member root: ${user.workspaceRoot}`
-    // overrides=permissionToSandbox(allowed, cwd, user.allowNetwork)
-    // next={...record, cwd, sandbox:overrides.sandbox, approvalPolicy:overrides.approvalPolicy} // DEFECT: spread
-    // if method==="turn/start" || record.sandboxPolicy!==undefined next.sandboxPolicy=overrides.sandboxPolicy
-    // if !user.allowDangerBypass || allowed!=="dangerBypass":
-    //   if next.approvalPolicy==="never" && allowed!=="dangerBypass" next.approvalPolicy="on-request"
-    //   if next.sandbox==="danger-full-access" && allowed not in (dangerBypass, fullAsk)
-    //     next.sandbox = allowed==="readonlyAsk" ? "read-only" : "workspace-write"
-    // return next
-    return 0;
+fn au_is_finite(v: f64) -> bool {
+    let lim: f64 = au_pow10(1.0, 308);
+    return v == v && v < lim && v > (0.0 - lim);
 }
 
-// ---- filterThreadsForUser(user, threads: unknown): unknown ---- // DEFECT: unknown passthrough
-fn AuthStore_filterThreadsForUser(s: &AuthStore, user_json: u64, threads_json: u64, out_json: &u64) -> void {
-    // Admin: return threads unfiltered. Member: TEMP also unfiltered (source comment:
-    // resume/read/delete still gated by ownsThread; restore owned-only filtering when
-    // multi-tenant isolation is re-enabled). Both branches return threads as-is.
+fn au_js_number(p: ptr, len: u64, out_v: &f64) -> bool {
+    *out_v = 0.0;
+    let lo: u64 = 0;
+    let hi: u64 = 0;
+    au_trim_range(p, len, &lo, &hi);
+    if lo >= hi { *out_v = 0.0; return true; };
+    // Infinity forms
+    let neg: bool = false;
+    let start: u64 = lo;
+    if au_byte(p, start) == 43 || au_byte(p, start) == 45 {
+        neg = au_byte(p, start) == 45;
+        start = start + 1;
+    };
+    if hi - start == 8 {
+        let ip: ptr = PTR_NULL();
+        PTR_BYTE_ADD(ip, p, start);
+        if au_eq(ip, 8, STR_PTR("Infinity"), STR_LEN("Infinity")) {
+            *out_v = au_pow10(1.0, 308);
+            if neg { *out_v = 0.0 - au_pow10(1.0, 308); };
+            return true;
+        };
+    };
+    // radix forms 0x / 0o / 0b
+    if hi - start > 2 && au_byte(p, start) == 48 {
+        let kind: u8 = au_byte(p, start + 1);
+        if kind == 120 || kind == 88 || kind == 111 || kind == 79 || kind == 98 || kind == 66 {
+            let base: u64 = 16;
+            if kind == 111 || kind == 79 { base = 8; };
+            if kind == 98 || kind == 66 { base = 2; };
+            let acc: f64 = 0.0;
+            let j: u64 = start + 2;
+            let any: bool = false;
+            while j < hi {
+                let d: i64 = au_hex_val(au_byte(p, j));
+                if d < 0 || (d as u64) >= base { return false; };
+                acc = (acc * (base as f64)) + (d as f64);
+                any = true;
+                j = j + 1;
+            }
+            if !any { return false; };
+            *out_v = acc;
+            if neg { *out_v = 0.0 - acc; };
+            return true;
+        };
+    };
+    // decimal
+    let mant: f64 = 0.0;
+    let frac_digits: i64 = 0;
+    let seen_digit: bool = false;
+    let seen_dot: bool = false;
+    let j: u64 = start;
+    while j < hi {
+        let c: u8 = au_byte(p, j);
+        if c >= 48 && c <= 57 {
+            mant = (mant * 10.0) + ((c - 48) as f64);
+            if seen_dot { frac_digits = frac_digits + 1; };
+            seen_digit = true;
+            j = j + 1;
+            continue;
+        };
+        if c == 46 && !seen_dot {
+            seen_dot = true;
+            j = j + 1;
+            continue;
+        };
+        break;
+    }
+    if !seen_digit { return false; };
+    let expo: i64 = 0;
+    if j < hi && (au_byte(p, j) == 101 || au_byte(p, j) == 69) {
+        j = j + 1;
+        let eneg: bool = false;
+        if j < hi && (au_byte(p, j) == 43 || au_byte(p, j) == 45) {
+            eneg = au_byte(p, j) == 45;
+            j = j + 1;
+        };
+        let eany: bool = false;
+        let ev: i64 = 0;
+        while j < hi && au_byte(p, j) >= 48 && au_byte(p, j) <= 57 {
+            ev = (ev * 10) + ((au_byte(p, j) - 48) as i64);
+            if ev > 400 { ev = 400; };
+            eany = true;
+            j = j + 1;
+        }
+        if !eany { return false; };
+        if eneg { expo = 0 - ev; } else { expo = ev; };
+    };
+    if j != hi { return false; };
+    let val: f64 = au_pow10(mant, expo - frac_digits);
+    *out_v = val;
+    if neg { *out_v = 0.0 - val; };
+    return true;
 }
 
-// ---- getUserRowByEmail(email): UserRow|null ----
-fn AuthStore_getUserRowByEmail(s: &AuthStore, email_ptr: ptr, email_len: u64, out: &UserRow) -> bool {
-    // normalized=normalizeEmail(email); if !normalized return false(null)
-    // row=SELECT * WHERE email AND not deleted LIMIT 1; return row ?? null
-    return false;
+fn au_floor(v: f64) -> f64 {
+    if v != v { return 0.0; };
+    if v >= 0.0 { return (v as i64) as f64; };
+    let t: f64 = (v as i64) as f64;
+    if t > v { return t - 1.0; };
+    return t;
 }
 
-// ---- getUserRow(id): UserRow|null ----
-fn AuthStore_getUserRow(s: &AuthStore, id_ptr: ptr, id_len: u64, out: &UserRow) -> bool {
-    // row=SELECT * WHERE id AND not deleted LIMIT 1; return row ?? null
-    return false;
-}
-
-// ---- changeOwnPassword(userId, currentPassword, newPassword): Promise<AuthUser> ---- // DEFECT: async [BLOCKED: body is a conversion-era comment skeleton (preset return, logic only in comments). Its awaits target verifyPassword/hashPassword (blocked at runtime/password.sla) and this store's own read/write layer (also skeleton); body retranslation required.]
-fn AuthStore_changeOwnPassword(s: &AuthStore, userId_ptr: ptr, userId_len: u64, current_ptr: ptr, current_len: u64, new_ptr: ptr, new_len: u64, out_json: &u64) -> i32 {
-    // if !current || !new throw "Current and new password are required"
-    // if new.length<8 throw "New password must be at least 8 characters"
-    // if current===new throw "New password must be different from current password"
-    // existing=getUserRow(userId); if !existing || status!=="active" throw "User not found"
-    // if !(await verifyPassword(current, existing.password_hash)) throw "Current password is incorrect" // DEFECT: async [BLOCKED: body is a conversion-era comment skeleton (preset return, logic only in comments). Its awaits target verifyPassword/hashPassword (blocked at runtime/password.sla) and this store's own read/write layer (also skeleton); body retranslation required.]
-    // hash=await hashPassword(new); UPDATE password_hash; user=getUser; if !user throw "User not found after password change"; return user
-    return 0;
-}
-
-// ---- getConcurrencyLimit(userId): number ----
-fn AuthStore_getConcurrencyLimit(s: &AuthStore, userId_ptr: ptr, userId_len: u64) -> i64 {
-    // row=getUserRow(userId); if !row return 1
-    // if role==="admin" return max(1, floor(row.concurrency || 20)); return max(1, floor(row.concurrency || 1))
-    return 1;
-}
-
-// ---- verifyPassword(email, password): Promise<UserRow|null> ---- // DEFECT: async; name shadows imported verifyPassword fn from runtime/password [BLOCKED: body is a conversion-era comment skeleton (preset return, logic only in comments). Its awaits target verifyPassword/hashPassword (blocked at runtime/password.sla) and this store's own read/write layer (also skeleton); body retranslation required.]
-fn AuthStore_verifyPasswordByEmail(s: &AuthStore, email_ptr: ptr, email_len: u64, password_ptr: ptr, password_len: u64, out: &UserRow) -> bool {
-    // NOTE: TS method verifyPassword vs imported verifyPassword(password, hash) — distinct in TS by arity/context;
-    // SLA fn renamed with ByEmail suffix and logged as a name deformation.
-    // user=getUserRowByEmail(email); if !user || status!=="active" return false
-    // if !(await verifyPassword(password, user.password_hash)) return false; out=user row; return true
-    return false;
-}
-
-// ---- renewIfExpiring(token): LoginResult|null ----
-fn AuthStore_renewIfExpiring(s: &AuthStore, token_ptr: ptr, token_len: u64, has_token: bool, out: &LoginResult) -> bool {
-    // claims = token ? verifyJwt(token, config.jwtSecret) : null; if !claims return false
-    // lifetime=claims.exp-claims.iat; remaining=claims.exp - floor(Date.now()/1000)
-    // if lifetime<=0 || remaining > lifetime/2 return false  (still fresh)
-    // try { return issueSessionForUser(claims.sub); } catch { return false; } // DEFECT: try/catch (deleted/disabled -> normal expiry path)
-    return false;
-}
-
-// ---- issueSessionForUser(userId): LoginResult ----
-fn AuthStore_issueSessionForUser(s: &AuthStore, userId_ptr: ptr, userId_len: u64, out: &LoginResult) -> i32 {
-    // user=SELECT * WHERE id AND not deleted; if !user || status!=="active" throw "User not found or inactive"
-    // now=floor(Date.now()/1000); exp=now+tokenExpireHours*3600
-    // token=signJwt({sub,email,role,sid:randomBytes(8).hex,iat:now,exp}, jwtSecret)
-    // UPDATE last_login_at/last_active_at/updated_at=Date.now()
-    // out={token, user:authUserFromRow(user), expiresAt:exp*1000}; return 0
-    return 0;
-}
-
-// ---- enableTotp(userId, secret): AuthUser ----
-fn AuthStore_enableTotp(s: &AuthStore, userId_ptr: ptr, userId_len: u64, secret_ptr: ptr, secret_len: u64, out_json: &u64) -> i32 {
-    // UPDATE users SET totp_secret=?, totp_enabled=1, totp_enabled_at=Date.now(), updated_at=Date.now() WHERE id=?
-    // user=getUser; if !user throw "User not found"; return user
-    return 0;
-}
-
-// ---- disableTotp(userId): AuthUser ----
-fn AuthStore_disableTotp(s: &AuthStore, userId_ptr: ptr, userId_len: u64, out_json: &u64) -> i32 {
-    // UPDATE SET totp_secret='', totp_enabled=0, totp_enabled_at=NULL, updated_at=Date.now()
-    // user=getUser; if !user throw; return user
-    return 0;
-}
-
-// ---- getTotpSecret(userId): string|null ----
-fn AuthStore_getTotpSecret(s: &AuthStore, userId_ptr: ptr, userId_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
-    // row=getUserRow(userId); if !row || !row.totp_enabled || !row.totp_secret return false(null); return row.totp_secret
-    return false;
-}
-
-// ---- ensureAtLeastOneAdmin(excludeId): void (private) ----
-fn AuthStore_ensureAtLeastOneAdmin(s: &AuthStore, excludeId_ptr: ptr, excludeId_len: u64) -> i32 {
-    // count=SELECT COUNT(*) WHERE role='admin' AND status='active' AND deleted_at IS NULL AND id!=?
-    // if (count?.count ?? 0)<1 throw "At least one active admin is required"
-    return 0;
-}
-
-// ---- ensureDefaultAdmin(): Promise<void> (private) ---- // DEFECT: async [BLOCKED: body is a conversion-era comment skeleton (preset return, logic only in comments). Its awaits target verifyPassword/hashPassword (blocked at runtime/password.sla) and this store's own read/write layer (also skeleton); body retranslation required.]
-fn AuthStore_ensureDefaultAdmin(s: &AuthStore) -> i32 {
-    // row=COUNT admins not deleted; if >0 return 0
-    // email=normalizeEmail(config.adminEmail); if !email throw "CODEX_UI_ADMIN_EMAIL is invalid"
-    // await createUser({email, password:config.adminPassword, username:"Super Admin", role:"admin",
-    //   status:"active", concurrency:20, maxPermission:"dangerBypass", allowWrite:true,
-    //   allowNetwork:true, allowDangerBypass:true})
-    // console.info(`[auth] Created default admin user: ${email}`) // DEFECT: console.*
-    // if !process.env.CODEX_UI_ADMIN_PASSWORD && !process.env.ADMIN_PASSWORD:
-    //   console.warn("[auth] Using default admin password ChangeMe123!; set CODEX_UI_ADMIN_PASSWORD before production use.")
-    return 0;
-}
-
-// ================= module-level functions (source order) =================
-
-// ---- permissionAllowedForUser(user, permission): boolean (exported) ----
-fn permissionAllowedForUser(user_json: u64, permission_ptr: ptr, permission_len: u64) -> bool {
-    // if user.role==="admin" return true
-    // if !user.allowDangerBypass && permission==="dangerBypass" return false
-    // if !user.allowWrite && permission!=="readonlyAsk" return false
-    // return PERMISSION_RANK[permission] <= PERMISSION_RANK[user.maxPermission] // via PERMISSION_RANK fn
-    return false;
-}
-
-// ---- configFromEnv(env = process.env): AuthConfig ----
-fn configFromEnv(env_json: u64, out: &AuthConfig) -> void {
-    // jwtSecret = env.CODEX_UI_JWT_SECRET ?? env.JWT_SECRET // DEFECT: process.env
-    // if !jwtSecret:
-    //   configEnvPath=join(homedir(),".config","codex-ultra",".env"); legacy=join(homedir(),".config","codex-react-ui",".env")
-    //   fallbackSecretPath=join(codexUiDataDir(env), "jwt.secret")
-    //   try { readable = existsSync(configEnvPath) ? configEnvPath : legacy;
-    //     if existsSync(readable): content=readFileSync(readable,"utf-8");
-    //       match=content.match(/CODEX_UI_JWT_SECRET=(.+)/); // DEFECT: RegExp match
-    //       if match && match[1]?.trim() jwtSecret=match[1].trim(); } catch {} // ignore
-    //   if !jwtSecret: try { if existsSync(fallbackSecretPath) jwtSecret=readFileSync(...).trim();
-    //       else { mkdirSync(dirname(fallback),{recursive:true}); jwtSecret=randomBytes(32).toString("base64url");
-    //         writeFileSync(fallbackSecretPath, jwtSecret, "utf-8"); } }
-    //     catch { jwtSecret=randomBytes(32).toString("base64url"); } // DEFECT: randomBytes base64url + fs sync
-    // return { jwtSecret: jwtSecret || randomBytes(32).toString("base64url"),
-    //   adminEmail: env.CODEX_UI_ADMIN_EMAIL ?? env.ADMIN_EMAIL ?? "admin@example.com",
-    //   adminPassword: env.CODEX_UI_ADMIN_PASSWORD ?? env.ADMIN_PASSWORD ?? "ChangeMe123!",
-    //   tokenExpireHours: positiveNumber(env.CODEX_UI_JWT_EXPIRE_HOURS ?? env.JWT_EXPIRE_HOURS, 24),
-    //   membersRoot: env.CODEX_UI_MEMBERS_ROOT ?? join(codexUiDataDir(env), "members") }
-}
-
-// ---- normalizeEmail(email): string ----
-fn normalizeEmail(email_ptr: ptr, email_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
-    // return email.trim().toLowerCase() (byte copy + ASCII lower in fix pass)
-}
-
-// ---- positiveNumber(value: string|undefined, fallback): number ----
+// ---- authStore.ts:1233-1236 — positiveNumber ----
 fn positiveNumber(value_ptr: ptr, value_len: u64, has_value: bool, fallback: f64) -> f64 {
-    // parsed=Number(value); return isFinite(parsed) && parsed>0 ? parsed : fallback // DEFECT: Number(string) parsing
+    if !has_value { return fallback; };
+    let v: f64 = 0.0;
+    if !au_js_number(value_ptr, value_len, &v) { return fallback; };
+    if au_is_finite(v) && v > 0.0 { return v; };
     return fallback;
 }
 
-// ---- normalizePermission(value: unknown, fallback): PermissionPresetId ---- // DEFECT: unknown
+// ---- L1223-1231 — normalizePermission ----
 fn normalizePermission(value_ptr: ptr, value_len: u64, has_value: bool, fallback_ptr: ptr, fallback_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
-    // if value in {readonlyAsk, workspaceAsk, fullAsk, dangerBypass} return value; return fallback
+    if has_value {
+        let is_preset: bool = au_eq(value_ptr, value_len, STR_PTR("readonlyAsk"), STR_LEN("readonlyAsk"));
+        if au_eq(value_ptr, value_len, STR_PTR("workspaceAsk"), STR_LEN("workspaceAsk")) { is_preset = true; };
+        if au_eq(value_ptr, value_len, STR_PTR("fullAsk"), STR_LEN("fullAsk")) { is_preset = true; };
+        if au_eq(value_ptr, value_len, STR_PTR("dangerBypass"), STR_LEN("dangerBypass")) { is_preset = true; };
+        if is_preset {
+            au_doc_str(STR_PTR("permission"), STR_LEN("permission"), value_ptr, value_len, out_ptr, out_len);
+            return;
+        };
+    };
+    au_doc_str(STR_PTR("permission"), STR_LEN("permission"), fallback_ptr, fallback_len, out_ptr, out_len);
 }
 
-// ---- authUserFromRow(row: UserRow): AuthUser ---- // DEFECT: AuthUser is shared dynamic type -> JSON out
-fn authUserFromRow(row: &UserRow, out_json: &u64) -> void {
-    // {id, email, username, role, status, balance:Number(row.balance), concurrency,
-    //  maxPermission: row.max_permission, allowWrite:Boolean(row.allow_write),
-    //  allowNetwork:Boolean(...), allowDangerBypass:Boolean(...), workspaceRoot: row.workspace_root,
-    //  notes, totpEnabled:Boolean(row.totp_enabled)}
+// ---- L1218-1221 — normalizeEmail ----
+fn normalizeEmail(email_ptr: ptr, email_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    let lo: u64 = 0;
+    let hi: u64 = 0;
+    au_trim_range(email_ptr, email_len, &lo, &hi);
+    let t = AuText { bytes: [0; 65536], len: 0 };
+    let i: u64 = lo;
+    while i < hi {
+        if t.len < 65536 {
+            t.bytes[t.len] = au_lower(au_byte(email_ptr, i));
+            t.len = t.len + 1;
+        };
+        i = i + 1;
+    }
+    au_doc_str(STR_PTR("email"), STR_LEN("email"), au_text_ptr(&t), t.len, out_ptr, out_len);
 }
 
-// ---- inferRequestedPermission(record): PermissionPresetId ---- // DEFECT: dynamic object
-fn inferRequestedPermission(record_json: u64, out_ptr: &ptr, out_len: &u64) -> void {
-    // approval=stringValue(record.approvalPolicy); sandbox=stringValue(record.sandbox)
-    // policyType=stringValue(asRecord(record.sandboxPolicy).type)
-    // if approval==="never" || sandbox==="danger-full-access" || policyType==="dangerFullAccess":
-    //   return approval==="never" ? "dangerBypass" : "fullAsk"
-    // if sandbox==="read-only" || policyType==="readOnly" return "readonlyAsk"
-    // if sandbox==="workspace-write" || policyType==="workspaceWrite" return "workspaceAsk"
-    // return "workspaceAsk"
+// ---- file read + .env scan (configFromEnv helpers) ----
+fn au_read_file_text(p: ptr, len: u64, out: &AuText) -> bool {
+    out.len = 0;
+    let total: u64 = 0;
+    if sa_std_fs_len(p, len, &total) != 0 { return false; };
+    if total > 4194304 { return false; };
+    let h: u64 = 0;
+    if sa_std_fs_read_file(p, len, 4194304, &h) != 0 || h == 0 { return false; };
+    let bp: ptr = sa_fs_read_buffer_data(h);
+    let bl: u64 = sa_fs_read_buffer_len(h);
+    au_append(out, bp, bl);
+    let f: i32 = sa_fs_read_buffer_free(h);
+    return true;
 }
 
-// ---- clampPermission(requested, user): PermissionPresetId ----
-fn clampPermission(requested_ptr: ptr, requested_len: u64, user_json: u64, out_ptr: &ptr, out_len: &u64) -> void {
-    // next=requested
-    // if user.role!=="admin":
-    //   if !allowDangerBypass && next==="dangerBypass":
-    //     next = allowWrite ? (maxPermission==="readonlyAsk" ? "readonlyAsk" : "workspaceAsk") : "readonlyAsk"
-    //   if !allowWrite next="readonlyAsk"
-    //   if PERMISSION_RANK(next) > PERMISSION_RANK(user.maxPermission) next=user.maxPermission
-    // return next
-}
-
-// ---- permissionToSandbox(permission, cwd, allowNetwork): {sandbox, approvalPolicy, sandboxPolicy} ----
-struct SandboxOverrides {
-    sandbox: [u8; 32], sandbox_len: u64,
-    approvalPolicy: [u8; 32], approvalPolicy_len: u64,
-    sandboxPolicy_json: u64, // DEFECT: dynamic object
-}
-fn permissionToSandbox(permission_ptr: ptr, permission_len: u64, cwd_ptr: ptr, cwd_len: u64, allowNetwork: bool, out: &SandboxOverrides) -> void {
-    // switch permission:
-    //  readonlyAsk -> {sandbox:"read-only", approvalPolicy:"on-request", sandboxPolicy:{type:"readOnly", networkAccess:allowNetwork}}
-    //  workspaceAsk -> {sandbox:"workspace-write", approvalPolicy:"on-request",
-    //    sandboxPolicy:{type:"workspaceWrite", writableRoots:[cwd], networkAccess:allowNetwork, excludeTmpdirEnvVar:false, excludeSlashTmp:false}}
-    //  fullAsk -> {sandbox:"danger-full-access", approvalPolicy:"on-request", sandboxPolicy:{type:"dangerFullAccess"}}
-    //  dangerBypass -> {sandbox:"danger-full-access", approvalPolicy:"never", sandboxPolicy:{type:"dangerFullAccess"}}
-}
-
-// ---- coerceWorkspaceCwd(requested: string|undefined, workspaceRoot, isAdmin): string ----
-fn coerceWorkspaceCwd(requested_ptr: ptr, requested_len: u64, has_requested: bool, root_ptr: ptr, root_len: u64, isAdmin: bool, out_ptr: &ptr, out_len: &u64) -> void {
-    // fallback = workspaceRoot || join(codexUiDataDir(), "workspace"); mkdirSync(fallback,{recursive:true,mode:0o700})
-    // if !requested || requested==="~/" || requested==="~" return fallback
-    // expanded = requested.startsWith("~/") ? join(homedir(), requested.slice(2)) : requested // DEFECT: homedir + slice
-    // if isAdmin return expanded; if !pathAllowed(expanded, workspaceRoot) return fallback; return expanded
-}
-
-// ---- pathAllowed(path, root): boolean ----
-fn pathAllowed(path_ptr: ptr, path_len: u64, root_ptr: ptr, root_len: u64) -> bool {
-    // normalizedPath=join(path); normalizedRoot=join(root) // NOTE: join() used as path normalizer in TS
-    // return normalizedPath===normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`)
-    // DEFECT: OS-specific separator (source hardcodes "/") preserved as-is.
+fn au_scan_env_secret(text_p: ptr, text_l: u64, out: &AuText) -> bool {
+    let key_p: ptr = STR_PTR("CODEX_UI_JWT_SECRET=");
+    let key_l: u64 = STR_LEN("CODEX_UI_JWT_SECRET=");
+    if text_l < key_l { return false; };
+    let i: u64 = 0;
+    while i + key_l <= text_l {
+        let hit: bool = true;
+        let j: u64 = 0;
+        while j < key_l {
+            if au_byte(text_p, i + j) != au_byte(key_p, j) { hit = false; break; };
+            j = j + 1;
+        }
+        if hit {
+            let vs: u64 = i + key_l;
+            let ve: u64 = vs;
+            while ve < text_l && au_byte(text_p, ve) != 10 { ve = ve + 1; }
+            let lo: u64 = 0;
+            let hi: u64 = 0;
+            let vp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(vp, text_p, vs);
+            au_trim_range(vp, ve - vs, &lo, &hi);
+            if hi <= lo { return false; };
+            out.len = 0;
+            let seg: ptr = PTR_NULL();
+            PTR_BYTE_ADD(seg, vp, lo);
+            au_append(out, seg, hi - lo);
+            return true;
+        };
+        i = i + 1;
+    }
     return false;
 }
 
-// ---- signJwt(payload: JwtPayload, secret): string ----
-fn signJwt(payload: &JwtPayload, secret_ptr: ptr, secret_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
-    // header={alg:"HS256", typ:"JWT"}; unsigned=`${base64UrlJson(header)}.${base64UrlJson(payload)}`
-    // return `${unsigned}.${hmac(unsigned, secret)}` // DEFECT: template string -> buffer concat
+fn au_random_secret(out: &AuText) -> void {
+    let raw: [u8; 32] = [0; 32];
+    let rp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(rp, &raw, 0);
+    let st: i32 = sa_crypto_random_bytes(rp, 32);
+    out.len = 0;
+    au_b64url_encode(rp, 32, out);
 }
 
-// ---- verifyJwt(token, secret): JwtPayload|null ----
-fn verifyJwt(token_ptr: ptr, token_len: u64, secret_ptr: ptr, secret_len: u64, out: &JwtPayload) -> bool {
-    // parts=token.split("."); if parts.length!==3 return false // DEFECT: split
-    // [headerPart, payloadPart, signature]=parts // DEFECT: array destructuring
-    // if any empty return false; unsigned=`${headerPart}.${payloadPart}`; expected=hmac(unsigned, secret)
-    // if !safeEqual(signature, expected) return false
-    // header=parseBase64UrlJson(headerPart); payload=parseBase64UrlJson(payloadPart) as Partial<JwtPayload>|null // DEFECT: cast
-    // if !header || header.alg!=="HS256" || !payload return false
-    // now=floor(Date.now()/1000)
-    // if typeof sub!=="string" || typeof email!=="string" || role not in {admin,user}
-    //   || typeof sid!=="string" || typeof iat!=="number" || typeof exp!=="number" || exp<=now return false
-    // out=payload as JwtPayload; return true
-    return false;
+// ---- L1185-1216 — authConfigFromEnv ----
+fn configFromEnv(env_json: u64, out: &AuthConfig) -> void {
+    let jwt = AuText { bytes: [0; 65536], len: 0 };
+    let jwt_present: bool = au_env_chain(env_json, STR_PTR("CODEX_UI_JWT_SECRET"), STR_LEN("CODEX_UI_JWT_SECRET"), STR_PTR("JWT_SECRET"), STR_LEN("JWT_SECRET"), &jwt);
+    if !jwt_present || jwt.len == 0 {
+        jwt.len = 0;
+        let home = AuText { bytes: [0; 65536], len: 0 };
+        au_home_dir(&home);
+        let cfg_path = AuPath { bytes: [0; 4096], len: 0 };
+        au_path_join2(au_text_ptr(&home), home.len, STR_PTR(".config/codex-ultra/.env"), STR_LEN(".config/codex-ultra/.env"), &cfg_path);
+        let legacy_path = AuPath { bytes: [0; 4096], len: 0 };
+        au_path_join2(au_text_ptr(&home), home.len, STR_PTR(".config/codex-react-ui/.env"), STR_LEN(".config/codex-react-ui/.env"), &legacy_path);
+        let readable = AuPath { bytes: [0; 4096], len: 0 };
+        if au_fs_exists(au_path_ptr(&cfg_path), cfg_path.len) {
+            au_append_path(&readable, au_path_ptr(&cfg_path), cfg_path.len);
+        } else {
+            au_append_path(&readable, au_path_ptr(&legacy_path), legacy_path.len);
+        };
+        if au_fs_exists(au_path_ptr(&readable), readable.len) {
+            let text = AuText { bytes: [0; 65536], len: 0 };
+            if au_read_file_text(au_path_ptr(&readable), readable.len, &text) {
+                let found = AuText { bytes: [0; 65536], len: 0 };
+                if au_scan_env_secret(au_text_ptr(&text), text.len, &found) {
+                    au_append(&jwt, au_text_ptr(&found), found.len);
+                };
+            };
+        };
+        let dd = AuPath { bytes: [0; 4096], len: 0 };
+        au_data_dir(&dd);
+        let fb = AuPath { bytes: [0; 4096], len: 0 };
+        au_path_join2(au_path_ptr(&dd), dd.len, STR_PTR("jwt.secret"), STR_LEN("jwt.secret"), &fb);
+        if jwt.len == 0 {
+            if au_fs_exists(au_path_ptr(&fb), fb.len) {
+                let text = AuText { bytes: [0; 65536], len: 0 };
+                if au_read_file_text(au_path_ptr(&fb), fb.len, &text) {
+                    let lo: u64 = 0;
+                    let hi: u64 = 0;
+                    au_trim_range(au_text_ptr(&text), text.len, &lo, &hi);
+                    let seg: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(seg, au_text_ptr(&text), lo);
+                    au_append(&jwt, seg, hi - lo);
+                };
+            };
+            if jwt.len == 0 {
+                let dir = AuPath { bytes: [0; 4096], len: 0 };
+                au_dirname(au_path_ptr(&fb), fb.len, &dir);
+                au_mkdir_p(au_path_ptr(&dir), dir.len);
+                au_random_secret(&jwt);
+                let wst: i32 = sa_fs_write_file(au_path_ptr(&fb), fb.len, au_text_ptr(&jwt), jwt.len);
+            };
+        };
+    };
+    if jwt.len == 0 { au_random_secret(&jwt); };
+    let email = AuText { bytes: [0; 65536], len: 0 };
+    if !au_env_chain(env_json, STR_PTR("CODEX_UI_ADMIN_EMAIL"), STR_LEN("CODEX_UI_ADMIN_EMAIL"), STR_PTR("ADMIN_EMAIL"), STR_LEN("ADMIN_EMAIL"), &email) {
+        au_append(&email, STR_PTR("admin@example.com"), STR_LEN("admin@example.com"));
+    };
+    let password = AuText { bytes: [0; 65536], len: 0 };
+    if !au_env_chain(env_json, STR_PTR("CODEX_UI_ADMIN_PASSWORD"), STR_LEN("CODEX_UI_ADMIN_PASSWORD"), STR_PTR("ADMIN_PASSWORD"), STR_LEN("ADMIN_PASSWORD"), &password) {
+        au_append(&password, STR_PTR("ChangeMe123!"), STR_LEN("ChangeMe123!"));
+    };
+    let expire_raw = AuText { bytes: [0; 65536], len: 0 };
+    let expire_present: bool = au_env_chain(env_json, STR_PTR("CODEX_UI_JWT_EXPIRE_HOURS"), STR_LEN("CODEX_UI_JWT_EXPIRE_HOURS"), STR_PTR("JWT_EXPIRE_HOURS"), STR_LEN("JWT_EXPIRE_HOURS"), &expire_raw);
+    let hours: f64 = positiveNumber(au_text_ptr(&expire_raw), expire_raw.len, expire_present, 24.0);
+    let members = AuText { bytes: [0; 65536], len: 0 };
+    if !au_env_present(env_json, STR_PTR("CODEX_UI_MEMBERS_ROOT"), STR_LEN("CODEX_UI_MEMBERS_ROOT"), &members) {
+        let dd = AuPath { bytes: [0; 4096], len: 0 };
+        au_data_dir(&dd);
+        let mp = AuPath { bytes: [0; 4096], len: 0 };
+        au_path_join2(au_path_ptr(&dd), dd.len, STR_PTR("members"), STR_LEN("members"), &mp);
+        au_append(&members, au_path_ptr(&mp), mp.len);
+    };
+    // write into the struct
+    out.jwtSecret_len = 0;
+    let i: u64 = 0;
+    let jp: ptr = au_text_ptr(&jwt);
+    while i < jwt.len && i < 512 { out.jwtSecret[i] = au_byte(jp, i); i = i + 1; }
+    out.jwtSecret_len = i;
+    out.adminEmail_len = 0;
+    i = 0;
+    let ep: ptr = au_text_ptr(&email);
+    while i < email.len && i < 320 { out.adminEmail[i] = au_byte(ep, i); i = i + 1; }
+    out.adminEmail_len = i;
+    out.adminPassword_len = 0;
+    i = 0;
+    let pp: ptr = au_text_ptr(&password);
+    while i < password.len && i < 512 { out.adminPassword[i] = au_byte(pp, i); i = i + 1; }
+    out.adminPassword_len = i;
+    out.tokenExpireHours = hours;
+    out.membersRoot_len = 0;
+    i = 0;
+    let mp2: ptr = au_text_ptr(&members);
+    while i < members.len && i < 512 { out.membersRoot[i] = au_byte(mp2, i); i = i + 1; }
+    out.membersRoot_len = i;
 }
 
-// ---- base64UrlJson(value: unknown): string ---- // DEFECT: unknown + Buffer
-fn base64UrlJson(value_json: u64, out_ptr: &ptr, out_len: &u64) -> void {
-    // return Buffer.from(JSON.stringify(value)).toString("base64url")
+fn au_config_copy(src: &AuthConfig, dst: &AuthConfig) -> void {
+    let p: ptr = PTR_NULL();
+    let l: u64 = 0;
+    au_cfg_field(src, 0, &p, &l);
+    dst.jwtSecret_len = 0;
+    let i: u64 = 0;
+    while i < l && i < 512 { dst.jwtSecret[i] = au_byte(p, i); i = i + 1; }
+    dst.jwtSecret_len = i;
+    au_cfg_field(src, 1, &p, &l);
+    dst.adminEmail_len = 0;
+    i = 0;
+    while i < l && i < 320 { dst.adminEmail[i] = au_byte(p, i); i = i + 1; }
+    dst.adminEmail_len = i;
+    au_cfg_field(src, 2, &p, &l);
+    dst.adminPassword_len = 0;
+    i = 0;
+    while i < l && i < 512 { dst.adminPassword[i] = au_byte(p, i); i = i + 1; }
+    dst.adminPassword_len = i;
+    dst.tokenExpireHours = src.tokenExpireHours;
+    au_cfg_field(src, 3, &p, &l);
+    dst.membersRoot_len = 0;
+    i = 0;
+    while i < l && i < 512 { dst.membersRoot[i] = au_byte(p, i); i = i + 1; }
+    dst.membersRoot_len = i;
 }
 
-// ---- parseBase64UrlJson(value: string): Record<string,unknown>|null ---- // DEFECT: dynamic object + Buffer
-fn parseBase64UrlJson(value_ptr: ptr, value_len: u64, out_json: &u64) -> bool {
-    // try { parsed=JSON.parse(Buffer.from(value,"base64url").toString("utf8"));
-    //   return parsed && typeof==="object" ? parsed(true) : false(null); } catch { return false; }
-    return false;
+// ---- L99-105 — constructor ----
+fn AuthStore_new(out: &AuthStore, database: u64, has_database: bool, config: &AuthConfig, has_config: bool) -> void {
+    out.db = 0;
+    if has_database { out.db = database; };
+    if has_config {
+        au_config_copy(config, &out.config);
+    } else {
+        configFromEnv(0, &out.config);
+    };
+    let p: ptr = PTR_NULL();
+    let l: u64 = 0;
+    au_cfg_field(&out.config, 3, &p, &l);
+    au_mkdir_p(p, l);
 }
 
-// ---- hmac(value, secret): string ----
-fn hmac(value_ptr: ptr, value_len: u64, secret_ptr: ptr, secret_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
-    // return createHmac("sha256", secret).update(value).digest("base64url") // DEFECT: node:crypto HMAC -> sa_std crypto (not yet surfaced)
+// ---- L107-126 — static fromEnv ----
+fn AuthStore_fromEnv(env_json: u64, database: u64, out: &AuthStore) -> bool {
+    let mode = AuText { bytes: [0; 65536], len: 0 };
+    let has_mode: bool = au_env_present(env_json, STR_PTR("CODEX_UI_AUTH"), STR_LEN("CODEX_UI_AUTH"), &mode);
+    if !has_mode {
+        // execPath fallback: /codex-standalone(\.exe)?$/i on argv[0]
+        let exe: u64 = sa_env_current_exe();
+        let is_standalone: bool = false;
+        if exe != 0 {
+            let ep: ptr = sa_env_buffer_data(exe);
+            let el: u64 = sa_env_buffer_len(exe);
+            let sw_a: bool = au_ends_with_ci(ep, el, STR_PTR("codex-standalone"), STR_LEN("codex-standalone"));
+            let sw_b: bool = au_ends_with_ci(ep, el, STR_PTR("codex-standalone.exe"), STR_LEN("codex-standalone.exe"));
+            if sw_a || sw_b {
+                is_standalone = true;
+            };
+        };
+        if is_standalone {
+            au_append(&mode, STR_PTR("off"), STR_LEN("off"));
+        } else {
+            au_append(&mode, STR_PTR("1"), STR_LEN("1"));
+        };
+    };
+    // trim + ASCII lowercase in place
+    let lo: u64 = 0;
+    let hi: u64 = 0;
+    let mp: ptr = au_text_ptr(&mode);
+    au_trim_range(mp, mode.len, &lo, &hi);
+    let norm = AuText { bytes: [0; 65536], len: 0 };
+    let i: u64 = lo;
+    while i < hi {
+        if norm.len < 65536 {
+            norm.bytes[norm.len] = au_lower(au_byte(mp, i));
+            norm.len = norm.len + 1;
+        };
+        i = i + 1;
+    }
+    let np: ptr = au_text_ptr(&norm);
+    let mode_off: bool = au_eq(np, norm.len, STR_PTR("0"), STR_LEN("0"));
+    if au_eq(np, norm.len, STR_PTR("false"), STR_LEN("false")) { mode_off = true; };
+    if au_eq(np, norm.len, STR_PTR("off"), STR_LEN("off")) { mode_off = true; };
+    if au_eq(np, norm.len, STR_PTR("local-token"), STR_LEN("local-token")) { mode_off = true; };
+    if mode_off {
+        return false;
+    };
+    let cfg = AuthConfig { jwtSecret: [0; 512], jwtSecret_len: 0, adminEmail: [0; 320], adminEmail_len: 0, adminPassword: [0; 512], adminPassword_len: 0, tokenExpireHours: 0.0, membersRoot: [0; 512], membersRoot_len: 0 };
+    configFromEnv(env_json, &cfg);
+    AuthStore_new(out, database, true, &cfg, true);
+    return true;
 }
 
-// ---- safeEqual(a, b): boolean ----
-fn safeEqual(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
-    // left=Buffer.from(a); right=Buffer.from(b); return left.length===right.length && timingSafeEqual(left, right)
-    // DEFECT: timingSafeEqual constant-time compare -> byte loop approx (must stay constant-time in fix pass)
-    return false;
+// ---- L128-190 — initialize (DDL verbatim in structure) ----
+fn AuthStore_initialize(s: &AuthStore) -> i32 {
+    let ddl_p: ptr = STR_PTR("CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT NOT NULL, username TEXT NOT NULL DEFAULT '', password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')), status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')), balance REAL NOT NULL DEFAULT 0, concurrency INTEGER NOT NULL DEFAULT 5, max_permission TEXT NOT NULL DEFAULT 'workspaceAsk' CHECK (max_permission IN ('readonlyAsk', 'workspaceAsk', 'fullAsk', 'dangerBypass')), allow_write INTEGER NOT NULL DEFAULT 1, allow_network INTEGER NOT NULL DEFAULT 0, allow_danger_bypass INTEGER NOT NULL DEFAULT 0, workspace_root TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', totp_secret TEXT NOT NULL DEFAULT '', totp_enabled INTEGER NOT NULL DEFAULT 0, totp_enabled_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER, last_login_at INTEGER, last_active_at INTEGER); CREATE UNIQUE INDEX IF NOT EXISTS users_email_active_idx ON users (email) WHERE deleted_at IS NULL; CREATE INDEX IF NOT EXISTS users_status_idx ON users (status); CREATE INDEX IF NOT EXISTS users_deleted_at_idx ON users (deleted_at); CREATE TABLE IF NOT EXISTS thread_owners (thread_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS thread_owners_user_idx ON thread_owners (user_id); CREATE TABLE IF NOT EXISTS balance_ledger (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, delta REAL NOT NULL, balance_after REAL NOT NULL, operation TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '', method TEXT NOT NULL DEFAULT '', reference_id TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS balance_ledger_user_idx ON balance_ledger (user_id, created_at);");
+    let ddl_l: u64 = STR_LEN("CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT NOT NULL, username TEXT NOT NULL DEFAULT '', password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')), status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')), balance REAL NOT NULL DEFAULT 0, concurrency INTEGER NOT NULL DEFAULT 5, max_permission TEXT NOT NULL DEFAULT 'workspaceAsk' CHECK (max_permission IN ('readonlyAsk', 'workspaceAsk', 'fullAsk', 'dangerBypass')), allow_write INTEGER NOT NULL DEFAULT 1, allow_network INTEGER NOT NULL DEFAULT 0, allow_danger_bypass INTEGER NOT NULL DEFAULT 0, workspace_root TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', totp_secret TEXT NOT NULL DEFAULT '', totp_enabled INTEGER NOT NULL DEFAULT 0, totp_enabled_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER, last_login_at INTEGER, last_active_at INTEGER); CREATE UNIQUE INDEX IF NOT EXISTS users_email_active_idx ON users (email) WHERE deleted_at IS NULL; CREATE INDEX IF NOT EXISTS users_status_idx ON users (status); CREATE INDEX IF NOT EXISTS users_deleted_at_idx ON users (deleted_at); CREATE TABLE IF NOT EXISTS thread_owners (thread_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS thread_owners_user_idx ON thread_owners (user_id); CREATE TABLE IF NOT EXISTS balance_ledger (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, delta REAL NOT NULL, balance_after REAL NOT NULL, operation TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '', method TEXT NOT NULL DEFAULT '', reference_id TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS balance_ledger_user_idx ON balance_ledger (user_id, created_at);");
+    if au_exec(s.db, ddl_p, ddl_l) != 0 {
+        return au_throw(STR_PTR("Auth store schema initialization failed"), STR_LEN("Auth store schema initialization failed"));
+    };
+    // legacy column migration — failure swallowed by TS
+    let ast: i32 = au_exec(s.db, STR_PTR("ALTER TABLE balance_ledger ADD COLUMN reference_id TEXT NOT NULL DEFAULT ''"), STR_LEN("ALTER TABLE balance_ledger ADD COLUMN reference_id TEXT NOT NULL DEFAULT ''"));
+    let ist: i32 = au_exec(s.db, STR_PTR("CREATE UNIQUE INDEX IF NOT EXISTS balance_ledger_reference_idx ON balance_ledger (user_id, reference_id) WHERE reference_id <> ''"), STR_LEN("CREATE UNIQUE INDEX IF NOT EXISTS balance_ledger_reference_idx ON balance_ledger (user_id, reference_id) WHERE reference_id <> ''"));
+    return AuthStore_ensureDefaultAdmin(s);
 }
 
-// ---- ADMIN_ONLY_METHODS: Set<string> const ---- // DEFECT: Set literal -> fn membership check
-fn isAdminOnlyMethodStatic(method_ptr: ptr, method_len: u64) -> bool {
-    // set = {"config/batchWrite","config/write","config/valueWrite","plugin/install",
-    //   "plugin/uninstall","mcpServer/add","mcpServer/remove","mcpServer/update"}
-    return false;
+// ---- user row queries ----
+fn au_query_user(s: &AuthStore, sql_p: ptr, sql_l: u64, bind_p: ptr, bind_l: u64, out_row: &UserRow) -> bool {
+    let stmt: u64 = au_prepare(s.db, sql_p, sql_l);
+    if stmt == 0 { return false; };
+    au_bind_text(stmt, 1, bind_p, bind_l);
+    let doc: u64 = 0;
+    let has: bool = au_step_row(stmt, &doc);
+    au_finalize(stmt);
+    if !has { return false; };
+    au_fill_user_row(doc, out_row);
+    let f: i32 = sa_json_free(doc);
+    return true;
 }
 
-// ---- isAdminOnlyMethod(method): boolean ----
-fn isAdminOnlyMethod(method_ptr: ptr, method_len: u64) -> bool {
-    // if ADMIN_ONLY_METHODS.has(method) return true
-    // if method.startsWith("config/") && method!=="config/read" return true; return false
-    return false;
+fn AuthStore_getUserRowByEmail(s: &AuthStore, email_ptr: ptr, email_len: u64, out: &UserRow) -> bool {
+    return au_query_user(s, STR_PTR("SELECT * FROM users WHERE email = ? AND deleted_at IS NULL LIMIT 1"), STR_LEN("SELECT * FROM users WHERE email = ? AND deleted_at IS NULL LIMIT 1"), email_ptr, email_len, out);
 }
 
-// ---- clampPathsForMember(record, workspaceRoot): Record<string,unknown> ---- // DEFECT: dynamic object
-fn clampPathsForMember(record_json: u64, root_ptr: ptr, root_len: u64, out_json: &u64) -> i32 {
-    // next={...record} // DEFECT: spread
-    // if typeof next.cwd==="string" next.cwd=coerceWorkspaceCwd(next.cwd, workspaceRoot, false)
-    // if typeof next.path==="string": if !pathAllowed(next.path, root) throw `Path outside member workspace: ${workspaceRoot}`
-    // if Array.isArray(next.cwds): next.cwds=next.cwds.map(entry => typeof entry==="string" ? coerceWorkspaceCwd(entry, root, false) : entry)
-    // if next.thread is non-array object: thread={...next.thread}; if typeof thread.cwd==="string" coerce; next.thread=thread
-    // return next
+fn AuthStore_getUserRow(s: &AuthStore, id_ptr: ptr, id_len: u64, out: &UserRow) -> bool {
+    return au_query_user(s, STR_PTR("SELECT * FROM users WHERE id = ? AND deleted_at IS NULL LIMIT 1"), STR_LEN("SELECT * FROM users WHERE id = ? AND deleted_at IS NULL LIMIT 1"), id_ptr, id_len, out);
+}
+
+fn AuthStore_getUser(s: &AuthStore, id_ptr: ptr, id_len: u64, out_json: &u64) -> bool {
+    *out_json = 0;
+    let row = UserRow { id: [0; 64], id_len: 0, email: [0; 320], email_len: 0, username: [0; 256], username_len: 0, password_hash: [0; 512], password_hash_len: 0, role: [0; 16], role_len: 0, status: [0; 16], status_len: 0, balance: 0.0, concurrency: 0, max_permission: [0; 32], max_permission_len: 0, allow_write: 0, allow_network: 0, allow_danger_bypass: 0, workspace_root: [0; 512], workspace_root_len: 0, notes: [0; 1024], notes_len: 0, totp_secret: [0; 256], totp_secret_len: 0, totp_enabled: 0, totp_enabled_at: 0, has_totp_enabled_at: false, created_at: 0, updated_at: 0, deleted_at: 0, has_deleted_at: false };
+    if !AuthStore_getUserRow(s, id_ptr, id_len, &row) { return false; };
+    authUserFromRow(&row, out_json);
+    return *out_json != 0;
+}
+
+// ---- L242-248 — listUsers ----
+fn AuthStore_listUsers(s: &AuthStore, out_json: &u64) -> void {
+    let arr: u64 = sa_json_parse(STR_PTR("[]"), STR_LEN("[]"));
+    *out_json = arr;
+    if arr == 0 { return; };
+    let stmt: u64 = au_prepare(s.db, STR_PTR("SELECT * FROM users WHERE deleted_at IS NULL ORDER BY created_at ASC"), STR_LEN("SELECT * FROM users WHERE deleted_at IS NULL ORDER BY created_at ASC"));
+    if stmt == 0 { return; };
+    let guard: u64 = 0;
+    while guard < 100000 {
+        guard = guard + 1;
+        let doc: u64 = 0;
+        if !au_step_row(stmt, &doc) { break; };
+        let row = UserRow { id: [0; 64], id_len: 0, email: [0; 320], email_len: 0, username: [0; 256], username_len: 0, password_hash: [0; 512], password_hash_len: 0, role: [0; 16], role_len: 0, status: [0; 16], status_len: 0, balance: 0.0, concurrency: 0, max_permission: [0; 32], max_permission_len: 0, allow_write: 0, allow_network: 0, allow_danger_bypass: 0, workspace_root: [0; 512], workspace_root_len: 0, notes: [0; 1024], notes_len: 0, totp_secret: [0; 256], totp_secret_len: 0, totp_enabled: 0, totp_enabled_at: 0, has_totp_enabled_at: false, created_at: 0, updated_at: 0, deleted_at: 0, has_deleted_at: false };
+        au_fill_user_row(doc, &row);
+        let f: i32 = sa_json_free(doc);
+        let user: u64 = 0;
+        authUserFromRow(&row, &user);
+        if user != 0 {
+            let pst: i32 = sa_json_array_push_node(arr, user);
+        };
+    }
+    au_finalize(stmt);
+}
+
+// shared by login and issueSessionForUser (TS duplicates the code)
+fn au_issue_session(s: &AuthStore, row: &UserRow, out: &LoginResult) -> void {
+    let now_s: u64 = (sa_time_unix_ms() / 1000) as u64;
+    let exp: u64 = now_s + ((s.config.tokenExpireHours * 3600.0) as u64);
+    let sid = AuText { bytes: [0; 65536], len: 0 };
+    au_random_hex(8, &sid);
+    let payload = JwtPayload { sub: [0; 64], sub_len: 0, email: [0; 320], email_len: 0, role: [0; 16], role_len: 0, sid: [0; 32], sid_len: 0, iat: 0, exp: 0 };
+    let id_p: ptr = PTR_NULL();
+    let id_l: u64 = 0;
+    au_row_field(row, 0, &id_p, &id_l);
+    let em_p: ptr = PTR_NULL();
+    let em_l: u64 = 0;
+    au_row_field(row, 1, &em_p, &em_l);
+    let ro_p: ptr = PTR_NULL();
+    let ro_l: u64 = 0;
+    au_row_field(row, 4, &ro_p, &ro_l);
+    au_jwt_payload_fill(&payload, id_p, id_l, em_p, em_l, ro_p, ro_l, au_text_ptr(&sid), sid.len, now_s, exp);
+    let sec_p: ptr = PTR_NULL();
+    let sec_l: u64 = 0;
+    au_cfg_field(&s.config, 0, &sec_p, &sec_l);
+    let tok_p: ptr = PTR_NULL();
+    let tok_l: u64 = 0;
+    signJwt(&payload, sec_p, sec_l, &tok_p, &tok_l);
+    out.token_len = 0;
+    let i: u64 = 0;
+    while i < tok_l && i < 1024 { out.token[i] = au_byte(tok_p, i); i = i + 1; }
+    out.token_len = i;
+    let ts: i64 = sa_time_unix_ms();
+    let stmt: u64 = au_prepare(s.db, STR_PTR("UPDATE users SET last_login_at = ?, last_active_at = ?, updated_at = ? WHERE id = ?"), STR_LEN("UPDATE users SET last_login_at = ?, last_active_at = ?, updated_at = ? WHERE id = ?"));
+    if stmt != 0 {
+        au_bind_int(stmt, 1, ts);
+        au_bind_int(stmt, 2, ts);
+        au_bind_int(stmt, 3, ts);
+        au_bind_text(stmt, 4, id_p, id_l);
+        au_step_once(stmt);
+        au_finalize(stmt);
+    };
+    authUserFromRow(row, &out.user_json);
+    out.expiresAt = exp * 1000;
+}
+
+// ---- L192-230 — login ----
+fn AuthStore_login(s: &AuthStore, email_ptr: ptr, email_len: u64, password_ptr: ptr, password_len: u64, out: &LoginResult) -> bool {
+    let ne_p: ptr = PTR_NULL();
+    let ne_l: u64 = 0;
+    normalizeEmail(email_ptr, email_len, &ne_p, &ne_l);
+    if ne_l == 0 || password_len == 0 { return false; };
+    let row = UserRow { id: [0; 64], id_len: 0, email: [0; 320], email_len: 0, username: [0; 256], username_len: 0, password_hash: [0; 512], password_hash_len: 0, role: [0; 16], role_len: 0, status: [0; 16], status_len: 0, balance: 0.0, concurrency: 0, max_permission: [0; 32], max_permission_len: 0, allow_write: 0, allow_network: 0, allow_danger_bypass: 0, workspace_root: [0; 512], workspace_root_len: 0, notes: [0; 1024], notes_len: 0, totp_secret: [0; 256], totp_secret_len: 0, totp_enabled: 0, totp_enabled_at: 0, has_totp_enabled_at: false, created_at: 0, updated_at: 0, deleted_at: 0, has_deleted_at: false };
+    if !AuthStore_getUserRowByEmail(s, ne_p, ne_l, &row) { return false; };
+    let st_p: ptr = PTR_NULL();
+    let st_l: u64 = 0;
+    au_row_field(&row, 5, &st_p, &st_l);
+    if !au_eq(st_p, st_l, STR_PTR("active"), STR_LEN("active")) { return false; };
+    let hash_p: ptr = PTR_NULL();
+    let hash_l: u64 = 0;
+    au_row_field(&row, 3, &hash_p, &hash_l);
+    let ok: bool = false;
+    let vst: i32 = verifyPassword(password_ptr, password_len, hash_p, hash_l, &ok);
+    if !ok { return false; };
+    au_issue_session(s, &row, out);
+    return true;
+}
+
+// ---- L232-240 — getUserByToken ----
+fn AuthStore_getUserByToken(s: &AuthStore, token_ptr: ptr, token_len: u64, has_token: bool, out_json: &u64) -> bool {
+    *out_json = 0;
+    if !has_token { return false; };
+    let sec_p: ptr = PTR_NULL();
+    let sec_l: u64 = 0;
+    au_cfg_field(&s.config, 0, &sec_p, &sec_l);
+    let claims = JwtPayload { sub: [0; 64], sub_len: 0, email: [0; 320], email_len: 0, role: [0; 16], role_len: 0, sid: [0; 32], sid_len: 0, iat: 0, exp: 0 };
+    if !verifyJwt(token_ptr, token_len, sec_p, sec_l, &claims) { return false; };
+    let sub_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sub_p, &claims.sub, 0);
+    let row = UserRow { id: [0; 64], id_len: 0, email: [0; 320], email_len: 0, username: [0; 256], username_len: 0, password_hash: [0; 512], password_hash_len: 0, role: [0; 16], role_len: 0, status: [0; 16], status_len: 0, balance: 0.0, concurrency: 0, max_permission: [0; 32], max_permission_len: 0, allow_write: 0, allow_network: 0, allow_danger_bypass: 0, workspace_root: [0; 512], workspace_root_len: 0, notes: [0; 1024], notes_len: 0, totp_secret: [0; 256], totp_secret_len: 0, totp_enabled: 0, totp_enabled_at: 0, has_totp_enabled_at: false, created_at: 0, updated_at: 0, deleted_at: 0, has_deleted_at: false };
+    if !AuthStore_getUserRow(s, sub_p, claims.sub_len, &row) { return false; };
+    let st_p: ptr = PTR_NULL();
+    let st_l: u64 = 0;
+    au_row_field(&row, 5, &st_p, &st_l);
+    if !au_eq(st_p, st_l, STR_PTR("active"), STR_LEN("active")) { return false; };
+    let em_p: ptr = PTR_NULL();
+    let em_l: u64 = 0;
+    au_row_field(&row, 1, &em_p, &em_l);
+    let cem_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cem_p, &claims.email, 0);
+    if !au_eq(em_p, em_l, cem_p, claims.email_len) { return false; };
+    let ro_p: ptr = PTR_NULL();
+    let ro_l: u64 = 0;
+    au_row_field(&row, 4, &ro_p, &ro_l);
+    let cro_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(cro_p, &claims.role, 0);
+    if !au_eq(ro_p, ro_l, cro_p, claims.role_len) { return false; };
+    let id_p: ptr = PTR_NULL();
+    let id_l: u64 = 0;
+    au_row_field(&row, 0, &id_p, &id_l);
+    let stmt: u64 = au_prepare(s.db, STR_PTR("UPDATE users SET last_active_at = ? WHERE id = ?"), STR_LEN("UPDATE users SET last_active_at = ? WHERE id = ?"));
+    if stmt != 0 {
+        au_bind_int(stmt, 1, sa_time_unix_ms());
+        au_bind_text(stmt, 2, id_p, id_l);
+        au_step_once(stmt);
+        au_finalize(stmt);
+    };
+    authUserFromRow(&row, out_json);
+    return *out_json != 0;
+}
+
+// ---- member input field access (code: 0 email, 1 password,
+// 2 username, 3 role, 4 status, 5 maxPermission, 6 notes) ----
+fn au_create_field(input: &CreateMemberInput, code: u64, out_p: &ptr, out_l: &u64) -> void {
+    *out_p = PTR_NULL();
+    *out_l = 0;
+    if code == 0 { PTR_BYTE_ADD(*out_p, &input.email, 0); *out_l = input.email_len; };
+    if code == 1 { PTR_BYTE_ADD(*out_p, &input.password, 0); *out_l = input.password_len; };
+    if code == 2 { PTR_BYTE_ADD(*out_p, &input.username, 0); *out_l = input.username_len; };
+    if code == 3 { PTR_BYTE_ADD(*out_p, &input.role, 0); *out_l = input.role_len; };
+    if code == 4 { PTR_BYTE_ADD(*out_p, &input.status, 0); *out_l = input.status_len; };
+    if code == 5 { PTR_BYTE_ADD(*out_p, &input.maxPermission, 0); *out_l = input.maxPermission_len; };
+    if code == 6 { PTR_BYTE_ADD(*out_p, &input.notes, 0); *out_l = input.notes_len; };
+}
+
+fn au_update_field(input: &UpdateMemberInput, code: u64, out_p: &ptr, out_l: &u64) -> void {
+    *out_p = PTR_NULL();
+    *out_l = 0;
+    if code == 0 { PTR_BYTE_ADD(*out_p, &input.email, 0); *out_l = input.email_len; };
+    if code == 1 { PTR_BYTE_ADD(*out_p, &input.password, 0); *out_l = input.password_len; };
+    if code == 2 { PTR_BYTE_ADD(*out_p, &input.username, 0); *out_l = input.username_len; };
+    if code == 3 { PTR_BYTE_ADD(*out_p, &input.role, 0); *out_l = input.role_len; };
+    if code == 4 { PTR_BYTE_ADD(*out_p, &input.status, 0); *out_l = input.status_len; };
+    if code == 5 { PTR_BYTE_ADD(*out_p, &input.maxPermission, 0); *out_l = input.maxPermission_len; };
+    if code == 6 { PTR_BYTE_ADD(*out_p, &input.notes, 0); *out_l = input.notes_len; };
+}
+
+fn au_set_create_field(input: &CreateMemberInput, code: u64, p: ptr, l: u64) -> void {
+    let i: u64 = 0;
+    if code == 0 { input.email_len = 0; while i < l && i < 320 { input.email[i] = au_byte(p, i); i = i + 1; } input.email_len = i; };
+    if code == 1 { input.password_len = 0; while i < l && i < 512 { input.password[i] = au_byte(p, i); i = i + 1; } input.password_len = i; };
+    if code == 2 { input.username_len = 0; while i < l && i < 256 { input.username[i] = au_byte(p, i); i = i + 1; } input.username_len = i; };
+    if code == 3 { input.role_len = 0; while i < l && i < 16 { input.role[i] = au_byte(p, i); i = i + 1; } input.role_len = i; };
+    if code == 4 { input.status_len = 0; while i < l && i < 16 { input.status[i] = au_byte(p, i); i = i + 1; } input.status_len = i; };
+    if code == 5 { input.maxPermission_len = 0; while i < l && i < 32 { input.maxPermission[i] = au_byte(p, i); i = i + 1; } input.maxPermission_len = i; };
+    if code == 6 { input.notes_len = 0; while i < l && i < 1024 { input.notes[i] = au_byte(p, i); i = i + 1; } input.notes_len = i; };
+}
+
+// existence probe for a prepared one-bind statement
+fn au_exists1(s: &AuthStore, sql_p: ptr, sql_l: u64, b1_p: ptr, b1_l: u64) -> bool {
+    let stmt: u64 = au_prepare(s.db, sql_p, sql_l);
+    if stmt == 0 { return false; };
+    au_bind_text(stmt, 1, b1_p, b1_l);
+    let doc: u64 = 0;
+    let has: bool = au_step_row(stmt, &doc);
+    au_finalize(stmt);
+    if doc != 0 {
+        let f: i32 = sa_json_free(doc);
+    };
+    return has;
+}
+
+fn au_count_admins(s: &AuthStore, exclude_p: ptr, exclude_l: u64, has_exclude: bool) -> i64 {
+    let stmt: u64 = 0;
+    if has_exclude {
+        stmt = au_prepare(s.db, STR_PTR("SELECT COUNT(*) AS count FROM users WHERE role = 'admin' AND status = 'active' AND deleted_at IS NULL AND id != ?"), STR_LEN("SELECT COUNT(*) AS count FROM users WHERE role = 'admin' AND status = 'active' AND deleted_at IS NULL AND id != ?"));
+        if stmt == 0 { return 0; };
+        au_bind_text(stmt, 1, exclude_p, exclude_l);
+    } else {
+        stmt = au_prepare(s.db, STR_PTR("SELECT COUNT(*) AS count FROM users WHERE role = 'admin' AND deleted_at IS NULL"), STR_LEN("SELECT COUNT(*) AS count FROM users WHERE role = 'admin' AND deleted_at IS NULL"));
+        if stmt == 0 { return 0; };
+    };
+    let doc: u64 = 0;
+    let has: bool = au_step_row(stmt, &doc);
+    au_finalize(stmt);
+    if !has { return 0; };
+    let n: i64 = au_col_i64(doc, STR_PTR("count"), STR_LEN("count"));
+    let f: i32 = sa_json_free(doc);
+    return n;
+}
+
+// ---- L1105-1113 — ensureAtLeastOneAdmin ----
+fn AuthStore_ensureAtLeastOneAdmin(s: &AuthStore, exclude_id_ptr: ptr, exclude_id_len: u64) -> i32 {
+    let n: i64 = au_count_admins(s, exclude_id_ptr, exclude_id_len, true);
+    if n < 1 {
+        return au_throw(STR_PTR("At least one active admin is required"), STR_LEN("At least one active admin is required"));
+    };
     return 0;
 }
 
-// ---- asRecord(value: unknown): Record<string,unknown> ---- // DEFECT: dynamic object (same helper as providerStore)
-fn asRecord(value_json: u64, out_json: &u64) -> void {
-    // return value && typeof==="object" && !Array.isArray(value) ? value : {}
+// ---- L255-322 — createUser ----
+fn AuthStore_createUser(s: &AuthStore, input: &CreateMemberInput, out_json: &u64) -> i32 {
+    *out_json = 0;
+    let em_p: ptr = PTR_NULL();
+    let em_l: u64 = 0;
+    au_create_field(input, 0, &em_p, &em_l);
+    let ne_p: ptr = PTR_NULL();
+    let ne_l: u64 = 0;
+    normalizeEmail(em_p, em_l, &ne_p, &ne_l);
+    if ne_l == 0 {
+        return au_throw(STR_PTR("Invalid email"), STR_LEN("Invalid email"));
+    };
+    let pw_p: ptr = PTR_NULL();
+    let pw_l: u64 = 0;
+    au_create_field(input, 1, &pw_p, &pw_l);
+    if pw_l < 8 {
+        return au_throw(STR_PTR("Password must be at least 8 characters"), STR_LEN("Password must be at least 8 characters"));
+    };
+    if au_exists1(s, STR_PTR("SELECT id FROM users WHERE email = ? AND deleted_at IS NULL LIMIT 1"), STR_LEN("SELECT id FROM users WHERE email = ? AND deleted_at IS NULL LIMIT 1"), ne_p, ne_l) {
+        return au_throw(STR_PTR("Email already exists"), STR_LEN("Email already exists"));
+    };
+    let id = AuText { bytes: [0; 65536], len: 0 };
+    au_random_uuid(&id);
+    let now: i64 = sa_time_unix_ms();
+    let role_p: ptr = STR_PTR("user");
+    let role_l: u64 = STR_LEN("user");
+    if input.has_role {
+        let rp: ptr = PTR_NULL();
+        let rl: u64 = 0;
+        au_create_field(input, 3, &rp, &rl);
+        if au_eq(rp, rl, STR_PTR("admin"), STR_LEN("admin")) {
+            role_p = STR_PTR("admin");
+            role_l = STR_LEN("admin");
+        };
+    };
+    let is_admin: bool = au_eq(role_p, role_l, STR_PTR("admin"), STR_LEN("admin"));
+    let status_p: ptr = STR_PTR("active");
+    let status_l: u64 = STR_LEN("active");
+    if input.has_status {
+        let sp: ptr = PTR_NULL();
+        let sl: u64 = 0;
+        au_create_field(input, 4, &sp, &sl);
+        if au_eq(sp, sl, STR_PTR("disabled"), STR_LEN("disabled")) {
+            status_p = STR_PTR("disabled");
+            status_l = STR_LEN("disabled");
+        };
+    };
+    let mp_in_p: ptr = PTR_NULL();
+    let mp_in_l: u64 = 0;
+    au_create_field(input, 5, &mp_in_p, &mp_in_l);
+    let fb_p: ptr = STR_PTR("workspaceAsk");
+    let fb_l: u64 = STR_LEN("workspaceAsk");
+    if is_admin {
+        fb_p = STR_PTR("dangerBypass");
+        fb_l = STR_LEN("dangerBypass");
+    };
+    let mp_p: ptr = PTR_NULL();
+    let mp_l: u64 = 0;
+    normalizePermission(mp_in_p, mp_in_l, input.has_maxPermission, fb_p, fb_l, &mp_p, &mp_l);
+    let allow_write: bool = !au_eq(mp_p, mp_l, STR_PTR("readonlyAsk"), STR_LEN("readonlyAsk"));
+    if input.has_allowWrite { allow_write = input.allowWrite; };
+    let allow_network: bool = false;
+    if input.has_allowNetwork { allow_network = input.allowNetwork; };
+    let allow_danger: bool = is_admin && au_eq(mp_p, mp_l, STR_PTR("dangerBypass"), STR_LEN("dangerBypass"));
+    if input.has_allowDangerBypass { allow_danger = input.allowDangerBypass; };
+    let mr_p: ptr = PTR_NULL();
+    let mr_l: u64 = 0;
+    au_cfg_field(&s.config, 3, &mr_p, &mr_l);
+    let ws = AuPath { bytes: [0; 4096], len: 0 };
+    au_path_join3(mr_p, mr_l, au_text_ptr(&id), id.len, STR_PTR("workspace"), STR_LEN("workspace"), &ws);
+    au_mkdir_p(au_path_ptr(&ws), ws.len);
+    let hash_doc: u64 = 0;
+    let hst: i32 = hashPassword(pw_p, pw_l, &hash_doc);
+    let hash = AuText { bytes: [0; 65536], len: 0 };
+    if hash_doc != 0 {
+        let hp: ptr = PTR_NULL();
+        let hl: u64 = 0;
+        if au_field_str(hash_doc, STR_PTR("hash"), STR_LEN("hash"), &hp, &hl) {
+            au_append(&hash, hp, hl);
+        };
+        let f: i32 = sa_json_free(hash_doc);
+    };
+    // username: trim(input.username ?? "") || fallback
+    let un_p: ptr = PTR_NULL();
+    let un_l: u64 = 0;
+    au_create_field(input, 2, &un_p, &un_l);
+    let ulo: u64 = 0;
+    let uhi: u64 = 0;
+    au_trim_range(un_p, un_l, &ulo, &uhi);
+    let username = AuText { bytes: [0; 65536], len: 0 };
+    if uhi > ulo {
+        let seg: ptr = PTR_NULL();
+        PTR_BYTE_ADD(seg, un_p, ulo);
+        au_append(&username, seg, uhi - ulo);
+    } else {
+        if is_admin {
+            au_append(&username, STR_PTR("Admin"), STR_LEN("Admin"));
+        } else {
+            let at: u64 = 0;
+            while at < ne_l && au_byte(ne_p, at) != 64 { at = at + 1; }
+            if at > 0 {
+                au_append(&username, ne_p, at);
+            } else {
+                au_append(&username, STR_PTR("member"), STR_LEN("member"));
+            };
+        };
+    };
+    let balance: f64 = 0.0;
+    if input.has_balance { balance = input.balance; };
+    let conc_in: f64 = 5.0;
+    if input.has_concurrency { conc_in = input.concurrency; };
+    let conc: i64 = (au_floor(conc_in)) as i64;
+    if conc < 1 { conc = 1; };
+    if conc > 100 { conc = 100; };
+    let notes_p: ptr = STR_PTR("");
+    let notes_l: u64 = 0;
+    if input.has_notes {
+        au_create_field(input, 6, &notes_p, &notes_l);
+    };
+    let stmt: u64 = au_prepare(s.db, STR_PTR("INSERT INTO users (id, email, username, password_hash, role, status, balance, concurrency, max_permission, allow_write, allow_network, allow_danger_bypass, workspace_root, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"), STR_LEN("INSERT INTO users (id, email, username, password_hash, role, status, balance, concurrency, max_permission, allow_write, allow_network, allow_danger_bypass, workspace_root, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+    if stmt == 0 {
+        return au_throw(STR_PTR("Failed to create user"), STR_LEN("Failed to create user"));
+    };
+    au_bind_text(stmt, 1, au_text_ptr(&id), id.len);
+    au_bind_text(stmt, 2, ne_p, ne_l);
+    au_bind_text(stmt, 3, au_text_ptr(&username), username.len);
+    au_bind_text(stmt, 4, au_text_ptr(&hash), hash.len);
+    au_bind_text(stmt, 5, role_p, role_l);
+    au_bind_text(stmt, 6, status_p, status_l);
+    au_bind_double(stmt, 7, balance);
+    au_bind_int(stmt, 8, conc);
+    au_bind_text(stmt, 9, mp_p, mp_l);
+    let aw_i: i64 = 0;
+    if allow_write { aw_i = 1; };
+    au_bind_int(stmt, 10, aw_i);
+    let an_i: i64 = 0;
+    if allow_network { an_i = 1; };
+    au_bind_int(stmt, 11, an_i);
+    let ad_i: i64 = 0;
+    if allow_danger { ad_i = 1; };
+    au_bind_int(stmt, 12, ad_i);
+    au_bind_text(stmt, 13, au_path_ptr(&ws), ws.len);
+    au_bind_text(stmt, 14, notes_p, notes_l);
+    au_bind_int(stmt, 15, now);
+    au_bind_int(stmt, 16, now);
+    au_step_once(stmt);
+    au_finalize(stmt);
+    if !AuthStore_getUser(s, au_text_ptr(&id), id.len, out_json) {
+        return au_throw(STR_PTR("Failed to create user"), STR_LEN("Failed to create user"));
+    };
+    return 0;
 }
 
-// ---- stringValue(value: unknown): string|undefined ---- // DEFECT: unknown
+// ---- L324-~420 — updateUser ----
+fn AuthStore_updateUser(s: &AuthStore, id_ptr: ptr, id_len: u64, input: &UpdateMemberInput, out_json: &u64) -> i32 {
+    *out_json = 0;
+    let existing = UserRow { id: [0; 64], id_len: 0, email: [0; 320], email_len: 0, username: [0; 256], username_len: 0, password_hash: [0; 512], password_hash_len: 0, role: [0; 16], role_len: 0, status: [0; 16], status_len: 0, balance: 0.0, concurrency: 0, max_permission: [0; 32], max_permission_len: 0, allow_write: 0, allow_network: 0, allow_danger_bypass: 0, workspace_root: [0; 512], workspace_root_len: 0, notes: [0; 1024], notes_len: 0, totp_secret: [0; 256], totp_secret_len: 0, totp_enabled: 0, totp_enabled_at: 0, has_totp_enabled_at: false, created_at: 0, updated_at: 0, deleted_at: 0, has_deleted_at: false };
+    if !AuthStore_getUserRow(s, id_ptr, id_len, &existing) {
+        return au_throw(STR_PTR("User not found"), STR_LEN("User not found"));
+    };
+    let ex_email_p: ptr = PTR_NULL();
+    let ex_email_l: u64 = 0;
+    au_row_field(&existing, 1, &ex_email_p, &ex_email_l);
+    let email_p: ptr = ex_email_p;
+    let email_l: u64 = ex_email_l;
+    if input.has_email {
+        let ie_p: ptr = PTR_NULL();
+        let ie_l: u64 = 0;
+        au_update_field(input, 0, &ie_p, &ie_l);
+        normalizeEmail(ie_p, ie_l, &email_p, &email_l);
+    };
+    if email_l == 0 {
+        return au_throw(STR_PTR("Invalid email"), STR_LEN("Invalid email"));
+    };
+    if !au_eq(email_p, email_l, ex_email_p, ex_email_l) {
+        let stmt: u64 = au_prepare(s.db, STR_PTR("SELECT id FROM users WHERE email = ? AND deleted_at IS NULL AND id != ? LIMIT 1"), STR_LEN("SELECT id FROM users WHERE email = ? AND deleted_at IS NULL AND id != ? LIMIT 1"));
+        let clash: bool = false;
+        if stmt != 0 {
+            au_bind_text(stmt, 1, email_p, email_l);
+            au_bind_text(stmt, 2, id_ptr, id_len);
+            let doc: u64 = 0;
+            clash = au_step_row(stmt, &doc);
+            if doc != 0 {
+                let f: i32 = sa_json_free(doc);
+            };
+            au_finalize(stmt);
+        };
+        if clash {
+            return au_throw(STR_PTR("Email already exists"), STR_LEN("Email already exists"));
+        };
+    };
+    let ex_role_p: ptr = PTR_NULL();
+    let ex_role_l: u64 = 0;
+    au_row_field(&existing, 4, &ex_role_p, &ex_role_l);
+    let role_p: ptr = ex_role_p;
+    let role_l: u64 = ex_role_l;
+    if input.has_role {
+        au_update_field(input, 3, &role_p, &role_l);
+    };
+    let ex_status_p: ptr = PTR_NULL();
+    let ex_status_l: u64 = 0;
+    au_row_field(&existing, 5, &ex_status_p, &ex_status_l);
+    let status_p: ptr = ex_status_p;
+    let status_l: u64 = ex_status_l;
+    if input.has_status {
+        au_update_field(input, 4, &status_p, &status_l);
+    };
+    let ex_mp_p: ptr = PTR_NULL();
+    let ex_mp_l: u64 = 0;
+    au_row_field(&existing, 6, &ex_mp_p, &ex_mp_l);
+    let mp_src_p: ptr = ex_mp_p;
+    let mp_src_l: u64 = ex_mp_l;
+    if input.has_maxPermission {
+        au_update_field(input, 5, &mp_src_p, &mp_src_l);
+    };
+    let mp_p: ptr = PTR_NULL();
+    let mp_l: u64 = 0;
+    normalizePermission(mp_src_p, mp_src_l, true, ex_mp_p, ex_mp_l, &mp_p, &mp_l);
+    let allow_write: bool = existing.allow_write != 0;
+    if input.has_allowWrite { allow_write = input.allowWrite; };
+    let allow_network: bool = existing.allow_network != 0;
+    if input.has_allowNetwork { allow_network = input.allowNetwork; };
+    let allow_danger: bool = existing.allow_danger_bypass != 0;
+    if input.has_allowDangerBypass { allow_danger = input.allowDangerBypass; };
+    let hash = AuText { bytes: [0; 65536], len: 0 };
+    let ex_hash_p: ptr = PTR_NULL();
+    let ex_hash_l: u64 = 0;
+    au_row_field(&existing, 3, &ex_hash_p, &ex_hash_l);
+    au_append(&hash, ex_hash_p, ex_hash_l);
+    if input.has_password {
+        let np_p: ptr = PTR_NULL();
+        let np_l: u64 = 0;
+        au_update_field(input, 1, &np_p, &np_l);
+        if np_l > 0 {
+            if np_l < 8 {
+                return au_throw(STR_PTR("Password must be at least 8 characters"), STR_LEN("Password must be at least 8 characters"));
+            };
+            let hash_doc: u64 = 0;
+            let hst: i32 = hashPassword(np_p, np_l, &hash_doc);
+            hash.len = 0;
+            if hash_doc != 0 {
+                let hp: ptr = PTR_NULL();
+                let hl: u64 = 0;
+                if au_field_str(hash_doc, STR_PTR("hash"), STR_LEN("hash"), &hp, &hl) {
+                    au_append(&hash, hp, hl);
+                };
+                let f: i32 = sa_json_free(hash_doc);
+            };
+        };
+    };
+    let ex_un_p: ptr = PTR_NULL();
+    let ex_un_l: u64 = 0;
+    au_row_field(&existing, 2, &ex_un_p, &ex_un_l);
+    let username = AuText { bytes: [0; 65536], len: 0 };
+    if input.has_username {
+        let iu_p: ptr = PTR_NULL();
+        let iu_l: u64 = 0;
+        au_update_field(input, 2, &iu_p, &iu_l);
+        let ulo: u64 = 0;
+        let uhi: u64 = 0;
+        au_trim_range(iu_p, iu_l, &ulo, &uhi);
+        let seg: ptr = PTR_NULL();
+        PTR_BYTE_ADD(seg, iu_p, ulo);
+        au_append(&username, seg, uhi - ulo);
+    } else {
+        au_append(&username, ex_un_p, ex_un_l);
+    };
+    let balance: f64 = existing.balance;
+    if input.has_balance { balance = input.balance; };
+    let conc_in: f64 = existing.concurrency as f64;
+    if input.has_concurrency { conc_in = input.concurrency; };
+    let conc: i64 = (au_floor(conc_in)) as i64;
+    if conc < 1 { conc = 1; };
+    if conc > 100 { conc = 100; };
+    let ex_notes_p: ptr = PTR_NULL();
+    let ex_notes_l: u64 = 0;
+    au_row_field(&existing, 8, &ex_notes_p, &ex_notes_l);
+    let notes_p: ptr = ex_notes_p;
+    let notes_l: u64 = ex_notes_l;
+    if input.has_notes {
+        au_update_field(input, 6, &notes_p, &notes_l);
+    };
+    let stmt: u64 = au_prepare(s.db, STR_PTR("UPDATE users SET email = ?, username = ?, password_hash = ?, role = ?, status = ?, balance = ?, concurrency = ?, max_permission = ?, allow_write = ?, allow_network = ?, allow_danger_bypass = ?, notes = ?, updated_at = ? WHERE id = ?"), STR_LEN("UPDATE users SET email = ?, username = ?, password_hash = ?, role = ?, status = ?, balance = ?, concurrency = ?, max_permission = ?, allow_write = ?, allow_network = ?, allow_danger_bypass = ?, notes = ?, updated_at = ? WHERE id = ?"));
+    if stmt == 0 {
+        return au_throw(STR_PTR("User not found"), STR_LEN("User not found"));
+    };
+    au_bind_text(stmt, 1, email_p, email_l);
+    au_bind_text(stmt, 2, au_text_ptr(&username), username.len);
+    au_bind_text(stmt, 3, au_text_ptr(&hash), hash.len);
+    au_bind_text(stmt, 4, role_p, role_l);
+    au_bind_text(stmt, 5, status_p, status_l);
+    au_bind_double(stmt, 6, balance);
+    au_bind_int(stmt, 7, conc);
+    au_bind_text(stmt, 8, mp_p, mp_l);
+    let aw_i: i64 = 0;
+    if allow_write { aw_i = 1; };
+    au_bind_int(stmt, 9, aw_i);
+    let an_i: i64 = 0;
+    if allow_network { an_i = 1; };
+    au_bind_int(stmt, 10, an_i);
+    let ad_i: i64 = 0;
+    if allow_danger { ad_i = 1; };
+    au_bind_int(stmt, 11, ad_i);
+    au_bind_text(stmt, 12, notes_p, notes_l);
+    au_bind_int(stmt, 13, sa_time_unix_ms());
+    au_bind_text(stmt, 14, id_ptr, id_len);
+    au_step_once(stmt);
+    au_finalize(stmt);
+    // TS evaluates the last-admin guard AFTER the update lands
+    let ex_is_admin: bool = au_eq(ex_role_p, ex_role_l, STR_PTR("admin"), STR_LEN("admin"));
+    if ex_is_admin && !au_eq(role_p, role_l, STR_PTR("admin"), STR_LEN("admin")) {
+        let gst: i32 = AuthStore_ensureAtLeastOneAdmin(s, id_ptr, id_len);
+        if gst != 0 { return gst; };
+    };
+    if ex_is_admin && au_eq(status_p, status_l, STR_PTR("disabled"), STR_LEN("disabled")) {
+        let gst: i32 = AuthStore_ensureAtLeastOneAdmin(s, id_ptr, id_len);
+        if gst != 0 { return gst; };
+    };
+    if !AuthStore_getUser(s, id_ptr, id_len, out_json) {
+        return au_throw(STR_PTR("User not found after update"), STR_LEN("User not found after update"));
+    };
+    return 0;
+}
+
+// ---- softDeleteUser ----
+fn AuthStore_softDeleteUser(s: &AuthStore, id_ptr: ptr, id_len: u64) -> i32 {
+    let existing = UserRow { id: [0; 64], id_len: 0, email: [0; 320], email_len: 0, username: [0; 256], username_len: 0, password_hash: [0; 512], password_hash_len: 0, role: [0; 16], role_len: 0, status: [0; 16], status_len: 0, balance: 0.0, concurrency: 0, max_permission: [0; 32], max_permission_len: 0, allow_write: 0, allow_network: 0, allow_danger_bypass: 0, workspace_root: [0; 512], workspace_root_len: 0, notes: [0; 1024], notes_len: 0, totp_secret: [0; 256], totp_secret_len: 0, totp_enabled: 0, totp_enabled_at: 0, has_totp_enabled_at: false, created_at: 0, updated_at: 0, deleted_at: 0, has_deleted_at: false };
+    if !AuthStore_getUserRow(s, id_ptr, id_len, &existing) {
+        return au_throw(STR_PTR("User not found"), STR_LEN("User not found"));
+    };
+    let role_p: ptr = PTR_NULL();
+    let role_l: u64 = 0;
+    au_row_field(&existing, 4, &role_p, &role_l);
+    if au_eq(role_p, role_l, STR_PTR("admin"), STR_LEN("admin")) {
+        let gst: i32 = AuthStore_ensureAtLeastOneAdmin(s, id_ptr, id_len);
+        if gst != 0 { return gst; };
+    };
+    let stmt: u64 = au_prepare(s.db, STR_PTR("UPDATE users SET deleted_at = ?, updated_at = ?, status = 'disabled' WHERE id = ?"), STR_LEN("UPDATE users SET deleted_at = ?, updated_at = ?, status = 'disabled' WHERE id = ?"));
+    if stmt == 0 {
+        return au_throw(STR_PTR("User not found"), STR_LEN("User not found"));
+    };
+    au_bind_int(stmt, 1, sa_time_unix_ms());
+    au_bind_int(stmt, 2, sa_time_unix_ms());
+    au_bind_text(stmt, 3, id_ptr, id_len);
+    au_step_once(stmt);
+    au_finalize(stmt);
+    return 0;
+}
+
+// ---- assertCanStartTurn ----
+fn AuthStore_assertCanStartTurn(s: &AuthStore, user_json: u64) -> i32 {
+    let role_p: ptr = PTR_NULL();
+    let role_l: u64 = 0;
+    if au_field_str(user_json, STR_PTR("role"), STR_LEN("role"), &role_p, &role_l) {
+        if au_eq(role_p, role_l, STR_PTR("admin"), STR_LEN("admin")) { return 0; };
+    };
+    let bal: f64 = 0.0;
+    if au_field_num(user_json, STR_PTR("balance"), STR_LEN("balance"), &bal) {
+        if bal <= 0.0 {
+            return au_throw(STR_PTR("Insufficient balance. Ask an admin to allocate credit."), STR_LEN("Insufficient balance. Ask an admin to allocate credit."));
+        };
+    };
+    return 0;
+}
+
+// ---- L1115-1131 — ensureDefaultAdmin ----
+fn AuthStore_ensureDefaultAdmin(s: &AuthStore) -> i32 {
+    let n: i64 = au_count_admins(s, PTR_NULL(), 0, false);
+    if n > 0 { return 0; };
+    let ae_p: ptr = PTR_NULL();
+    let ae_l: u64 = 0;
+    au_cfg_field(&s.config, 1, &ae_p, &ae_l);
+    let ne_p: ptr = PTR_NULL();
+    let ne_l: u64 = 0;
+    normalizeEmail(ae_p, ae_l, &ne_p, &ne_l);
+    if ne_l == 0 {
+        return au_throw(STR_PTR("CODEX_UI_ADMIN_EMAIL is invalid"), STR_LEN("CODEX_UI_ADMIN_EMAIL is invalid"));
+    };
+    let input = CreateMemberInput { email: [0; 320], email_len: 0, password: [0; 512], password_len: 0, username: [0; 256], username_len: 0, has_username: true, role: [0; 16], role_len: 0, has_role: true, status: [0; 16], status_len: 0, has_status: true, balance: 0.0, has_balance: false, concurrency: 20.0, has_concurrency: true, maxPermission: [0; 32], maxPermission_len: 0, has_maxPermission: true, allowWrite: true, has_allowWrite: true, allowNetwork: true, has_allowNetwork: true, allowDangerBypass: true, has_allowDangerBypass: true, notes: [0; 1024], notes_len: 0, has_notes: false };
+    au_set_create_field(&input, 0, ne_p, ne_l);
+    let ap_p: ptr = PTR_NULL();
+    let ap_l: u64 = 0;
+    au_cfg_field(&s.config, 2, &ap_p, &ap_l);
+    au_set_create_field(&input, 1, ap_p, ap_l);
+    au_set_create_field(&input, 2, STR_PTR("Super Admin"), STR_LEN("Super Admin"));
+    au_set_create_field(&input, 3, STR_PTR("admin"), STR_LEN("admin"));
+    au_set_create_field(&input, 4, STR_PTR("active"), STR_LEN("active"));
+    au_set_create_field(&input, 5, STR_PTR("dangerBypass"), STR_LEN("dangerBypass"));
+    let created: u64 = 0;
+    let cst: i32 = AuthStore_createUser(s, &input, &created);
+    if cst != 0 { return cst; };
+    let f: i32 = sa_json_free(created);
+    sa_print_bytes(STR_PTR("Created default admin account: "), STR_LEN("Created default admin account: "));
+    sa_print_bytes(ne_p, ne_l);
+    sa_print_bytes(STR_PTR("\n"), STR_LEN("\n"));
+    let pw_missing_a: bool = sa_env_has(STR_PTR("CODEX_UI_ADMIN_PASSWORD"), STR_LEN("CODEX_UI_ADMIN_PASSWORD")) == 0;
+    let pw_missing_b: bool = sa_env_has(STR_PTR("ADMIN_PASSWORD"), STR_LEN("ADMIN_PASSWORD")) == 0;
+    if pw_missing_a && pw_missing_b {
+        sa_print_bytes(STR_PTR("Set CODEX_UI_ADMIN_PASSWORD to change the default admin password\n"), STR_LEN("Set CODEX_UI_ADMIN_PASSWORD to change the default admin password\n"));
+    };
+    return 0;
+}
+
+// ---- debit/adjust/ledger ----
+fn au_debited(s: &AuthStore, user_id_p: ptr, user_id_l: u64, ref_p: ptr, ref_l: u64) -> bool {
+    let stmt: u64 = au_prepare(s.db, STR_PTR("SELECT 1 FROM balance_ledger WHERE user_id = ? AND reference_id = ? LIMIT 1"), STR_LEN("SELECT 1 FROM balance_ledger WHERE user_id = ? AND reference_id = ? LIMIT 1"));
+    if stmt == 0 { return false; };
+    au_bind_text(stmt, 1, user_id_p, user_id_l);
+    au_bind_text(stmt, 2, ref_p, ref_l);
+    let doc: u64 = 0;
+    let has: bool = au_step_row(stmt, &doc);
+    au_finalize(stmt);
+    if doc != 0 {
+        let f: i32 = sa_json_free(doc);
+    };
+    return has;
+}
+
+// TS catch path: ROLLBACK, idempotency recheck, then rethrow
+fn au_debit_fail(s: &AuthStore, user_id_p: ptr, user_id_l: u64, ref_p: ptr, ref_l: u64, out_json: &u64, msg_p: ptr, msg_l: u64) -> i32 {
+    let rst: i32 = au_exec(s.db, STR_PTR("ROLLBACK"), STR_LEN("ROLLBACK"));
+    if ref_l > 0 && au_debited(s, user_id_p, user_id_l, ref_p, ref_l) {
+        if AuthStore_getUser(s, user_id_p, user_id_l, out_json) {
+            return 0;
+        };
+    };
+    return au_throw(msg_p, msg_l);
+}
+
+fn AuthStore_debitBalance(s: &AuthStore, user_id_ptr: ptr, user_id_len: u64, amount: f64, meta_json: u64, has_meta: bool, out_json: &u64) -> i32 {
+    *out_json = 0;
+    if !(amount > 0.0) || !au_is_finite(amount) {
+        return au_throw(STR_PTR("Debit amount must be positive"), STR_LEN("Debit amount must be positive"));
+    };
+    let ref_id = AuText { bytes: [0; 65536], len: 0 };
+    if has_meta && meta_json != 0 {
+        let rp: ptr = PTR_NULL();
+        let rl: u64 = 0;
+        if au_field_str(meta_json, STR_PTR("referenceId"), STR_LEN("referenceId"), &rp, &rl) {
+            let lo: u64 = 0;
+            let hi: u64 = 0;
+            au_trim_range(rp, rl, &lo, &hi);
+            let seg: ptr = PTR_NULL();
+            PTR_BYTE_ADD(seg, rp, lo);
+            au_append(&ref_id, seg, hi - lo);
+        };
+    };
+    let existing = UserRow { id: [0; 64], id_len: 0, email: [0; 320], email_len: 0, username: [0; 256], username_len: 0, password_hash: [0; 512], password_hash_len: 0, role: [0; 16], role_len: 0, status: [0; 16], status_len: 0, balance: 0.0, concurrency: 0, max_permission: [0; 32], max_permission_len: 0, allow_write: 0, allow_network: 0, allow_danger_bypass: 0, workspace_root: [0; 512], workspace_root_len: 0, notes: [0; 1024], notes_len: 0, totp_secret: [0; 256], totp_secret_len: 0, totp_enabled: 0, totp_enabled_at: 0, has_totp_enabled_at: false, created_at: 0, updated_at: 0, deleted_at: 0, has_deleted_at: false };
+    if !AuthStore_getUserRow(s, user_id_ptr, user_id_len, &existing) {
+        return au_throw(STR_PTR("User not found"), STR_LEN("User not found"));
+    };
+    if ref_id.len > 0 && au_debited(s, user_id_ptr, user_id_len, au_text_ptr(&ref_id), ref_id.len) {
+        authUserFromRow(&existing, out_json);
+        return 0;
+    };
+    let role_p: ptr = PTR_NULL();
+    let role_l: u64 = 0;
+    au_row_field(&existing, 4, &role_p, &role_l);
+    if au_eq(role_p, role_l, STR_PTR("admin"), STR_LEN("admin")) {
+        authUserFromRow(&existing, out_json);
+        return 0;
+    };
+    let bst: i32 = au_exec(s.db, STR_PTR("BEGIN IMMEDIATE"), STR_LEN("BEGIN IMMEDIATE"));
+    let locked = UserRow { id: [0; 64], id_len: 0, email: [0; 320], email_len: 0, username: [0; 256], username_len: 0, password_hash: [0; 512], password_hash_len: 0, role: [0; 16], role_len: 0, status: [0; 16], status_len: 0, balance: 0.0, concurrency: 0, max_permission: [0; 32], max_permission_len: 0, allow_write: 0, allow_network: 0, allow_danger_bypass: 0, workspace_root: [0; 512], workspace_root_len: 0, notes: [0; 1024], notes_len: 0, totp_secret: [0; 256], totp_secret_len: 0, totp_enabled: 0, totp_enabled_at: 0, has_totp_enabled_at: false, created_at: 0, updated_at: 0, deleted_at: 0, has_deleted_at: false };
+    if !AuthStore_getUserRow(s, user_id_ptr, user_id_len, &locked) {
+        return au_debit_fail(s, user_id_ptr, user_id_len, au_text_ptr(&ref_id), ref_id.len, out_json, STR_PTR("User not found"), STR_LEN("User not found"));
+    };
+    let next: f64 = locked.balance - amount;
+    if next < 0.0 {
+        return au_debit_fail(s, user_id_ptr, user_id_len, au_text_ptr(&ref_id), ref_id.len, out_json, STR_PTR("Insufficient balance"), STR_LEN("Insufficient balance"));
+    };
+    let now: i64 = sa_time_unix_ms();
+    let ustmt: u64 = au_prepare(s.db, STR_PTR("UPDATE users SET balance = ?, updated_at = ? WHERE id = ?"), STR_LEN("UPDATE users SET balance = ?, updated_at = ? WHERE id = ?"));
+    if ustmt != 0 {
+        au_bind_double(ustmt, 1, next);
+        au_bind_int(ustmt, 2, now);
+        au_bind_text(ustmt, 3, user_id_ptr, user_id_len);
+        au_step_once(ustmt);
+        au_finalize(ustmt);
+    };
+    let reason_p: ptr = STR_PTR("usage");
+    let reason_l: u64 = STR_LEN("usage");
+    let tid_p: ptr = STR_PTR("");
+    let tid_l: u64 = 0;
+    let meth_p: ptr = STR_PTR("");
+    let meth_l: u64 = 0;
+    if has_meta && meta_json != 0 {
+        let xp: ptr = PTR_NULL();
+        let xl: u64 = 0;
+        if au_field_str(meta_json, STR_PTR("reason"), STR_LEN("reason"), &xp, &xl) { reason_p = xp; reason_l = xl; };
+        if au_field_str(meta_json, STR_PTR("threadId"), STR_LEN("threadId"), &xp, &xl) { tid_p = xp; tid_l = xl; };
+        if au_field_str(meta_json, STR_PTR("method"), STR_LEN("method"), &xp, &xl) { meth_p = xp; meth_l = xl; };
+    };
+    let lid = AuText { bytes: [0; 65536], len: 0 };
+    au_random_uuid(&lid);
+    let istmt: u64 = au_prepare(s.db, STR_PTR("INSERT INTO balance_ledger (id, user_id, delta, balance_after, operation, reason, thread_id, method, reference_id, created_at) VALUES (?, ?, ?, ?, 'debit', ?, ?, ?, ?, ?)"), STR_LEN("INSERT INTO balance_ledger (id, user_id, delta, balance_after, operation, reason, thread_id, method, reference_id, created_at) VALUES (?, ?, ?, ?, 'debit', ?, ?, ?, ?, ?)"));
+    if istmt != 0 {
+        au_bind_text(istmt, 1, au_text_ptr(&lid), lid.len);
+        au_bind_text(istmt, 2, user_id_ptr, user_id_len);
+        au_bind_double(istmt, 3, 0.0 - amount);
+        au_bind_double(istmt, 4, next);
+        au_bind_text(istmt, 5, reason_p, reason_l);
+        au_bind_text(istmt, 6, tid_p, tid_l);
+        au_bind_text(istmt, 7, meth_p, meth_l);
+        au_bind_text(istmt, 8, au_text_ptr(&ref_id), ref_id.len);
+        au_bind_int(istmt, 9, now);
+        au_step_once(istmt);
+        au_finalize(istmt);
+    };
+    let cst: i32 = au_exec(s.db, STR_PTR("COMMIT"), STR_LEN("COMMIT"));
+    if !AuthStore_getUser(s, user_id_ptr, user_id_len, out_json) {
+        return au_throw(STR_PTR("User not found after debit"), STR_LEN("User not found after debit"));
+    };
+    return 0;
+}
+
+fn AuthStore_adjustBalance(s: &AuthStore, user_id_ptr: ptr, user_id_len: u64, amount: f64, operation: u64, notes_ptr: ptr, notes_len: u64, out_json: &u64) -> i32 {
+    *out_json = 0;
+    let op_p: ptr = STR_PTR("set");
+    let op_l: u64 = STR_LEN("set");
+    if operation == 1 { op_p = STR_PTR("add"); op_l = STR_LEN("add"); };
+    if operation == 2 { op_p = STR_PTR("subtract"); op_l = STR_LEN("subtract"); };
+    if !au_is_finite(amount) {
+        return au_throw(STR_PTR("Invalid amount"), STR_LEN("Invalid amount"));
+    };
+    if operation != 0 && !(amount > 0.0) {
+        return au_throw(STR_PTR("Amount must be > 0 for add/subtract"), STR_LEN("Amount must be > 0 for add/subtract"));
+    };
+    if operation == 0 && amount < 0.0 {
+        return au_throw(STR_PTR("Balance cannot be negative"), STR_LEN("Balance cannot be negative"));
+    };
+    let existing = UserRow { id: [0; 64], id_len: 0, email: [0; 320], email_len: 0, username: [0; 256], username_len: 0, password_hash: [0; 512], password_hash_len: 0, role: [0; 16], role_len: 0, status: [0; 16], status_len: 0, balance: 0.0, concurrency: 0, max_permission: [0; 32], max_permission_len: 0, allow_write: 0, allow_network: 0, allow_danger_bypass: 0, workspace_root: [0; 512], workspace_root_len: 0, notes: [0; 1024], notes_len: 0, totp_secret: [0; 256], totp_secret_len: 0, totp_enabled: 0, totp_enabled_at: 0, has_totp_enabled_at: false, created_at: 0, updated_at: 0, deleted_at: 0, has_deleted_at: false };
+    if !AuthStore_getUserRow(s, user_id_ptr, user_id_len, &existing) {
+        return au_throw(STR_PTR("User not found"), STR_LEN("User not found"));
+    };
+    let current: f64 = existing.balance;
+    let next: f64 = amount;
+    if operation == 1 { next = current + amount; };
+    if operation == 2 { next = current - amount; };
+    if next < 0.0 {
+        return au_throw(STR_PTR("Balance cannot be negative"), STR_LEN("Balance cannot be negative"));
+    };
+    let ustmt: u64 = au_prepare(s.db, STR_PTR("UPDATE users SET balance = ?, updated_at = ? WHERE id = ?"), STR_LEN("UPDATE users SET balance = ?, updated_at = ? WHERE id = ?"));
+    let now: i64 = sa_time_unix_ms();
+    if ustmt != 0 {
+        au_bind_double(ustmt, 1, next);
+        au_bind_int(ustmt, 2, now);
+        au_bind_text(ustmt, 3, user_id_ptr, user_id_len);
+        au_step_once(ustmt);
+        au_finalize(ustmt);
+    };
+    let reason = AuText { bytes: [0; 65536], len: 0 };
+    if notes_len > 0 {
+        au_append(&reason, notes_ptr, notes_len);
+    } else {
+        au_append(&reason, STR_PTR("admin "), STR_LEN("admin "));
+        au_append(&reason, op_p, op_l);
+    };
+    let lid = AuText { bytes: [0; 65536], len: 0 };
+    au_random_uuid(&lid);
+    let istmt: u64 = au_prepare(s.db, STR_PTR("INSERT INTO balance_ledger (id, user_id, delta, balance_after, operation, reason, thread_id, method, created_at) VALUES (?, ?, ?, ?, ?, ?, '', 'admin', ?)"), STR_LEN("INSERT INTO balance_ledger (id, user_id, delta, balance_after, operation, reason, thread_id, method, created_at) VALUES (?, ?, ?, ?, ?, ?, '', 'admin', ?)"));
+    if istmt != 0 {
+        au_bind_text(istmt, 1, au_text_ptr(&lid), lid.len);
+        au_bind_text(istmt, 2, user_id_ptr, user_id_len);
+        au_bind_double(istmt, 3, next - current);
+        au_bind_double(istmt, 4, next);
+        au_bind_text(istmt, 5, op_p, op_l);
+        au_bind_text(istmt, 6, au_text_ptr(&reason), reason.len);
+        au_bind_int(istmt, 7, now);
+        au_step_once(istmt);
+        au_finalize(istmt);
+    };
+    if !AuthStore_getUser(s, user_id_ptr, user_id_len, out_json) {
+        return au_throw(STR_PTR("User not found after balance update"), STR_LEN("User not found after balance update"));
+    };
+    return 0;
+}
+
+fn au_clamp_limit(limit: f64, cap: f64) -> i64 {
+    let v: i64 = (au_floor(limit)) as i64;
+    if v < 1 { v = 1; };
+    if (v as f64) > cap { v = cap as i64; };
+    return v;
+}
+
+fn au_collect_ledger(s: &AuthStore, stmt: u64, out_json: &u64) -> void {
+    let arr: u64 = sa_json_parse(STR_PTR("[]"), STR_LEN("[]"));
+    *out_json = arr;
+    if stmt == 0 || arr == 0 { return; };
+    let guard: u64 = 0;
+    while guard < 100000 {
+        guard = guard + 1;
+        let doc: u64 = 0;
+        if !au_step_row(stmt, &doc) { break; };
+        let pst: i32 = sa_json_array_push_node(arr, doc);
+    }
+}
+
+fn AuthStore_listBalanceLedger(s: &AuthStore, user_id_ptr: ptr, user_id_len: u64, limit: f64, out_json: &u64) -> void {
+    let lim: i64 = au_clamp_limit(limit, 200.0);
+    let stmt: u64 = au_prepare(s.db, STR_PTR("SELECT id, user_id, delta, balance_after, operation, reason, thread_id, method, reference_id, created_at FROM balance_ledger WHERE user_id = ? ORDER BY created_at DESC LIMIT ?"), STR_LEN("SELECT id, user_id, delta, balance_after, operation, reason, thread_id, method, reference_id, created_at FROM balance_ledger WHERE user_id = ? ORDER BY created_at DESC LIMIT ?"));
+    if stmt != 0 {
+        au_bind_text(stmt, 1, user_id_ptr, user_id_len);
+        au_bind_int(stmt, 2, lim);
+    };
+    au_collect_ledger(s, stmt, out_json);
+    au_finalize(stmt);
+}
+
+fn AuthStore_listBalanceLedgerForAdmin(s: &AuthStore, limit: f64, user_id_ptr: ptr, user_id_len: u64, has_user_id: bool, out_json: &u64) -> void {
+    let lim: i64 = au_clamp_limit(limit, 500.0);
+    if has_user_id {
+        AuthStore_listBalanceLedger(s, user_id_ptr, user_id_len, lim as f64, out_json);
+        return;
+    };
+    let stmt: u64 = au_prepare(s.db, STR_PTR("SELECT l.id, l.user_id, u.email AS user_email, l.delta, l.balance_after, l.operation, l.reason, l.thread_id, l.method, l.reference_id, l.created_at FROM balance_ledger l LEFT JOIN users u ON u.id = l.user_id ORDER BY l.created_at DESC LIMIT ?"), STR_LEN("SELECT l.id, l.user_id, u.email AS user_email, l.delta, l.balance_after, l.operation, l.reason, l.thread_id, l.method, l.reference_id, l.created_at FROM balance_ledger l LEFT JOIN users u ON u.id = l.user_id ORDER BY l.created_at DESC LIMIT ?"));
+    if stmt != 0 {
+        au_bind_int(stmt, 1, lim);
+    };
+    au_collect_ledger(s, stmt, out_json);
+    au_finalize(stmt);
+}
+
+// ---- getUsageSummary ----
+fn au_iso_date(ms: i64, out: &AuSmall) -> void {
+    out.len = 0;
+    let buf: u64 = sa_time_iso_from_unix_ms(ms);
+    if buf == 0 { return; };
+    let bp: ptr = sa_fmt_buffer_data(buf);
+    let bl: u64 = sa_fmt_buffer_len(buf);
+    let n: u64 = bl;
+    if n > 10 { n = 10; };
+    au_append_small(out, bp, n);
+    let f: i32 = sa_fmt_buffer_free(buf);
+}
+
+fn au_summary_query(s: &AuthStore, sql_p: ptr, sql_l: u64, since: i64, uid_p: ptr, uid_l: u64, has_uid: bool, out_doc: &u64) -> bool {
+    *out_doc = 0;
+    let stmt: u64 = au_prepare(s.db, sql_p, sql_l);
+    if stmt == 0 { return false; };
+    au_bind_int(stmt, 1, since);
+    if has_uid {
+        au_bind_text(stmt, 2, uid_p, uid_l);
+    };
+    let has: bool = au_step_row(stmt, out_doc);
+    au_finalize(stmt);
+    return has;
+}
+
+fn AuthStore_getUsageSummary(s: &AuthStore, options_json: u64, has_options: bool, out: &UsageSummary) -> void {
+    let days_in: f64 = 7.0;
+    let uid_p: ptr = PTR_NULL();
+    let uid_l: u64 = 0;
+    let is_admin: bool = false;
+    if has_options && options_json != 0 {
+        let dv: f64 = 0.0;
+        if au_field_num(options_json, STR_PTR("days"), STR_LEN("days"), &dv) { days_in = dv; };
+        let xp: ptr = PTR_NULL();
+        let xl: u64 = 0;
+        if au_field_str(options_json, STR_PTR("userId"), STR_LEN("userId"), &xp, &xl) && xl > 0 {
+            uid_p = xp;
+            uid_l = xl;
+        };
+        is_admin = au_field_bool(options_json, STR_PTR("isAdmin"), STR_LEN("isAdmin"));
+    };
+    let has_uid: bool = uid_l > 0;
+    let days: i64 = (au_floor(days_in)) as i64;
+    if days < 1 { days = 1; };
+    if days > 90 { days = 90; };
+    let now: i64 = sa_time_unix_ms();
+    let since: i64 = now - ((days as i64) * 86400000);
+    // UTC midnight (registered deviation from TS local setHours)
+    let today_start: i64 = (now / 86400000) * 86400000;
+    out.periodDays = days as u64;
+    out.has_balance = false;
+    out.balance = 0.0;
+    if has_uid {
+        let udoc: u64 = 0;
+        if AuthStore_getUser(s, uid_p, uid_l, &udoc) {
+            let bv: f64 = 0.0;
+            if au_field_num(udoc, STR_PTR("balance"), STR_LEN("balance"), &bv) {
+                out.balance = bv;
+                out.has_balance = true;
+            };
+            let f: i32 = sa_json_free(udoc);
+        };
+    };
+    let tot_sql_p: ptr = STR_PTR("SELECT COALESCE(SUM(CASE WHEN delta < 0 THEN -delta ELSE 0 END), 0) AS total_debit, COALESCE(SUM(CASE WHEN delta > 0 THEN delta ELSE 0 END), 0) AS total_credit, COALESCE(SUM(CASE WHEN operation = 'debit' THEN 1 ELSE 0 END), 0) AS turn_count FROM balance_ledger WHERE created_at >= ?");
+    let tot_sql_l: u64 = STR_LEN("SELECT COALESCE(SUM(CASE WHEN delta < 0 THEN -delta ELSE 0 END), 0) AS total_debit, COALESCE(SUM(CASE WHEN delta > 0 THEN delta ELSE 0 END), 0) AS total_credit, COALESCE(SUM(CASE WHEN operation = 'debit' THEN 1 ELSE 0 END), 0) AS turn_count FROM balance_ledger WHERE created_at >= ?");
+    let tot_sql_u_p: ptr = STR_PTR("SELECT COALESCE(SUM(CASE WHEN delta < 0 THEN -delta ELSE 0 END), 0) AS total_debit, COALESCE(SUM(CASE WHEN delta > 0 THEN delta ELSE 0 END), 0) AS total_credit, COALESCE(SUM(CASE WHEN operation = 'debit' THEN 1 ELSE 0 END), 0) AS turn_count FROM balance_ledger WHERE created_at >= ? AND user_id = ?");
+    let tot_sql_u_l: u64 = STR_LEN("SELECT COALESCE(SUM(CASE WHEN delta < 0 THEN -delta ELSE 0 END), 0) AS total_debit, COALESCE(SUM(CASE WHEN delta > 0 THEN delta ELSE 0 END), 0) AS total_credit, COALESCE(SUM(CASE WHEN operation = 'debit' THEN 1 ELSE 0 END), 0) AS turn_count FROM balance_ledger WHERE created_at >= ? AND user_id = ?");
+    let tdoc: u64 = 0;
+    let thas: bool = false;
+    if has_uid {
+        thas = au_summary_query(s, tot_sql_u_p, tot_sql_u_l, since, uid_p, uid_l, true, &tdoc);
+    } else {
+        thas = au_summary_query(s, tot_sql_p, tot_sql_l, since, uid_p, uid_l, false, &tdoc);
+    };
+    out.totalDebit = 0.0;
+    out.totalCredit = 0.0;
+    out.turnCount = 0;
+    if thas && tdoc != 0 {
+        out.totalDebit = au_col_f64(tdoc, STR_PTR("total_debit"), STR_LEN("total_debit"));
+        out.totalCredit = au_col_f64(tdoc, STR_PTR("total_credit"), STR_LEN("total_credit"));
+        out.turnCount = au_col_i64(tdoc, STR_PTR("turn_count"), STR_LEN("turn_count")) as u64;
+        let f: i32 = sa_json_free(tdoc);
+    };
+    let tod_sql_p: ptr = STR_PTR("SELECT COALESCE(SUM(CASE WHEN delta < 0 THEN -delta ELSE 0 END), 0) AS today_debit FROM balance_ledger WHERE created_at >= ?");
+    let tod_sql_l: u64 = STR_LEN("SELECT COALESCE(SUM(CASE WHEN delta < 0 THEN -delta ELSE 0 END), 0) AS today_debit FROM balance_ledger WHERE created_at >= ?");
+    let tod_sql_u_p: ptr = STR_PTR("SELECT COALESCE(SUM(CASE WHEN delta < 0 THEN -delta ELSE 0 END), 0) AS today_debit FROM balance_ledger WHERE created_at >= ? AND user_id = ?");
+    let tod_sql_u_l: u64 = STR_LEN("SELECT COALESCE(SUM(CASE WHEN delta < 0 THEN -delta ELSE 0 END), 0) AS today_debit FROM balance_ledger WHERE created_at >= ? AND user_id = ?");
+    let ddoc: u64 = 0;
+    let dhas: bool = false;
+    if has_uid {
+        dhas = au_summary_query(s, tod_sql_u_p, tod_sql_u_l, today_start, uid_p, uid_l, true, &ddoc);
+    } else {
+        dhas = au_summary_query(s, tod_sql_p, tod_sql_l, today_start, uid_p, uid_l, false, &ddoc);
+    };
+    out.todayDebit = 0.0;
+    if dhas && ddoc != 0 {
+        out.todayDebit = au_col_f64(ddoc, STR_PTR("today_debit"), STR_LEN("today_debit"));
+        let f: i32 = sa_json_free(ddoc);
+    };
+    // daily buckets (insertion order: prefill oldest -> today)
+    let bkeys: [u8; 1280] = [0; 1280];
+    let bdebit: [f64; 128] = [0.0; 128];
+    let bcredit: [f64; 128] = [0.0; 128];
+    let bturns: [u64; 128] = [0; 128];
+    let bcount: u64 = 0;
+    let di: i64 = days - 1;
+    while di >= 0 {
+        let d = AuSmall { bytes: [0; 8192], len: 0 };
+        au_iso_date(today_start - (di * 86400000), &d);
+        if bcount < 128 && d.len == 10 {
+            let base: u64 = bcount * 10;
+            let j: u64 = 0;
+            while j < 10 { bkeys[base + j] = d.bytes[j]; j = j + 1; }
+            bcount = bcount + 1;
+        };
+        di = di - 1;
+    }
+    let rows_sql_p: ptr = STR_PTR("SELECT created_at, delta, operation FROM balance_ledger WHERE created_at >= ? ORDER BY created_at ASC");
+    let rows_sql_l: u64 = STR_LEN("SELECT created_at, delta, operation FROM balance_ledger WHERE created_at >= ? ORDER BY created_at ASC");
+    let rows_sql_u_p: ptr = STR_PTR("SELECT created_at, delta, operation FROM balance_ledger WHERE created_at >= ? AND user_id = ? ORDER BY created_at ASC");
+    let rows_sql_u_l: u64 = STR_LEN("SELECT created_at, delta, operation FROM balance_ledger WHERE created_at >= ? AND user_id = ? ORDER BY created_at ASC");
+    let rstmt: u64 = 0;
+    if has_uid {
+        rstmt = au_prepare(s.db, rows_sql_u_p, rows_sql_u_l);
+        if rstmt != 0 {
+            au_bind_int(rstmt, 1, since);
+            au_bind_text(rstmt, 2, uid_p, uid_l);
+        };
+    } else {
+        rstmt = au_prepare(s.db, rows_sql_p, rows_sql_l);
+        if rstmt != 0 {
+            au_bind_int(rstmt, 1, since);
+        };
+    };
+    if rstmt != 0 {
+        let guard: u64 = 0;
+        while guard < 100000 {
+            guard = guard + 1;
+            let rdoc: u64 = 0;
+            if !au_step_row(rstmt, &rdoc) { break; };
+            let created: i64 = au_col_i64(rdoc, STR_PTR("created_at"), STR_LEN("created_at"));
+            let delta: f64 = au_col_f64(rdoc, STR_PTR("delta"), STR_LEN("delta"));
+            let op_p: ptr = PTR_NULL();
+            let op_l: u64 = 0;
+            let op_has: bool = au_field_str(rdoc, STR_PTR("operation"), STR_LEN("operation"), &op_p, &op_l);
+            let key = AuSmall { bytes: [0; 8192], len: 0 };
+            au_iso_date(created, &key);
+            // find or append bucket
+            let slot: i64 = -1;
+            let bi: u64 = 0;
+            while bi < bcount {
+                let base: u64 = bi * 10;
+                let same: bool = key.len == 10;
+                if same {
+                    let j: u64 = 0;
+                    while j < 10 {
+                        if bkeys[base + j] != key.bytes[j] { same = false; };
+                        j = j + 1;
+                    }
+                };
+                if same { slot = bi as i64; break; };
+                bi = bi + 1;
+            }
+            if slot < 0 && bcount < 128 && key.len == 10 {
+                let base: u64 = bcount * 10;
+                let j: u64 = 0;
+                while j < 10 { bkeys[base + j] = key.bytes[j]; j = j + 1; }
+                slot = bcount as i64;
+                bcount = bcount + 1;
+            };
+            if slot >= 0 {
+                let su: u64 = slot as u64;
+                if delta < 0.0 { bdebit[su] = bdebit[su] + (0.0 - delta); };
+                if delta > 0.0 { bcredit[su] = bcredit[su] + delta; };
+                if op_has && au_eq(op_p, op_l, STR_PTR("debit"), STR_LEN("debit")) { bturns[su] = bturns[su] + 1; };
+            };
+            let f: i32 = sa_json_free(rdoc);
+        }
+        au_finalize(rstmt);
+    };
+    let daily: u64 = sa_json_parse(STR_PTR("[]"), STR_LEN("[]"));
+    let bi2: u64 = 0;
+    while bi2 < bcount {
+        let entry: u64 = sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+        if entry != 0 {
+            let kp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(kp, &bkeys, bi2 * 10);
+            let e1: i32 = sa_json_object_set_string(entry, STR_PTR("date"), STR_LEN("date"), kp, 10);
+            let e2: i32 = sa_json_object_set_f64(entry, STR_PTR("debit"), STR_LEN("debit"), bdebit[bi2]);
+            let e3: i32 = sa_json_object_set_f64(entry, STR_PTR("credit"), STR_LEN("credit"), bcredit[bi2]);
+            let e4: i32 = sa_json_object_set_i64(entry, STR_PTR("turns"), STR_LEN("turns"), bturns[bi2] as i64);
+            let pst: i32 = sa_json_array_push_node(daily, entry);
+        };
+        bi2 = bi2 + 1;
+    }
+    out.daily_json = daily;
+    let ops_sql_p: ptr = STR_PTR("SELECT operation, COUNT(*) AS count, COALESCE(SUM(ABS(delta)), 0) AS total FROM balance_ledger WHERE created_at >= ? GROUP BY operation ORDER BY total DESC");
+    let ops_sql_l: u64 = STR_LEN("SELECT operation, COUNT(*) AS count, COALESCE(SUM(ABS(delta)), 0) AS total FROM balance_ledger WHERE created_at >= ? GROUP BY operation ORDER BY total DESC");
+    let ops_sql_u_p: ptr = STR_PTR("SELECT operation, COUNT(*) AS count, COALESCE(SUM(ABS(delta)), 0) AS total FROM balance_ledger WHERE created_at >= ? AND user_id = ? GROUP BY operation ORDER BY total DESC");
+    let ops_sql_u_l: u64 = STR_LEN("SELECT operation, COUNT(*) AS count, COALESCE(SUM(ABS(delta)), 0) AS total FROM balance_ledger WHERE created_at >= ? AND user_id = ? GROUP BY operation ORDER BY total DESC");
+    let ostmt: u64 = 0;
+    if has_uid {
+        ostmt = au_prepare(s.db, ops_sql_u_p, ops_sql_u_l);
+        if ostmt != 0 {
+            au_bind_int(ostmt, 1, since);
+            au_bind_text(ostmt, 2, uid_p, uid_l);
+        };
+    } else {
+        ostmt = au_prepare(s.db, ops_sql_p, ops_sql_l);
+        if ostmt != 0 {
+            au_bind_int(ostmt, 1, since);
+        };
+    };
+    au_collect_ledger(s, ostmt, &out.byOperation_json);
+    au_finalize(ostmt);
+    out.has_topUsers = false;
+    out.topUsers_json = 0;
+    if is_admin && !has_uid {
+        let tstmt: u64 = au_prepare(s.db, STR_PTR("SELECT l.user_id AS userId, COALESCE(u.email, l.user_id) AS email, COALESCE(SUM(CASE WHEN l.delta < 0 THEN -l.delta ELSE 0 END), 0) AS debit, COALESCE(SUM(CASE WHEN l.operation = 'debit' THEN 1 ELSE 0 END), 0) AS turns FROM balance_ledger l LEFT JOIN users u ON u.id = l.user_id WHERE l.created_at >= ? GROUP BY l.user_id ORDER BY debit DESC LIMIT 10"), STR_LEN("SELECT l.user_id AS userId, COALESCE(u.email, l.user_id) AS email, COALESCE(SUM(CASE WHEN l.delta < 0 THEN -l.delta ELSE 0 END), 0) AS debit, COALESCE(SUM(CASE WHEN l.operation = 'debit' THEN 1 ELSE 0 END), 0) AS turns FROM balance_ledger l LEFT JOIN users u ON u.id = l.user_id WHERE l.created_at >= ? GROUP BY l.user_id ORDER BY debit DESC LIMIT 10"));
+        if tstmt != 0 {
+            au_bind_int(tstmt, 1, since);
+        };
+        au_collect_ledger(s, tstmt, &out.topUsers_json);
+        au_finalize(tstmt);
+        out.has_topUsers = out.topUsers_json != 0;
+    };
+}
+
+// ---- record/string helpers (authStore variants) ----
+fn asRecord(value_json: u64, out_json: &u64) -> void {
+    if value_json != 0 && sa_json_kind(value_json) == 7 {
+        *out_json = value_json;
+        return;
+    };
+    *out_json = sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+}
+
+// stringValue: string kind, trimmed, undefined when blank
 fn stringValue(value_json: u64, out_ptr: &ptr, out_len: &u64) -> bool {
-    // return typeof value==="string" && value.trim() ? trimmed(true) : undefined(false)
+    *out_ptr = PTR_NULL();
+    *out_len = 0;
+    let p: ptr = PTR_NULL();
+    let l: u64 = 0;
+    if !au_jstr(value_json, &p, &l) { return false; };
+    let lo: u64 = 0;
+    let hi: u64 = 0;
+    au_trim_range(p, l, &lo, &hi);
+    if hi <= lo { return false; };
+    let seg: ptr = PTR_NULL();
+    PTR_BYTE_ADD(seg, p, lo);
+    au_doc_str(STR_PTR("stringvalue"), STR_LEN("stringvalue"), seg, hi - lo, out_ptr, out_len);
+    return true;
+}
+
+fn au_field_string_value(node: u64, key_p: ptr, key_l: u64, out_p: &ptr, out_l: &u64) -> bool {
+    return stringValue(au_jget(node, key_p, key_l), out_p, out_l);
+}
+
+fn au_clone_doc(doc: u64) -> u64 {
+    if doc == 0 { return 0; };
+    let buf: u64 = 0;
+    if sa_json_stringify(doc, &buf) != 0 || buf == 0 { return 0; };
+    let bp: ptr = sa_json_buffer_data(buf);
+    let bl: u64 = sa_json_buffer_len(buf);
+    let out: u64 = sa_json_parse(bp, bl);
+    let f: i32 = sa_json_buffer_free(buf);
+    return out;
+}
+
+fn au_user_is_admin(user_json: u64) -> bool {
+    let p: ptr = PTR_NULL();
+    let l: u64 = 0;
+    if !au_field_str(user_json, STR_PTR("role"), STR_LEN("role"), &p, &l) { return false; };
+    return au_eq(p, l, STR_PTR("admin"), STR_LEN("admin"));
+}
+
+fn au_user_root(user_json: u64, out_p: &ptr, out_l: &u64) -> bool {
+    return au_field_str(user_json, STR_PTR("workspaceRoot"), STR_LEN("workspaceRoot"), out_p, out_l);
+}
+
+// ---- L1007-1027 — inferRequestedPermission ----
+fn inferRequestedPermission(record_json: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    let approval_p: ptr = PTR_NULL();
+    let approval_l: u64 = 0;
+    let has_approval: bool = au_field_string_value(record_json, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"), &approval_p, &approval_l);
+    let approval = AuText { bytes: [0; 65536], len: 0 };
+    if has_approval { au_append(&approval, approval_p, approval_l); };
+    let sandbox_p: ptr = PTR_NULL();
+    let sandbox_l: u64 = 0;
+    let has_sandbox: bool = au_field_string_value(record_json, STR_PTR("sandbox"), STR_LEN("sandbox"), &sandbox_p, &sandbox_l);
+    let sandbox = AuText { bytes: [0; 65536], len: 0 };
+    if has_sandbox { au_append(&sandbox, sandbox_p, sandbox_l); };
+    let policy_doc: u64 = 0;
+    asRecord(au_jget(record_json, STR_PTR("sandboxPolicy"), STR_LEN("sandboxPolicy")), &policy_doc);
+    let ptype_p: ptr = PTR_NULL();
+    let ptype_l: u64 = 0;
+    let has_ptype: bool = au_field_string_value(policy_doc, STR_PTR("type"), STR_LEN("type"), &ptype_p, &ptype_l);
+    let ptype = AuText { bytes: [0; 65536], len: 0 };
+    if has_ptype { au_append(&ptype, ptype_p, ptype_l); };
+    if policy_doc != 0 && policy_doc != au_jget(record_json, STR_PTR("sandboxPolicy"), STR_LEN("sandboxPolicy")) {
+        let f: i32 = sa_json_free(policy_doc);
+    };
+    let ap: ptr = au_text_ptr(&approval);
+    let sb: ptr = au_text_ptr(&sandbox);
+    let pt: ptr = au_text_ptr(&ptype);
+    let wants_bypass: bool = au_eq(ap, approval.len, STR_PTR("never"), STR_LEN("never"));
+    let danger: bool = wants_bypass || au_eq(sb, sandbox.len, STR_PTR("danger-full-access"), STR_LEN("danger-full-access")) || au_eq(pt, ptype.len, STR_PTR("dangerFullAccess"), STR_LEN("dangerFullAccess"));
+    if danger {
+        if wants_bypass {
+            au_doc_str(STR_PTR("permission"), STR_LEN("permission"), STR_PTR("dangerBypass"), STR_LEN("dangerBypass"), out_ptr, out_len);
+        } else {
+            au_doc_str(STR_PTR("permission"), STR_LEN("permission"), STR_PTR("fullAsk"), STR_LEN("fullAsk"), out_ptr, out_len);
+        };
+        return;
+    };
+    if au_eq(sb, sandbox.len, STR_PTR("read-only"), STR_LEN("read-only")) || au_eq(pt, ptype.len, STR_PTR("readOnly"), STR_LEN("readOnly")) {
+        au_doc_str(STR_PTR("permission"), STR_LEN("permission"), STR_PTR("readonlyAsk"), STR_LEN("readonlyAsk"), out_ptr, out_len);
+        return;
+    };
+    au_doc_str(STR_PTR("permission"), STR_LEN("permission"), STR_PTR("workspaceAsk"), STR_LEN("workspaceAsk"), out_ptr, out_len);
+}
+
+// ---- L1029-1048 — clampPermission ----
+fn clampPermission(requested_ptr: ptr, requested_len: u64, user_json: u64, out_ptr: &ptr, out_len: &u64) -> void {
+    let next = AuText { bytes: [0; 65536], len: 0 };
+    au_append(&next, requested_ptr, requested_len);
+    if !au_user_is_admin(user_json) {
+        let allow_db: bool = au_field_bool(user_json, STR_PTR("allowDangerBypass"), STR_LEN("allowDangerBypass"));
+        let allow_write: bool = au_field_bool(user_json, STR_PTR("allowWrite"), STR_LEN("allowWrite"));
+        let mp_p: ptr = PTR_NULL();
+        let mp_l: u64 = 0;
+        let has_mp: bool = au_field_str(user_json, STR_PTR("maxPermission"), STR_LEN("maxPermission"), &mp_p, &mp_l);
+        let mp = AuText { bytes: [0; 65536], len: 0 };
+        if has_mp { au_append(&mp, mp_p, mp_l); };
+        if !allow_db && au_eq(au_text_ptr(&next), next.len, STR_PTR("dangerBypass"), STR_LEN("dangerBypass")) {
+            next.len = 0;
+            if allow_write {
+                if has_mp && au_eq(au_text_ptr(&mp), mp.len, STR_PTR("readonlyAsk"), STR_LEN("readonlyAsk")) {
+                    au_append(&next, STR_PTR("readonlyAsk"), STR_LEN("readonlyAsk"));
+                } else {
+                    au_append(&next, STR_PTR("workspaceAsk"), STR_LEN("workspaceAsk"));
+                };
+            } else {
+                au_append(&next, STR_PTR("readonlyAsk"), STR_LEN("readonlyAsk"));
+            };
+        };
+        if !allow_write {
+            next.len = 0;
+            au_append(&next, STR_PTR("readonlyAsk"), STR_LEN("readonlyAsk"));
+        };
+        if has_mp {
+            let r_next: i64 = PERMISSION_RANK(au_text_ptr(&next), next.len);
+            let r_max: i64 = PERMISSION_RANK(au_text_ptr(&mp), mp.len);
+            if r_next > r_max {
+                next.len = 0;
+                au_append(&next, au_text_ptr(&mp), mp.len);
+            };
+        };
+    };
+    au_doc_str(STR_PTR("permission"), STR_LEN("permission"), au_text_ptr(&next), next.len, out_ptr, out_len);
+}
+
+// ---- L1050-1081 — permissionToSandbox ----
+fn au_set_overrides(out: &SandboxOverrides, sb_p: ptr, sb_l: u64, ap_p: ptr, ap_l: u64, policy: u64) -> void {
+    out.sandbox_len = 0;
+    let i: u64 = 0;
+    while i < sb_l && i < 32 { out.sandbox[i] = au_byte(sb_p, i); i = i + 1; }
+    out.sandbox_len = i;
+    out.approvalPolicy_len = 0;
+    i = 0;
+    while i < ap_l && i < 32 { out.approvalPolicy[i] = au_byte(ap_p, i); i = i + 1; }
+    out.approvalPolicy_len = i;
+    out.sandboxPolicy_json = policy;
+}
+
+fn permissionToSandbox(permission_ptr: ptr, permission_len: u64, cwd_ptr: ptr, cwd_len: u64, allow_network: bool, out: &SandboxOverrides) -> void {
+    let policy: u64 = sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if au_eq(permission_ptr, permission_len, STR_PTR("readonlyAsk"), STR_LEN("readonlyAsk")) {
+        if policy != 0 {
+            let p1: i32 = sa_json_object_set_string(policy, STR_PTR("type"), STR_LEN("type"), STR_PTR("readOnly"), STR_LEN("readOnly"));
+            let p2: i32 = sa_json_object_set_bool(policy, STR_PTR("networkAccess"), STR_LEN("networkAccess"), allow_network);
+        };
+        au_set_overrides(out, STR_PTR("read-only"), STR_LEN("read-only"), STR_PTR("on-request"), STR_LEN("on-request"), policy);
+        return;
+    };
+    if au_eq(permission_ptr, permission_len, STR_PTR("fullAsk"), STR_LEN("fullAsk")) {
+        if policy != 0 {
+            let p1: i32 = sa_json_object_set_string(policy, STR_PTR("type"), STR_LEN("type"), STR_PTR("dangerFullAccess"), STR_LEN("dangerFullAccess"));
+        };
+        au_set_overrides(out, STR_PTR("danger-full-access"), STR_LEN("danger-full-access"), STR_PTR("on-request"), STR_LEN("on-request"), policy);
+        return;
+    };
+    if au_eq(permission_ptr, permission_len, STR_PTR("dangerBypass"), STR_LEN("dangerBypass")) {
+        if policy != 0 {
+            let p1: i32 = sa_json_object_set_string(policy, STR_PTR("type"), STR_LEN("type"), STR_PTR("dangerFullAccess"), STR_LEN("dangerFullAccess"));
+        };
+        au_set_overrides(out, STR_PTR("danger-full-access"), STR_LEN("danger-full-access"), STR_PTR("never"), STR_LEN("never"), policy);
+        return;
+    };
+    // workspaceAsk (and, defensively, any unlisted preset)
+    if policy != 0 {
+        let p1: i32 = sa_json_object_set_string(policy, STR_PTR("type"), STR_LEN("type"), STR_PTR("workspaceWrite"), STR_LEN("workspaceWrite"));
+        let roots: u64 = sa_json_parse(STR_PTR("[]"), STR_LEN("[]"));
+        if roots != 0 {
+            let pst: i32 = sa_json_array_push_string(roots, cwd_ptr, cwd_len);
+        };
+        let p2: i32 = sa_json_object_set_node(policy, STR_PTR("writableRoots"), STR_LEN("writableRoots"), roots);
+        let p3: i32 = sa_json_object_set_bool(policy, STR_PTR("networkAccess"), STR_LEN("networkAccess"), allow_network);
+        let p4: i32 = sa_json_object_set_bool(policy, STR_PTR("excludeTmpdirEnvVar"), STR_LEN("excludeTmpdirEnvVar"), false);
+        let p5: i32 = sa_json_object_set_bool(policy, STR_PTR("excludeSlashTmp"), STR_LEN("excludeSlashTmp"), false);
+    };
+    au_set_overrides(out, STR_PTR("workspace-write"), STR_LEN("workspace-write"), STR_PTR("on-request"), STR_LEN("on-request"), policy);
+}
+
+// ---- L1097-1103 — pathAllowed ----
+fn pathAllowed(path_ptr: ptr, path_len: u64, root_ptr: ptr, root_len: u64) -> bool {
+    let np = AuPath { bytes: [0; 4096], len: 0 };
+    au_path_normalize(path_ptr, path_len, &np);
+    let nr = AuPath { bytes: [0; 4096], len: 0 };
+    au_path_normalize(root_ptr, root_len, &nr);
+    if au_eq(au_path_ptr(&np), np.len, au_path_ptr(&nr), nr.len) { return true; };
+    let prefix = AuPath { bytes: [0; 4096], len: 0 };
+    au_append_path(&prefix, au_path_ptr(&nr), nr.len);
+    au_append_path(&prefix, STR_PTR("/"), STR_LEN("/"));
+    return au_starts_with(au_path_ptr(&np), np.len, au_path_ptr(&prefix), prefix.len);
+}
+
+// ---- L1083-1095 — coerceWorkspaceCwd ----
+fn coerceWorkspaceCwd(requested_ptr: ptr, requested_len: u64, has_requested: bool, root_ptr: ptr, root_len: u64, is_admin: bool, out_ptr: &ptr, out_len: &u64) -> void {
+    let fallback = AuPath { bytes: [0; 4096], len: 0 };
+    if root_len > 0 {
+        au_path_normalize(root_ptr, root_len, &fallback);
+    } else {
+        let dd = AuPath { bytes: [0; 4096], len: 0 };
+        au_data_dir(&dd);
+        au_path_join2(au_path_ptr(&dd), dd.len, STR_PTR("workspace"), STR_LEN("workspace"), &fallback);
+    };
+    au_mkdir_p(au_path_ptr(&fallback), fallback.len);
+    if !has_requested || au_eq(requested_ptr, requested_len, STR_PTR("~/"), STR_LEN("~/")) || au_eq(requested_ptr, requested_len, STR_PTR("~"), STR_LEN("~")) {
+        au_doc_str(STR_PTR("cwd"), STR_LEN("cwd"), au_path_ptr(&fallback), fallback.len, out_ptr, out_len);
+        return;
+    };
+    let expanded = AuPath { bytes: [0; 4096], len: 0 };
+    if au_starts_with(requested_ptr, requested_len, STR_PTR("~/"), STR_LEN("~/")) {
+        let home = AuText { bytes: [0; 65536], len: 0 };
+        au_home_dir(&home);
+        let rest: ptr = PTR_NULL();
+        PTR_BYTE_ADD(rest, requested_ptr, 2);
+        au_path_join2(au_text_ptr(&home), home.len, rest, requested_len - 2, &expanded);
+    } else {
+        au_path_normalize(requested_ptr, requested_len, &expanded);
+    };
+    if is_admin {
+        au_doc_str(STR_PTR("cwd"), STR_LEN("cwd"), au_path_ptr(&expanded), expanded.len, out_ptr, out_len);
+        return;
+    };
+    if !pathAllowed(au_path_ptr(&expanded), expanded.len, root_ptr, root_len) {
+        au_doc_str(STR_PTR("cwd"), STR_LEN("cwd"), au_path_ptr(&fallback), fallback.len, out_ptr, out_len);
+        return;
+    };
+    au_doc_str(STR_PTR("cwd"), STR_LEN("cwd"), au_path_ptr(&expanded), expanded.len, out_ptr, out_len);
+}
+
+// ---- L989-1005 — isAdminOnlyMethod ----
+fn isAdminOnlyMethodStatic(method_ptr: ptr, method_len: u64) -> bool {
+    if au_eq(method_ptr, method_len, STR_PTR("config/batchWrite"), STR_LEN("config/batchWrite")) { return true; };
+    if au_eq(method_ptr, method_len, STR_PTR("config/write"), STR_LEN("config/write")) { return true; };
+    if au_eq(method_ptr, method_len, STR_PTR("config/valueWrite"), STR_LEN("config/valueWrite")) { return true; };
+    if au_eq(method_ptr, method_len, STR_PTR("plugin/install"), STR_LEN("plugin/install")) { return true; };
+    if au_eq(method_ptr, method_len, STR_PTR("plugin/uninstall"), STR_LEN("plugin/uninstall")) { return true; };
+    if au_eq(method_ptr, method_len, STR_PTR("mcpServer/add"), STR_LEN("mcpServer/add")) { return true; };
+    if au_eq(method_ptr, method_len, STR_PTR("mcpServer/remove"), STR_LEN("mcpServer/remove")) { return true; };
+    if au_eq(method_ptr, method_len, STR_PTR("mcpServer/update"), STR_LEN("mcpServer/update")) { return true; };
     return false;
+}
+
+fn isAdminOnlyMethod(method_ptr: ptr, method_len: u64) -> bool {
+    if isAdminOnlyMethodStatic(method_ptr, method_len) { return true; };
+    if au_starts_with(method_ptr, method_len, STR_PTR("config/"), STR_LEN("config/")) {
+        return !au_eq(method_ptr, method_len, STR_PTR("config/read"), STR_LEN("config/read"));
+    };
+    return false;
+}
+
+// ---- L932-987 — enforcePermissionParams ----
+fn AuthStore_enforcePermissionParams(s: &AuthStore, user_json: u64, method_ptr: ptr, method_len: u64, params_json: u64, out_json: &u64) -> i32 {
+    *out_json = 0;
+    let record: u64 = 0;
+    asRecord(params_json, &record);
+    let is_thread: bool = au_eq(method_ptr, method_len, STR_PTR("thread/start"), STR_LEN("thread/start"));
+    let is_turn: bool = au_eq(method_ptr, method_len, STR_PTR("turn/start"), STR_LEN("turn/start"));
+    if !is_thread && !is_turn {
+        *out_json = record;
+        return 0;
+    };
+    let req_p: ptr = PTR_NULL();
+    let req_l: u64 = 0;
+    inferRequestedPermission(record, &req_p, &req_l);
+    let requested = AuText { bytes: [0; 65536], len: 0 };
+    au_append(&requested, req_p, req_l);
+    let all_p: ptr = PTR_NULL();
+    let all_l: u64 = 0;
+    clampPermission(au_text_ptr(&requested), requested.len, user_json, &all_p, &all_l);
+    let allowed = AuText { bytes: [0; 65536], len: 0 };
+    au_append(&allowed, all_p, all_l);
+    let root_p: ptr = PTR_NULL();
+    let root_l: u64 = 0;
+    let has_root: bool = au_user_root(user_json, &root_p, &root_l);
+    let root = AuText { bytes: [0; 65536], len: 0 };
+    if has_root { au_append(&root, root_p, root_l); };
+    let is_admin: bool = au_user_is_admin(user_json);
+    let cwd_in_p: ptr = PTR_NULL();
+    let cwd_in_l: u64 = 0;
+    let has_cwd: bool = au_field_string_value(record, STR_PTR("cwd"), STR_LEN("cwd"), &cwd_in_p, &cwd_in_l);
+    let cwd_in = AuText { bytes: [0; 65536], len: 0 };
+    if has_cwd { au_append(&cwd_in, cwd_in_p, cwd_in_l); };
+    let cwd_p: ptr = PTR_NULL();
+    let cwd_l: u64 = 0;
+    coerceWorkspaceCwd(au_text_ptr(&cwd_in), cwd_in.len, has_cwd, au_text_ptr(&root), root.len, is_admin, &cwd_p, &cwd_l);
+    let cwd = AuText { bytes: [0; 65536], len: 0 };
+    au_append(&cwd, cwd_p, cwd_l);
+    if !is_admin {
+        let allow_db: bool = au_field_bool(user_json, STR_PTR("allowDangerBypass"), STR_LEN("allowDangerBypass"));
+        let all_danger: bool = au_eq(au_text_ptr(&allowed), allowed.len, STR_PTR("dangerBypass"), STR_LEN("dangerBypass"));
+        let req_danger: bool = au_eq(au_text_ptr(&requested), requested.len, STR_PTR("dangerBypass"), STR_LEN("dangerBypass"));
+        if !allow_db && (all_danger || req_danger) {
+            return au_throw(STR_PTR("Member policy forbids dangerously-bypass-approvals-and-sandbox"), STR_LEN("Member policy forbids dangerously-bypass-approvals-and-sandbox"));
+        };
+        if !pathAllowed(au_text_ptr(&cwd), cwd.len, au_text_ptr(&root), root.len) {
+            let msg = AuText { bytes: [0; 65536], len: 0 };
+            au_append(&msg, STR_PTR("Workspace path outside member root: "), STR_LEN("Workspace path outside member root: "));
+            au_append(&msg, au_text_ptr(&root), root.len);
+            return au_throw(au_text_ptr(&msg), msg.len);
+        };
+    };
+    let allow_network: bool = au_field_bool(user_json, STR_PTR("allowNetwork"), STR_LEN("allowNetwork"));
+    let overrides = SandboxOverrides { sandbox: [0; 32], sandbox_len: 0, approvalPolicy: [0; 32], approvalPolicy_len: 0, sandboxPolicy_json: 0 };
+    permissionToSandbox(au_text_ptr(&allowed), allowed.len, au_text_ptr(&cwd), cwd.len, allow_network, &overrides);
+    let next: u64 = au_clone_doc(record);
+    if next == 0 {
+        *out_json = record;
+        return 0;
+    };
+    let sb_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sb_p, &overrides.sandbox, 0);
+    let ap_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(ap_p, &overrides.approvalPolicy, 0);
+    let n1: i32 = sa_json_object_set_string(next, STR_PTR("cwd"), STR_LEN("cwd"), au_text_ptr(&cwd), cwd.len);
+    let n2: i32 = sa_json_object_set_string(next, STR_PTR("sandbox"), STR_LEN("sandbox"), sb_p, overrides.sandbox_len);
+    let n3: i32 = sa_json_object_set_string(next, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"), ap_p, overrides.approvalPolicy_len);
+    let has_policy: bool = au_jget(record, STR_PTR("sandboxPolicy"), STR_LEN("sandboxPolicy")) != 0;
+    if is_turn || has_policy {
+        if overrides.sandboxPolicy_json != 0 {
+            let n4: i32 = sa_json_object_set_node(next, STR_PTR("sandboxPolicy"), STR_LEN("sandboxPolicy"), overrides.sandboxPolicy_json);
+        };
+    };
+    // smuggled danger settings are clamped back unless the member
+    // is fully cleared for dangerBypass
+    let allow_db2: bool = au_field_bool(user_json, STR_PTR("allowDangerBypass"), STR_LEN("allowDangerBypass"));
+    let all_danger2: bool = au_eq(au_text_ptr(&allowed), allowed.len, STR_PTR("dangerBypass"), STR_LEN("dangerBypass"));
+    if !allow_db2 || !all_danger2 {
+        let nap_p: ptr = PTR_NULL();
+        let nap_l: u64 = 0;
+        if au_field_string_value(next, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"), &nap_p, &nap_l) {
+            if au_eq(nap_p, nap_l, STR_PTR("never"), STR_LEN("never")) && !all_danger2 {
+                let n5: i32 = sa_json_object_set_string(next, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"), STR_PTR("on-request"), STR_LEN("on-request"));
+            };
+        };
+        let nsb_p: ptr = PTR_NULL();
+        let nsb_l: u64 = 0;
+        if au_field_string_value(next, STR_PTR("sandbox"), STR_LEN("sandbox"), &nsb_p, &nsb_l) {
+            let full: bool = au_eq(au_text_ptr(&allowed), allowed.len, STR_PTR("fullAsk"), STR_LEN("fullAsk"));
+            if au_eq(nsb_p, nsb_l, STR_PTR("danger-full-access"), STR_LEN("danger-full-access")) && !all_danger2 && !full {
+                if au_eq(au_text_ptr(&allowed), allowed.len, STR_PTR("readonlyAsk"), STR_LEN("readonlyAsk")) {
+                    let n6: i32 = sa_json_object_set_string(next, STR_PTR("sandbox"), STR_LEN("sandbox"), STR_PTR("read-only"), STR_LEN("read-only"));
+                } else {
+                    let n6: i32 = sa_json_object_set_string(next, STR_PTR("sandbox"), STR_LEN("sandbox"), STR_PTR("workspace-write"), STR_LEN("workspace-write"));
+                };
+            };
+        };
+    };
+    *out_json = next;
+    return 0;
+}
+
+// ---- clampPathsForMember ----
+fn clampPathsForMember(record_json: u64, root_ptr: ptr, root_len: u64, out_json: &u64) -> i32 {
+    *out_json = 0;
+    let next: u64 = au_clone_doc(record_json);
+    if next == 0 {
+        *out_json = record_json;
+        return 0;
+    };
+    let cwd_p: ptr = PTR_NULL();
+    let cwd_l: u64 = 0;
+    if au_field_str(next, STR_PTR("cwd"), STR_LEN("cwd"), &cwd_p, &cwd_l) {
+        let in_cwd = AuText { bytes: [0; 65536], len: 0 };
+        au_append(&in_cwd, cwd_p, cwd_l);
+        let out_p: ptr = PTR_NULL();
+        let out_l: u64 = 0;
+        coerceWorkspaceCwd(au_text_ptr(&in_cwd), in_cwd.len, true, root_ptr, root_len, false, &out_p, &out_l);
+        let s1: i32 = sa_json_object_set_string(next, STR_PTR("cwd"), STR_LEN("cwd"), out_p, out_l);
+    };
+    let path_p: ptr = PTR_NULL();
+    let path_l: u64 = 0;
+    if au_field_str(next, STR_PTR("path"), STR_LEN("path"), &path_p, &path_l) {
+        if !pathAllowed(path_p, path_l, root_ptr, root_len) {
+            let msg = AuText { bytes: [0; 65536], len: 0 };
+            au_append(&msg, STR_PTR("Path outside member workspace: "), STR_LEN("Path outside member workspace: "));
+            au_append(&msg, root_ptr, root_len);
+            return au_throw(au_text_ptr(&msg), msg.len);
+        };
+    };
+    let cwds: u64 = au_jget(next, STR_PTR("cwds"), STR_LEN("cwds"));
+    if cwds != 0 && sa_json_kind(cwds) == 6 {
+        let count: u64 = 0;
+        let cst: i32 = sa_json_value_count(cwds, &count);
+        let mapped: u64 = sa_json_parse(STR_PTR("[]"), STR_LEN("[]"));
+        let i: u64 = 0;
+        while i < count {
+            let item: u64 = 0;
+            let ast: i32 = sa_json_array_get(cwds, i, &item);
+            if item != 0 && sa_json_kind(item) == 5 {
+                let sp: ptr = PTR_NULL();
+                let sl: u64 = 0;
+                if au_jstr(item, &sp, &sl) {
+                    let in_cwd = AuText { bytes: [0; 65536], len: 0 };
+                    au_append(&in_cwd, sp, sl);
+                    let out_p: ptr = PTR_NULL();
+                    let out_l: u64 = 0;
+                    coerceWorkspaceCwd(au_text_ptr(&in_cwd), in_cwd.len, true, root_ptr, root_len, false, &out_p, &out_l);
+                    let pst: i32 = sa_json_array_push_string(mapped, out_p, out_l);
+                } else {
+                    let clone: u64 = au_clone_doc(item);
+                    let pst: i32 = sa_json_array_push_node(mapped, clone);
+                };
+            } else {
+                let clone: u64 = au_clone_doc(item);
+                let pst: i32 = sa_json_array_push_node(mapped, clone);
+            };
+            i = i + 1;
+        }
+        let s2: i32 = sa_json_object_set_node(next, STR_PTR("cwds"), STR_LEN("cwds"), mapped);
+    };
+    let thread: u64 = au_jget(next, STR_PTR("thread"), STR_LEN("thread"));
+    if thread != 0 && sa_json_kind(thread) == 7 {
+        let tcwd_p: ptr = PTR_NULL();
+        let tcwd_l: u64 = 0;
+        if au_field_str(thread, STR_PTR("cwd"), STR_LEN("cwd"), &tcwd_p, &tcwd_l) {
+            let in_cwd = AuText { bytes: [0; 65536], len: 0 };
+            au_append(&in_cwd, tcwd_p, tcwd_l);
+            let out_p: ptr = PTR_NULL();
+            let out_l: u64 = 0;
+            coerceWorkspaceCwd(au_text_ptr(&in_cwd), in_cwd.len, true, root_ptr, root_len, false, &out_p, &out_l);
+            let tclone: u64 = au_clone_doc(thread);
+            if tclone != 0 {
+                let s3: i32 = sa_json_object_set_string(tclone, STR_PTR("cwd"), STR_LEN("cwd"), out_p, out_l);
+                let s4: i32 = sa_json_object_set_node(next, STR_PTR("thread"), STR_LEN("thread"), tclone);
+            };
+        };
+    };
+    *out_json = next;
+    return 0;
+}
+
+// ---- L663-~700 — enforceMemberRpc ----
+fn AuthStore_enforceMemberRpc(s: &AuthStore, user_json: u64, method_ptr: ptr, method_len: u64, params_json: u64, out_json: &u64) -> i32 {
+    *out_json = 0;
+    let record: u64 = 0;
+    asRecord(params_json, &record);
+    let is_thread: bool = au_eq(method_ptr, method_len, STR_PTR("thread/start"), STR_LEN("thread/start"));
+    let is_turn: bool = au_eq(method_ptr, method_len, STR_PTR("turn/start"), STR_LEN("turn/start"));
+    if !au_user_is_admin(user_json) {
+        if isAdminOnlyMethod(method_ptr, method_len) {
+            let msg = AuText { bytes: [0; 65536], len: 0 };
+            au_append(&msg, STR_PTR("Admin only: "), STR_LEN("Admin only: "));
+            au_append(&msg, method_ptr, method_len);
+            return au_throw(au_text_ptr(&msg), msg.len);
+        };
+        if is_thread || is_turn {
+            return AuthStore_enforcePermissionParams(s, user_json, method_ptr, method_len, record, out_json);
+        };
+        let root_p: ptr = PTR_NULL();
+        let root_l: u64 = 0;
+        au_user_root(user_json, &root_p, &root_l);
+        let root = AuText { bytes: [0; 65536], len: 0 };
+        au_append(&root, root_p, root_l);
+        return clampPathsForMember(record, au_text_ptr(&root), root.len, out_json);
+    };
+    if is_thread || is_turn {
+        return AuthStore_enforcePermissionParams(s, user_json, method_ptr, method_len, record, out_json);
+    };
+    *out_json = record;
+    return 0;
+}
+
+// ---- thread ownership ----
+fn au_thread_owner(s: &AuthStore, thread_id_p: ptr, thread_id_l: u64, out_p: &ptr, out_l: &u64) -> bool {
+    *out_p = PTR_NULL();
+    *out_l = 0;
+    let stmt: u64 = au_prepare(s.db, STR_PTR("SELECT user_id FROM thread_owners WHERE thread_id = ? LIMIT 1"), STR_LEN("SELECT user_id FROM thread_owners WHERE thread_id = ? LIMIT 1"));
+    if stmt == 0 { return false; };
+    au_bind_text(stmt, 1, thread_id_p, thread_id_l);
+    let doc: u64 = 0;
+    let has: bool = au_step_row(stmt, &doc);
+    au_finalize(stmt);
+    if !has { return false; };
+    let ok: bool = au_field_str(doc, STR_PTR("user_id"), STR_LEN("user_id"), out_p, out_l);
+    if ok {
+        au_doc_str(STR_PTR("owner"), STR_LEN("owner"), *out_p, *out_l, out_p, out_l);
+    };
+    let f: i32 = sa_json_free(doc);
+    return ok;
+}
+
+fn AuthStore_claimThread(s: &AuthStore, thread_id_ptr: ptr, thread_id_len: u64, user_id_ptr: ptr, user_id_len: u64) -> i32 {
+    if thread_id_len == 0 || user_id_len == 0 { return 0; };
+    let owner_p: ptr = PTR_NULL();
+    let owner_l: u64 = 0;
+    if au_thread_owner(s, thread_id_ptr, thread_id_len, &owner_p, &owner_l) {
+        if au_eq(owner_p, owner_l, user_id_ptr, user_id_len) { return 0; };
+        return au_throw(STR_PTR("Thread belongs to another member"), STR_LEN("Thread belongs to another member"));
+    };
+    let stmt: u64 = au_prepare(s.db, STR_PTR("INSERT INTO thread_owners (thread_id, user_id, created_at) VALUES (?, ?, ?)"), STR_LEN("INSERT INTO thread_owners (thread_id, user_id, created_at) VALUES (?, ?, ?)"));
+    if stmt != 0 {
+        au_bind_text(stmt, 1, thread_id_ptr, thread_id_len);
+        au_bind_text(stmt, 2, user_id_ptr, user_id_len);
+        au_bind_int(stmt, 3, sa_time_unix_ms());
+        au_step_once(stmt);
+        au_finalize(stmt);
+    };
+    return 0;
+}
+
+fn AuthStore_ownsThread(s: &AuthStore, thread_id_ptr: ptr, thread_id_len: u64, user_id_ptr: ptr, user_id_len: u64) -> bool {
+    let owner_p: ptr = PTR_NULL();
+    let owner_l: u64 = 0;
+    if !au_thread_owner(s, thread_id_ptr, thread_id_len, &owner_p, &owner_l) { return true; };
+    return au_eq(owner_p, owner_l, user_id_ptr, user_id_len);
+}
+
+fn AuthStore_threadOwnerId(s: &AuthStore, thread_id_ptr: ptr, thread_id_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    return au_thread_owner(s, thread_id_ptr, thread_id_len, out_ptr, out_len);
+}
+
+fn AuthStore_listThreadIdsForUser(s: &AuthStore, user_id_ptr: ptr, user_id_len: u64, out_json: &u64) -> void {
+    let arr: u64 = sa_json_parse(STR_PTR("[]"), STR_LEN("[]"));
+    *out_json = arr;
+    let stmt: u64 = au_prepare(s.db, STR_PTR("SELECT thread_id FROM thread_owners WHERE user_id = ? ORDER BY created_at DESC"), STR_LEN("SELECT thread_id FROM thread_owners WHERE user_id = ? ORDER BY created_at DESC"));
+    if stmt == 0 || arr == 0 { return; };
+    au_bind_text(stmt, 1, user_id_ptr, user_id_len);
+    let guard: u64 = 0;
+    while guard < 100000 {
+        guard = guard + 1;
+        let doc: u64 = 0;
+        if !au_step_row(stmt, &doc) { break; };
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        if au_field_str(doc, STR_PTR("thread_id"), STR_LEN("thread_id"), &tp, &tl) {
+            let pst: i32 = sa_json_array_push_string(arr, tp, tl);
+        };
+        let f: i32 = sa_json_free(doc);
+    }
+    au_finalize(stmt);
+}
+
+// TEMP in TS: member thread filtering currently returns the list
+// unchanged in both branches — replicated as-is.
+fn AuthStore_filterThreadsForUser(s: &AuthStore, user_json: u64, threads_json: u64, out_json: &u64) -> void {
+    *out_json = threads_json;
+}
+
+// ---- changeOwnPassword / concurrency / verify / renew / issue / totp ----
+fn AuthStore_changeOwnPassword(s: &AuthStore, user_id_ptr: ptr, user_id_len: u64, current_ptr: ptr, current_len: u64, new_ptr: ptr, new_len: u64, out_json: &u64) -> i32 {
+    *out_json = 0;
+    if current_len == 0 || new_len == 0 {
+        return au_throw(STR_PTR("Current and new password are required"), STR_LEN("Current and new password are required"));
+    };
+    if new_len < 8 {
+        return au_throw(STR_PTR("New password must be at least 8 characters"), STR_LEN("New password must be at least 8 characters"));
+    };
+    if au_eq(current_ptr, current_len, new_ptr, new_len) {
+        return au_throw(STR_PTR("New password must be different from current password"), STR_LEN("New password must be different from current password"));
+    };
+    let row = UserRow { id: [0; 64], id_len: 0, email: [0; 320], email_len: 0, username: [0; 256], username_len: 0, password_hash: [0; 512], password_hash_len: 0, role: [0; 16], role_len: 0, status: [0; 16], status_len: 0, balance: 0.0, concurrency: 0, max_permission: [0; 32], max_permission_len: 0, allow_write: 0, allow_network: 0, allow_danger_bypass: 0, workspace_root: [0; 512], workspace_root_len: 0, notes: [0; 1024], notes_len: 0, totp_secret: [0; 256], totp_secret_len: 0, totp_enabled: 0, totp_enabled_at: 0, has_totp_enabled_at: false, created_at: 0, updated_at: 0, deleted_at: 0, has_deleted_at: false };
+    if !AuthStore_getUserRow(s, user_id_ptr, user_id_len, &row) {
+        return au_throw(STR_PTR("User not found"), STR_LEN("User not found"));
+    };
+    let st_p: ptr = PTR_NULL();
+    let st_l: u64 = 0;
+    au_row_field(&row, 5, &st_p, &st_l);
+    if !au_eq(st_p, st_l, STR_PTR("active"), STR_LEN("active")) {
+        return au_throw(STR_PTR("User not found"), STR_LEN("User not found"));
+    };
+    let hash_p: ptr = PTR_NULL();
+    let hash_l: u64 = 0;
+    au_row_field(&row, 3, &hash_p, &hash_l);
+    let ok: bool = false;
+    let vst: i32 = verifyPassword(current_ptr, current_len, hash_p, hash_l, &ok);
+    if !ok {
+        return au_throw(STR_PTR("Current password is incorrect"), STR_LEN("Current password is incorrect"));
+    };
+    let hash_doc: u64 = 0;
+    let hst: i32 = hashPassword(new_ptr, new_len, &hash_doc);
+    let hash = AuText { bytes: [0; 65536], len: 0 };
+    if hash_doc != 0 {
+        let hp: ptr = PTR_NULL();
+        let hl: u64 = 0;
+        if au_field_str(hash_doc, STR_PTR("hash"), STR_LEN("hash"), &hp, &hl) {
+            au_append(&hash, hp, hl);
+        };
+        let f: i32 = sa_json_free(hash_doc);
+    };
+    let stmt: u64 = au_prepare(s.db, STR_PTR("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?"), STR_LEN("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?"));
+    if stmt != 0 {
+        au_bind_text(stmt, 1, au_text_ptr(&hash), hash.len);
+        au_bind_int(stmt, 2, sa_time_unix_ms());
+        au_bind_text(stmt, 3, user_id_ptr, user_id_len);
+        au_step_once(stmt);
+        au_finalize(stmt);
+    };
+    if !AuthStore_getUser(s, user_id_ptr, user_id_len, out_json) {
+        return au_throw(STR_PTR("User not found after password change"), STR_LEN("User not found after password change"));
+    };
+    return 0;
+}
+
+fn AuthStore_getConcurrencyLimit(s: &AuthStore, user_id_ptr: ptr, user_id_len: u64) -> i64 {
+    let row = UserRow { id: [0; 64], id_len: 0, email: [0; 320], email_len: 0, username: [0; 256], username_len: 0, password_hash: [0; 512], password_hash_len: 0, role: [0; 16], role_len: 0, status: [0; 16], status_len: 0, balance: 0.0, concurrency: 0, max_permission: [0; 32], max_permission_len: 0, allow_write: 0, allow_network: 0, allow_danger_bypass: 0, workspace_root: [0; 512], workspace_root_len: 0, notes: [0; 1024], notes_len: 0, totp_secret: [0; 256], totp_secret_len: 0, totp_enabled: 0, totp_enabled_at: 0, has_totp_enabled_at: false, created_at: 0, updated_at: 0, deleted_at: 0, has_deleted_at: false };
+    if !AuthStore_getUserRow(s, user_id_ptr, user_id_len, &row) { return 1; };
+    let dflt: i64 = 1;
+    let role_p: ptr = PTR_NULL();
+    let role_l: u64 = 0;
+    au_row_field(&row, 4, &role_p, &role_l);
+    if au_eq(role_p, role_l, STR_PTR("admin"), STR_LEN("admin")) { dflt = 20; };
+    let v: i64 = row.concurrency;
+    if v == 0 { v = dflt; };
+    if v < 1 { v = 1; };
+    return v;
+}
+
+fn AuthStore_verifyPasswordByEmail(s: &AuthStore, email_ptr: ptr, email_len: u64, password_ptr: ptr, password_len: u64, out: &UserRow) -> bool {
+    let ne_p: ptr = PTR_NULL();
+    let ne_l: u64 = 0;
+    normalizeEmail(email_ptr, email_len, &ne_p, &ne_l);
+    if !AuthStore_getUserRowByEmail(s, ne_p, ne_l, out) { return false; };
+    let st_p: ptr = PTR_NULL();
+    let st_l: u64 = 0;
+    au_row_field(out, 5, &st_p, &st_l);
+    if !au_eq(st_p, st_l, STR_PTR("active"), STR_LEN("active")) { return false; };
+    let hash_p: ptr = PTR_NULL();
+    let hash_l: u64 = 0;
+    au_row_field(out, 3, &hash_p, &hash_l);
+    let ok: bool = false;
+    let vst: i32 = verifyPassword(password_ptr, password_len, hash_p, hash_l, &ok);
+    return ok;
+}
+
+fn AuthStore_issueSessionForUser(s: &AuthStore, user_id_ptr: ptr, user_id_len: u64, out: &LoginResult) -> i32 {
+    let row = UserRow { id: [0; 64], id_len: 0, email: [0; 320], email_len: 0, username: [0; 256], username_len: 0, password_hash: [0; 512], password_hash_len: 0, role: [0; 16], role_len: 0, status: [0; 16], status_len: 0, balance: 0.0, concurrency: 0, max_permission: [0; 32], max_permission_len: 0, allow_write: 0, allow_network: 0, allow_danger_bypass: 0, workspace_root: [0; 512], workspace_root_len: 0, notes: [0; 1024], notes_len: 0, totp_secret: [0; 256], totp_secret_len: 0, totp_enabled: 0, totp_enabled_at: 0, has_totp_enabled_at: false, created_at: 0, updated_at: 0, deleted_at: 0, has_deleted_at: false };
+    if !AuthStore_getUserRow(s, user_id_ptr, user_id_len, &row) {
+        return au_throw(STR_PTR("User not found or inactive"), STR_LEN("User not found or inactive"));
+    };
+    let st_p: ptr = PTR_NULL();
+    let st_l: u64 = 0;
+    au_row_field(&row, 5, &st_p, &st_l);
+    if !au_eq(st_p, st_l, STR_PTR("active"), STR_LEN("active")) {
+        return au_throw(STR_PTR("User not found or inactive"), STR_LEN("User not found or inactive"));
+    };
+    au_issue_session(s, &row, out);
+    return 0;
+}
+
+fn AuthStore_renewIfExpiring(s: &AuthStore, token_ptr: ptr, token_len: u64, has_token: bool, out: &LoginResult) -> bool {
+    if !has_token { return false; };
+    let sec_p: ptr = PTR_NULL();
+    let sec_l: u64 = 0;
+    au_cfg_field(&s.config, 0, &sec_p, &sec_l);
+    let claims = JwtPayload { sub: [0; 64], sub_len: 0, email: [0; 320], email_len: 0, role: [0; 16], role_len: 0, sid: [0; 32], sid_len: 0, iat: 0, exp: 0 };
+    if !verifyJwt(token_ptr, token_len, sec_p, sec_l, &claims) { return false; };
+    let lifetime: i64 = (claims.exp as i64) - (claims.iat as i64);
+    let remaining: i64 = (claims.exp as i64) - (sa_time_unix_ms() / 1000);
+    if lifetime <= 0 || (remaining * 2) > lifetime { return false; };
+    let sub_p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sub_p, &claims.sub, 0);
+    return AuthStore_issueSessionForUser(s, sub_p, claims.sub_len, out) == 0;
+}
+
+fn AuthStore_enableTotp(s: &AuthStore, user_id_ptr: ptr, user_id_len: u64, secret_ptr: ptr, secret_len: u64, out_json: &u64) -> i32 {
+    *out_json = 0;
+    let stmt: u64 = au_prepare(s.db, STR_PTR("UPDATE users SET totp_secret = ?, totp_enabled = 1, totp_enabled_at = ?, updated_at = ? WHERE id = ?"), STR_LEN("UPDATE users SET totp_secret = ?, totp_enabled = 1, totp_enabled_at = ?, updated_at = ? WHERE id = ?"));
+    if stmt != 0 {
+        au_bind_text(stmt, 1, secret_ptr, secret_len);
+        au_bind_int(stmt, 2, sa_time_unix_ms());
+        au_bind_int(stmt, 3, sa_time_unix_ms());
+        au_bind_text(stmt, 4, user_id_ptr, user_id_len);
+        au_step_once(stmt);
+        au_finalize(stmt);
+    };
+    if !AuthStore_getUser(s, user_id_ptr, user_id_len, out_json) {
+        return au_throw(STR_PTR("User not found"), STR_LEN("User not found"));
+    };
+    return 0;
+}
+
+fn AuthStore_disableTotp(s: &AuthStore, user_id_ptr: ptr, user_id_len: u64, out_json: &u64) -> i32 {
+    *out_json = 0;
+    let stmt: u64 = au_prepare(s.db, STR_PTR("UPDATE users SET totp_secret = '', totp_enabled = 0, totp_enabled_at = NULL, updated_at = ? WHERE id = ?"), STR_LEN("UPDATE users SET totp_secret = '', totp_enabled = 0, totp_enabled_at = NULL, updated_at = ? WHERE id = ?"));
+    if stmt != 0 {
+        au_bind_int(stmt, 1, sa_time_unix_ms());
+        au_bind_text(stmt, 2, user_id_ptr, user_id_len);
+        au_step_once(stmt);
+        au_finalize(stmt);
+    };
+    if !AuthStore_getUser(s, user_id_ptr, user_id_len, out_json) {
+        return au_throw(STR_PTR("User not found"), STR_LEN("User not found"));
+    };
+    return 0;
+}
+
+fn AuthStore_getTotpSecret(s: &AuthStore, user_id_ptr: ptr, user_id_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    *out_ptr = PTR_NULL();
+    *out_len = 0;
+    let row = UserRow { id: [0; 64], id_len: 0, email: [0; 320], email_len: 0, username: [0; 256], username_len: 0, password_hash: [0; 512], password_hash_len: 0, role: [0; 16], role_len: 0, status: [0; 16], status_len: 0, balance: 0.0, concurrency: 0, max_permission: [0; 32], max_permission_len: 0, allow_write: 0, allow_network: 0, allow_danger_bypass: 0, workspace_root: [0; 512], workspace_root_len: 0, notes: [0; 1024], notes_len: 0, totp_secret: [0; 256], totp_secret_len: 0, totp_enabled: 0, totp_enabled_at: 0, has_totp_enabled_at: false, created_at: 0, updated_at: 0, deleted_at: 0, has_deleted_at: false };
+    if !AuthStore_getUserRow(s, user_id_ptr, user_id_len, &row) { return false; };
+    if row.totp_enabled == 0 { return false; };
+    let sp: ptr = PTR_NULL();
+    let sl: u64 = 0;
+    au_row_field(&row, 9, &sp, &sl);
+    if sl == 0 { return false; };
+    au_doc_str(STR_PTR("totp"), STR_LEN("totp"), sp, sl, out_ptr, out_len);
+    return true;
+}
+
+// ---- L1000 — permissionAllowedForUser ----
+fn permissionAllowedForUser(user_json: u64, permission_ptr: ptr, permission_len: u64) -> bool {
+    if au_user_is_admin(user_json) { return true; };
+    let allow_db: bool = au_field_bool(user_json, STR_PTR("allowDangerBypass"), STR_LEN("allowDangerBypass"));
+    if !allow_db && au_eq(permission_ptr, permission_len, STR_PTR("dangerBypass"), STR_LEN("dangerBypass")) { return false; };
+    let allow_write: bool = au_field_bool(user_json, STR_PTR("allowWrite"), STR_LEN("allowWrite"));
+    if !allow_write && !au_eq(permission_ptr, permission_len, STR_PTR("readonlyAsk"), STR_LEN("readonlyAsk")) { return false; };
+    let mp_p: ptr = PTR_NULL();
+    let mp_l: u64 = 0;
+    if !au_field_str(user_json, STR_PTR("maxPermission"), STR_LEN("maxPermission"), &mp_p, &mp_l) { return false; };
+    return PERMISSION_RANK(permission_ptr, permission_len) <= PERMISSION_RANK(mp_p, mp_l);
 }
