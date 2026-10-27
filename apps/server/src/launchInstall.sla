@@ -1,45 +1,271 @@
-// Converted 1:1 from apps/server/src/launchInstall.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
-// Launch-adapter install/detect/env management: LAUNCH_SPECS table, PATH discovery,
-// .env parse/upsert, git clone + install.sh execution, OpenAI API probe, install jobs.
-
+// launchInstall.sla — full-body retranslation of launchInstall.ts
+// (1037 lines, CXU plugins @ f2cb649d), launch/install family 8/8
+// (Agent AD3 rebuild, step 5). Launch-adapter install/detect/env
+// management: LAUNCH_SPECS table, PATH discovery, .env parse/upsert,
+// git clone + install.sh execution, OpenAI API probe, install jobs.
+//
+// Async model (ASYNC_MODEL.md):
+// - installLaunchAdapters / installOne / runCmd / ensureCloned /
+//   runInstallSh / testOpenAiApi / validateEnvModeBeforeSave are async
+//   in TS, but every await is on a process or HTTP completion -> R8
+//   contract-layer blocking degeneration: synchronous bodies over the
+//   blocking std process runner (defect-#1 workaround: run + try_wait
+//   poll + drain, never exec_capture) and the blocking HTTP v2 client.
+// - installLock (TS: `let installLock: Promise<void> | null`, spin
+//   `while (installLock) await installLock`, set before the try,
+//   released in finally) -> R11 explicit cell state: sa_global cell
+//   "launchinstall.lock" holds 0 (free) / 1 (held); contenders poll
+//   with sa_time_sleep_ms(10). NO constant-ok stub: the state is real
+//   shared state, observable via installLockHeldNow().
+// - createInstallJob (sync fn) launches the TS fire-and-forget async
+//   IIFE -> R9: a sa_thread spawn drives installLaunchAdapters and
+//   settles the job record. Job records live in ONE JSON doc whose
+//   handle is kept in sa_global cell "launchinstall.jobsdoc",
+//   serialized by cell "launchinstall.jobslock" (same R11 pattern).
+//   getInstallJob reads the record back out of that doc.
+//
+// Representation choices (registered deviations from the bulk skeleton):
+// - The skeleton's (out_ptr: &ptr, out_len: &u64) string outs point at
+//   storage the callee cannot own; string results are returned through
+//   &LiText / &LiStr out params instead (same precedent as the FMA/BU/FA
+//   retranslations). Struct definitions and fn names follow the
+//   skeleton; InstallLaunchResultItem.steps and job logs are JSON texts.
+// - spawnRuntimeProcess (runtime/process.js) is backed directly by
+//   sa_std_process_* (the runtime wrapper's POSIX shape); win32-only
+//   branches of the TS (platform checks, E:/D:/ candidates) are
+//   platform seams — the POSIX path is implemented.
+// - toolchainDirCandidates (cliVersions.sla) is consumed defensively:
+//   its JSON dir array is merged into pathDirs only when it parses.
+// - InstallJob.time uses a HH:MM:SS clock text (TS toLocaleTimeString
+//   is locale-shaped; the shape is preserved, the locale is not).
+// - testOpenAiApi timeouts: the HTTP client call carries the 6 s /
+//   10 s budgets; a transport failure after the budget reads as the
+//   TS timeout message (AbortError discrimination approximated by
+//   elapsed time >= budget).
 @import "sa_std/io/print.sai"
 @import "sa_std/fs.sai"
 @import "sa_std/env.sai"
 @import "sa_std/process.sai"
+@import "sa_std/process.sa"
 @import "sa_std/http_client.sai"
 @import "sa_std/encoding/json.sai"
+@import "sa_std/globals.sai"
+@import "sa_std/time.sai"
 @import "sa_std/string.sa"
 @import "sa_std/ptr.sa"
+@import "cliVersions.sla"
 
-// DEFECT: Node fs sync APIs (existsSync/readFileSync/writeFileSync/mkdirSync/statSync/chmodSync), os.homedir,
-// path join/resolve/delimiter and process.env/process.platform have partial sa_std coverage only; approximated via sa_std_fs_* / sa_env_* externs.
-// DEFECT: dynamic object — Record<string,string> env maps represented as JSON text buffers / (ptr,len) key-value scans.
+// ---------------------------------------------------------------------------
+// Text helpers (family pattern).
+// ---------------------------------------------------------------------------
 
-// InstallLogLevel: "info"|"success"|"error"|"warn" -> u64 tag 0/1/2/3.
-// DEFECT: closure type — InstallSubLogger = (msg, level) => void callback type has no counterpart; logger passed as opaque ctx id + standalone emit functions.
+struct LiText {
+    bytes: [u8; 262144], len: u64
+}
+
+struct LiStr {
+    bytes: [u8; 8192], len: u64
+}
+
+fn li_text_ptr(s: &LiText) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &s.bytes, 0);
+    return p;
+}
+
+fn li_str_ptr(s: &LiStr) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &s.bytes, 0);
+    return p;
+}
+
+fn li_byte(p: ptr, i: u64) -> u8 {
+    let b: u8 = 0;
+    PTR_BYTE_AT(b, p, i);
+    return b;
+}
+
+fn li_push(s: &LiText, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        if s.len < 262144 { s.bytes[s.len] = li_byte(p, i); s.len = s.len + 1; };
+        i = i + 1;
+    }
+}
+
+fn li_push_str(s: &LiStr, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        if s.len < 8192 { s.bytes[s.len] = li_byte(p, i); s.len = s.len + 1; };
+        i = i + 1;
+    }
+}
+
+fn li_eq(p: ptr, n: u64, q: ptr, qn: u64) -> bool {
+    if n != qn { return false; };
+    let i: u64 = 0;
+    while i < n {
+        if li_byte(p, i) != li_byte(q, i) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn li_contains(p: ptr, n: u64, q: ptr, qn: u64) -> bool {
+    if qn == 0 { return true; };
+    if n < qn { return false; };
+    let i: u64 = 0;
+    while i + qn <= n {
+        let sub: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sub, p, i);
+        if li_eq(sub, qn, q, qn) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn li_lower(b: u8) -> u8 {
+    if b >= 65 && b <= 90 { return b + 32; };
+    return b;
+}
+
+fn li_trim_range(p: ptr, n: u64, out_s: &u64, out_e: &u64) -> void {
+    let s: u64 = 0;
+    let e: u64 = n;
+    while s < e {
+        let b = li_byte(p, s);
+        if b == 32 || b == 9 || b == 10 || b == 13 { s = s + 1; } else { break; };
+    }
+    while e > s {
+        let b = li_byte(p, e - 1);
+        if b == 32 || b == 9 || b == 10 || b == 13 { e = e - 1; } else { break; };
+    }
+    *out_s = s;
+    *out_e = e;
+}
+
+fn li_trimmed(p: ptr, n: u64, out: &LiStr) -> void {
+    out.len = 0;
+    let s: u64 = 0;
+    let e: u64 = 0;
+    li_trim_range(p, n, &s, &e);
+    if e > s {
+        let sp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(sp, p, s);
+        li_push_str(out, sp, e - s);
+    };
+}
+
+fn li_join2(a_p: ptr, a_l: u64, b_p: ptr, b_l: u64, out: &LiStr) -> void {
+    out.len = 0;
+    li_push_str(out, a_p, a_l);
+    if a_l > 0 && li_byte(a_p, a_l - 1) != 47 { li_push_str(out, STR_PTR("/"), STR_LEN("/")); };
+    li_push_str(out, b_p, b_l);
+}
+
+fn li_join3(a_p: ptr, a_l: u64, b_p: ptr, b_l: u64, c_p: ptr, c_l: u64, out: &LiStr) -> void {
+    let mid = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_join2(a_p, a_l, b_p, b_l, &mid);
+    li_join2(li_str_ptr(&mid), mid.len, c_p, c_l, out);
+}
+
+// Guard-return free helpers (PhiStateConflict family: unconditional calls).
+fn li_free_doc(doc: u64) -> void {
+    if doc == 0 { return; };
+    sa_json_free(doc);
+}
+
+fn li_free_env_buffer(h: u64) -> void {
+    if h == 0 { return; };
+    sa_env_buffer_free(h);
+}
+
+fn li_free_buffer(h: u64) -> void {
+    if h == 0 { return; };
+    sa_json_buffer_free(h);
+}
+
+fn li_parse(p: ptr, n: u64) -> u64 {
+    if n == 0 { return 0; };
+    return sa_json_parse(p, n);
+}
+
+fn li_get(parent: u64, key_p: ptr, key_l: u64) -> u64 {
+    if parent == 0 { return 0; };
+    let v: u64 = 0;
+    if sa_json_object_get(parent, key_p, key_l, &v) != 0 { return 0; };
+    return v;
+}
+
+fn li_stringify_into(doc: u64, out: &LiText) -> bool {
+    out.len = 0;
+    if doc == 0 { return false; };
+    let h: u64 = 0;
+    if sa_json_stringify(doc, &h) != 0 || h == 0 { return false; };
+    let dp: ptr = sa_json_buffer_data(h);
+    li_push(out, dp, sa_json_buffer_len(h));
+    li_free_buffer(h);
+    return true;
+}
+
+fn li_node_string(doc: u64, key_p: ptr, key_l: u64, out: &LiStr) -> bool {
+    out.len = 0;
+    let node = li_get(doc, key_p, key_l);
+    if node == 0 { return false; };
+    if sa_json_kind(node) != 5 { return false; };
+    let np: ptr = sa_json_string_ptr(node);
+    li_push_str(out, np, sa_json_string_len(node));
+    return true;
+}
+
+fn li_node_text(doc: u64, key_p: ptr, key_l: u64, out: &LiText) -> bool {
+    out.len = 0;
+    let node = li_get(doc, key_p, key_l);
+    if node == 0 { return false; };
+    if sa_json_kind(node) != 5 { return false; };
+    let np: ptr = sa_json_string_ptr(node);
+    li_push(out, np, sa_json_string_len(node));
+    return true;
+}
+
+fn li_env_read(name_p: ptr, name_l: u64, out: &LiStr) -> bool {
+    out.len = 0;
+    let h: u64 = sa_env_get(name_p, name_l);
+    if h == 0 { return false; };
+    let bp: ptr = sa_env_buffer_data(h);
+    li_push_str(out, bp, sa_env_buffer_len(h));
+    sa_env_buffer_free(h);
+    return out.len > 0;
+}
+
+fn li_exists(p: ptr, n: u64) -> bool {
+    return sa_std_fs_exists(p, n) == 0;
+}
+
+fn li_read_file(p: ptr, n: u64, out: &LiText) -> bool {
+    out.len = 0;
+    let h: u64 = sa_fs_read_file(p, n, 4194304);
+    if h == 0 { return false; };
+    let dp: ptr = sa_fs_read_buffer_data(h);
+    li_push(out, dp, sa_fs_read_buffer_len(h));
+    sa_fs_read_buffer_free(h);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Skeleton struct surface (kept from the bulk pass).
+// ---------------------------------------------------------------------------
 
 struct LaunchAdapterSpec {
     id_ptr: ptr, id_len: u64,
     repo_ptr: ptr, repo_len: u64,
-    hasCloneUrl: bool, cloneUrl_ptr: ptr, cloneUrl_len: u64, // cloneUrl: string | null
-    wrapperBins_ptr: ptr, wrapperBins_len: u64, // string[] -> JSON array text
+    hasCloneUrl: bool, cloneUrl_ptr: ptr, cloneUrl_len: u64,
+    wrapperBins_ptr: ptr, wrapperBins_len: u64,
     wrapperBinsCount: u64,
-    productBins_ptr: ptr, productBins_len: u64, // string[] -> JSON array text
+    productBins_ptr: ptr, productBins_len: u64,
     productBinsCount: u64,
     envPrefix_ptr: ptr, envPrefix_len: u64,
     configDirName_ptr: ptr, configDirName_len: u64,
-}
-
-// LAUNCH_SPECS (源 L25-L144): 11 entries, order preserved 1:1:
-// code-launch, agy-launch, claude-launch (productBins claude+claudecode), gemini-launch, crush-launch,
-// auggie-launch, grok-launch (productBins grok+agent), agent-launch (cloneUrl null, shares GROK_LAUNCH_/grok-launch),
-// coderabbit-launch (null), freebuff-launch (null), pi-launch (repo "pi", null, wrapperBins pi+pi-launch).
-// DEFECT: const array of object literals -> accessor fn returning spec by index; literal table materialized at fix stage.
-fn launchSpecsCount() -> u64 { return 11; }
-fn launchSpecAt(index: u64, out: &LaunchAdapterSpec) -> bool {
-    // DEFECT: static table data (URLs https://github.com/layola13/<repo>.git etc.) not embedded in bulk pass; fields filled at fix stage.
-    if index >= 11 { return false; };
-    return true;
 }
 
 struct LaunchAdapterStatus {
@@ -70,12 +296,12 @@ struct LaunchEnvValues {
 }
 
 struct InstallLaunchRequest {
-    ids_ptr: ptr, ids_len: u64, idsCount: u64, hasIds: bool, // string[] -> JSON array text
+    ids_ptr: ptr, ids_len: u64, idsCount: u64, hasIds: bool,
     missingOnly: bool, hasMissingOnly: bool,
-    skipCli: bool, hasSkipCli: bool, // default true semantics in source comments; undefined check used in installOne
-    envMode: u64, hasEnvMode: bool, // 0=shared 1=separate 2=none
+    skipCli: bool, hasSkipCli: bool,
+    envMode: u64, hasEnvMode: bool,
     sharedEnv: LaunchEnvValues, hasSharedEnv: bool,
-    separateEnv_ptr: ptr, separateEnv_len: u64, hasSeparateEnv: bool, // DEFECT: dynamic object Record<string, LaunchEnvValues> as JSON buffer
+    separateEnv_ptr: ptr, separateEnv_len: u64, hasSeparateEnv: bool,
     forceEnv: bool, hasForceEnv: bool,
     sourceRoot_ptr: ptr, sourceRoot_len: u64, hasSourceRoot: bool,
     skipModelTest: bool, hasSkipModelTest: bool,
@@ -84,250 +310,2324 @@ struct InstallLaunchRequest {
 struct InstallLaunchResultItem {
     id_ptr: ptr, id_len: u64,
     ok: bool,
-    steps_ptr: ptr, steps_len: u64, stepsCount: u64, // string[] -> JSON array text
+    steps_ptr: ptr, steps_len: u64, stepsCount: u64,
     hasError: bool, error_ptr: ptr, error_len: u64,
     hasStatus: bool, status: LaunchAdapterStatus,
 }
 
-// Module state (源 L206): let installLock: Promise<void> | null
-// DEFECT: Promise-based mutex — installLock approximated as bool flag on a state struct.
 struct LaunchInstallState {
     installLockHeld: bool,
-    jobs_ptr: ptr, jobs_len: u64, // DEFECT: Map<string, InstallJob> -> JSON buffer store, see InstallJob section
+    jobs_ptr: ptr, jobs_len: u64,
     jobsCount: u64,
 }
 
-fn home(out_ptr: &ptr, out_len: &u64) -> void {
-    // 源 L208-L210: process.env.HOME || process.env.USERPROFILE || homedir()
-    // DEFECT: process.env access approximated via sa_env_get.
-    *out_ptr = STR_PTR("");
-    *out_len = 0;
+fn li_spec_fill(out: &LaunchAdapterSpec, id_p: ptr, id_l: u64, repo_p: ptr, repo_l: u64, has_clone: bool, clone_p: ptr, clone_l: u64, wrap_p: ptr, wrap_l: u64, wrap_n: u64, prod_p: ptr, prod_l: u64, prod_n: u64, prefix_p: ptr, prefix_l: u64, dir_p: ptr, dir_l: u64) -> void {
+    out.id_ptr = id_p;
+    out.id_len = id_l;
+    out.repo_ptr = repo_p;
+    out.repo_len = repo_l;
+    out.hasCloneUrl = has_clone;
+    out.cloneUrl_ptr = clone_p;
+    out.cloneUrl_len = clone_l;
+    out.wrapperBins_ptr = wrap_p;
+    out.wrapperBins_len = wrap_l;
+    out.wrapperBinsCount = wrap_n;
+    out.productBins_ptr = prod_p;
+    out.productBins_len = prod_l;
+    out.productBinsCount = prod_n;
+    out.envPrefix_ptr = prefix_p;
+    out.envPrefix_len = prefix_l;
+    out.configDirName_ptr = dir_p;
+    out.configDirName_len = dir_l;
 }
 
-fn defaultSourceRoot(custom_ptr: ptr, custom_len: u64, hasCustom: bool, out_ptr: &ptr, out_len: &u64) -> void {
-    // 源 L212-L221: trimmed custom ("~/" expands under home, else resolve) else env CODEX_UI_LAUNCH_SRC_ROOT else join(home,"projects")
-    // DEFECT: path resolve/join semantics approximated.
-    *out_ptr = custom_ptr;
-    *out_len = custom_len;
-}
+// LAUNCH_SPECS (TS L26-128): 11 entries, order preserved 1:1.
+fn launchSpecsCount() -> u64 { return 11; }
 
-fn pathDirs(out_ptr: &ptr, out_len: &u64, outCount: &u64) -> void {
-    // 源 L223-L254: extra toolchain dirs (home .local/bin, bin, .codex/bin, .claude/bin, .grok/bin, .agy/bin, .pi/bin,
-    // .opencode/bin, .codex-ultra/bin, .bun/bin, .bun/install/global/bin, .npm-global/bin, toolchainDirCandidates(home, env),
-    // /usr/local/bin, /usr/local/sbin, /usr/bin, /opt/bin, /opt/node/bin, /tools/node/bin, /opt/homebrew/bin,
-    // linuxbrew bin+sbin, /snap/bin, /var/lib/snapd/snap/bin, /var/lib/flatpak/exports/bin, /nix/.../bin)
-    // + PATH split by delimiter, de-duplicated via Set preserving order.
-    // DEFECT: Set de-dup + spread of cross-module toolchainDirCandidates (cliVersions) approximated; cross-module import kept as extern call at fix stage.
-    *outCount = 0;
-}
-
-fn findOnPath(names_ptr: ptr, names_len: u64, namesCount: u64, out_ptr: &ptr, out_len: &u64, outFound: &bool) -> void {
-    // 源 L256-L276: for name x dir: existsSync; on POSIX also statSync isFile + mode & 0o111 executable; first hit wins; win32 skips exec check
-    // DEFECT: process.platform branch + stat mode bits approximated via sa_std_fs_* metadata at fix stage.
-    *outFound = false;
-}
-
-fn configEnvPath(spec: &LaunchAdapterSpec, out_ptr: &ptr, out_len: &u64) -> void {
-    // 源 L278-L281: join(env XDG_CONFIG_HOME || join(home,".config"), spec.configDirName, ".env")
-    *out_ptr = STR_PTR("");
-    *out_len = 0;
-}
-
-fn parseEnvFile(path_ptr: ptr, path_len: u64, out_ptr: &ptr, out_len: &u64) -> void {
-    // 源 L283-L303: missing -> {}; per line: skip blank/#, split at first "=", trim key/value, strip matching surrounding quotes
-    // DEFECT: dynamic object Record<string,string> returned as JSON buffer.
-    *out_len = 0;
-}
-
-fn isPlaceholder(value_ptr: ptr, value_len: u64, hasValue: bool) -> bool {
-    // 源 L305-L316: empty -> true; lowercase contains your-api-key / sk-your-key / your-gateway, or equals changeme / xxx
-    if hasValue == false { return true; };
+fn launchSpecAt(index: u64, out: &LaunchAdapterSpec) -> bool {
+    if index == 0 { li_spec_fill(out, STR_PTR("code-launch"), STR_LEN("code-launch"), STR_PTR("code-launch"), STR_LEN("code-launch"), true, STR_PTR("https://github.com/layola13/code-launch.git"), STR_LEN("https://github.com/layola13/code-launch.git"), STR_PTR("[\"code-launch\"]"), STR_LEN("[\"code-launch\"]"), 1, STR_PTR("[\"codex\"]"), STR_LEN("[\"codex\"]"), 1, STR_PTR("CODE_LAUNCH_"), STR_LEN("CODE_LAUNCH_"), STR_PTR("code-launch"), STR_LEN("code-launch")); return true; };
+    if index == 1 { li_spec_fill(out, STR_PTR("agy-launch"), STR_LEN("agy-launch"), STR_PTR("agy-launch"), STR_LEN("agy-launch"), true, STR_PTR("https://github.com/layola13/agy-launch.git"), STR_LEN("https://github.com/layola13/agy-launch.git"), STR_PTR("[\"agy-launch\"]"), STR_LEN("[\"agy-launch\"]"), 1, STR_PTR("[\"agy\"]"), STR_LEN("[\"agy\"]"), 1, STR_PTR("AGY_LAUNCH_"), STR_LEN("AGY_LAUNCH_"), STR_PTR("agy-launch"), STR_LEN("agy-launch")); return true; };
+    if index == 2 { li_spec_fill(out, STR_PTR("claude-launch"), STR_LEN("claude-launch"), STR_PTR("claude-launch"), STR_LEN("claude-launch"), true, STR_PTR("https://github.com/layola13/claude-launch.git"), STR_LEN("https://github.com/layola13/claude-launch.git"), STR_PTR("[\"claude-launch\"]"), STR_LEN("[\"claude-launch\"]"), 1, STR_PTR("[\"claude\",\"claudecode\"]"), STR_LEN("[\"claude\",\"claudecode\"]"), 2, STR_PTR("CLAUDE_LAUNCH_"), STR_LEN("CLAUDE_LAUNCH_"), STR_PTR("claude-launch"), STR_LEN("claude-launch")); return true; };
+    if index == 3 { li_spec_fill(out, STR_PTR("gemini-launch"), STR_LEN("gemini-launch"), STR_PTR("gemini-launch"), STR_LEN("gemini-launch"), true, STR_PTR("https://github.com/layola13/gemini-launch.git"), STR_LEN("https://github.com/layola13/gemini-launch.git"), STR_PTR("[\"gemini-launch\"]"), STR_LEN("[\"gemini-launch\"]"), 1, STR_PTR("[\"gemini\"]"), STR_LEN("[\"gemini\"]"), 1, STR_PTR("GEMINI_LAUNCH_"), STR_LEN("GEMINI_LAUNCH_"), STR_PTR("gemini-launch"), STR_LEN("gemini-launch")); return true; };
+    if index == 4 { li_spec_fill(out, STR_PTR("crush-launch"), STR_LEN("crush-launch"), STR_PTR("crush-launch"), STR_LEN("crush-launch"), true, STR_PTR("https://github.com/layola13/crush-launch.git"), STR_LEN("https://github.com/layola13/crush-launch.git"), STR_PTR("[\"crush-launch\"]"), STR_LEN("[\"crush-launch\"]"), 1, STR_PTR("[\"crush\"]"), STR_LEN("[\"crush\"]"), 1, STR_PTR("CRUSH_LAUNCH_"), STR_LEN("CRUSH_LAUNCH_"), STR_PTR("crush-launch"), STR_LEN("crush-launch")); return true; };
+    if index == 5 { li_spec_fill(out, STR_PTR("auggie-launch"), STR_LEN("auggie-launch"), STR_PTR("auggie-launch"), STR_LEN("auggie-launch"), true, STR_PTR("https://github.com/layola13/auggie-launch.git"), STR_LEN("https://github.com/layola13/auggie-launch.git"), STR_PTR("[\"auggie-launch\"]"), STR_LEN("[\"auggie-launch\"]"), 1, STR_PTR("[\"auggie\"]"), STR_LEN("[\"auggie\"]"), 1, STR_PTR("AUGGIE_LAUNCH_"), STR_LEN("AUGGIE_LAUNCH_"), STR_PTR("auggie-launch"), STR_LEN("auggie-launch")); return true; };
+    if index == 6 { li_spec_fill(out, STR_PTR("grok-launch"), STR_LEN("grok-launch"), STR_PTR("grok-launch"), STR_LEN("grok-launch"), true, STR_PTR("https://github.com/layola13/grok-launch.git"), STR_LEN("https://github.com/layola13/grok-launch.git"), STR_PTR("[\"grok-launch\"]"), STR_LEN("[\"grok-launch\"]"), 1, STR_PTR("[\"grok\",\"agent\"]"), STR_LEN("[\"grok\",\"agent\"]"), 2, STR_PTR("GROK_LAUNCH_"), STR_LEN("GROK_LAUNCH_"), STR_PTR("grok-launch"), STR_LEN("grok-launch")); return true; };
+    if index == 7 { li_spec_fill(out, STR_PTR("agent-launch"), STR_LEN("agent-launch"), STR_PTR("agent-launch"), STR_LEN("agent-launch"), false, STR_PTR(""), STR_LEN(""), STR_PTR("[\"agent-launch\",\"grok-launch\"]"), STR_LEN("[\"agent-launch\",\"grok-launch\"]"), 2, STR_PTR("[\"agent\",\"grok\"]"), STR_LEN("[\"agent\",\"grok\"]"), 2, STR_PTR("GROK_LAUNCH_"), STR_LEN("GROK_LAUNCH_"), STR_PTR("grok-launch"), STR_LEN("grok-launch")); return true; };
+    if index == 8 { li_spec_fill(out, STR_PTR("coderabbit-launch"), STR_LEN("coderabbit-launch"), STR_PTR("coderabbit-launch"), STR_LEN("coderabbit-launch"), false, STR_PTR(""), STR_LEN(""), STR_PTR("[\"coderabbit-launch\",\"cr-launch\"]"), STR_LEN("[\"coderabbit-launch\",\"cr-launch\"]"), 2, STR_PTR("[\"coderabbit\",\"cr\"]"), STR_LEN("[\"coderabbit\",\"cr\"]"), 2, STR_PTR("CODERABBIT_LAUNCH_"), STR_LEN("CODERABBIT_LAUNCH_"), STR_PTR("coderabbit-launch"), STR_LEN("coderabbit-launch")); return true; };
+    if index == 9 { li_spec_fill(out, STR_PTR("freebuff-launch"), STR_LEN("freebuff-launch"), STR_PTR("freebuff-launch"), STR_LEN("freebuff-launch"), false, STR_PTR(""), STR_LEN(""), STR_PTR("[\"freebuff-launch\"]"), STR_LEN("[\"freebuff-launch\"]"), 1, STR_PTR("[\"freebuff\"]"), STR_LEN("[\"freebuff\"]"), 1, STR_PTR("FREEBUFF_LAUNCH_"), STR_LEN("FREEBUFF_LAUNCH_"), STR_PTR("freebuff-launch"), STR_LEN("freebuff-launch")); return true; };
+    if index == 10 { li_spec_fill(out, STR_PTR("pi-launch"), STR_LEN("pi-launch"), STR_PTR("pi"), STR_LEN("pi"), false, STR_PTR(""), STR_LEN(""), STR_PTR("[\"pi\",\"pi-launch\"]"), STR_LEN("[\"pi\",\"pi-launch\"]"), 2, STR_PTR("[\"pi\"]"), STR_LEN("[\"pi\"]"), 1, STR_PTR("PI_LAUNCH_"), STR_LEN("PI_LAUNCH_"), STR_PTR("pi-launch"), STR_LEN("pi-launch")); return true; };
     return false;
-}
-
-fn resolveSourceDir(spec: &LaunchAdapterSpec, custom_ptr: ptr, custom_len: u64, hasCustom: bool, out_ptr: &ptr, out_len: &u64, outFound: &bool) -> void {
-    // 源 L318-L337: candidates join(root,repo), home/projects, home/src, /root/projects, E:/projects, D:/projects;
-    // dir qualifies if install.sh OR main.py OR packages/coding-agent exists inside
-    *outFound = false;
 }
 
 fn getSpec(id_ptr: ptr, id_len: u64, out: &LaunchAdapterSpec) -> bool {
-    // 源 L339-L341: LAUNCH_SPECS.find(s => s.id === id)
-    // DEFECT: closure predicate Array.find approximated as index loop over launchSpecAt.
+    let i: u64 = 0;
+    while i < 11 {
+        if launchSpecAt(i, out) {
+            if li_eq(out.id_ptr, out.id_len, id_ptr, id_len) { return true; };
+        };
+        i = i + 1;
+    }
     return false;
 }
 
-fn detectAdapter(spec: &LaunchAdapterSpec, customRoot_ptr: ptr, customRoot_len: u64, hasCustomRoot: bool, out: &LaunchAdapterStatus) -> void {
-    // 源 L343-L405: try { wrapperPath=findOnPath(wrapperBins); sourceDir=resolveSourceDir; sourceCliPath=
-    // sourceDir/packages/coding-agent/src/cli.ts if exists; productCliPath=findOnPath(productBins)||sourceCliPath;
-    // envMap=parseEnvFile(envPath); baseUrl/model/apiKey via envPrefix keys (API_KEY ?? API_KEYS);
-    // installed = wrapperPath || (id=="pi-launch" && sourceCliPath); needsInstall/needsSetup derived }
-    // catch { all-absent fallback status with needsInstall/needsSetup true }
-    // DEFECT: try/catch fallback approximated — failure path fills the same fallback status struct.
+// ---------------------------------------------------------------------------
+// home / source root / PATH discovery (TS L182-257).
+// ---------------------------------------------------------------------------
+
+fn home(out: &LiStr) -> void {
+    out.len = 0;
+    if li_env_read(STR_PTR("HOME"), STR_LEN("HOME"), out) { return; };
+    if li_env_read(STR_PTR("USERPROFILE"), STR_LEN("USERPROFILE"), out) { return; };
+    let h: u64 = sa_env_home_dir();
+    if h != 0 {
+        let bp: ptr = sa_env_buffer_data(h);
+        li_push_str(out, bp, sa_env_buffer_len(h));
+    };
+    li_free_env_buffer(h);
+}
+
+fn defaultSourceRoot(custom_ptr: ptr, custom_len: u64, hasCustom: bool, out: &LiStr) -> void {
+    out.len = 0;
+    if hasCustom {
+        let t = LiStr { bytes: [0u8; 8192], len: 0 };
+        li_trimmed(custom_ptr, custom_len, &t);
+        if t.len > 0 {
+            if t.len > 2 && li_byte(li_str_ptr(&t), 0) == 126 && li_byte(li_str_ptr(&t), 1) == 47 {
+                let hm = LiStr { bytes: [0u8; 8192], len: 0 };
+                home(&hm);
+                let rest: ptr = PTR_NULL();
+                PTR_BYTE_ADD(rest, li_str_ptr(&t), 2);
+                li_join2(li_str_ptr(&hm), hm.len, rest, t.len - 2, out);
+                return;
+            };
+            if li_byte(li_str_ptr(&t), 0) == 47 {
+                li_push_str(out, li_str_ptr(&t), t.len);
+                return;
+            };
+            let cwd = LiStr { bytes: [0u8; 8192], len: 0 };
+            let ch: u64 = sa_env_current_dir();
+            if ch != 0 {
+                let bp: ptr = sa_env_buffer_data(ch);
+                li_push_str(&cwd, bp, sa_env_buffer_len(ch));
+            };
+            li_free_env_buffer(ch);
+            li_join2(li_str_ptr(&cwd), cwd.len, li_str_ptr(&t), t.len, out);
+            return;
+        };
+    };
+    if li_env_read(STR_PTR("CODEX_UI_LAUNCH_SRC_ROOT"), STR_LEN("CODEX_UI_LAUNCH_SRC_ROOT"), out) { return; };
+    let hm = LiStr { bytes: [0u8; 8192], len: 0 };
+    home(&hm);
+    li_join2(li_str_ptr(&hm), hm.len, STR_PTR("projects"), STR_LEN("projects"), out);
+}
+
+// Append dir to the JSON array text under construction when not present.
+fn li_dirs_push_unique(arr: &LiText, count: &u64, dir_p: ptr, dir_l: u64) -> void {
+    let doc = li_parse(li_text_ptr(arr), arr.len);
+    if doc != 0 {
+        let cnt: u64 = 0;
+        sa_json_value_count(doc, &cnt);
+        let i: u64 = 0;
+        let dup = false;
+        while i < cnt {
+            let item: u64 = 0;
+            if sa_json_array_get(doc, i, &item) == 0 {
+                if item != 0 && sa_json_kind(item) == 5 {
+                    let ip: ptr = sa_json_string_ptr(item);
+                    if li_eq(ip, sa_json_string_len(item), dir_p, dir_l) { dup = true; };
+                };
+            };
+            i = i + 1;
+        }
+        li_free_doc(doc);
+        if dup { return; };
+    };
+    let doc2 = li_parse(li_text_ptr(arr), arr.len);
+    if doc2 == 0 { return; };
+    sa_json_array_push_string(doc2, dir_p, dir_l);
+    let c_now = *count;
+    *count = c_now + 1;
+    li_stringify_into(doc2, arr);
+    li_free_doc(doc2);
+}
+
+fn pathDirs(out: &LiText, outCount: &u64) -> void {
+    out.len = 0;
+    li_push(out, STR_PTR("[]"), STR_LEN("[]"));
+    *outCount = 0;
+    let hm = LiStr { bytes: [0u8; 8192], len: 0 };
+    home(&hm);
+    let hp: ptr = li_str_ptr(&hm);
+    let d = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_join2(hp, hm.len, STR_PTR(".local/bin"), STR_LEN(".local/bin"), &d);
+    li_dirs_push_unique(out, outCount, li_str_ptr(&d), d.len);
+    li_join2(hp, hm.len, STR_PTR("bin"), STR_LEN("bin"), &d);
+    li_dirs_push_unique(out, outCount, li_str_ptr(&d), d.len);
+    li_join2(hp, hm.len, STR_PTR(".codex/bin"), STR_LEN(".codex/bin"), &d);
+    li_dirs_push_unique(out, outCount, li_str_ptr(&d), d.len);
+    li_join2(hp, hm.len, STR_PTR(".claude/bin"), STR_LEN(".claude/bin"), &d);
+    li_dirs_push_unique(out, outCount, li_str_ptr(&d), d.len);
+    li_join2(hp, hm.len, STR_PTR(".grok/bin"), STR_LEN(".grok/bin"), &d);
+    li_dirs_push_unique(out, outCount, li_str_ptr(&d), d.len);
+    li_join2(hp, hm.len, STR_PTR(".agy/bin"), STR_LEN(".agy/bin"), &d);
+    li_dirs_push_unique(out, outCount, li_str_ptr(&d), d.len);
+    li_join2(hp, hm.len, STR_PTR(".pi/bin"), STR_LEN(".pi/bin"), &d);
+    li_dirs_push_unique(out, outCount, li_str_ptr(&d), d.len);
+    li_join2(hp, hm.len, STR_PTR(".opencode/bin"), STR_LEN(".opencode/bin"), &d);
+    li_dirs_push_unique(out, outCount, li_str_ptr(&d), d.len);
+    li_join2(hp, hm.len, STR_PTR(".codex-ultra/bin"), STR_LEN(".codex-ultra/bin"), &d);
+    li_dirs_push_unique(out, outCount, li_str_ptr(&d), d.len);
+    li_join2(hp, hm.len, STR_PTR(".bun/bin"), STR_LEN(".bun/bin"), &d);
+    li_dirs_push_unique(out, outCount, li_str_ptr(&d), d.len);
+    li_join3(hp, hm.len, STR_PTR(".bun/install"), STR_LEN(".bun/install"), STR_PTR("global/bin"), STR_LEN("global/bin"), &d);
+    li_dirs_push_unique(out, outCount, li_str_ptr(&d), d.len);
+    li_join2(hp, hm.len, STR_PTR(".npm-global/bin"), STR_LEN(".npm-global/bin"), &d);
+    li_dirs_push_unique(out, outCount, li_str_ptr(&d), d.len);
+    // toolchainDirCandidates(homeDir, env) — defensive consumption.
+    let scratch = LiText { bytes: [0u8; 262144], len: 0 };
+    let env_json = LiText { bytes: [0u8; 262144], len: 0 };
+    let ev: u64 = sa_env_vars_json();
+    if ev != 0 {
+        let bp: ptr = sa_env_buffer_data(ev);
+        li_push(&env_json, bp, sa_env_buffer_len(ev));
+    };
+    li_free_env_buffer(ev);
+    let tn = toolchainDirCandidates(hp, hm.len, hm.len > 0, li_text_ptr(&env_json), env_json.len, li_text_ptr(&scratch));
+    let tdoc: u64 = 0;
+    if tn > 0 && tn <= 262144 {
+        scratch.len = tn;
+        tdoc = li_parse(li_text_ptr(&scratch), scratch.len);
+        if tdoc != 0 {
+            let cnt: u64 = 0;
+            sa_json_value_count(tdoc, &cnt);
+            let i: u64 = 0;
+            while i < cnt {
+                let item: u64 = 0;
+                if sa_json_array_get(tdoc, i, &item) == 0 {
+                    if item != 0 && sa_json_kind(item) == 5 {
+                        let ip: ptr = sa_json_string_ptr(item);
+                        li_dirs_push_unique(out, outCount, ip, sa_json_string_len(item));
+                    };
+                };
+                i = i + 1;
+            }
+        };
+    };
+    li_free_doc(tdoc);
+    li_dirs_push_unique(out, outCount, STR_PTR("/usr/local/bin"), STR_LEN("/usr/local/bin"));
+    li_dirs_push_unique(out, outCount, STR_PTR("/usr/local/sbin"), STR_LEN("/usr/local/sbin"));
+    li_dirs_push_unique(out, outCount, STR_PTR("/usr/bin"), STR_LEN("/usr/bin"));
+    li_dirs_push_unique(out, outCount, STR_PTR("/opt/bin"), STR_LEN("/opt/bin"));
+    li_dirs_push_unique(out, outCount, STR_PTR("/opt/node/bin"), STR_LEN("/opt/node/bin"));
+    li_dirs_push_unique(out, outCount, STR_PTR("/tools/node/bin"), STR_LEN("/tools/node/bin"));
+    li_dirs_push_unique(out, outCount, STR_PTR("/opt/homebrew/bin"), STR_LEN("/opt/homebrew/bin"));
+    li_dirs_push_unique(out, outCount, STR_PTR("/home/linuxbrew/.linuxbrew/bin"), STR_LEN("/home/linuxbrew/.linuxbrew/bin"));
+    li_dirs_push_unique(out, outCount, STR_PTR("/home/linuxbrew/.linuxbrew/sbin"), STR_LEN("/home/linuxbrew/.linuxbrew/sbin"));
+    li_dirs_push_unique(out, outCount, STR_PTR("/snap/bin"), STR_LEN("/snap/bin"));
+    li_dirs_push_unique(out, outCount, STR_PTR("/var/lib/snapd/snap/bin"), STR_LEN("/var/lib/snapd/snap/bin"));
+    li_dirs_push_unique(out, outCount, STR_PTR("/var/lib/flatpak/exports/bin"), STR_LEN("/var/lib/flatpak/exports/bin"));
+    li_dirs_push_unique(out, outCount, STR_PTR("/nix/var/nix/profiles/default/bin"), STR_LEN("/nix/var/nix/profiles/default/bin"));
+    // PATH env split on ':' (POSIX delimiter; win32 ';' is a platform seam).
+    let path_env = LiText { bytes: [0u8; 262144], len: 0 };
+    let ph: u64 = sa_env_get(STR_PTR("PATH"), STR_LEN("PATH"));
+    if ph != 0 {
+        let bp: ptr = sa_env_buffer_data(ph);
+        li_push(&path_env, bp, sa_env_buffer_len(ph));
+    };
+    li_free_env_buffer(ph);
+    if path_env.len > 0 {
+        let pp: ptr = li_text_ptr(&path_env);
+        let start: u64 = 0;
+        let i: u64 = 0;
+        while i <= path_env.len {
+            if i == path_env.len || li_byte(pp, i) == 58 {
+                if i > start {
+                    let seg: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(seg, pp, start);
+                    li_dirs_push_unique(out, outCount, seg, i - start);
+                };
+                start = i + 1;
+            };
+            i = i + 1;
+        }
+    };
+}
+
+fn li_is_exec_file(p: ptr, n: u64) -> bool {
+    let md: u64 = sa_fs_metadata(p, n);
+    if md == 0 { return false; };
+    let is_file = sa_fs_metadata_is_file(md) != 0;
+    let mode: u32 = sa_fs_metadata_mode(md);
+    sa_fs_metadata_free(md);
+    if !is_file { return false; };
+    return (mode & 73) != 0;
+}
+
+fn findOnPath(names_ptr: ptr, names_len: u64, namesCount: u64, out: &LiStr, outFound: &bool) -> void {
+    out.len = 0;
+    *outFound = false;
+    let dirs = LiText { bytes: [0u8; 262144], len: 0 };
+    let dcnt: u64 = 0;
+    pathDirs(&dirs, &dcnt);
+    let ndoc = li_parse(names_ptr, names_len);
+    if ndoc == 0 { return; };
+    let ddoc = li_parse(li_text_ptr(&dirs), dirs.len);
+    let ni: u64 = 0;
+    while ni < namesCount {
+        let nitem: u64 = 0;
+        if sa_json_array_get(ndoc, ni, &nitem) == 0 {
+            if nitem != 0 && sa_json_kind(nitem) == 5 {
+                let np: ptr = sa_json_string_ptr(nitem);
+                let nl: u64 = sa_json_string_len(nitem);
+                if ddoc != 0 {
+                    let dc: u64 = 0;
+                    sa_json_value_count(ddoc, &dc);
+                    let di: u64 = 0;
+                    while di < dc {
+                        let ditem: u64 = 0;
+                        if sa_json_array_get(ddoc, di, &ditem) == 0 {
+                            if ditem != 0 && sa_json_kind(ditem) == 5 {
+                                let dp2: ptr = sa_json_string_ptr(ditem);
+                                let dl2: u64 = sa_json_string_len(ditem);
+                                let full = LiStr { bytes: [0u8; 8192], len: 0 };
+                                li_join2(dp2, dl2, np, nl, &full);
+                                if li_is_exec_file(li_str_ptr(&full), full.len) {
+                                    li_push_str(out, li_str_ptr(&full), full.len);
+                                    *outFound = true;
+                                    li_free_doc(ddoc);
+                                    li_free_doc(ndoc);
+                                    return;
+                                };
+                            };
+                        };
+                        di = di + 1;
+                    }
+                };
+            };
+        };
+        ni = ni + 1;
+    }
+    li_free_doc(ddoc);
+    li_free_doc(ndoc);
+}
+
+fn configEnvPath(spec: &LaunchAdapterSpec, out: &LiStr) -> void {
+    out.len = 0;
+    let base = LiStr { bytes: [0u8; 8192], len: 0 };
+    if !li_env_read(STR_PTR("XDG_CONFIG_HOME"), STR_LEN("XDG_CONFIG_HOME"), &base) {
+        let hm = LiStr { bytes: [0u8; 8192], len: 0 };
+        home(&hm);
+        li_join2(li_str_ptr(&hm), hm.len, STR_PTR(".config"), STR_LEN(".config"), &base);
+    };
+    let mid = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_join2(li_str_ptr(&base), base.len, spec.configDirName_ptr, spec.configDirName_len, &mid);
+    li_join2(li_str_ptr(&mid), mid.len, STR_PTR(".env"), STR_LEN(".env"), out);
+}
+
+// ---------------------------------------------------------------------------
+// .env parsing / placeholders / source dirs / detection (TS L259-392).
+// Status string fields point into a caller-provided arena (LiText) that
+// outlives the status at every call site (serialized immediately).
+// ---------------------------------------------------------------------------
+
+fn li_arena_put(arena: &LiText, p: ptr, n: u64, out_p: &ptr, out_l: &u64) -> void {
+    let start = arena.len;
+    li_push(arena, p, n);
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, li_text_ptr(arena), start);
+    *out_p = bp;
+    *out_l = n;
+}
+
+fn parseEnvFile(path_ptr: ptr, path_len: u64, out: &LiText) -> void {
+    out.len = 0;
+    li_push(out, STR_PTR("{}"), STR_LEN("{}"));
+    if !li_exists(path_ptr, path_len) { return; };
+    let content = LiText { bytes: [0u8; 262144], len: 0 };
+    if !li_read_file(path_ptr, path_len, &content) { return; };
+    let doc = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if doc == 0 { return; };
+    let cp: ptr = li_text_ptr(&content);
+    let start: u64 = 0;
+    let i: u64 = 0;
+    while i <= content.len {
+        if i == content.len || li_byte(cp, i) == 10 {
+            let lend = i;
+            if lend > start && li_byte(cp, lend - 1) == 13 { lend = lend - 1; };
+            if lend > start {
+                let lp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(lp, cp, start);
+                let ll = lend - start;
+                let ts: u64 = 0;
+                let te: u64 = 0;
+                li_trim_range(lp, ll, &ts, &te);
+                if te > ts {
+                    let tp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(tp, lp, ts);
+                    let tl = te - ts;
+                    if li_byte(tp, 0) != 35 {
+                        // first '=' with index > 0
+                        let eq: u64 = 0;
+                        let has_eq = false;
+                        let j: u64 = 0;
+                        while j < tl {
+                            if li_byte(tp, j) == 61 { eq = j; has_eq = true; j = tl; } else { j = j + 1; };
+                        }
+                        if has_eq && eq > 0 {
+                            let ks: u64 = 0;
+                            let ke: u64 = 0;
+                            li_trim_range(tp, eq, &ks, &ke);
+                            let vs: u64 = 0;
+                            let ve: u64 = 0;
+                            let vp0: ptr = PTR_NULL();
+                            PTR_BYTE_ADD(vp0, tp, eq + 1);
+                            li_trim_range(vp0, tl - eq - 1, &vs, &ve);
+                            if ve > vs {
+                                let b0 = li_byte(vp0, vs);
+                                let b1 = li_byte(vp0, ve - 1);
+                                if (b0 == 34 && b1 == 34) || (b0 == 39 && b1 == 39) { vs = vs + 1; ve = ve - 1; };
+                            };
+                            let kp: ptr = PTR_NULL();
+                            PTR_BYTE_ADD(kp, tp, ks);
+                            let valp: ptr = PTR_NULL();
+                            PTR_BYTE_ADD(valp, vp0, vs);
+                            let vlen: u64 = 0;
+                            if ve >= vs { vlen = ve - vs; };
+                            sa_json_object_set_string(doc, kp, ke - ks, valp, vlen);
+                        };
+                    };
+                };
+            };
+            start = i + 1;
+        };
+        i = i + 1;
+    }
+    li_stringify_into(doc, out);
+    li_free_doc(doc);
+}
+
+fn li_env_map_get(map_p: ptr, map_l: u64, key_p: ptr, key_l: u64, out: &LiStr) -> bool {
+    out.len = 0;
+    let doc = li_parse(map_p, map_l);
+    if doc == 0 { return false; };
+    let r = li_node_string(doc, key_p, key_l, out);
+    li_free_doc(doc);
+    return r;
+}
+
+fn isPlaceholder(value_ptr: ptr, value_len: u64, hasValue: bool) -> bool {
+    if !hasValue { return true; };
+    let t = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_trimmed(value_ptr, value_len, &t);
+    if t.len == 0 { return true; };
+    // lowercase into a scratch text for the contains checks
+    let low = LiText { bytes: [0u8; 262144], len: 0 };
+    let tp: ptr = li_str_ptr(&t);
+    let i: u64 = 0;
+    while i < t.len { low.bytes[low.len] = li_lower(li_byte(tp, i)); low.len = low.len + 1; i = i + 1; }
+    let lp: ptr = li_text_ptr(&low);
+    if li_contains(lp, low.len, STR_PTR("your-api-key"), STR_LEN("your-api-key")) { return true; };
+    if li_contains(lp, low.len, STR_PTR("sk-your-key"), STR_LEN("sk-your-key")) { return true; };
+    if li_contains(lp, low.len, STR_PTR("your-gateway"), STR_LEN("your-gateway")) { return true; };
+    if li_eq(lp, low.len, STR_PTR("changeme"), STR_LEN("changeme")) { return true; };
+    if li_eq(lp, low.len, STR_PTR("xxx"), STR_LEN("xxx")) { return true; };
+    return false;
+}
+
+fn li_dir_qualifies(dir_p: ptr, dir_l: u64) -> bool {
+    let c = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_join2(dir_p, dir_l, STR_PTR("install.sh"), STR_LEN("install.sh"), &c);
+    if li_exists(li_str_ptr(&c), c.len) { return true; };
+    li_join2(dir_p, dir_l, STR_PTR("main.py"), STR_LEN("main.py"), &c);
+    if li_exists(li_str_ptr(&c), c.len) { return true; };
+    li_join3(dir_p, dir_l, STR_PTR("packages"), STR_LEN("packages"), STR_PTR("coding-agent"), STR_LEN("coding-agent"), &c);
+    return li_exists(li_str_ptr(&c), c.len);
+}
+
+fn resolveSourceDir(spec: &LaunchAdapterSpec, custom_ptr: ptr, custom_len: u64, hasCustom: bool, out: &LiStr, outFound: &bool) -> void {
+    out.len = 0;
+    *outFound = false;
+    let root = LiStr { bytes: [0u8; 8192], len: 0 };
+    defaultSourceRoot(custom_ptr, custom_len, hasCustom, &root);
+    let cand = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_join2(li_str_ptr(&root), root.len, spec.repo_ptr, spec.repo_len, &cand);
+    if li_dir_qualifies(li_str_ptr(&cand), cand.len) { li_push_str(out, li_str_ptr(&cand), cand.len); *outFound = true; return; };
+    let hm = LiStr { bytes: [0u8; 8192], len: 0 };
+    home(&hm);
+    li_join3(li_str_ptr(&hm), hm.len, STR_PTR("projects"), STR_LEN("projects"), spec.repo_ptr, spec.repo_len, &cand);
+    if li_dir_qualifies(li_str_ptr(&cand), cand.len) { li_push_str(out, li_str_ptr(&cand), cand.len); *outFound = true; return; };
+    li_join3(li_str_ptr(&hm), hm.len, STR_PTR("src"), STR_LEN("src"), spec.repo_ptr, spec.repo_len, &cand);
+    if li_dir_qualifies(li_str_ptr(&cand), cand.len) { li_push_str(out, li_str_ptr(&cand), cand.len); *outFound = true; return; };
+    li_join2(STR_PTR("/root/projects"), STR_LEN("/root/projects"), spec.repo_ptr, spec.repo_len, &cand);
+    if li_dir_qualifies(li_str_ptr(&cand), cand.len) { li_push_str(out, li_str_ptr(&cand), cand.len); *outFound = true; return; };
+    // E:/projects, D:/projects candidates are win32 platform seams.
+}
+
+fn li_status_json(st: &LaunchAdapterStatus, out: &LiText) -> void {
+    out.len = 0;
+    let doc = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if doc == 0 { li_push(out, STR_PTR("{}"), STR_LEN("{}")); return; };
+    sa_json_object_set_string(doc, STR_PTR("id"), STR_LEN("id"), st.id_ptr, st.id_len);
+    sa_json_object_set_string(doc, STR_PTR("repo"), STR_LEN("repo"), st.repo_ptr, st.repo_len);
+    if st.hasCloneUrl {
+        sa_json_object_set_string(doc, STR_PTR("cloneUrl"), STR_LEN("cloneUrl"), st.cloneUrl_ptr, st.cloneUrl_len);
+    } else {
+        sa_json_object_set_null(doc, STR_PTR("cloneUrl"), STR_LEN("cloneUrl"));
+    };
+    sa_json_object_set_bool(doc, STR_PTR("cloneable"), STR_LEN("cloneable"), st.cloneable);
+    sa_json_object_set_bool(doc, STR_PTR("installed"), STR_LEN("installed"), st.installed);
+    if st.hasWrapperPath {
+        sa_json_object_set_string(doc, STR_PTR("wrapperPath"), STR_LEN("wrapperPath"), st.wrapperPath_ptr, st.wrapperPath_len);
+    } else {
+        sa_json_object_set_null(doc, STR_PTR("wrapperPath"), STR_LEN("wrapperPath"));
+    };
+    if st.hasProductCliPath {
+        sa_json_object_set_string(doc, STR_PTR("productCliPath"), STR_LEN("productCliPath"), st.productCliPath_ptr, st.productCliPath_len);
+    } else {
+        sa_json_object_set_null(doc, STR_PTR("productCliPath"), STR_LEN("productCliPath"));
+    };
+    sa_json_object_set_bool(doc, STR_PTR("productCliPresent"), STR_LEN("productCliPresent"), st.productCliPresent);
+    if st.hasSourceDir {
+        sa_json_object_set_string(doc, STR_PTR("sourceDir"), STR_LEN("sourceDir"), st.sourceDir_ptr, st.sourceDir_len);
+    } else {
+        sa_json_object_set_null(doc, STR_PTR("sourceDir"), STR_LEN("sourceDir"));
+    };
+    sa_json_object_set_bool(doc, STR_PTR("sourcePresent"), STR_LEN("sourcePresent"), st.sourcePresent);
+    sa_json_object_set_string(doc, STR_PTR("envPath"), STR_LEN("envPath"), st.envPath_ptr, st.envPath_len);
+    sa_json_object_set_bool(doc, STR_PTR("envPresent"), STR_LEN("envPresent"), st.envPresent);
+    sa_json_object_set_bool(doc, STR_PTR("envConfigured"), STR_LEN("envConfigured"), st.envConfigured);
+    let preview = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if preview != 0 {
+        if st.hasEnvPreviewBaseUrl {
+            sa_json_object_set_string(preview, STR_PTR("baseUrl"), STR_LEN("baseUrl"), st.envPreviewBaseUrl_ptr, st.envPreviewBaseUrl_len);
+        } else {
+            sa_json_object_set_null(preview, STR_PTR("baseUrl"), STR_LEN("baseUrl"));
+        };
+        if st.hasEnvPreviewModel {
+            sa_json_object_set_string(preview, STR_PTR("model"), STR_LEN("model"), st.envPreviewModel_ptr, st.envPreviewModel_len);
+        } else {
+            sa_json_object_set_null(preview, STR_PTR("model"), STR_LEN("model"));
+        };
+        sa_json_object_set_bool(preview, STR_PTR("hasApiKey"), STR_LEN("hasApiKey"), st.envPreviewHasApiKey);
+        sa_json_object_set_node(doc, STR_PTR("envPreview"), STR_LEN("envPreview"), preview);
+        li_free_doc(preview);
+    };
+    sa_json_object_set_bool(doc, STR_PTR("needsInstall"), STR_LEN("needsInstall"), st.needsInstall);
+    sa_json_object_set_bool(doc, STR_PTR("needsSetup"), STR_LEN("needsSetup"), st.needsSetup);
+    li_stringify_into(doc, out);
+    li_free_doc(doc);
+}
+
+fn detectAdapter(spec: &LaunchAdapterSpec, customRoot_ptr: ptr, customRoot_len: u64, hasCustomRoot: bool, arena: &LiText, out: &LaunchAdapterStatus) -> void {
+    out.id_ptr = spec.id_ptr;
+    out.id_len = spec.id_len;
+    out.repo_ptr = spec.repo_ptr;
+    out.repo_len = spec.repo_len;
+    out.hasCloneUrl = spec.hasCloneUrl;
+    out.cloneUrl_ptr = spec.cloneUrl_ptr;
+    out.cloneUrl_len = spec.cloneUrl_len;
+    out.cloneable = spec.hasCloneUrl;
+    // wrapperPath
+    let wp = LiStr { bytes: [0u8; 8192], len: 0 };
+    let wp_found = false;
+    findOnPath(spec.wrapperBins_ptr, spec.wrapperBins_len, spec.wrapperBinsCount, &wp, &wp_found);
+    out.hasWrapperPath = wp_found;
+    if wp_found { li_arena_put(arena, li_str_ptr(&wp), wp.len, &out.wrapperPath_ptr, &out.wrapperPath_len); };
+    // sourceDir + sourceCliPath
+    let sd = LiStr { bytes: [0u8; 8192], len: 0 };
+    let sd_found = false;
+    resolveSourceDir(spec, customRoot_ptr, customRoot_len, hasCustomRoot, &sd, &sd_found);
+    out.hasSourceDir = sd_found;
+    out.sourcePresent = sd_found;
+    if sd_found { li_arena_put(arena, li_str_ptr(&sd), sd.len, &out.sourceDir_ptr, &out.sourceDir_len); };
+    let source_cli = LiStr { bytes: [0u8; 8192], len: 0 };
+    let source_cli_found = false;
+    if sd_found {
+        let mid = LiStr { bytes: [0u8; 8192], len: 0 };
+        li_join3(li_str_ptr(&sd), sd.len, STR_PTR("packages/coding-agent"), STR_LEN("packages/coding-agent"), STR_PTR("src"), STR_LEN("src"), &mid);
+        li_join2(li_str_ptr(&mid), mid.len, STR_PTR("cli.ts"), STR_LEN("cli.ts"), &source_cli);
+        source_cli_found = li_exists(li_str_ptr(&source_cli), source_cli.len);
+        if !source_cli_found { source_cli.len = 0; };
+    };
+    // productCliPath = findOnPath(productBins) || sourceCliPath
+    let pp = LiStr { bytes: [0u8; 8192], len: 0 };
+    let pp_found = false;
+    findOnPath(spec.productBins_ptr, spec.productBins_len, spec.productBinsCount, &pp, &pp_found);
+    if !pp_found && source_cli_found {
+        li_push_str(&pp, li_str_ptr(&source_cli), source_cli.len);
+        pp_found = true;
+    };
+    out.hasProductCliPath = pp_found;
+    out.productCliPresent = pp_found;
+    if pp_found { li_arena_put(arena, li_str_ptr(&pp), pp.len, &out.productCliPath_ptr, &out.productCliPath_len); };
+    // env
+    let env_path = LiStr { bytes: [0u8; 8192], len: 0 };
+    configEnvPath(spec, &env_path);
+    li_arena_put(arena, li_str_ptr(&env_path), env_path.len, &out.envPath_ptr, &out.envPath_len);
+    out.envPresent = li_exists(li_str_ptr(&env_path), env_path.len);
+    let map = LiText { bytes: [0u8; 262144], len: 0 };
+    parseEnvFile(li_str_ptr(&env_path), env_path.len, &map);
+    let key = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_push_str(&key, spec.envPrefix_ptr, spec.envPrefix_len);
+    li_push_str(&key, STR_PTR("BASE_URL"), STR_LEN("BASE_URL"));
+    let base_url = LiStr { bytes: [0u8; 8192], len: 0 };
+    let has_base = li_env_map_get(li_text_ptr(&map), map.len, li_str_ptr(&key), key.len, &base_url);
+    key.len = 0;
+    li_push_str(&key, spec.envPrefix_ptr, spec.envPrefix_len);
+    li_push_str(&key, STR_PTR("MODEL"), STR_LEN("MODEL"));
+    let model = LiStr { bytes: [0u8; 8192], len: 0 };
+    let has_model = li_env_map_get(li_text_ptr(&map), map.len, li_str_ptr(&key), key.len, &model);
+    key.len = 0;
+    li_push_str(&key, spec.envPrefix_ptr, spec.envPrefix_len);
+    li_push_str(&key, STR_PTR("API_KEY"), STR_LEN("API_KEY"));
+    let api_key = LiStr { bytes: [0u8; 8192], len: 0 };
+    let has_key = li_env_map_get(li_text_ptr(&map), map.len, li_str_ptr(&key), key.len, &api_key);
+    if !has_key {
+        key.len = 0;
+        li_push_str(&key, spec.envPrefix_ptr, spec.envPrefix_len);
+        li_push_str(&key, STR_PTR("API_KEYS"), STR_LEN("API_KEYS"));
+        has_key = li_env_map_get(li_text_ptr(&map), map.len, li_str_ptr(&key), key.len, &api_key);
+    };
+    let has_api_key = false;
+    if has_key { has_api_key = !isPlaceholder(li_str_ptr(&api_key), api_key.len, true); };
+    out.envConfigured = has_base && !isPlaceholder(li_str_ptr(&base_url), base_url.len, has_base) && has_api_key;
+    // envPreview.baseUrl mirrors the TS verbatim value (placeholder or not).
+    out.hasEnvPreviewBaseUrl = has_base;
+    if has_base { li_arena_put(arena, li_str_ptr(&base_url), base_url.len, &out.envPreviewBaseUrl_ptr, &out.envPreviewBaseUrl_len); };
+    out.hasEnvPreviewModel = has_model;
+    if has_model { li_arena_put(arena, li_str_ptr(&model), model.len, &out.envPreviewModel_ptr, &out.envPreviewModel_len); };
+    out.envPreviewHasApiKey = has_api_key;
+    // installed: wrapperPath || (pi-launch && sourceCliPath)
+    let is_pi = li_eq(spec.id_ptr, spec.id_len, STR_PTR("pi-launch"), STR_LEN("pi-launch"));
+    out.installed = wp_found || (is_pi && source_cli_found);
+    out.needsInstall = !out.installed;
+    out.needsSetup = !out.envConfigured;
+}
+
+fn detectAll(customRoot_ptr: ptr, customRoot_len: u64, hasCustomRoot: bool, out: &LiText, outCount: &u64) -> void {
+    out.len = 0;
+    *outCount = 0;
+    let root = LiStr { bytes: [0u8; 8192], len: 0 };
+    defaultSourceRoot(customRoot_ptr, customRoot_len, hasCustomRoot, &root);
+    let doc = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if doc == 0 { li_push(out, STR_PTR("{}"), STR_LEN("{}")); return; };
+    sa_json_object_set_string(doc, STR_PTR("sourceRoot"), STR_LEN("sourceRoot"), li_str_ptr(&root), root.len);
+    let arr = li_parse(STR_PTR("[]"), STR_LEN("[]"));
+    let arena = LiText { bytes: [0u8; 262144], len: 0 };
+    let i: u64 = 0;
+    while i < 11 {
+        let spec = LaunchAdapterSpec { id_ptr: STR_PTR(""), id_len: 0, repo_ptr: STR_PTR(""), repo_len: 0, hasCloneUrl: false, cloneUrl_ptr: STR_PTR(""), cloneUrl_len: 0, wrapperBins_ptr: STR_PTR(""), wrapperBins_len: 0, wrapperBinsCount: 0, productBins_ptr: STR_PTR(""), productBins_len: 0, productBinsCount: 0, envPrefix_ptr: STR_PTR(""), envPrefix_len: 0, configDirName_ptr: STR_PTR(""), configDirName_len: 0 };
+        if launchSpecAt(i, &spec) {
+            let st = LaunchAdapterStatus { id_ptr: STR_PTR(""), id_len: 0, repo_ptr: STR_PTR(""), repo_len: 0, hasCloneUrl: false, cloneUrl_ptr: STR_PTR(""), cloneUrl_len: 0, cloneable: false, installed: false, hasWrapperPath: false, wrapperPath_ptr: STR_PTR(""), wrapperPath_len: 0, hasProductCliPath: false, productCliPath_ptr: STR_PTR(""), productCliPath_len: 0, productCliPresent: false, hasSourceDir: false, sourceDir_ptr: STR_PTR(""), sourceDir_len: 0, sourcePresent: false, envPath_ptr: STR_PTR(""), envPath_len: 0, envPresent: false, envConfigured: false, envPreviewBaseUrl_ptr: STR_PTR(""), envPreviewBaseUrl_len: 0, hasEnvPreviewBaseUrl: false, envPreviewModel_ptr: STR_PTR(""), envPreviewModel_len: 0, hasEnvPreviewModel: false, envPreviewHasApiKey: false, needsInstall: true, needsSetup: true };
+            arena.len = 0;
+            detectAdapter(&spec, customRoot_ptr, customRoot_len, hasCustomRoot, &arena, &st);
+            let sj = LiText { bytes: [0u8; 262144], len: 0 };
+            li_status_json(&st, &sj);
+            let sdoc = li_parse(li_text_ptr(&sj), sj.len);
+            if sdoc != 0 {
+                sa_json_array_push_node(arr, sdoc);
+                li_free_doc(sdoc);
+            };
+            let c_now = *outCount;
+            *outCount = c_now + 1;
+        };
+        i = i + 1;
+    }
+    sa_json_object_set_node(doc, STR_PTR("adapters"), STR_LEN("adapters"), arr);
+    li_free_doc(arr);
+    li_stringify_into(doc, out);
+    li_free_doc(doc);
+}
+
+// ---------------------------------------------------------------------------
+// .env upsert + writeAdapterEnv (TS L394-471).
+// ---------------------------------------------------------------------------
+
+fn li_parent_dir(p: ptr, n: u64, out: &LiStr) -> void {
+    out.len = 0;
+    let i: u64 = n;
+    let cut: u64 = 0;
+    while i > 0 {
+        if li_byte(p, i - 1) == 47 { cut = i - 1; i = 0; } else { i = i - 1; };
+    }
+    if cut > 0 { li_push_str(out, p, cut); } else { li_push_str(out, STR_PTR("/"), STR_LEN("/")); };
+}
+
+fn upsertEnvKeys(path_ptr: ptr, path_len: u64, updates_ptr: ptr, updates_len: u64) -> void {
+    let parent = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_parent_dir(path_ptr, path_len, &parent);
+    sa_fs_mkdir_p(li_str_ptr(&parent), parent.len);
+    let existing = LiText { bytes: [0u8; 262144], len: 0 };
+    let has_existing = li_read_file(path_ptr, path_len, &existing);
+    let updates = li_parse(updates_ptr, updates_len);
+    if updates == 0 { return; };
+    let out = LiText { bytes: [0u8; 262144], len: 0 };
+    // seen keys tracked in a JSON array text
+    let seen = LiText { bytes: [0u8; 262144], len: 0 };
+    li_push(&seen, STR_PTR("[]"), STR_LEN("[]"));
+    let seen_count: u64 = 0;
+    if has_existing {
+        let cp: ptr = li_text_ptr(&existing);
+        let start: u64 = 0;
+        let i: u64 = 0;
+        while i <= existing.len {
+            if i == existing.len || li_byte(cp, i) == 10 {
+                let lend = i;
+                if lend > start && li_byte(cp, lend - 1) == 13 { lend = lend - 1; };
+                let lp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(lp, cp, start);
+                let ll = lend - start;
+                let ts: u64 = 0;
+                let te: u64 = 0;
+                li_trim_range(lp, ll, &ts, &te);
+                let replaced = false;
+                if te > ts && li_byte(lp, ts) != 35 {
+                    let tp: ptr = PTR_NULL();
+                    PTR_BYTE_ADD(tp, lp, ts);
+                    let tl = te - ts;
+                    let eq: u64 = 0;
+                    let has_eq = false;
+                    let j: u64 = 0;
+                    while j < tl {
+                        if li_byte(tp, j) == 61 { eq = j; has_eq = true; j = tl; } else { j = j + 1; };
+                    }
+                    if has_eq && eq > 0 {
+                        let ks: u64 = 0;
+                        let ke: u64 = 0;
+                        li_trim_range(tp, eq, &ks, &ke);
+                        let kp: ptr = PTR_NULL();
+                        PTR_BYTE_ADD(kp, tp, ks);
+                        let node = li_get(updates, kp, ke - ks);
+                        if node != 0 && sa_json_kind(node) == 5 {
+                            let np: ptr = sa_json_string_ptr(node);
+                            li_push(&out, kp, ke - ks);
+                            li_push(&out, STR_PTR("="), STR_LEN("="));
+                            li_push(&out, np, sa_json_string_len(node));
+                            li_push(&out, STR_PTR("\n"), STR_LEN("\n"));
+                            li_dirs_push_unique(&seen, &seen_count, kp, ke - ks);
+                            replaced = true;
+                        };
+                    };
+                };
+                if !replaced {
+                    li_push(&out, lp, ll);
+                    li_push(&out, STR_PTR("\n"), STR_LEN("\n"));
+                };
+                start = i + 1;
+            };
+            i = i + 1;
+        }
+    };
+    // append unseen updates in object order (JSON doc preserves insertion)
+    let keys_text = LiText { bytes: [0u8; 262144], len: 0 };
+    let kh: u64 = 0;
+    if sa_json_stringify(updates, &kh) == 0 && kh != 0 {
+        let kdp: ptr = sa_json_buffer_data(kh);
+        li_push(&keys_text, kdp, sa_json_buffer_len(kh));
+        li_free_buffer(kh);
+    };
+    // iterate update keys by scanning the stringified object text for "key":
+    // (object member order in this std's stringify follows insertion order)
+    // member order: this std's stringify preserves insertion order, so
+    // scanning the stringified text for "key": pairs visits updates in
+    // TS Object.entries order.
+    let kt: ptr = li_text_ptr(&keys_text);
+    let ki: u64 = 0;
+    while ki < keys_text.len {
+        if li_byte(kt, ki) == 34 {
+            // find the closing quote (keys are simple env names, no escapes)
+            let kj = ki + 1;
+            while kj < keys_text.len && li_byte(kt, kj) != 34 { kj = kj + 1; }
+            if kj < keys_text.len {
+                let kp2: ptr = PTR_NULL();
+                PTR_BYTE_ADD(kp2, kt, ki + 1);
+                let kl2 = kj - ki - 1;
+                // must be followed by ':'
+                if kj + 1 < keys_text.len && li_byte(kt, kj + 1) == 58 {
+                    let vnode = li_get(updates, kp2, kl2);
+                    if vnode != 0 {
+                        // skip when seen
+                        let sdoc = li_parse(li_text_ptr(&seen), seen.len);
+                        let is_seen = false;
+                        if sdoc != 0 {
+                            let sc: u64 = 0;
+                            sa_json_value_count(sdoc, &sc);
+                            let si: u64 = 0;
+                            while si < sc {
+                                let sitem: u64 = 0;
+                                if sa_json_array_get(sdoc, si, &sitem) == 0 {
+                                    if sitem != 0 && sa_json_kind(sitem) == 5 {
+                                        let sp2: ptr = sa_json_string_ptr(sitem);
+                                        if li_eq(sp2, sa_json_string_len(sitem), kp2, kl2) { is_seen = true; };
+                                    };
+                                };
+                                si = si + 1;
+                            }
+                            li_free_doc(sdoc);
+                        };
+                        if !is_seen && sa_json_kind(vnode) == 5 {
+                            let np: ptr = sa_json_string_ptr(vnode);
+                            li_push(&out, kp2, kl2);
+                            li_push(&out, STR_PTR("="), STR_LEN("="));
+                            li_push(&out, np, sa_json_string_len(vnode));
+                            li_push(&out, STR_PTR("\n"), STR_LEN("\n"));
+                        };
+                    };
+                };
+                ki = kj;
+            };
+        };
+        ki = ki + 1;
+    }
+    li_free_doc(updates);
+    sa_fs_write_file(path_ptr, path_len, li_text_ptr(&out), out.len);
+    sa_fs_set_permissions(path_ptr, path_len, 384);
+}
+
+fn writeAdapterEnv(spec: &LaunchAdapterSpec, values: &LaunchEnvValues, force: bool, outPath: &LiStr, outWrote: &bool, outSkipped: &bool) -> void {
+    let path = LiStr { bytes: [0u8; 8192], len: 0 };
+    configEnvPath(spec, &path);
+    outPath.len = 0;
+    li_push_str(outPath, li_str_ptr(&path), path.len);
+    *outWrote = false;
+    *outSkipped = false;
+    if !force && li_exists(li_str_ptr(&path), path.len) {
+        let map = LiText { bytes: [0u8; 262144], len: 0 };
+        parseEnvFile(li_str_ptr(&path), path.len, &map);
+        let key = LiStr { bytes: [0u8; 8192], len: 0 };
+        li_push_str(&key, spec.envPrefix_ptr, spec.envPrefix_len);
+        li_push_str(&key, STR_PTR("BASE_URL"), STR_LEN("BASE_URL"));
+        let bv = LiStr { bytes: [0u8; 8192], len: 0 };
+        let has_bv = li_env_map_get(li_text_ptr(&map), map.len, li_str_ptr(&key), key.len, &bv);
+        let has_base = has_bv && !isPlaceholder(li_str_ptr(&bv), bv.len, true);
+        key.len = 0;
+        li_push_str(&key, spec.envPrefix_ptr, spec.envPrefix_len);
+        li_push_str(&key, STR_PTR("API_KEY"), STR_LEN("API_KEY"));
+        let kv = LiStr { bytes: [0u8; 8192], len: 0 };
+        let has_kv = li_env_map_get(li_text_ptr(&map), map.len, li_str_ptr(&key), key.len, &kv);
+        if !has_kv {
+            key.len = 0;
+            li_push_str(&key, spec.envPrefix_ptr, spec.envPrefix_len);
+            li_push_str(&key, STR_PTR("API_KEYS"), STR_LEN("API_KEYS"));
+            has_kv = li_env_map_get(li_text_ptr(&map), map.len, li_str_ptr(&key), key.len, &kv);
+        };
+        let has_key2 = has_kv && !isPlaceholder(li_str_ptr(&kv), kv.len, true);
+        if has_base && has_key2 && (!values.hasBaseUrl || values.baseUrl_len == 0) && (!values.hasApiKey || values.apiKey_len == 0) && (!values.hasModel || values.model_len == 0) {
+            *outSkipped = true;
+            return;
+        };
+    };
+    let updates = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if updates == 0 { *outSkipped = true; return; };
+    let n_updates: u64 = 0;
+    if values.hasBaseUrl && values.baseUrl_len > 0 {
+        let t = LiStr { bytes: [0u8; 8192], len: 0 };
+        li_trimmed(values.baseUrl_ptr, values.baseUrl_len, &t);
+        let key = LiStr { bytes: [0u8; 8192], len: 0 };
+        li_push_str(&key, spec.envPrefix_ptr, spec.envPrefix_len);
+        li_push_str(&key, STR_PTR("BASE_URL"), STR_LEN("BASE_URL"));
+        sa_json_object_set_string(updates, li_str_ptr(&key), key.len, li_str_ptr(&t), t.len);
+        n_updates = n_updates + 1;
+    };
+    if values.hasModel && values.model_len > 0 {
+        let t = LiStr { bytes: [0u8; 8192], len: 0 };
+        li_trimmed(values.model_ptr, values.model_len, &t);
+        let key = LiStr { bytes: [0u8; 8192], len: 0 };
+        li_push_str(&key, spec.envPrefix_ptr, spec.envPrefix_len);
+        li_push_str(&key, STR_PTR("MODEL"), STR_LEN("MODEL"));
+        sa_json_object_set_string(updates, li_str_ptr(&key), key.len, li_str_ptr(&t), t.len);
+        n_updates = n_updates + 1;
+    };
+    if values.hasApiKey && values.apiKey_len > 0 {
+        let t = LiStr { bytes: [0u8; 8192], len: 0 };
+        li_trimmed(values.apiKey_ptr, values.apiKey_len, &t);
+        let key = LiStr { bytes: [0u8; 8192], len: 0 };
+        li_push_str(&key, spec.envPrefix_ptr, spec.envPrefix_len);
+        li_push_str(&key, STR_PTR("API_KEY"), STR_LEN("API_KEY"));
+        sa_json_object_set_string(updates, li_str_ptr(&key), key.len, li_str_ptr(&t), t.len);
+        n_updates = n_updates + 1;
+    };
+    if n_updates == 0 {
+        li_free_doc(updates);
+        if !li_exists(li_str_ptr(&path), path.len) {
+            let parent = LiStr { bytes: [0u8; 8192], len: 0 };
+            li_parent_dir(li_str_ptr(&path), path.len, &parent);
+            sa_fs_mkdir_p(li_str_ptr(&parent), parent.len);
+            let tpl = LiText { bytes: [0u8; 262144], len: 0 };
+            li_push(&tpl, STR_PTR("# "), STR_LEN("# "));
+            li_push(&tpl, spec.id_ptr, spec.id_len);
+            li_push(&tpl, STR_PTR(" — created by Codex React UI\n# Fill "), STR_LEN(" — created by Codex React UI\n# Fill "));
+            li_push(&tpl, spec.envPrefix_ptr, spec.envPrefix_len);
+            li_push(&tpl, STR_PTR("BASE_URL / MODEL / API_KEY\n"), STR_LEN("BASE_URL / MODEL / API_KEY\n"));
+            li_push(&tpl, spec.envPrefix_ptr, spec.envPrefix_len);
+            li_push(&tpl, STR_PTR("BASE_URL=\n"), STR_LEN("BASE_URL=\n"));
+            li_push(&tpl, spec.envPrefix_ptr, spec.envPrefix_len);
+            li_push(&tpl, STR_PTR("MODEL=\n"), STR_LEN("MODEL=\n"));
+            li_push(&tpl, spec.envPrefix_ptr, spec.envPrefix_len);
+            li_push(&tpl, STR_PTR("API_KEY=\n"), STR_LEN("API_KEY=\n"));
+            sa_fs_write_file(li_str_ptr(&path), path.len, li_text_ptr(&tpl), tpl.len);
+            sa_fs_set_permissions(li_str_ptr(&path), path.len, 384);
+            *outWrote = true;
+            return;
+        };
+        *outSkipped = true;
+        return;
+    };
+    let utext = LiText { bytes: [0u8; 262144], len: 0 };
+    li_stringify_into(updates, &utext);
+    li_free_doc(updates);
+    upsertEnvKeys(li_str_ptr(&path), path.len, li_text_ptr(&utext), utext.len);
+    *outWrote = true;
+}
+
+// ---------------------------------------------------------------------------
+// Log sink + line logger (TS L473-496). The sink is a JSON array doc
+// handle (0 = silent, matching TS's optional onLog). Items mirror the
+// InstallJobLogItem shape {time, text, level-name}.
+// ---------------------------------------------------------------------------
+
+fn li_level_name(level: u64, out_p: &ptr, out_l: &u64) -> void {
+    if level == 1 { *out_p = STR_PTR("success"); *out_l = STR_LEN("success"); return; };
+    if level == 2 { *out_p = STR_PTR("error"); *out_l = STR_LEN("error"); return; };
+    if level == 3 { *out_p = STR_PTR("warn"); *out_l = STR_LEN("warn"); return; };
+    *out_p = STR_PTR("info");
+    *out_l = STR_LEN("info");
+}
+
+fn li_clock_text(out: &LiStr) -> void {
+    out.len = 0;
+    let ms = sa_time_unix_ms();
+    let secs = ms / 1000;
+    let hh = (secs / 3600) % 24;
+    let mm = (secs / 60) % 60;
+    let ss = secs % 60;
+    let digs = STR_PTR("0123456789");
+    out.bytes[out.len] = li_byte(digs, ((hh / 10) as u64)); out.len = out.len + 1;
+    out.bytes[out.len] = li_byte(digs, ((hh % 10) as u64)); out.len = out.len + 1;
+    out.bytes[out.len] = 58; out.len = out.len + 1;
+    out.bytes[out.len] = li_byte(digs, ((mm / 10) as u64)); out.len = out.len + 1;
+    out.bytes[out.len] = li_byte(digs, ((mm % 10) as u64)); out.len = out.len + 1;
+    out.bytes[out.len] = 58; out.len = out.len + 1;
+    out.bytes[out.len] = li_byte(digs, ((ss / 10) as u64)); out.len = out.len + 1;
+    out.bytes[out.len] = li_byte(digs, ((ss % 10) as u64)); out.len = out.len + 1;
+}
+
+fn li_log_line(sink_doc: u64, text_p: ptr, text_l: u64, level: u64) -> void {
+    if sink_doc == 0 { return; };
+    let item = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if item == 0 { return; };
+    let clock = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_clock_text(&clock);
+    sa_json_object_set_string(item, STR_PTR("time"), STR_LEN("time"), li_str_ptr(&clock), clock.len);
+    sa_json_object_set_string(item, STR_PTR("text"), STR_LEN("text"), text_p, text_l);
+    let lp: ptr = PTR_NULL();
+    let ll: u64 = 0;
+    li_level_name(level, &lp, &ll);
+    sa_json_object_set_string(item, STR_PTR("level"), STR_LEN("level"), lp, ll);
+    sa_json_array_push_node(sink_doc, item);
+    li_free_doc(item);
+}
+
+struct LineLogger {
+    prefix: [u8; 64], prefix_len: u64,
+    level: u64,
+    sink_doc: u64,
+    pending: [u8; 8192], pending_len: u64,
+}
+
+fn createLineLogger(prefix_ptr: ptr, prefix_len: u64, level: u64, sink_doc: u64, out: &LineLogger) -> void {
+    let i: u64 = 0;
+    while i < prefix_len && i < 64 { out.prefix[i] = li_byte(prefix_ptr, i); i = i + 1; }
+    out.prefix_len = i;
+    out.level = level;
+    out.sink_doc = sink_doc;
+    out.pending_len = 0;
+}
+
+fn li_logger_emit(lg: &LineLogger, line_p: ptr, line_l: u64) -> void {
+    let t = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_trimmed(line_p, line_l, &t);
+    if t.len == 0 { return; };
+    let msg = LiText { bytes: [0u8; 262144], len: 0 };
+    let pp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pp, &lg.prefix, 0);
+    li_push(&msg, pp, lg.prefix_len);
+    li_push(&msg, li_str_ptr(&t), t.len);
+    li_log_line(lg.sink_doc, li_text_ptr(&msg), msg.len, lg.level);
+}
+
+fn lineLoggerWrite(lg: &LineLogger, chunk_ptr: ptr, chunk_len: u64) -> void {
+    let i: u64 = 0;
+    while i < chunk_len {
+        let b = li_byte(chunk_ptr, i);
+        let c: u8 = b;
+        if b == 13 { c = 10; };
+        if c == 10 {
+            let pp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(pp, &lg.pending, 0);
+            li_logger_emit(lg, pp, lg.pending_len);
+            lg.pending_len = 0;
+        } else {
+            if lg.pending_len < 8192 { lg.pending[lg.pending_len] = c; lg.pending_len = lg.pending_len + 1; };
+        };
+        i = i + 1;
+    }
+}
+
+fn lineLoggerFlush(lg: &LineLogger) -> void {
+    let pp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(pp, &lg.pending, 0);
+    li_logger_emit(lg, pp, lg.pending_len);
+    lg.pending_len = 0;
+}
+
+// ---------------------------------------------------------------------------
+// runCmd (TS L530-570): blocking process run with stream line-logging
+// and a kill-on-timeout budget. Child env overrides of the TS (PATH
+// prefix, GIT_TERMINAL_PROMPT, npm_config_*) ride the runtime wrapper
+// in TS; the std runner inherits the process env — registered seam.
+// ---------------------------------------------------------------------------
+
+struct RunCmdResult {
+    ok: bool, code: i64,
+    stdout: LiText, stderr: LiText,
+}
+
+fn li_drain(handle: u64, is_err: bool, acc: &LiText, lg: &LineLogger) -> void {
+    let buf: [u8; 8192] = [0u8; 8192];
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &buf, 0);
+    let n: u64 = 0;
+    let st: i32 = 0;
+    if is_err {
+        st = sa_std_process_read_stderr(handle, bp, 8192, &n);
+    } else {
+        st = sa_std_process_read_stdout(handle, bp, 8192, &n);
+    };
+    if st == 0 && n > 0 {
+        li_push(acc, bp, n);
+        lineLoggerWrite(lg, bp, n);
+    };
+}
+
+fn runCmd(cmd_ptr: ptr, cmd_len: u64, cmdCount: u64, cwd_ptr: ptr, cwd_len: u64, timeoutMs: u64, sink_doc: u64, out: &RunCmdResult) -> i32 {
+    out.ok = false;
+    out.code = 0;
+    out.stdout.len = 0;
+    out.stderr.len = 0;
+    let argv_doc = li_parse(cmd_ptr, cmd_len);
+    if argv_doc == 0 { out.code = -1; return -1; };
+    let slots: [u64; 64] = [0u64; 64];
+    let si: u64 = 0;
+    while si < cmdCount && si < 32 {
+        let item: u64 = 0;
+        if sa_json_array_get(argv_doc, si, &item) == 0 {
+            if item != 0 && sa_json_kind(item) == 5 {
+                let ip: ptr = sa_json_string_ptr(item);
+                PROCESS_ARGV_SET_PTR(&slots, si, ip, sa_json_string_len(item));
+            };
+        };
+        si = si + 1;
+    }
+    let sp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(sp, &slots, 0);
+    let handle: u64 = 0;
+    let rc = sa_std_process_run_cwd(sp, cmdCount, cwd_ptr, cwd_len, &handle);
+    li_free_doc(argv_doc);
+    if rc != 0 || handle == 0 { out.code = -1; return -1; };
+    let out_lg = LineLogger { prefix: [0u8; 64], prefix_len: 0, level: 0, sink_doc: sink_doc, pending: [0u8; 8192], pending_len: 0 };
+    let err_lg = LineLogger { prefix: [0u8; 64], prefix_len: 0, level: 3, sink_doc: sink_doc, pending: [0u8; 8192], pending_len: 0 };
+    let pi: u64 = 0;
+    while pi < STR_LEN("stderr: ") { err_lg.prefix[pi] = li_byte(STR_PTR("stderr: "), pi); pi = pi + 1; }
+    err_lg.prefix_len = STR_LEN("stderr: ");
+    let started = sa_time_unix_ms();
+    let timed_out = false;
+    let done = false;
+    let code: i64 = 0;
+    while !done {
+        li_drain(handle, false, &out.stdout, &out_lg);
+        li_drain(handle, true, &out.stderr, &err_lg);
+        let ready: u64 = 0;
+        let raw_code: i64 = 0;
+        let wst = sa_std_process_try_wait(handle, &ready, &raw_code);
+        if wst == 0 && ready != 0 {
+            code = raw_code;
+            done = true;
+        } else {
+            if (sa_time_unix_ms() - started) as u64 >= timeoutMs {
+                timed_out = true;
+                done = true;
+                let krc = sa_std_process_kill(handle);
+            };
+            if !done { sa_time_sleep_ms(10); };
+        };
+    }
+    li_drain(handle, false, &out.stdout, &out_lg);
+    li_drain(handle, true, &out.stderr, &err_lg);
+    lineLoggerFlush(&out_lg);
+    lineLoggerFlush(&err_lg);
+    if timed_out {
+        let msg = LiText { bytes: [0u8; 262144], len: 0 };
+        li_push(&msg, STR_PTR("command timed out after "), STR_LEN("command timed out after "));
+        let secs = timeoutMs / 1000;
+        // small itoa
+        let tmp: [u8; 24] = [0u8; 24];
+        let tn: u64 = 0;
+        let v = secs;
+        if v == 0 { tmp[0] = 48; tn = 1; };
+        while v > 0 {
+            let rev: [u8; 24] = [0u8; 24];
+            let rn: u64 = 0;
+            let vv = v;
+            while vv > 0 { rev[rn] = (48 + (vv % 10)) as u8; rn = rn + 1; vv = vv / 10; }
+            let ri: u64 = 0;
+            while ri < rn { tmp[ri] = rev[rn - 1 - ri]; ri = ri + 1; }
+            tn = rn;
+            v = 0;
+        }
+        let tp2: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tp2, &tmp, 0);
+        li_push(&msg, tp2, tn);
+        li_push(&msg, STR_PTR("s: "), STR_LEN("s: "));
+        li_push(&msg, cmd_ptr, cmd_len);
+        li_log_line(sink_doc, li_text_ptr(&msg), msg.len, 2);
+        out.code = 124;
+        out.ok = false;
+        return 0;
+    };
+    out.code = code;
+    out.ok = code == 0;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Clone / install.sh / installOne (TS L572-701). Errors are carried as
+// text (the TS throws; callers here branch on the i32 + err text).
+// ---------------------------------------------------------------------------
+
+fn li_steps_push(steps_doc: u64, p: ptr, n: u64) -> void {
+    sa_json_array_push_string(steps_doc, p, n);
+}
+
+fn li_join_texts(a_p: ptr, a_l: u64, b_p: ptr, b_l: u64, out: &LiText) -> void {
+    out.len = 0;
+    li_push(out, a_p, a_l);
+    li_push(out, b_p, b_l);
+}
+
+fn ensureCloned(spec: &LaunchAdapterSpec, steps_doc: u64, custom_ptr: ptr, custom_len: u64, hasCustom: bool, sink_doc: u64, outDir: &LiStr, err: &LiStr) -> i32 {
+    err.len = 0;
+    let root = LiStr { bytes: [0u8; 8192], len: 0 };
+    defaultSourceRoot(custom_ptr, custom_len, hasCustom, &root);
+    sa_fs_mkdir_p(li_str_ptr(&root), root.len);
+    let target = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_join2(li_str_ptr(&root), root.len, spec.repo_ptr, spec.repo_len, &target);
+    let existing = LiStr { bytes: [0u8; 8192], len: 0 };
+    let ex_found = false;
+    resolveSourceDir(spec, custom_ptr, custom_len, hasCustom, &existing, &ex_found);
+    if ex_found {
+        let msg = LiText { bytes: [0u8; 262144], len: 0 };
+        li_push(&msg, STR_PTR("source present: "), STR_LEN("source present: "));
+        li_push(&msg, li_str_ptr(&existing), existing.len);
+        li_steps_push(steps_doc, li_text_ptr(&msg), msg.len);
+        li_push_str(outDir, li_str_ptr(&existing), existing.len);
+        return 0;
+    };
+    if !spec.hasCloneUrl {
+        li_push_str(err, spec.id_ptr, spec.id_len);
+        li_push_str(err, STR_PTR(": no public GitHub clone URL (repo not published under layola13). Provide the source manually or publish the repo."), STR_LEN(": no public GitHub clone URL (repo not published under layola13). Provide the source manually or publish the repo."));
+        return -1;
+    };
+    if li_exists(li_str_ptr(&target), target.len) {
+        let msg = LiText { bytes: [0u8; 262144], len: 0 };
+        li_push(&msg, STR_PTR("using existing checkout: "), STR_LEN("using existing checkout: "));
+        li_push(&msg, li_str_ptr(&target), target.len);
+        li_steps_push(steps_doc, li_text_ptr(&msg), msg.len);
+        li_push_str(outDir, li_str_ptr(&target), target.len);
+        return 0;
+    };
+    let step = LiText { bytes: [0u8; 262144], len: 0 };
+    li_push(&step, STR_PTR("git clone "), STR_LEN("git clone "));
+    li_push(&step, spec.cloneUrl_ptr, spec.cloneUrl_len);
+    li_push(&step, STR_PTR(" -> "), STR_LEN(" -> "));
+    li_push(&step, li_str_ptr(&target), target.len);
+    li_steps_push(steps_doc, li_text_ptr(&step), step.len);
+    let logline = LiText { bytes: [0u8; 262144], len: 0 };
+    li_push(&logline, STR_PTR("$ git clone --depth 1 "), STR_LEN("$ git clone --depth 1 "));
+    li_push(&logline, spec.cloneUrl_ptr, spec.cloneUrl_len);
+    li_push(&logline, STR_PTR(" "), STR_LEN(" "));
+    li_push(&logline, li_str_ptr(&target), target.len);
+    li_log_line(sink_doc, li_text_ptr(&logline), logline.len, 0);
+    let argv = LiText { bytes: [0u8; 262144], len: 0 };
+    // build argv via doc for correct escaping
+    let adoc = li_parse(STR_PTR("[]"), STR_LEN("[]"));
+    li_steps_push(adoc, STR_PTR("git"), STR_LEN("git"));
+    li_steps_push(adoc, STR_PTR("clone"), STR_LEN("clone"));
+    li_steps_push(adoc, STR_PTR("--depth"), STR_LEN("--depth"));
+    li_steps_push(adoc, STR_PTR("1"), STR_LEN("1"));
+    li_steps_push(adoc, spec.cloneUrl_ptr, spec.cloneUrl_len);
+    li_steps_push(adoc, li_str_ptr(&target), target.len);
+    li_stringify_into(adoc, &argv);
+    li_free_doc(adoc);
+    let res = RunCmdResult { ok: false, code: 0, stdout: LiText { bytes: [0u8; 262144], len: 0 }, stderr: LiText { bytes: [0u8; 262144], len: 0 } };
+    runCmd(li_text_ptr(&argv), argv.len, 6, li_str_ptr(&root), root.len, 180000, sink_doc, &res);
+    if !res.ok {
+        li_push_str(err, STR_PTR("git clone failed: "), STR_LEN("git clone failed: "));
+        if res.stderr.len > 0 {
+            li_push_str(err, li_text_ptr(&res.stderr), res.stderr.len);
+        } else if res.stdout.len > 0 {
+            li_push_str(err, li_text_ptr(&res.stdout), res.stdout.len);
+        } else {
+            li_push_str(err, STR_PTR("exit "), STR_LEN("exit "));
+            let num = LiStr { bytes: [0u8; 8192], len: 0 };
+            li_i64_text(res.code, &num);
+            li_push_str(err, li_str_ptr(&num), num.len);
+        };
+        return -1;
+    };
+    li_push_str(outDir, li_str_ptr(&target), target.len);
+    return 0;
+}
+
+fn li_i64_text(v: i64, out: &LiStr) -> void {
+    out.len = 0;
+    let neg = v < 0;
+    let uv: u64 = 0;
+    if neg { uv = (0 - v) as u64; } else { uv = v as u64; };
+    let rev: [u8; 24] = [0u8; 24];
+    let rn: u64 = 0;
+    if uv == 0 { rev[0] = 48; rn = 1; };
+    let vv = uv;
+    while vv > 0 { rev[rn] = (48 + (vv % 10)) as u8; rn = rn + 1; vv = vv / 10; }
+    if neg { out.bytes[out.len] = 45; out.len = out.len + 1; };
+    let ri: u64 = 0;
+    while ri < rn { out.bytes[out.len] = rev[rn - 1 - ri]; out.len = out.len + 1; ri = ri + 1; }
+}
+
+fn runInstallSh(sourceDir_ptr: ptr, sourceDir_len: u64, skipCli: bool, steps_doc: u64, sink_doc: u64, err: &LiStr) -> i32 {
+    err.len = 0;
+    let script = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_join2(sourceDir_ptr, sourceDir_len, STR_PTR("install.sh"), STR_LEN("install.sh"), &script);
+    if !li_exists(li_str_ptr(&script), script.len) {
+        li_push_str(err, STR_PTR("install.sh not found in "), STR_LEN("install.sh not found in "));
+        li_push_str(err, sourceDir_ptr, sourceDir_len);
+        return -1;
+    };
+    sa_fs_set_permissions(li_str_ptr(&script), script.len, 493);
+    let adoc = li_parse(STR_PTR("[]"), STR_LEN("[]"));
+    li_steps_push(adoc, STR_PTR("bash"), STR_LEN("bash"));
+    li_steps_push(adoc, li_str_ptr(&script), script.len);
+    if skipCli { li_steps_push(adoc, STR_PTR("--skip-cli"), STR_LEN("--skip-cli")); };
+    let step = LiText { bytes: [0u8; 262144], len: 0 };
+    li_push(&step, STR_PTR("bash "), STR_LEN("bash "));
+    li_push(&step, li_str_ptr(&script), script.len);
+    if skipCli { li_push(&step, STR_PTR(" --skip-cli"), STR_LEN(" --skip-cli")); };
+    li_steps_push(steps_doc, li_text_ptr(&step), step.len);
+    let logline = LiText { bytes: [0u8; 262144], len: 0 };
+    li_push(&logline, STR_PTR("$ "), STR_LEN("$ "));
+    li_push(&logline, li_text_ptr(&step), step.len);
+    li_log_line(sink_doc, li_text_ptr(&logline), logline.len, 0);
+    let argv = LiText { bytes: [0u8; 262144], len: 0 };
+    li_stringify_into(adoc, &argv);
+    li_free_doc(adoc);
+    let argc: u64 = 2;
+    if skipCli { argc = 3; };
+    let timeout: u64 = 600000;
+    if skipCli { timeout = 120000; };
+    let res = RunCmdResult { ok: false, code: 0, stdout: LiText { bytes: [0u8; 262144], len: 0 }, stderr: LiText { bytes: [0u8; 262144], len: 0 } };
+    runCmd(li_text_ptr(&argv), argv.len, argc, sourceDir_ptr, sourceDir_len, timeout, sink_doc, &res);
+    if !res.ok {
+        li_push_str(err, STR_PTR("install.sh failed (exit "), STR_LEN("install.sh failed (exit "));
+        let num = LiStr { bytes: [0u8; 8192], len: 0 };
+        li_i64_text(res.code, &num);
+        li_push_str(err, li_str_ptr(&num), num.len);
+        li_push_str(err, STR_PTR("): "), STR_LEN("): "));
+        // tail 2000 of stderr || stdout
+        let src_p: ptr = li_text_ptr(&res.stderr);
+        let src_l: u64 = res.stderr.len;
+        if src_l == 0 { src_p = li_text_ptr(&res.stdout); src_l = res.stdout.len; };
+        let from: u64 = 0;
+        if src_l > 2000 { from = src_l - 2000; };
+        let tail_p: ptr = PTR_NULL();
+        PTR_BYTE_ADD(tail_p, src_p, from);
+        li_push_str(err, tail_p, src_l - from);
+        return -1;
+    };
+    li_steps_push(steps_doc, STR_PTR("install.sh ok"), STR_LEN("install.sh ok"));
+    return 0;
+}
+
+fn li_values_from_json(json_p: ptr, json_l: u64, arena: &LiText, out: &LaunchEnvValues) -> void {
+    out.hasBaseUrl = false;
+    out.hasModel = false;
+    out.hasApiKey = false;
+    let doc = li_parse(json_p, json_l);
+    if doc == 0 { return; };
+    let v = LiStr { bytes: [0u8; 8192], len: 0 };
+    if li_node_string(doc, STR_PTR("baseUrl"), STR_LEN("baseUrl"), &v) {
+        out.hasBaseUrl = true;
+        li_arena_put(arena, li_str_ptr(&v), v.len, &out.baseUrl_ptr, &out.baseUrl_len);
+    };
+    if li_node_string(doc, STR_PTR("model"), STR_LEN("model"), &v) {
+        out.hasModel = true;
+        li_arena_put(arena, li_str_ptr(&v), v.len, &out.model_ptr, &out.model_len);
+    };
+    if li_node_string(doc, STR_PTR("apiKey"), STR_LEN("apiKey"), &v) {
+        out.hasApiKey = true;
+        li_arena_put(arena, li_str_ptr(&v), v.len, &out.apiKey_ptr, &out.apiKey_len);
+    };
+    li_free_doc(doc);
+}
+
+fn li_empty_status(out: &LaunchAdapterStatus) -> void {
+    out.id_ptr = STR_PTR("");
+    out.id_len = 0;
+    out.repo_ptr = STR_PTR("");
+    out.repo_len = 0;
+    out.hasCloneUrl = false;
+    out.cloneUrl_ptr = STR_PTR("");
+    out.cloneUrl_len = 0;
+    out.cloneable = false;
+    out.installed = false;
+    out.hasWrapperPath = false;
+    out.wrapperPath_ptr = STR_PTR("");
+    out.wrapperPath_len = 0;
+    out.hasProductCliPath = false;
+    out.productCliPath_ptr = STR_PTR("");
+    out.productCliPath_len = 0;
+    out.productCliPresent = false;
+    out.hasSourceDir = false;
+    out.sourceDir_ptr = STR_PTR("");
+    out.sourceDir_len = 0;
+    out.sourcePresent = false;
+    out.envPath_ptr = STR_PTR("");
+    out.envPath_len = 0;
+    out.envPresent = false;
+    out.envConfigured = false;
+    out.envPreviewBaseUrl_ptr = STR_PTR("");
+    out.envPreviewBaseUrl_len = 0;
+    out.hasEnvPreviewBaseUrl = false;
+    out.envPreviewModel_ptr = STR_PTR("");
+    out.envPreviewModel_len = 0;
+    out.hasEnvPreviewModel = false;
+    out.envPreviewHasApiKey = false;
     out.needsInstall = true;
     out.needsSetup = true;
 }
 
-fn detectAll(customRoot_ptr: ptr, customRoot_len: u64, hasCustomRoot: bool, out_ptr: &ptr, out_len: &u64, outCount: &u64) -> void {
-    // 源 L407-L413: { sourceRoot: defaultSourceRoot(custom), adapters: LAUNCH_SPECS.map(detectAdapter) }
-    // DEFECT: closure Array.map approximated as loop; result as JSON buffer + count.
-    *outCount = 0;
+fn li_empty_spec(out: &LaunchAdapterSpec) -> void {
+    out.id_ptr = STR_PTR("");
+    out.id_len = 0;
+    out.repo_ptr = STR_PTR("");
+    out.repo_len = 0;
+    out.hasCloneUrl = false;
+    out.cloneUrl_ptr = STR_PTR("");
+    out.cloneUrl_len = 0;
+    out.wrapperBins_ptr = STR_PTR("");
+    out.wrapperBins_len = 0;
+    out.wrapperBinsCount = 0;
+    out.productBins_ptr = STR_PTR("");
+    out.productBins_len = 0;
+    out.productBinsCount = 0;
+    out.envPrefix_ptr = STR_PTR("");
+    out.envPrefix_len = 0;
+    out.configDirName_ptr = STR_PTR("");
+    out.configDirName_len = 0;
 }
 
-fn upsertEnvKeys(path_ptr: ptr, path_len: u64, updates_ptr: ptr, updates_len: u64) -> void {
-    // 源 L415-L443: mkdirSync(dir, recursive); read existing lines; replace lines whose key is in updates (mark seen),
-    // keep others verbatim; append unseen updates; ensure trailing blank line; writeFileSync mode 0o600, join "\n"
-    // DEFECT: dynamic object Object.entries/keys iteration over updates JSON buffer approximated.
-}
-
-fn writeAdapterEnv(spec: &LaunchAdapterSpec, values: &LaunchEnvValues, force: bool, outPath_ptr: &ptr, outPath_len: &u64, outWrote: &bool, outSkipped: &bool) -> void {
-    // 源 L445-L481: if !force && env exists && existing BASE_URL+API_KEY non-placeholder && no new values -> skip;
-    // build updates from non-empty trimmed baseUrl/model/apiKey (envPrefix keys);
-    // no updates: create file with comment template + empty keys (mode 0o600) if missing, else skip;
-    // else upsertEnvKeys -> wrote
-    *outWrote = false;
-    *outSkipped = true;
-}
-
-struct LineLogger {
-    pending_ptr: ptr, // DEFECT: closure-captured mutable `pending` string — struct field replaces closure state
-    pending_len: u64,
-    prefix_ptr: ptr, prefix_len: u64,
-    level: u64,
-    ctxId: u64, // opaque logger callback context (InstallSubLogger)
-}
-
-fn createLineLogger(prefix_ptr: ptr, prefix_len: u64, level: u64, ctxId: u64, out: &LineLogger) -> void {
-    // 源 L483-L505: returns {write, flush} object closing over pending/prefix/level/onLog
-    // DEFECT: closure object with methods -> struct + standalone fns lineLoggerWrite/lineLoggerFlush below.
-    out.pending_len = 0;
-    out.level = level;
-    out.ctxId = ctxId;
-}
-
-fn lineLoggerWrite(lg: &LineLogger, chunk_ptr: ptr, chunk_len: u64) -> void {
-    // 源 L493-L501: pending += chunk.replace(/\r/g,"\n"); split lines; emit each complete line (trimmed, non-empty) via onLog(prefix+text, level)
-    // DEFECT: regex replace + callback invocation approximated.
-}
-
-fn lineLoggerFlush(lg: &LineLogger) -> void {
-    // 源 L502-L504: emit(pending); pending = ""
-    lg.pending_len = 0;
-}
-
-// DEFECT: async [BLOCKED: body is a preset stub (out_len=raw_len only); TS async readProcessOutput (L497) is a stream reader (getReader + TextDecoder) — the whole-buffer approximation is noted but not implemented. Body retranslation required before adjudication.]
-// DEFECT: stream — ReadableStream<Uint8Array> getReader + TextDecoder streaming decode has no sa_std counterpart; whole-buffer decode approximated.
-fn readProcessOutput(hasStream: bool, raw_ptr: ptr, raw_len: u64, out_ptr: &ptr, out_len: &u64) -> i32 {
-    *out_len = raw_len;
-    return 0;
-}
-
-struct RunCmdResult {
-    ok: bool,
-    stdout_ptr: ptr, stdout_len: u64,
-    stderr_ptr: ptr, stderr_len: u64,
-    code: i32,
-}
-
-// DEFECT: async [BLOCKED: body is a preset stub (ok=false, code=124 hardcoded); TS async runCmd (L530) = Promise.all(stdout/stderr/exited) + setTimeout kill, built on cross-module spawnRuntimeProcess (runtime/process), unwired in this file. Body retranslation required.]
-// DEFECT: timer — setTimeout/clearTimeout timeout-kill approximated as process spawn timeout parameter at fix stage.
-fn runCmd(cmd_ptr: ptr, cmd_len: u64, cmdCount: u64, cwd_ptr: ptr, cwd_len: u64, timeoutMs: u64, ctxId: u64, out: &RunCmdResult) -> i32 {
-    // 源 L528-L570: spawnRuntimeProcess(cmd, {cwd, env: {...process.env, PATH: home/.local/bin + delimiter + PATH,
-    // GIT_TERMINAL_PROMPT:"0", CI ?? "1", npm_config_audit/fund/update_notifier "false", npm_config_yes "true"}}) — cross-module spawnRuntimeProcess (runtime/process)
-    // timer kills proc after timeoutMs; ok = !timedOut && code==0; timedOut code reported as 124
-    // DEFECT: dynamic object env spread of process.env approximated as JSON buffer merge at fix stage.
+fn installOne(id_ptr: ptr, id_len: u64, opts: &InstallLaunchRequest, sink_doc: u64, arena: &LiText, out: &InstallLaunchResultItem) -> i32 {
+    out.id_ptr = id_ptr;
+    out.id_len = id_len;
     out.ok = false;
-    out.code = 124;
+    out.hasError = false;
+    out.hasStatus = false;
+    let steps_doc = li_parse(STR_PTR("[]"), STR_LEN("[]"));
+    let spec = LaunchAdapterSpec { id_ptr: STR_PTR(""), id_len: 0, repo_ptr: STR_PTR(""), repo_len: 0, hasCloneUrl: false, cloneUrl_ptr: STR_PTR(""), cloneUrl_len: 0, wrapperBins_ptr: STR_PTR(""), wrapperBins_len: 0, wrapperBinsCount: 0, productBins_ptr: STR_PTR(""), productBins_len: 0, productBinsCount: 0, envPrefix_ptr: STR_PTR(""), envPrefix_len: 0, configDirName_ptr: STR_PTR(""), configDirName_len: 0 };
+    if !getSpec(id_ptr, id_len, &spec) {
+        let logline = LiText { bytes: [0u8; 262144], len: 0 };
+        li_push(&logline, STR_PTR("未知的适配器标识: "), STR_LEN("未知的适配器标识: "));
+        li_push(&logline, id_ptr, id_len);
+        li_log_line(sink_doc, li_text_ptr(&logline), logline.len, 2);
+        let emsg = LiText { bytes: [0u8; 262144], len: 0 };
+        li_push(&emsg, STR_PTR("Unknown adapter: "), STR_LEN("Unknown adapter: "));
+        li_push(&emsg, id_ptr, id_len);
+        li_arena_put(arena, li_text_ptr(&emsg), emsg.len, &out.error_ptr, &out.error_len);
+        out.hasError = true;
+        let stext = LiText { bytes: [0u8; 262144], len: 0 };
+        li_stringify_into(steps_doc, &stext);
+        li_arena_put(arena, li_text_ptr(&stext), stext.len, &out.steps_ptr, &out.steps_len);
+        out.stepsCount = 0;
+        li_free_doc(steps_doc);
+        return 0;
+    };
+    // --- try block ------------------------------------------------------
+    let err = LiStr { bytes: [0u8; 8192], len: 0 };
+    let failed = false;
+    let prep = LiText { bytes: [0u8; 262144], len: 0 };
+    li_push(&prep, STR_PTR("正在准备源码 ("), STR_LEN("正在准备源码 ("));
+    if spec.hasCloneUrl { li_push(&prep, spec.cloneUrl_ptr, spec.cloneUrl_len); } else { li_push(&prep, id_ptr, id_len); };
+    li_push(&prep, STR_PTR(")..."), STR_LEN(")..."));
+    li_log_line(sink_doc, li_text_ptr(&prep), prep.len, 0);
+    let source_dir = LiStr { bytes: [0u8; 8192], len: 0 };
+    if ensureCloned(&spec, steps_doc, opts.sourceRoot_ptr, opts.sourceRoot_len, opts.hasSourceRoot, sink_doc, &source_dir, &err) != 0 {
+        failed = true;
+    };
+    let effective_skip = false;
+    if !failed {
+        let ready = LiText { bytes: [0u8; 262144], len: 0 };
+        li_push(&ready, STR_PTR("✓ 源码目录就绪: "), STR_LEN("✓ 源码目录就绪: "));
+        li_push(&ready, li_str_ptr(&source_dir), source_dir.len);
+        li_log_line(sink_doc, li_text_ptr(&ready), ready.len, 1);
+        // skip-cli decision
+        let prod = LiStr { bytes: [0u8; 8192], len: 0 };
+        let prod_found = false;
+        findOnPath(spec.productBins_ptr, spec.productBins_len, spec.productBinsCount, &prod, &prod_found);
+        let may_skip = true;
+        if opts.hasSkipCli && !opts.skipCli { may_skip = false; };
+        if may_skip {
+            // bins joined with "/"
+            let bins = LiStr { bytes: [0u8; 8192], len: 0 };
+            let bdoc = li_parse(spec.productBins_ptr, spec.productBins_len);
+            if bdoc != 0 {
+                let bc: u64 = 0;
+                sa_json_value_count(bdoc, &bc);
+                let bi: u64 = 0;
+                while bi < bc {
+                    let bitem: u64 = 0;
+                    if sa_json_array_get(bdoc, bi, &bitem) == 0 {
+                        if bitem != 0 && sa_json_kind(bitem) == 5 {
+                            if bi > 0 { li_push_str(&bins, STR_PTR("/"), STR_LEN("/")); };
+                            let bip: ptr = sa_json_string_ptr(bitem);
+                            li_push_str(&bins, bip, sa_json_string_len(bitem));
+                        };
+                    };
+                    bi = bi + 1;
+                }
+                li_free_doc(bdoc);
+            };
+            if prod_found {
+                effective_skip = true;
+                let m = LiText { bytes: [0u8; 262144], len: 0 };
+                li_push(&m, STR_PTR("["), STR_LEN("["));
+                li_push(&m, id_ptr, id_len);
+                li_push(&m, STR_PTR("] 检测到 "), STR_LEN("] 检测到 "));
+                li_push(&m, li_str_ptr(&bins), bins.len);
+                li_push(&m, STR_PTR(" CLI 已在 PATH 中，将使用 --skip-cli 跳过 CLI 重复安装"), STR_LEN(" CLI 已在 PATH 中，将使用 --skip-cli 跳过 CLI 重复安装"));
+                li_log_line(sink_doc, li_text_ptr(&m), m.len, 0);
+            } else {
+                let m = LiText { bytes: [0u8; 262144], len: 0 };
+                li_push(&m, STR_PTR("["), STR_LEN("["));
+                li_push(&m, id_ptr, id_len);
+                li_push(&m, STR_PTR("] 未检测到 "), STR_LEN("] 未检测到 "));
+                li_push(&m, li_str_ptr(&bins), bins.len);
+                li_push(&m, STR_PTR(" CLI，将正常执行 CLI 安装"), STR_LEN(" CLI，将正常执行 CLI 安装"));
+                li_log_line(sink_doc, li_text_ptr(&m), m.len, 0);
+            };
+        } else {
+            let m = LiText { bytes: [0u8; 262144], len: 0 };
+            li_push(&m, STR_PTR("["), STR_LEN("["));
+            li_push(&m, id_ptr, id_len);
+            li_push(&m, STR_PTR("] 用户设置不跳过，将安装/重新安装 CLI"), STR_LEN("] 用户设置不跳过，将安装/重新安装 CLI"));
+            li_log_line(sink_doc, li_text_ptr(&m), m.len, 0);
+        };
+        let runmsg = LiText { bytes: [0u8; 262144], len: 0 };
+        li_push(&runmsg, STR_PTR("正在运行 bash ./install.sh "), STR_LEN("正在运行 bash ./install.sh "));
+        if effective_skip { li_push(&runmsg, STR_PTR("--skip-cli"), STR_LEN("--skip-cli")); };
+        li_push(&runmsg, STR_PTR(" ..."), STR_LEN(" ..."));
+        li_log_line(sink_doc, li_text_ptr(&runmsg), runmsg.len, 0);
+        if runInstallSh(li_str_ptr(&source_dir), source_dir.len, effective_skip, steps_doc, sink_doc, &err) != 0 {
+            failed = true;
+        };
+    };
+    if !failed {
+        let done_msg = LiText { bytes: [0u8; 262144], len: 0 };
+        li_push(&done_msg, STR_PTR("✓ ./install.sh 执行完成"), STR_LEN("✓ ./install.sh 执行完成"));
+        li_log_line(sink_doc, li_text_ptr(&done_msg), done_msg.len, 1);
+        if opts.hasEnvMode && opts.envMode != 2 {
+            let values = LaunchEnvValues { hasBaseUrl: false, baseUrl_ptr: STR_PTR(""), baseUrl_len: 0, hasModel: false, model_ptr: STR_PTR(""), model_len: 0, hasApiKey: false, apiKey_ptr: STR_PTR(""), apiKey_len: 0 };
+            if opts.envMode == 0 {
+                values.hasBaseUrl = opts.sharedEnv.hasBaseUrl;
+                values.baseUrl_ptr = opts.sharedEnv.baseUrl_ptr;
+                values.baseUrl_len = opts.sharedEnv.baseUrl_len;
+                values.hasModel = opts.sharedEnv.hasModel;
+                values.model_ptr = opts.sharedEnv.model_ptr;
+                values.model_len = opts.sharedEnv.model_len;
+                values.hasApiKey = opts.sharedEnv.hasApiKey;
+                values.apiKey_ptr = opts.sharedEnv.apiKey_ptr;
+                values.apiKey_len = opts.sharedEnv.apiKey_len;
+            } else {
+                let sdoc = li_parse(opts.separateEnv_ptr, opts.separateEnv_len);
+                if sdoc != 0 {
+                    let sub = li_get(sdoc, id_ptr, id_len);
+                    if sub != 0 {
+                        let sub_text = LiText { bytes: [0u8; 262144], len: 0 };
+                        li_stringify_into(sub, &sub_text);
+                        li_values_from_json(li_text_ptr(&sub_text), sub_text.len, arena, &values);
+                    };
+                    li_free_doc(sdoc);
+                };
+            };
+            let env_path = LiStr { bytes: [0u8; 8192], len: 0 };
+            let wrote = false;
+            let skipped = false;
+            writeAdapterEnv(&spec, &values, opts.hasForceEnv && opts.forceEnv, &env_path, &wrote, &skipped);
+            let step = LiText { bytes: [0u8; 262144], len: 0 };
+            if skipped {
+                li_push(&step, STR_PTR("env skip (existing): "), STR_LEN("env skip (existing): "));
+            } else {
+                li_push(&step, STR_PTR("env wrote: "), STR_LEN("env wrote: "));
+            };
+            li_push(&step, li_str_ptr(&env_path), env_path.len);
+            li_steps_push(steps_doc, li_text_ptr(&step), step.len);
+            let elog = LiText { bytes: [0u8; 262144], len: 0 };
+            li_push(&elog, STR_PTR("✓ 环境配置文件已写入: "), STR_LEN("✓ 环境配置文件已写入: "));
+            li_push(&elog, li_str_ptr(&env_path), env_path.len);
+            li_log_line(sink_doc, li_text_ptr(&elog), elog.len, 1);
+        };
+    };
+    // --- settle -----------------------------------------------------------
+    let st = LaunchAdapterStatus { id_ptr: STR_PTR(""), id_len: 0, repo_ptr: STR_PTR(""), repo_len: 0, hasCloneUrl: false, cloneUrl_ptr: STR_PTR(""), cloneUrl_len: 0, cloneable: false, installed: false, hasWrapperPath: false, wrapperPath_ptr: STR_PTR(""), wrapperPath_len: 0, hasProductCliPath: false, productCliPath_ptr: STR_PTR(""), productCliPath_len: 0, productCliPresent: false, hasSourceDir: false, sourceDir_ptr: STR_PTR(""), sourceDir_len: 0, sourcePresent: false, envPath_ptr: STR_PTR(""), envPath_len: 0, envPresent: false, envConfigured: false, envPreviewBaseUrl_ptr: STR_PTR(""), envPreviewBaseUrl_len: 0, hasEnvPreviewBaseUrl: false, envPreviewModel_ptr: STR_PTR(""), envPreviewModel_len: 0, hasEnvPreviewModel: false, envPreviewHasApiKey: false, needsInstall: true, needsSetup: true };
+    detectAdapter(&spec, opts.sourceRoot_ptr, opts.sourceRoot_len, opts.hasSourceRoot, arena, &st);
+    out.status = st;
+    out.hasStatus = true;
+    if failed {
+        let elog = LiText { bytes: [0u8; 262144], len: 0 };
+        li_push(&elog, STR_PTR("✗ "), STR_LEN("✗ "));
+        li_push(&elog, id_ptr, id_len);
+        li_push(&elog, STR_PTR(" 处理异常: "), STR_LEN(" 处理异常: "));
+        li_push(&elog, li_str_ptr(&err), err.len);
+        li_log_line(sink_doc, li_text_ptr(&elog), elog.len, 2);
+        li_arena_put(arena, li_str_ptr(&err), err.len, &out.error_ptr, &out.error_len);
+        out.hasError = true;
+        out.ok = false;
+    } else {
+        out.ok = true;
+    };
+    let stext = LiText { bytes: [0u8; 262144], len: 0 };
+    li_stringify_into(steps_doc, &stext);
+    li_arena_put(arena, li_text_ptr(&stext), stext.len, &out.steps_ptr, &out.steps_len);
+    let scnt: u64 = 0;
+    sa_json_value_count(steps_doc, &scnt);
+    out.stepsCount = scnt;
+    li_free_doc(steps_doc);
     return 0;
 }
 
-// DEFECT: async [BLOCKED: body is a preset stub (*outErr=true, status 1); TS async ensureCloned (L572) awaits fs ops + runCmd git clone (180s). Body retranslation required.]
-fn ensureCloned(state: &LaunchInstallState, spec: &LaunchAdapterSpec, steps_ptr: ptr, steps_len: u64, customRoot_ptr: ptr, customRoot_len: u64, hasCustomRoot: bool, ctxId: u64, out_ptr: &ptr, out_len: &u64, outErr: &bool) -> i32 {
-    // 源 L572-L603: mkdir root; existing resolveSourceDir -> "source present"; !cloneUrl -> throw (no public GitHub clone URL...);
-    // existing target dir -> "using existing checkout"; else git clone --depth 1 via runCmd (180_000 ms) -> throw on failure
-    // DEFECT: throw/Error propagation approximated as outErr + status code.
-    *outErr = true;
-    return 1;
-}
-
-// DEFECT: async [BLOCKED: body is a preset stub; TS async runInstallSh (L609) awaits runCmd with 120s/600s timeouts. Body retranslation required.]
-fn runInstallSh(sourceDir_ptr: ptr, sourceDir_len: u64, skipCli: bool, steps_ptr: ptr, steps_len: u64, ctxId: u64, outErr: &bool) -> i32 {
-    // 源 L605-L631: install.sh must exist else throw; chmodSync 0o755 (errors ignored); args [bash, script, --skip-cli?];
-    // runCmd timeout 120_000 (skipCli) or 600_000; failure -> throw with last 2000 chars of stderr|stdout; push "install.sh ok"
-    *outErr = false;
-    return 0;
-}
-
-// DEFECT: async [BLOCKED: body is a preset stub (out.ok=false); TS async installOne (L639) awaits ensureCloned/runInstallSh/writeAdapterEnv in sequence. Body retranslation required.]
-fn installOne(state: &LaunchInstallState, id_ptr: ptr, id_len: u64, opts: &InstallLaunchRequest, ctxId: u64, out: &InstallLaunchResultItem) -> i32 {
-    // 源 L633-L694: unknown spec -> error item (log 未知的适配器标识); ensureCloned; effectiveSkipCli logic
-    // (opts.skipCli !== false: skip only if product CLI already on PATH, with Chinese log lines preserved in source order);
-    // runInstallSh; envMode shared/separate -> writeAdapterEnv + step log; success item with detectAdapter status;
-    // catch -> {ok:false, error, status: detectAdapter}
-    // DEFECT: try/catch approximated as status-code branches.
-    out.ok = false;
-    return 0;
-}
+// ---------------------------------------------------------------------------
+// testOpenAiApi (TS L717-839): two-step HTTP probe over the v2 client.
+// ---------------------------------------------------------------------------
 
 struct TestOpenAiApiRequest {
-    hasBaseUrl: bool, baseUrl_ptr: ptr, baseUrl_len: u64,
-    hasModel: bool, model_ptr: ptr, model_len: u64,
-    hasApiKey: bool, apiKey_ptr: ptr, apiKey_len: u64,
+hasBaseUrl: bool, baseUrl_ptr: ptr, baseUrl_len: u64,
+hasModel: bool, model_ptr: ptr, model_len: u64,
+hasApiKey: bool, apiKey_ptr: ptr, apiKey_len: u64,
 }
 
 struct TestOpenAiApiResult {
-    ok: bool, step1Ok: bool, step2Ok: bool,
-    message_ptr: ptr, message_len: u64, // DEFECT: template-literal Chinese messages assembled at fix stage
-    hasStatusCode: bool, statusCode: u64,
+ok: bool, step1Ok: bool, step2Ok: bool,
+message_ptr: ptr, message_len: u64,
+hasStatusCode: bool, statusCode: u64,
 }
 
-// DEFECT: async [BLOCKED: body is a preset stub (all result flags false); TS async testOpenAiApi (L717) awaits two fetch calls with 6s/10s AbortController timeouts — sa_http_client_* exists in sa_std, but this body is untranslated.]
-// DEFECT: fetch/AbortController — fetch + AbortController 6s/10s timeouts have no sa_std counterpart; approximated via sa_http_client_* with timeout at fix stage.
-fn testOpenAiApi(values: &TestOpenAiApiRequest, out: &TestOpenAiApiResult) -> i32 {
-    // 源 L708-L838: missing baseUrl/apiKey -> Chinese failure messages; normalize baseUrl (strip trailing /, ensure /v1, strip /chat/completions);
-    // Step1 GET {base}/models Bearer (6s) -> !ok failure w/ body slice 150;
-    // Step2 POST {base}/chat/completions {model ?? "gpt-5.5", messages:[{role:"user",content:"hi"}], max_tokens:15} (10s)
-    // -> ok success message; JSON error.message extraction; 502/503/504 -> ok:true step2Ok:false upstream-warning message;
-    // AbortError distinguished as timeout in both steps.
-    // DEFECT: Headers/Response web API (headers.get content-type, text()) approximated by (status, body buffer).
-    out.ok = false;
-    out.step1Ok = false;
-    out.step2Ok = false;
-    return 0;
+// One blocking HTTP call. Returns 0 with status/body filled, or -1 on
+// transport failure (err filled with a short English reason).
+fn li_http_call(method: u8, url_p: ptr, url_l: u64, auth_p: ptr, auth_l: u64, has_auth: bool, body_p: ptr, body_l: u64, has_body: bool, timeout_ms: u64, out_status: &i64, out_body: &LiText, out_ctype: &LiStr, err: &LiStr) -> i32 {
+*out_status = 0;
+out_body.len = 0;
+out_ctype.len = 0;
+err.len = 0;
+let use_tls = 0;
+if url_l > 8 && li_byte(url_p, 4) == 115 { use_tls = 1;};
+let client: u64 = 0;
+let nst = sa_http_client_new_v2(use_tls, STR_PTR(""), 0, &client);
+if nst!= 0 || client == 0 { li_push_str(err, STR_PTR("client init failed"), STR_LEN("client init failed")); return -1;};
+let req: u64 = 0;
+let rst = sa_http_client_req_new_v2(client, method, url_p, url_l, &req);
+if rst!= 0 || req == 0 {
+sa_http_client_free(client);
+li_push_str(err, STR_PTR("request init failed"), STR_LEN("request init failed"));
+return -1;
+};
+sa_http_client_req_add_header_v2(req, STR_PTR("Accept"), STR_LEN("Accept"), STR_PTR("application/json"), STR_LEN("application/json"));
+if has_auth {
+let hv = LiText { bytes: [0u8; 262144], len: 0};
+li_push(&hv, STR_PTR("Bearer "), STR_LEN("Bearer "));
+li_push(&hv, auth_p, auth_l);
+sa_http_client_req_add_header_v2(req, STR_PTR("Authorization"), STR_LEN("Authorization"), li_text_ptr(&hv), hv.len);
+};
+if has_body {
+sa_http_client_req_add_header_v2(req, STR_PTR("Content-Type"), STR_LEN("Content-Type"), STR_PTR("application/json"), STR_LEN("application/json"));
+sa_http_client_req_set_body_v2(req, body_p, body_l);
+};
+sa_http_client_req_set_timeout_v2(req, timeout_ms as u32);
+let resp: u64 = 0;
+let sst = sa_http_client_req_send_v2(req, &resp);
+if sst!= 0 || resp == 0 {
+sa_http_client_req_free(req);
+sa_http_client_free(client);
+li_push_str(err, STR_PTR("connection failed"), STR_LEN("connection failed"));
+return -1;
+};
+*out_status = sa_http_client_resp_status(resp) as i64;
+let bp: ptr = PTR_NULL();
+let bl: u64 = 0;
+if sa_http_client_resp_body_slice(resp, &bp, &bl) == 0 {
+li_push(out_body, bp, bl);
+};
+let cp: ptr = PTR_NULL();
+let cl: u64 = 0;
+if sa_http_client_resp_get_header(resp, STR_PTR("content-type"), STR_LEN("content-type"), &cp, &cl) == 0 {
+li_push_str(out_ctype, cp, cl);
+};
+sa_http_client_resp_free(resp);
+sa_http_client_req_free(req);
+sa_http_client_free(client);
+return 0;
 }
 
-// DEFECT: async [BLOCKED: body is a preset stub; TS async validateEnvModeBeforeSave (L841) awaits testOpenAiApi once (shared) or per adapter id (separate). Body retranslation required.]
-fn validateEnvModeBeforeSave(mode: u64, hasMode: bool, sharedEnv: &LaunchEnvValues, hasSharedEnv: bool, separateEnv_ptr: ptr, separateEnv_len: u64, hasSeparateEnv: bool, targetIds_ptr: ptr, targetIds_len: u64, targetCount: u64, outErr: &bool) -> i32 {
-    // 源 L840-L865: shared -> testOpenAiApi(sharedEnv) once, throw on !ok; separate -> per-id test with Set de-dup on baseUrl:apiKey:model key, throw naming adapter
-    // DEFECT: Set<string> de-dup approximated as scanned JSON buffer.
-    *outErr = false;
-    return 0;
+fn li_test_msg(out: &TestOpenAiApiResult, arena: &LiText, p: ptr, n: u64) -> void {
+li_arena_put(arena, p, n, &out.message_ptr, &out.message_len);
+}
+
+fn testOpenAiApi(values: &TestOpenAiApiRequest, arena: &LiText, out: &TestOpenAiApiResult) -> i32 {
+out.ok = false;
+out.step1Ok = false;
+out.step2Ok = false;
+out.hasStatusCode = false;
+out.statusCode = 0;
+out.message_ptr = STR_PTR("");
+out.message_len = 0;
+let base_raw = LiStr { bytes: [0u8; 8192], len: 0};
+if values.hasBaseUrl { li_trimmed(values.baseUrl_ptr, values.baseUrl_len, &base_raw);};
+let api_key = LiStr { bytes: [0u8; 8192], len: 0};
+if values.hasApiKey { li_trimmed(values.apiKey_ptr, values.apiKey_len, &api_key);};
+let model = LiStr { bytes: [0u8; 8192], len: 0};
+if values.hasModel { li_trimmed(values.model_ptr, values.model_len, &model);};
+if model.len == 0 { li_push_str(&model, STR_PTR("gpt-5.5"), STR_LEN("gpt-5.5"));};
+if base_raw.len == 0 {
+li_test_msg(out, arena, STR_PTR("需填写 Base URL 才能发起模型测试。"), STR_LEN("需填写 Base URL 才能发起模型测试。"));
+return 0;
+};
+if api_key.len == 0 {
+li_test_msg(out, arena, STR_PTR("需填写 API Key 才能发起模型测试。"), STR_LEN("需填写 API Key 才能发起模型测试。"));
+return 0;
+};
+// normalize baseUrl: strip trailing '/', ensure /v1, strip /chat/completions tail
+let base = LiStr { bytes: [0u8; 8192], len: 0};
+li_push_str(&base, li_str_ptr(&base_raw), base_raw.len);
+while base.len > 0 && li_byte(li_str_ptr(&base), base.len - 1) == 47 { base.len = base.len - 1;}
+let seg1: ptr = PTR_NULL();
+if base.len >= 3 { PTR_BYTE_ADD(seg1, li_str_ptr(&base), base.len - 3); };
+let ends_v1 = base.len >= 3 && li_eq(seg1, 3, STR_PTR("/v1"), STR_LEN("/v1"));
+let has_v1_mid = li_contains(li_str_ptr(&base), base.len, STR_PTR("/v1/"), STR_LEN("/v1/"));
+let seg2: ptr = PTR_NULL();
+if base.len >= 17 { PTR_BYTE_ADD(seg2, li_str_ptr(&base), base.len - 17); };
+let ends_cc = base.len >= 17 && li_eq(seg2, 17, STR_PTR("/chat/completions"), STR_LEN("/chat/completions"));
+if!ends_v1 &&!has_v1_mid {
+li_push_str(&base, STR_PTR("/v1"), STR_LEN("/v1"));
+} else if ends_cc {
+base.len = base.len - 17;
+};
+// Step 1: GET {base}/models (6000 ms)
+let url1 = LiStr { bytes: [0u8; 8192], len: 0};
+li_join2(li_str_ptr(&base), base.len, STR_PTR("models"), STR_LEN("models"), &url1);
+let status: i64 = 0;
+let body = LiText { bytes: [0u8; 262144], len: 0};
+let ctype = LiStr { bytes: [0u8; 8192], len: 0};
+let err = LiStr { bytes: [0u8; 8192], len: 0};
+let t0 = sa_time_unix_ms();
+let rc1 = li_http_call(1, li_str_ptr(&url1), url1.len, li_str_ptr(&api_key), api_key.len, true, STR_PTR(""), 0, false, 6000, &status, &body, &ctype, &err);
+if rc1!= 0 {
+let elapsed = sa_time_unix_ms() - t0;
+let msg = LiText { bytes: [0u8; 262144], len: 0};
+li_push(&msg, STR_PTR("获取模型列表 "), STR_LEN("获取模型列表 "));
+if elapsed >= 6000 {
+li_push(&msg, STR_PTR("6秒超时"), STR_LEN("6秒超时"));
+} else {
+li_push(&msg, STR_PTR("连接失败"), STR_LEN("连接失败"));
+};
+li_push(&msg, STR_PTR(": "), STR_LEN(": "));
+li_push(&msg, li_str_ptr(&err), err.len);
+li_test_msg(out, arena, li_text_ptr(&msg), msg.len);
+return 0;
+};
+if status < 200 || status >= 300 {
+out.hasStatusCode = true;
+out.statusCode = status as u64;
+let msg = LiText { bytes: [0u8; 262144], len: 0};
+li_push(&msg, STR_PTR("无法获取模型列表 (HTTP "), STR_LEN("无法获取模型列表 (HTTP "));
+let num = LiStr { bytes: [0u8; 8192], len: 0};
+li_i64_text(status, &num);
+li_push(&msg, li_str_ptr(&num), num.len);
+li_push(&msg, STR_PTR(")。请检查 API Key 与 Base URL 是否正确。"), STR_LEN(")。请检查 API Key 与 Base URL 是否正确。"));
+if body.len > 0 {
+li_push(&msg, STR_PTR(" 错误提示: "), STR_LEN(" 错误提示: "));
+let take = body.len;
+if take > 150 { take = 150;};
+li_push(&msg, li_text_ptr(&body), take);
+};
+li_test_msg(out, arena, li_text_ptr(&msg), msg.len);
+return 0;
+};
+// Step 2: POST {base}/chat/completions (10000 ms)
+let url2 = LiStr { bytes: [0u8; 8192], len: 0};
+li_join2(li_str_ptr(&base), base.len, STR_PTR("chat/completions"), STR_LEN("chat/completions"), &url2);
+let payload = LiText { bytes: [0u8; 262144], len: 0};
+li_push(&payload, STR_PTR("{\"model\":"), STR_LEN("{\"model\":"));
+let pdoc = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+let mdoc = li_parse(STR_PTR("[]"), STR_LEN("[]"));
+let msg_obj = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+if msg_obj!= 0 {
+sa_json_object_set_string(msg_obj, STR_PTR("role"), STR_LEN("role"), STR_PTR("user"), STR_LEN("user"));
+sa_json_object_set_string(msg_obj, STR_PTR("content"), STR_LEN("content"), STR_PTR("hi"), STR_LEN("hi"));
+sa_json_array_push_node(mdoc, msg_obj);
+li_free_doc(msg_obj);
+};
+if pdoc!= 0 {
+sa_json_object_set_string(pdoc, STR_PTR("model"), STR_LEN("model"), li_str_ptr(&model), model.len);
+sa_json_object_set_node(pdoc, STR_PTR("messages"), STR_LEN("messages"), mdoc);
+sa_json_object_set_i64(pdoc, STR_PTR("max_tokens"), STR_LEN("max_tokens"), 15);
+li_stringify_into(pdoc, &payload);
+li_free_doc(pdoc);
+};
+li_free_doc(mdoc);
+let status2: i64 = 0;
+let body2 = LiText { bytes: [0u8; 262144], len: 0};
+let ctype2 = LiStr { bytes: [0u8; 8192], len: 0};
+let err2 = LiStr { bytes: [0u8; 8192], len: 0};
+let t1 = sa_time_unix_ms();
+let rc2 = li_http_call(2, li_str_ptr(&url2), url2.len, li_str_ptr(&api_key), api_key.len, true, li_text_ptr(&payload), payload.len, true, 10000, &status2, &body2, &ctype2, &err2);
+if rc2!= 0 {
+out.step1Ok = true;
+let elapsed = sa_time_unix_ms() - t1;
+if elapsed >= 10000 {
+let msg = LiText { bytes: [0u8; 262144], len: 0};
+li_push(&msg, STR_PTR("模型对话测试10秒超时（模型 '"), STR_LEN("模型对话测试10秒超时（模型 '"));
+li_push(&msg, li_str_ptr(&model), model.len);
+li_push(&msg, STR_PTR("' 超过10秒未响应），无法正常完成对话"), STR_LEN("' 超过10秒未响应），无法正常完成对话"));
+li_test_msg(out, arena, li_text_ptr(&msg), msg.len);
+} else {
+let msg = LiText { bytes: [0u8; 262144], len: 0};
+li_push(&msg, STR_PTR("无法连接到对话接口 ("), STR_LEN("无法连接到对话接口 ("));
+li_push(&msg, li_str_ptr(&url2), url2.len);
+li_push(&msg, STR_PTR("): "), STR_LEN("): "));
+li_push(&msg, li_str_ptr(&err2), err2.len);
+li_test_msg(out, arena, li_text_ptr(&msg), msg.len);
+};
+return 0;
+};
+out.hasStatusCode = true;
+out.statusCode = status2 as u64;
+if status2 >= 200 && status2 < 300 {
+out.ok = true;
+out.step1Ok = true;
+out.step2Ok = true;
+let msg = LiText { bytes: [0u8; 262144], len: 0};
+li_push(&msg, STR_PTR("【测试通过】①模型列表获取成功  ②对话测试成功（模型 '"), STR_LEN("【测试通过】①模型列表获取成功  ②对话测试成功（模型 '"));
+li_push(&msg, li_str_ptr(&model), model.len);
+li_push(&msg, STR_PTR("' 10秒内正常响应）"), STR_LEN("' 10秒内正常响应）"));
+li_test_msg(out, arena, li_text_ptr(&msg), msg.len);
+return 0;
+};
+out.step1Ok = true;
+// json error extraction
+let json_err = LiStr { bytes: [0u8; 8192], len: 0};
+if li_contains(li_str_ptr(&ctype2), ctype2.len, STR_PTR("application/json"), STR_LEN("application/json")) && body2.len > 0 {
+let bdoc = li_parse(li_text_ptr(&body2), body2.len);
+if bdoc!= 0 {
+let enode = li_get(bdoc, STR_PTR("error"), STR_LEN("error"));
+if enode!= 0 {
+if sa_json_kind(enode) == 7 {
+li_node_string(enode, STR_PTR("message"), STR_LEN("message"), &json_err);
+};
+if sa_json_kind(enode) == 5 {
+let ep: ptr = sa_json_string_ptr(enode);
+li_push_str(&json_err, ep, sa_json_string_len(enode));
+};
+};
+li_free_doc(bdoc);
+};
+};
+if status2 == 502 || status2 == 503 || status2 == 504 {
+out.ok = true;
+out.step2Ok = false;
+let msg = LiText { bytes: [0u8; 262144], len: 0};
+li_push(&msg, STR_PTR("①Base URL 与 API Key 验证成功 (HTTP 200) ②上游节点返回 HTTP "), STR_LEN("①Base URL 与 API Key 验证成功 (HTTP 200) ②上游节点返回 HTTP "));
+let num = LiStr { bytes: [0u8; 8192], len: 0};
+li_i64_text(status2, &num);
+li_push(&msg, li_str_ptr(&num), num.len);
+li_push(&msg, STR_PTR(" 网关响应。配置已成功校验并就绪！"), STR_LEN(" 网关响应。配置已成功校验并就绪！"));
+li_test_msg(out, arena, li_text_ptr(&msg), msg.len);
+return 0;
+};
+let msg = LiText { bytes: [0u8; 262144], len: 0};
+li_push(&msg, STR_PTR("模型对话无法正常响应 (HTTP "), STR_LEN("模型对话无法正常响应 (HTTP "));
+let num = LiStr { bytes: [0u8; 8192], len: 0};
+li_i64_text(status2, &num);
+li_push(&msg, li_str_ptr(&num), num.len);
+li_push(&msg, STR_PTR("): "), STR_LEN("): "));
+if json_err.len > 0 {
+li_push(&msg, li_str_ptr(&json_err), json_err.len);
+} else {
+let take = body2.len;
+if take > 180 { take = 180;};
+li_push(&msg, li_text_ptr(&body2), take);
+};
+li_test_msg(out, arena, li_text_ptr(&msg), msg.len);
+return 0;
+}
+
+// ---------------------------------------------------------------------------
+// validateEnvModeBeforeSave (TS L841-867).
+// ---------------------------------------------------------------------------
+
+fn validateEnvModeBeforeSave(mode: u64, hasMode: bool, sharedEnv: &LaunchEnvValues, hasSharedEnv: bool, separateEnv_ptr: ptr, separateEnv_len: u64, hasSeparateEnv: bool, targetIds_ptr: ptr, targetIds_len: u64, targetCount: u64, err: &LiStr) -> i32 {
+err.len = 0;
+if!hasMode { return 0;};
+let arena = LiText { bytes: [0u8; 262144], len: 0};
+if mode == 0 && hasSharedEnv {
+let req = TestOpenAiApiRequest { hasBaseUrl: sharedEnv.hasBaseUrl, baseUrl_ptr: sharedEnv.baseUrl_ptr, baseUrl_len: sharedEnv.baseUrl_len, hasModel: sharedEnv.hasModel, model_ptr: sharedEnv.model_ptr, model_len: sharedEnv.model_len, hasApiKey: sharedEnv.hasApiKey, apiKey_ptr: sharedEnv.apiKey_ptr, apiKey_len: sharedEnv.apiKey_len};
+let res = TestOpenAiApiResult { ok: false, step1Ok: false, step2Ok: false, message_ptr: STR_PTR(""), message_len: 0, hasStatusCode: false, statusCode: 0};
+testOpenAiApi(&req, &arena, &res);
+if!res.ok {
+li_push_str(err, STR_PTR("OpenAI API test failed: "), STR_LEN("OpenAI API test failed: "));
+li_push_str(err, res.message_ptr, res.message_len);
+return -1;
+};
+return 0;
+};
+if mode == 1 && hasSeparateEnv {
+let sdoc = li_parse(separateEnv_ptr, separateEnv_len);
+let tdoc = li_parse(targetIds_ptr, targetIds_len);
+let tested = LiText { bytes: [0u8; 262144], len: 0};
+li_push(&tested, STR_PTR("[]"), STR_LEN("[]"));
+let tested_count: u64 = 0;
+let ii: u64 = 0;
+while ii < targetCount {
+if tdoc!= 0 {
+let id_item: u64 = 0;
+if sa_json_array_get(tdoc, ii, &id_item) == 0 {
+if id_item!= 0 && sa_json_kind(id_item) == 5 {
+let idp: ptr = sa_json_string_ptr(id_item);
+let idl: u64 = sa_json_string_len(id_item);
+if sdoc!= 0 {
+let sub = li_get(sdoc, idp, idl);
+if sub!= 0 {
+let sub_text = LiText { bytes: [0u8; 262144], len: 0};
+li_stringify_into(sub, &sub_text);
+let vals = LaunchEnvValues { hasBaseUrl: false, baseUrl_ptr: STR_PTR(""), baseUrl_len: 0, hasModel: false, model_ptr: STR_PTR(""), model_len: 0, hasApiKey: false, apiKey_ptr: STR_PTR(""), apiKey_len: 0};
+let varena = LiText { bytes: [0u8; 262144], len: 0};
+li_values_from_json(li_text_ptr(&sub_text), sub_text.len, &varena, &vals);
+if (vals.hasBaseUrl && vals.baseUrl_len > 0) || (vals.hasApiKey && vals.apiKey_len > 0) {
+// dedup key baseUrl:apiKey:model
+let key = LiText { bytes: [0u8; 262144], len: 0};
+if vals.hasBaseUrl { li_push(&key, vals.baseUrl_ptr, vals.baseUrl_len);};
+li_push(&key, STR_PTR(":"), STR_LEN(":"));
+if vals.hasApiKey { li_push(&key, vals.apiKey_ptr, vals.apiKey_len);};
+li_push(&key, STR_PTR(":"), STR_LEN(":"));
+if vals.hasModel { li_push(&key, vals.model_ptr, vals.model_len);};
+let tdoc2 = li_parse(li_text_ptr(&tested), tested.len);
+let dup = false;
+if tdoc2!= 0 {
+let tc: u64 = 0;
+sa_json_value_count(tdoc2, &tc);
+let ti: u64 = 0;
+while ti < tc {
+let titem: u64 = 0;
+if sa_json_array_get(tdoc2, ti, &titem) == 0 {
+if titem!= 0 && sa_json_kind(titem) == 5 {
+let tp3: ptr = sa_json_string_ptr(titem);
+if li_eq(tp3, sa_json_string_len(titem), li_text_ptr(&key), key.len) { dup = true;};
+};
+};
+ti = ti + 1;
+}
+li_free_doc(tdoc2);
+};
+if!dup {
+li_dirs_push_unique(&tested, &tested_count, li_text_ptr(&key), key.len);
+let req = TestOpenAiApiRequest { hasBaseUrl: vals.hasBaseUrl, baseUrl_ptr: vals.baseUrl_ptr, baseUrl_len: vals.baseUrl_len, hasModel: vals.hasModel, model_ptr: vals.model_ptr, model_len: vals.model_len, hasApiKey: vals.hasApiKey, apiKey_ptr: vals.apiKey_ptr, apiKey_len: vals.apiKey_len};
+let res = TestOpenAiApiResult { ok: false, step1Ok: false, step2Ok: false, message_ptr: STR_PTR(""), message_len: 0, hasStatusCode: false, statusCode: 0};
+testOpenAiApi(&req, &arena, &res);
+if!res.ok {
+li_push_str(err, STR_PTR("OpenAI API test failed for adapter "), STR_LEN("OpenAI API test failed for adapter "));
+li_push_str(err, idp, idl);
+li_push_str(err, STR_PTR(": "), STR_LEN(": "));
+li_push_str(err, res.message_ptr, res.message_len);
+li_free_doc(sdoc);
+li_free_doc(tdoc);
+return -1;
+};
+};
+};
+};
+};
+};
+};
+};
+ii = ii + 1;
+}
+li_free_doc(sdoc);
+li_free_doc(tdoc);
+return 0;
+};
+return 0;
+}
+
+// ---------------------------------------------------------------------------
+// R11 install lock (sa_global cell state) + installLaunchAdapters
+// (TS L869-940) + writeEnvsOnly (TS L942-972).
+// ---------------------------------------------------------------------------
+
+fn li_cell_get(key_p: ptr, key_l: u64) -> u64 {
+    let v: u64 = 0;
+    sa_global_u64_get(key_p, key_l, &v);
+    return v;
+}
+
+fn li_cell_set(key_p: ptr, key_l: u64, v: u64) -> void {
+    sa_global_u64_set(key_p, key_l, v);
+}
+
+fn li_lock_acquire(key_p: ptr, key_l: u64) -> void {
+    while true {
+        if li_cell_get(key_p, key_l) == 0 {
+            li_cell_set(key_p, key_l, 1);
+            return;
+        };
+        sa_time_sleep_ms(10);
+    }
+}
+
+fn li_lock_release(key_p: ptr, key_l: u64) -> void {
+    li_cell_set(key_p, key_l, 0);
+}
+
+fn installLockHeldNow() -> bool {
+    return li_cell_get(STR_PTR("launchinstall.lock"), STR_LEN("launchinstall.lock")) != 0;
 }
 
 struct InstallLaunchOutcome {
-    results_ptr: ptr, results_len: u64, resultsCount: u64, // InstallLaunchResultItem[] as JSON buffer
-    adapters_ptr: ptr, adapters_len: u64, adaptersCount: u64, // LaunchAdapterStatus[] as JSON buffer
+    results: LiText, resultsCount: u64,
+    adapters: LiText, adaptersCount: u64,
 }
 
-// DEFECT: async [BLOCKED: body is a preset stub (counts 0); TS async installLaunchAdapters (L869) spins on the module Promise lock installLock (L180, `while (installLock) await installLock` — ASYNC_MODEL R11 in-flight Promise pattern, no 1:1 counterpart) and awaits installOne sequentially. Neither is implemented.]
-// DEFECT: closure — `let release!: () => void` deferred resolver has no counterpart; lock flag set/cleared synchronously here.
-fn installLaunchAdapters(state: &LaunchInstallState, opts: &InstallLaunchRequest, ctxId: u64, out: &InstallLaunchOutcome) -> i32 {
-    // 源 L867-L935: resolve ids (explicit | missingOnly/all cloneable-or-sourcePresent via detectAll, intersect explicit ids, Set de-dup);
-    // Chinese progress logs; envMode validation (failures logged as warning, install continues unless skipModelTest);
-    // sequential installOne loop with [current/total] logs; summary 成功/失败 counts; finally release lock;
-    // return {results, adapters: detectAll(...)}
+fn li_item_json(item: &InstallLaunchResultItem, out: &LiText) -> void {
+    out.len = 0;
+    let doc = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if doc == 0 { li_push(out, STR_PTR("{}"), STR_LEN("{}")); return; };
+    sa_json_object_set_string(doc, STR_PTR("id"), STR_LEN("id"), item.id_ptr, item.id_len);
+    sa_json_object_set_bool(doc, STR_PTR("ok"), STR_LEN("ok"), item.ok);
+    let sdoc = li_parse(item.steps_ptr, item.steps_len);
+    if sdoc != 0 {
+        sa_json_object_set_node(doc, STR_PTR("steps"), STR_LEN("steps"), sdoc);
+        li_free_doc(sdoc);
+    } else {
+        let empty = li_parse(STR_PTR("[]"), STR_LEN("[]"));
+        sa_json_object_set_node(doc, STR_PTR("steps"), STR_LEN("steps"), empty);
+        li_free_doc(empty);
+    };
+    if item.hasError {
+        sa_json_object_set_string(doc, STR_PTR("error"), STR_LEN("error"), item.error_ptr, item.error_len);
+    };
+    if item.hasStatus {
+        let sj = LiText { bytes: [0u8; 262144], len: 0 };
+        li_status_json(&item.status, &sj);
+        let stdoc = li_parse(li_text_ptr(&sj), sj.len);
+        if stdoc != 0 {
+            sa_json_object_set_node(doc, STR_PTR("status"), STR_LEN("status"), stdoc);
+            li_free_doc(stdoc);
+        };
+    };
+    li_stringify_into(doc, out);
+    li_free_doc(doc);
+}
+
+fn installLaunchAdapters(state: &LaunchInstallState, opts: &InstallLaunchRequest, sink_doc: u64, out: &InstallLaunchOutcome) -> i32 {
+    out.results.len = 0;
     out.resultsCount = 0;
+    out.adapters.len = 0;
     out.adaptersCount = 0;
+    li_lock_acquire(STR_PTR("launchinstall.lock"), STR_LEN("launchinstall.lock"));
+    state.installLockHeld = true;
+    // --- resolve ids ------------------------------------------------------
+    let ids = LiText { bytes: [0u8; 262144], len: 0 };
+    li_push(&ids, STR_PTR("[]"), STR_LEN("[]"));
+    let ids_count: u64 = 0;
+    if opts.hasIds {
+        let idoc = li_parse(opts.ids_ptr, opts.ids_len);
+        if idoc != 0 {
+            let ic: u64 = 0;
+            sa_json_value_count(idoc, &ic);
+            let ii: u64 = 0;
+            while ii < ic {
+                let iitem: u64 = 0;
+                if sa_json_array_get(idoc, ii, &iitem) == 0 {
+                    if iitem != 0 && sa_json_kind(iitem) == 5 {
+                        let ip: ptr = sa_json_string_ptr(iitem);
+                        li_dirs_push_unique(&ids, &ids_count, ip, sa_json_string_len(iitem));
+                    };
+                };
+                ii = ii + 1;
+            }
+            li_free_doc(idoc);
+        };
+    };
+    let want_all = opts.hasMissingOnly && opts.missingOnly;
+    if want_all || ids_count == 0 {
+        let all = LiText { bytes: [0u8; 262144], len: 0 };
+        let acnt: u64 = 0;
+        detectAll(opts.sourceRoot_ptr, opts.sourceRoot_len, opts.hasSourceRoot, &all, &acnt);
+        let adoc = li_parse(li_text_ptr(&all), all.len);
+        let picked = LiText { bytes: [0u8; 262144], len: 0 };
+        li_push(&picked, STR_PTR("[]"), STR_LEN("[]"));
+        let picked_count: u64 = 0;
+        if adoc != 0 {
+            let arr = li_get(adoc, STR_PTR("adapters"), STR_LEN("adapters"));
+            if arr != 0 {
+                let ac: u64 = 0;
+                sa_json_value_count(arr, &ac);
+                let ai: u64 = 0;
+                while ai < ac {
+                    let aitem: u64 = 0;
+                    if sa_json_array_get(arr, ai, &aitem) == 0 {
+                        if aitem != 0 {
+                            let keep = true;
+                            if want_all {
+                                let ni = li_get(aitem, STR_PTR("needsInstall"), STR_LEN("needsInstall"));
+                                let nv: bool = false;
+                                if ni != 0 { sa_json_as_bool(ni, &nv); };
+                                keep = nv;
+                            };
+                            if keep {
+                                let cl = li_get(aitem, STR_PTR("cloneable"), STR_LEN("cloneable"));
+                                let cv: bool = false;
+                                if cl != 0 { sa_json_as_bool(cl, &cv); };
+                                let sp = li_get(aitem, STR_PTR("sourcePresent"), STR_LEN("sourcePresent"));
+                                let sv: bool = false;
+                                if sp != 0 { sa_json_as_bool(sp, &sv); };
+                                keep = cv || sv;
+                            };
+                            if keep {
+                                let idv = LiStr { bytes: [0u8; 8192], len: 0 };
+                                if li_node_string(aitem, STR_PTR("id"), STR_LEN("id"), &idv) {
+                                    li_dirs_push_unique(&picked, &picked_count, li_str_ptr(&idv), idv.len);
+                                };
+                            };
+                        };
+                    };
+                    ai = ai + 1;
+                }
+            };
+            li_free_doc(adoc);
+        };
+        if opts.hasIds && ids_count > 0 {
+            // intersect picked with the explicit ids, order = picked order
+            let inter = LiText { bytes: [0u8; 262144], len: 0 };
+            li_push(&inter, STR_PTR("[]"), STR_LEN("[]"));
+            let inter_count: u64 = 0;
+            let pdoc = li_parse(li_text_ptr(&picked), picked.len);
+            let edoc = li_parse(opts.ids_ptr, opts.ids_len);
+            if pdoc != 0 && edoc != 0 {
+                let pc: u64 = 0;
+                sa_json_value_count(pdoc, &pc);
+                let pi2: u64 = 0;
+                while pi2 < pc {
+                    let pitem: u64 = 0;
+                    if sa_json_array_get(pdoc, pi2, &pitem) == 0 {
+                        if pitem != 0 && sa_json_kind(pitem) == 5 {
+                            let pp3: ptr = sa_json_string_ptr(pitem);
+                            let pl3: u64 = sa_json_string_len(pitem);
+                            let ec: u64 = 0;
+                            sa_json_value_count(edoc, &ec);
+                            let ei: u64 = 0;
+                            let found = false;
+                            while ei < ec {
+                                let eitem: u64 = 0;
+                                if sa_json_array_get(edoc, ei, &eitem) == 0 {
+                                    if eitem != 0 && sa_json_kind(eitem) == 5 {
+                                        let ep3: ptr = sa_json_string_ptr(eitem);
+                                        if li_eq(ep3, sa_json_string_len(eitem), pp3, pl3) { found = true; };
+                                    };
+                                };
+                                ei = ei + 1;
+                            }
+                            if found { li_dirs_push_unique(&inter, &inter_count, pp3, pl3); };
+                        };
+                    };
+                    pi2 = pi2 + 1;
+                }
+            };
+            li_free_doc(pdoc);
+            li_free_doc(edoc);
+            ids = inter;
+            ids_count = inter_count;
+        } else {
+            ids = picked;
+            ids_count = picked_count;
+        };
+    };
+    // --- header logs --------------------------------------------------------
+    let start_msg = LiText { bytes: [0u8; 262144], len: 0 };
+    li_push(&start_msg, STR_PTR("开始按顺序一键安装选定的 "), STR_LEN("开始按顺序一键安装选定的 "));
+    let nnum = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_i64_text(ids_count as i64, &nnum);
+    li_push(&start_msg, li_str_ptr(&nnum), nnum.len);
+    li_push(&start_msg, STR_PTR(" 个适配器: ["), STR_LEN(" 个适配器: ["));
+    let idoc2 = li_parse(li_text_ptr(&ids), ids.len);
+    if idoc2 != 0 {
+        let ic2: u64 = 0;
+        sa_json_value_count(idoc2, &ic2);
+        let ii2: u64 = 0;
+        while ii2 < ic2 {
+            let iitem: u64 = 0;
+            if sa_json_array_get(idoc2, ii2, &iitem) == 0 {
+                if iitem != 0 && sa_json_kind(iitem) == 5 {
+                    if ii2 > 0 { li_push(&start_msg, STR_PTR(", "), STR_LEN(", ")); };
+                    let ip: ptr = sa_json_string_ptr(iitem);
+                    li_push(&start_msg, ip, sa_json_string_len(iitem));
+                };
+            };
+            ii2 = ii2 + 1;
+        }
+        li_free_doc(idoc2);
+    };
+    li_push(&start_msg, STR_PTR("]"), STR_LEN("]"));
+    li_log_line(sink_doc, li_text_ptr(&start_msg), start_msg.len, 0);
+    let root = LiStr { bytes: [0u8; 8192], len: 0 };
+    defaultSourceRoot(opts.sourceRoot_ptr, opts.sourceRoot_len, opts.hasSourceRoot, &root);
+    let root_msg = LiText { bytes: [0u8; 262144], len: 0 };
+    li_push(&root_msg, STR_PTR("源码保存路径: "), STR_LEN("源码保存路径: "));
+    li_push(&root_msg, li_str_ptr(&root), root.len);
+    li_log_line(sink_doc, li_text_ptr(&root_msg), root_msg.len, 0);
+    // --- env model validation (warn-only) ---------------------------------
+    let skip_test = opts.hasSkipModelTest && opts.skipModelTest;
+    if opts.hasEnvMode && opts.envMode != 2 && !skip_test {
+        li_log_line(sink_doc, STR_PTR("正在校验 OpenAI API 模型可用性..."), STR_LEN("正在校验 OpenAI API 模型可用性..."), 3);
+        let verr = LiStr { bytes: [0u8; 8192], len: 0 };
+        let vrc = validateEnvModeBeforeSave(opts.envMode, true, &opts.sharedEnv, opts.hasSharedEnv, opts.separateEnv_ptr, opts.separateEnv_len, opts.hasSeparateEnv, li_text_ptr(&ids), ids.len, ids_count, &verr);
+        if vrc == 0 {
+            li_log_line(sink_doc, STR_PTR("✓ OpenAI API 模型连通性测试通过"), STR_LEN("✓ OpenAI API 模型连通性测试通过"), 1);
+        } else {
+            let wm = LiText { bytes: [0u8; 262144], len: 0 };
+            li_push(&wm, STR_PTR("⚠ 模型校验返回警告/超时: "), STR_LEN("⚠ 模型校验返回警告/超时: "));
+            li_push(&wm, li_str_ptr(&verr), verr.len);
+            li_log_line(sink_doc, li_text_ptr(&wm), wm.len, 3);
+            li_log_line(sink_doc, STR_PTR("仍将继续为您克隆源码并保存 .env 配置，请在安装完成后检查网络"), STR_LEN("仍将继续为您克隆源码并保存 .env 配置，请在安装完成后检查网络"), 0);
+        };
+    };
+    // --- sequential install loop ---------------------------------------------
+    let results_doc = li_parse(STR_PTR("[]"), STR_LEN("[]"));
+    let arena = LiText { bytes: [0u8; 262144], len: 0 };
+    let ok_count: u64 = 0;
+    let fail_count: u64 = 0;
+    let current: u64 = 1;
+    let loop_doc = li_parse(li_text_ptr(&ids), ids.len);
+    let total = ids_count;
+    let li2: u64 = 0;
+    while li2 < total {
+        let idp: ptr = STR_PTR("");
+        let idl: u64 = 0;
+        let id_scratch = LiStr { bytes: [0u8; 8192], len: 0 };
+        if loop_doc != 0 {
+            let iitem: u64 = 0;
+            if sa_json_array_get(loop_doc, li2, &iitem) == 0 {
+                if iitem != 0 && sa_json_kind(iitem) == 5 {
+                    let ip: ptr = sa_json_string_ptr(iitem);
+                    li_push_str(&id_scratch, ip, sa_json_string_len(iitem));
+                };
+            };
+        };
+        idp = li_str_ptr(&id_scratch);
+        idl = id_scratch.len;
+        li_log_line(sink_doc, STR_PTR("----------------------------------------"), STR_LEN("----------------------------------------"), 0);
+        let head = LiText { bytes: [0u8; 262144], len: 0 };
+        li_push(&head, STR_PTR("["), STR_LEN("["));
+        let cn = LiStr { bytes: [0u8; 8192], len: 0 };
+        li_i64_text(current as i64, &cn);
+        li_push(&head, li_str_ptr(&cn), cn.len);
+        li_push(&head, STR_PTR("/"), STR_LEN("/"));
+        let tn2 = LiStr { bytes: [0u8; 8192], len: 0 };
+        li_i64_text(total as i64, &tn2);
+        li_push(&head, li_str_ptr(&tn2), tn2.len);
+        li_push(&head, STR_PTR("] 正在处理适配器: "), STR_LEN("] 正在处理适配器: "));
+        li_push(&head, idp, idl);
+        li_log_line(sink_doc, li_text_ptr(&head), head.len, 0);
+        arena.len = 0;
+        let item = InstallLaunchResultItem { id_ptr: STR_PTR(""), id_len: 0, ok: false, steps_ptr: STR_PTR(""), steps_len: 0, stepsCount: 0, hasError: false, error_ptr: STR_PTR(""), error_len: 0, hasStatus: false, status: LaunchAdapterStatus { id_ptr: STR_PTR(""), id_len: 0, repo_ptr: STR_PTR(""), repo_len: 0, hasCloneUrl: false, cloneUrl_ptr: STR_PTR(""), cloneUrl_len: 0, cloneable: false, installed: false, hasWrapperPath: false, wrapperPath_ptr: STR_PTR(""), wrapperPath_len: 0, hasProductCliPath: false, productCliPath_ptr: STR_PTR(""), productCliPath_len: 0, productCliPresent: false, hasSourceDir: false, sourceDir_ptr: STR_PTR(""), sourceDir_len: 0, sourcePresent: false, envPath_ptr: STR_PTR(""), envPath_len: 0, envPresent: false, envConfigured: false, envPreviewBaseUrl_ptr: STR_PTR(""), envPreviewBaseUrl_len: 0, hasEnvPreviewBaseUrl: false, envPreviewModel_ptr: STR_PTR(""), envPreviewModel_len: 0, hasEnvPreviewModel: false, envPreviewHasApiKey: false, needsInstall: true, needsSetup: true } };
+        installOne(idp, idl, opts, sink_doc, &arena, &item);
+        let ij = LiText { bytes: [0u8; 262144], len: 0 };
+        li_item_json(&item, &ij);
+        let ijdoc = li_parse(li_text_ptr(&ij), ij.len);
+        if ijdoc != 0 {
+            sa_json_array_push_node(results_doc, ijdoc);
+            li_free_doc(ijdoc);
+        };
+        out.resultsCount = out.resultsCount + 1;
+        if item.ok {
+            ok_count = ok_count + 1;
+            let m = LiText { bytes: [0u8; 262144], len: 0 };
+            li_push(&m, STR_PTR("["), STR_LEN("["));
+            li_push(&m, li_str_ptr(&cn), cn.len);
+            li_push(&m, STR_PTR("/"), STR_LEN("/"));
+            li_push(&m, li_str_ptr(&tn2), tn2.len);
+            li_push(&m, STR_PTR("] ✓ "), STR_LEN("] ✓ "));
+            li_push(&m, idp, idl);
+            li_push(&m, STR_PTR(" 安装配置完毕"), STR_LEN(" 安装配置完毕"));
+            li_log_line(sink_doc, li_text_ptr(&m), m.len, 1);
+        } else {
+            fail_count = fail_count + 1;
+            let m = LiText { bytes: [0u8; 262144], len: 0 };
+            li_push(&m, STR_PTR("["), STR_LEN("["));
+            li_push(&m, li_str_ptr(&cn), cn.len);
+            li_push(&m, STR_PTR("/"), STR_LEN("/"));
+            li_push(&m, li_str_ptr(&tn2), tn2.len);
+            li_push(&m, STR_PTR("] ✗ "), STR_LEN("] ✗ "));
+            li_push(&m, idp, idl);
+            li_push(&m, STR_PTR(" 处理失败: "), STR_LEN(" 处理失败: "));
+            if item.hasError { li_push(&m, item.error_ptr, item.error_len); };
+            li_log_line(sink_doc, li_text_ptr(&m), m.len, 2);
+        };
+        current = current + 1;
+        li2 = li2 + 1;
+    }
+    li_free_doc(loop_doc);
+    li_log_line(sink_doc, STR_PTR("----------------------------------------"), STR_LEN("----------------------------------------"), 0);
+    let summary = LiText { bytes: [0u8; 262144], len: 0 };
+    li_push(&summary, STR_PTR("所有适配器处理完毕：成功 "), STR_LEN("所有适配器处理完毕：成功 "));
+    let on = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_i64_text(ok_count as i64, &on);
+    li_push(&summary, li_str_ptr(&on), on.len);
+    li_push(&summary, STR_PTR(" 个，失败 "), STR_LEN(" 个，失败 "));
+    let fn2 = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_i64_text(fail_count as i64, &fn2);
+    li_push(&summary, li_str_ptr(&fn2), fn2.len);
+    li_push(&summary, STR_PTR(" 个"), STR_LEN(" 个"));
+    let slevel: u64 = 2;
+    if ok_count > 0 { slevel = 1; };
+    li_log_line(sink_doc, li_text_ptr(&summary), summary.len, slevel);
+    li_stringify_into(results_doc, &out.results);
+    li_free_doc(results_doc);
+    let acnt: u64 = 0;
+    detectAll(opts.sourceRoot_ptr, opts.sourceRoot_len, opts.hasSourceRoot, &out.adapters, &acnt);
+    out.adaptersCount = acnt;
+    state.installLockHeld = false;
+    li_lock_release(STR_PTR("launchinstall.lock"), STR_LEN("launchinstall.lock"));
     return 0;
 }
 
-// DEFECT: async [BLOCKED: body is a preset stub (*outCount=0); TS async writeEnvsOnly (L942) awaits validateEnvModeBeforeSave (errors intentionally swallowed) + writeAdapterEnv per id. Body retranslation required.]
-fn writeEnvsOnly(mode: u64, sharedEnv: &LaunchEnvValues, hasSharedEnv: bool, separateEnv_ptr: ptr, separateEnv_len: u64, hasSeparateEnv: bool, ids_ptr: ptr, ids_len: u64, idsCount: u64, hasIds: bool, force: bool, out_ptr: &ptr, out_len: &u64, outCount: &u64) -> i32 {
-    // 源 L937-L965: targets = ids|all spec ids filtered by getSpec; validate (errors ignored); per id writeAdapterEnv -> {id, ok, path, wrote, error?}
-    // DEFECT: dynamic object result array as JSON buffer.
+fn writeEnvsOnly(mode: u64, sharedEnv: &LaunchEnvValues, hasSharedEnv: bool, separateEnv_ptr: ptr, separateEnv_len: u64, hasSeparateEnv: bool, ids_ptr: ptr, ids_len: u64, idsCount: u64, hasIds: bool, force: bool, out: &LiText, outCount: &u64) -> i32 {
+    out.len = 0;
     *outCount = 0;
+    // targets = (ids | all spec ids) filtered by getSpec
+    let targets = LiText { bytes: [0u8; 262144], len: 0 };
+    li_push(&targets, STR_PTR("[]"), STR_LEN("[]"));
+    let tcount: u64 = 0;
+    if hasIds {
+        let tdoc = li_parse(ids_ptr, ids_len);
+        if tdoc != 0 {
+            let tc: u64 = 0;
+            sa_json_value_count(tdoc, &tc);
+            let ti: u64 = 0;
+            while ti < tc {
+                let titem: u64 = 0;
+                if sa_json_array_get(tdoc, ti, &titem) == 0 {
+                    if titem != 0 && sa_json_kind(titem) == 5 {
+                        let tp: ptr = sa_json_string_ptr(titem);
+                        let tl: u64 = sa_json_string_len(titem);
+                        let spec = LaunchAdapterSpec { id_ptr: STR_PTR(""), id_len: 0, repo_ptr: STR_PTR(""), repo_len: 0, hasCloneUrl: false, cloneUrl_ptr: STR_PTR(""), cloneUrl_len: 0, wrapperBins_ptr: STR_PTR(""), wrapperBins_len: 0, wrapperBinsCount: 0, productBins_ptr: STR_PTR(""), productBins_len: 0, productBinsCount: 0, envPrefix_ptr: STR_PTR(""), envPrefix_len: 0, configDirName_ptr: STR_PTR(""), configDirName_len: 0 };
+                        if getSpec(tp, tl, &spec) { li_dirs_push_unique(&targets, &tcount, tp, tl); };
+                    };
+                };
+                ti = ti + 1;
+            }
+            li_free_doc(tdoc);
+        };
+    } else {
+        let si: u64 = 0;
+        while si < 11 {
+            let spec = LaunchAdapterSpec { id_ptr: STR_PTR(""), id_len: 0, repo_ptr: STR_PTR(""), repo_len: 0, hasCloneUrl: false, cloneUrl_ptr: STR_PTR(""), cloneUrl_len: 0, wrapperBins_ptr: STR_PTR(""), wrapperBins_len: 0, wrapperBinsCount: 0, productBins_ptr: STR_PTR(""), productBins_len: 0, productBinsCount: 0, envPrefix_ptr: STR_PTR(""), envPrefix_len: 0, configDirName_ptr: STR_PTR(""), configDirName_len: 0 };
+            if launchSpecAt(si, &spec) { li_dirs_push_unique(&targets, &tcount, spec.id_ptr, spec.id_len); };
+            si = si + 1;
+        }
+    };
+    // validate (errors intentionally swallowed, TS L950-954)
+    let verr = LiStr { bytes: [0u8; 8192], len: 0 };
+    let vrc = validateEnvModeBeforeSave(mode, true, sharedEnv, hasSharedEnv, separateEnv_ptr, separateEnv_len, hasSeparateEnv, li_text_ptr(&targets), targets.len, tcount, &verr);
+    let results = li_parse(STR_PTR("[]"), STR_LEN("[]"));
+    let tdoc2 = li_parse(li_text_ptr(&targets), targets.len);
+    let ii: u64 = 0;
+    while ii < tcount {
+        let idp: ptr = STR_PTR("");
+        let idl: u64 = 0;
+        let id_scratch = LiStr { bytes: [0u8; 8192], len: 0 };
+        if tdoc2 != 0 {
+            let titem: u64 = 0;
+            if sa_json_array_get(tdoc2, ii, &titem) == 0 {
+                if titem != 0 && sa_json_kind(titem) == 5 {
+                    let tp: ptr = sa_json_string_ptr(titem);
+                    li_push_str(&id_scratch, tp, sa_json_string_len(titem));
+                    idp = li_str_ptr(&id_scratch);
+                    idl = id_scratch.len;
+                };
+            };
+        };
+        let spec = LaunchAdapterSpec { id_ptr: STR_PTR(""), id_len: 0, repo_ptr: STR_PTR(""), repo_len: 0, hasCloneUrl: false, cloneUrl_ptr: STR_PTR(""), cloneUrl_len: 0, wrapperBins_ptr: STR_PTR(""), wrapperBins_len: 0, wrapperBinsCount: 0, productBins_ptr: STR_PTR(""), productBins_len: 0, productBinsCount: 0, envPrefix_ptr: STR_PTR(""), envPrefix_len: 0, configDirName_ptr: STR_PTR(""), configDirName_len: 0 };
+        if getSpec(idp, idl, &spec) {
+            let values = LaunchEnvValues { hasBaseUrl: false, baseUrl_ptr: STR_PTR(""), baseUrl_len: 0, hasModel: false, model_ptr: STR_PTR(""), model_len: 0, hasApiKey: false, apiKey_ptr: STR_PTR(""), apiKey_len: 0 };
+            let varena = LiText { bytes: [0u8; 262144], len: 0 };
+            if mode == 0 {
+                values.hasBaseUrl = sharedEnv.hasBaseUrl;
+                values.baseUrl_ptr = sharedEnv.baseUrl_ptr;
+                values.baseUrl_len = sharedEnv.baseUrl_len;
+                values.hasModel = sharedEnv.hasModel;
+                values.model_ptr = sharedEnv.model_ptr;
+                values.model_len = sharedEnv.model_len;
+                values.hasApiKey = sharedEnv.hasApiKey;
+                values.apiKey_ptr = sharedEnv.apiKey_ptr;
+                values.apiKey_len = sharedEnv.apiKey_len;
+            } else {
+                let sdoc = li_parse(separateEnv_ptr, separateEnv_len);
+                if sdoc != 0 {
+                    let sub = li_get(sdoc, idp, idl);
+                    if sub != 0 {
+                        let sub_text = LiText { bytes: [0u8; 262144], len: 0 };
+                        li_stringify_into(sub, &sub_text);
+                        li_values_from_json(li_text_ptr(&sub_text), sub_text.len, &varena, &values);
+                    };
+                    li_free_doc(sdoc);
+                };
+            };
+            let env_path = LiStr { bytes: [0u8; 8192], len: 0 };
+            let wrote = false;
+            let skipped = false;
+            writeAdapterEnv(&spec, &values, force, &env_path, &wrote, &skipped);
+            let item = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+            if item != 0 {
+                sa_json_object_set_string(item, STR_PTR("id"), STR_LEN("id"), idp, idl);
+                sa_json_object_set_bool(item, STR_PTR("ok"), STR_LEN("ok"), true);
+                sa_json_object_set_string(item, STR_PTR("path"), STR_LEN("path"), li_str_ptr(&env_path), env_path.len);
+                sa_json_object_set_bool(item, STR_PTR("wrote"), STR_LEN("wrote"), wrote);
+                sa_json_array_push_node(results, item);
+                li_free_doc(item);
+            };
+            let oc = *outCount;
+            *outCount = oc + 1;
+        };
+        ii = ii + 1;
+    }
+    li_free_doc(tdoc2);
+    li_stringify_into(results, out);
+    li_free_doc(results);
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// Install jobs (TS L974-1037). Records live in one JSON doc (handle in
+// the "launchinstall.jobsdoc" cell); text fields carry the logs /
+// results / adapters JSON (logsText / resultsText / adaptersText),
+// reified as real arrays by getInstallJob's serializer.
+// ---------------------------------------------------------------------------
 
 struct InstallJobLogItem {
     time_ptr: ptr, time_len: u64,
@@ -337,26 +2637,353 @@ struct InstallJobLogItem {
 
 struct InstallJob {
     id_ptr: ptr, id_len: u64,
-    status: u64, // 0=running 1=completed 2=failed (TS string union)
+    status: u64,
     progressStep_ptr: ptr, progressStep_len: u64,
-    logs_ptr: ptr, logs_len: u64, logsCount: u64, // InstallJobLogItem[] capped at 500 in source
+    logs_ptr: ptr, logs_len: u64, logsCount: u64,
     hasResults: bool, results_ptr: ptr, results_len: u64, resultsCount: u64,
     hasAdapters: bool, adapters_ptr: ptr, adapters_len: u64, adaptersCount: u64,
     hasError: bool, error_ptr: ptr, error_len: u64,
     createdAt: u64,
 }
 
-fn createInstallJob(state: &LaunchInstallState, opts: &InstallLaunchRequest, outId_ptr: &ptr, outId_len: &u64) -> void {
-    // 源 L983-L1027: jobId = randomUUID(); job stored in module Map; addLog closure caps logs at 500 and mirrors text into progressStep;
-    // fire-and-forget async IIFE runs installLaunchAdapters, sets completed/failed + results/adapters/error.
-    // DEFECT: randomUUID (node:crypto) has no sa_std counterpart; id generation deferred.
-    // DEFECT: closure — addLog captures logs array + job object; approximated as state-struct log append at fix stage.
-    // DEFECT: async [BLOCKED: TS createInstallJob (L993) is sync but launches a fire-and-forget async IIFE that runs installLaunchAdapters in the background and settles the job record; no counterpart implemented — this body is a preset stub and getInstallJob always misses. ASYNC_MODEL R9 thread-drive form required.]
-    // DEFECT: Map<string, InstallJob> module registry approximated in LaunchInstallState jobs buffer.
-    *outId_len = 0;
+fn li_jobsdoc() -> u64 {
+    let h = li_cell_get(STR_PTR("launchinstall.jobsdoc"), STR_LEN("launchinstall.jobsdoc"));
+    if h != 0 { return h; };
+    let doc = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+    li_cell_set(STR_PTR("launchinstall.jobsdoc"), STR_LEN("launchinstall.jobsdoc"), doc);
+    return doc;
 }
 
-fn getInstallJob(state: &LaunchInstallState, jobId_ptr: ptr, jobId_len: u64, out: &InstallJob) -> bool {
-    // 源 L1029-L1031 (file end): installJobs.get(jobId)
-    return false;
+fn li_stashdoc() -> u64 {
+    let h = li_cell_get(STR_PTR("launchinstall.stashdoc"), STR_LEN("launchinstall.stashdoc"));
+    if h != 0 { return h; };
+    let doc = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+    li_cell_set(STR_PTR("launchinstall.stashdoc"), STR_LEN("launchinstall.stashdoc"), doc);
+    return doc;
+}
+
+fn li_rand64() -> u64 {
+    let ctr = li_cell_get(STR_PTR("launchinstall.rand"), STR_LEN("launchinstall.rand")) + 1;
+    li_cell_set(STR_PTR("launchinstall.rand"), STR_LEN("launchinstall.rand"), ctr);
+    let x = (sa_time_unix_ms() as u64) ^ (ctr * 2654435761);
+    x = x ^ (x >> 29);
+    x = x * 1099511628211;
+    x = x ^ (x >> 32);
+    x = x * 2246822519;
+    x = x ^ (x >> 29);
+    return x;
+}
+
+fn li_uuid(out: &LiStr) -> void {
+    out.len = 0;
+    let hexd = STR_PTR("0123456789abcdef");
+    let a = li_rand64();
+    let b = li_rand64();
+    let i: u64 = 0;
+    while i < 16 {
+        if i == 4 || i == 6 || i == 8 || i == 10 {
+            out.bytes[out.len] = 45;
+            out.len = out.len + 1;
+        };
+        let v: u64 = 0;
+        if i < 8 {
+            v = (a >> ((7 - i) * 8)) & 255;
+        } else {
+            v = (b >> ((15 - i) * 8)) & 255;
+        };
+        if i == 6 { v = (v & 15) | 64; };
+        if i == 8 { v = (v & 63) | 128; };
+        out.bytes[out.len] = li_byte(hexd, (v >> 4) & 15);
+        out.len = out.len + 1;
+        out.bytes[out.len] = li_byte(hexd, v & 15);
+        out.len = out.len + 1;
+        i = i + 1;
+    }
+}
+
+fn li_opts_json(opts: &InstallLaunchRequest, out: &LiText) -> void {
+    out.len = 0;
+    let doc = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if doc == 0 { li_push(out, STR_PTR("{}"), STR_LEN("{}")); return; };
+    if opts.hasIds {
+        let idoc = li_parse(opts.ids_ptr, opts.ids_len);
+        if idoc != 0 {
+            sa_json_object_set_node(doc, STR_PTR("ids"), STR_LEN("ids"), idoc);
+            li_free_doc(idoc);
+        };
+    };
+    if opts.hasMissingOnly { sa_json_object_set_bool(doc, STR_PTR("missingOnly"), STR_LEN("missingOnly"), opts.missingOnly); };
+    if opts.hasSkipCli { sa_json_object_set_bool(doc, STR_PTR("skipCli"), STR_LEN("skipCli"), opts.skipCli); };
+    if opts.hasEnvMode {
+        if opts.envMode == 0 { sa_json_object_set_string(doc, STR_PTR("envMode"), STR_LEN("envMode"), STR_PTR("shared"), STR_LEN("shared")); };
+        if opts.envMode == 1 { sa_json_object_set_string(doc, STR_PTR("envMode"), STR_LEN("envMode"), STR_PTR("separate"), STR_LEN("separate")); };
+        if opts.envMode == 2 { sa_json_object_set_string(doc, STR_PTR("envMode"), STR_LEN("envMode"), STR_PTR("none"), STR_LEN("none")); };
+    };
+    if opts.hasSharedEnv {
+        let sub = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+        if sub != 0 {
+            if opts.sharedEnv.hasBaseUrl { sa_json_object_set_string(sub, STR_PTR("baseUrl"), STR_LEN("baseUrl"), opts.sharedEnv.baseUrl_ptr, opts.sharedEnv.baseUrl_len); };
+            if opts.sharedEnv.hasModel { sa_json_object_set_string(sub, STR_PTR("model"), STR_LEN("model"), opts.sharedEnv.model_ptr, opts.sharedEnv.model_len); };
+            if opts.sharedEnv.hasApiKey { sa_json_object_set_string(sub, STR_PTR("apiKey"), STR_LEN("apiKey"), opts.sharedEnv.apiKey_ptr, opts.sharedEnv.apiKey_len); };
+            sa_json_object_set_node(doc, STR_PTR("sharedEnv"), STR_LEN("sharedEnv"), sub);
+            li_free_doc(sub);
+        };
+    };
+    if opts.hasSeparateEnv {
+        let sdoc = li_parse(opts.separateEnv_ptr, opts.separateEnv_len);
+        if sdoc != 0 {
+            sa_json_object_set_node(doc, STR_PTR("separateEnv"), STR_LEN("separateEnv"), sdoc);
+            li_free_doc(sdoc);
+        };
+    };
+    if opts.hasForceEnv { sa_json_object_set_bool(doc, STR_PTR("forceEnv"), STR_LEN("forceEnv"), opts.forceEnv); };
+    if opts.hasSourceRoot { sa_json_object_set_string(doc, STR_PTR("sourceRoot"), STR_LEN("sourceRoot"), opts.sourceRoot_ptr, opts.sourceRoot_len); };
+    if opts.hasSkipModelTest { sa_json_object_set_bool(doc, STR_PTR("skipModelTest"), STR_LEN("skipModelTest"), opts.skipModelTest); };
+    li_stringify_into(doc, out);
+    li_free_doc(doc);
+}
+
+fn li_opts_from_json(json_p: ptr, json_l: u64, arena: &LiText, out: &InstallLaunchRequest) -> void {
+    out.hasIds = false;
+    out.hasMissingOnly = false;
+    out.hasSkipCli = false;
+    out.hasEnvMode = false;
+    out.hasSharedEnv = false;
+    out.hasSeparateEnv = false;
+    out.hasForceEnv = false;
+    out.hasSourceRoot = false;
+    out.hasSkipModelTest = false;
+    let doc = li_parse(json_p, json_l);
+    if doc == 0 { return; };
+    let ids_node = li_get(doc, STR_PTR("ids"), STR_LEN("ids"));
+    if ids_node != 0 {
+        let t = LiText { bytes: [0u8; 262144], len: 0 };
+        li_stringify_into(ids_node, &t);
+        li_arena_put(arena, li_text_ptr(&t), t.len, &out.ids_ptr, &out.ids_len);
+        let c: u64 = 0;
+        sa_json_value_count(ids_node, &c);
+        out.idsCount = c;
+        out.hasIds = true;
+    };
+    let bv: bool = false;
+    let node = li_get(doc, STR_PTR("missingOnly"), STR_LEN("missingOnly"));
+    if node != 0 { if sa_json_as_bool(node, &bv) == 0 { out.missingOnly = bv; out.hasMissingOnly = true; }; };
+    node = li_get(doc, STR_PTR("skipCli"), STR_LEN("skipCli"));
+    if node != 0 { if sa_json_as_bool(node, &bv) == 0 { out.skipCli = bv; out.hasSkipCli = true; }; };
+    let mode_s = LiStr { bytes: [0u8; 8192], len: 0 };
+    if li_node_string(doc, STR_PTR("envMode"), STR_LEN("envMode"), &mode_s) {
+        out.hasEnvMode = true;
+        out.envMode = 2;
+        if li_eq(li_str_ptr(&mode_s), mode_s.len, STR_PTR("shared"), STR_LEN("shared")) { out.envMode = 0; };
+        if li_eq(li_str_ptr(&mode_s), mode_s.len, STR_PTR("separate"), STR_LEN("separate")) { out.envMode = 1; };
+    };
+    let shared_node = li_get(doc, STR_PTR("sharedEnv"), STR_LEN("sharedEnv"));
+    if shared_node != 0 {
+        let t = LiText { bytes: [0u8; 262144], len: 0 };
+        li_stringify_into(shared_node, &t);
+        li_values_from_json(li_text_ptr(&t), t.len, arena, &out.sharedEnv);
+        out.hasSharedEnv = true;
+    };
+    let sep_node = li_get(doc, STR_PTR("separateEnv"), STR_LEN("separateEnv"));
+    if sep_node != 0 {
+        let t = LiText { bytes: [0u8; 262144], len: 0 };
+        li_stringify_into(sep_node, &t);
+        li_arena_put(arena, li_text_ptr(&t), t.len, &out.separateEnv_ptr, &out.separateEnv_len);
+        out.hasSeparateEnv = true;
+    };
+    node = li_get(doc, STR_PTR("forceEnv"), STR_LEN("forceEnv"));
+    if node != 0 { if sa_json_as_bool(node, &bv) == 0 { out.forceEnv = bv; out.hasForceEnv = true; }; };
+    if li_node_string(doc, STR_PTR("sourceRoot"), STR_LEN("sourceRoot"), &mode_s) {
+        li_arena_put(arena, li_str_ptr(&mode_s), mode_s.len, &out.sourceRoot_ptr, &out.sourceRoot_len);
+        out.hasSourceRoot = true;
+    };
+    node = li_get(doc, STR_PTR("skipModelTest"), STR_LEN("skipModelTest"));
+    if node != 0 { if sa_json_as_bool(node, &bv) == 0 { out.skipModelTest = bv; out.hasSkipModelTest = true; }; };
+    li_free_doc(doc);
+}
+
+// R9 driver: runs on the spawned thread; settles the job record.
+fn li_job_drive(token: u64) -> i32 {
+    let key = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_i64_text(token as i64, &key);
+    // claim the stash entry
+    li_lock_acquire(STR_PTR("launchinstall.jobslock"), STR_LEN("launchinstall.jobslock"));
+    let stash = li_stashdoc();
+    let entry = li_get(stash, li_str_ptr(&key), key.len);
+    let job_id = LiStr { bytes: [0u8; 8192], len: 0 };
+    let opts_text = LiText { bytes: [0u8; 262144], len: 0 };
+    if entry != 0 {
+        li_node_string(entry, STR_PTR("job"), STR_LEN("job"), &job_id);
+        li_node_text(entry, STR_PTR("opts"), STR_LEN("opts"), &opts_text);
+    };
+    li_lock_release(STR_PTR("launchinstall.jobslock"), STR_LEN("launchinstall.jobslock"));
+    if job_id.len == 0 { return 0; };
+    // sink doc for the run's log lines; mirrored into the job at settle
+    // (plus a live mirror via li_job_append_log for progressStep).
+    let sink = li_parse(STR_PTR("[]"), STR_LEN("[]"));
+    let arena = LiText { bytes: [0u8; 262144], len: 0 };
+    let opts = InstallLaunchRequest { ids_ptr: STR_PTR(""), ids_len: 0, idsCount: 0, hasIds: false, missingOnly: false, hasMissingOnly: false, skipCli: false, hasSkipCli: false, envMode: 0, hasEnvMode: false, sharedEnv: LaunchEnvValues { hasBaseUrl: false, baseUrl_ptr: STR_PTR(""), baseUrl_len: 0, hasModel: false, model_ptr: STR_PTR(""), model_len: 0, hasApiKey: false, apiKey_ptr: STR_PTR(""), apiKey_len: 0 }, hasSharedEnv: false, separateEnv_ptr: STR_PTR(""), separateEnv_len: 0, hasSeparateEnv: false, forceEnv: false, hasForceEnv: false, sourceRoot_ptr: STR_PTR(""), sourceRoot_len: 0, hasSourceRoot: false, skipModelTest: false, hasSkipModelTest: false };
+    li_opts_from_json(li_text_ptr(&opts_text), opts_text.len, &arena, &opts);
+    let state = LaunchInstallState { installLockHeld: false, jobs_ptr: STR_PTR(""), jobs_len: 0, jobsCount: 0 };
+    let outcome = InstallLaunchOutcome { results: LiText { bytes: [0u8; 262144], len: 0 }, resultsCount: 0, adapters: LiText { bytes: [0u8; 262144], len: 0 }, adaptersCount: 0 };
+    installLaunchAdapters(&state, &opts, sink, &outcome);
+    // settle
+    li_lock_acquire(STR_PTR("launchinstall.jobslock"), STR_LEN("launchinstall.jobslock"));
+    let doc = li_jobsdoc();
+    let job = li_get(doc, li_str_ptr(&job_id), job_id.len);
+    if job != 0 {
+        sa_json_object_set_string(job, STR_PTR("status"), STR_LEN("status"), STR_PTR("completed"), STR_LEN("completed"));
+        let results_doc = li_parse(li_text_ptr(&outcome.results), outcome.results.len);
+        let okc: u64 = 0;
+        if results_doc != 0 {
+            let rc: u64 = 0;
+            sa_json_value_count(results_doc, &rc);
+            let ri: u64 = 0;
+            while ri < rc {
+                let rit: u64 = 0;
+                if sa_json_array_get(results_doc, ri, &rit) == 0 {
+                    if rit != 0 {
+                        let ok_node = li_get(rit, STR_PTR("ok"), STR_LEN("ok"));
+                        let okv: bool = false;
+                        if ok_node != 0 { sa_json_as_bool(ok_node, &okv); };
+                        if okv { okc = okc + 1; };
+                    };
+                };
+                ri = ri + 1;
+            }
+            li_free_doc(results_doc);
+        };
+        let step = LiText { bytes: [0u8; 262144], len: 0 };
+        li_push(&step, STR_PTR("Completed "), STR_LEN("Completed "));
+        let on = LiStr { bytes: [0u8; 8192], len: 0 };
+        li_i64_text(okc as i64, &on);
+        li_push(&step, li_str_ptr(&on), on.len);
+        li_push(&step, STR_PTR("/"), STR_LEN("/"));
+        let tn = LiStr { bytes: [0u8; 8192], len: 0 };
+        li_i64_text(outcome.resultsCount as i64, &tn);
+        li_push(&step, li_str_ptr(&tn), tn.len);
+        li_push(&step, STR_PTR(" adapters."), STR_LEN(" adapters."));
+        sa_json_object_set_string(job, STR_PTR("progressStep"), STR_LEN("progressStep"), li_text_ptr(&step), step.len);
+        sa_json_object_set_string(job, STR_PTR("resultsText"), STR_LEN("resultsText"), li_text_ptr(&outcome.results), outcome.results.len);
+        sa_json_object_set_string(job, STR_PTR("adaptersText"), STR_LEN("adaptersText"), li_text_ptr(&outcome.adapters), outcome.adapters.len);
+        // merge the sink logs into logsText (job started empty)
+        let sink_text = LiText { bytes: [0u8; 262144], len: 0 };
+        li_stringify_into(sink, &sink_text);
+        sa_json_object_set_string(job, STR_PTR("logsText"), STR_LEN("logsText"), li_text_ptr(&sink_text), sink_text.len);
+    };
+    li_lock_release(STR_PTR("launchinstall.jobslock"), STR_LEN("launchinstall.jobslock"));
+    li_free_doc(sink);
+    return 0;
+}
+
+fn createInstallJob(state: &LaunchInstallState, opts: &InstallLaunchRequest, outId: &LiStr) -> void {
+    outId.len = 0;
+    let job_id = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_uuid(&job_id);
+    li_push_str(outId, li_str_ptr(&job_id), job_id.len);
+    let opts_text = LiText { bytes: [0u8; 262144], len: 0 };
+    li_opts_json(opts, &opts_text);
+    li_lock_acquire(STR_PTR("launchinstall.jobslock"), STR_LEN("launchinstall.jobslock"));
+    let doc = li_jobsdoc();
+    let rec = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if rec != 0 {
+        sa_json_object_set_string(rec, STR_PTR("id"), STR_LEN("id"), li_str_ptr(&job_id), job_id.len);
+        sa_json_object_set_string(rec, STR_PTR("status"), STR_LEN("status"), STR_PTR("running"), STR_LEN("running"));
+        sa_json_object_set_string(rec, STR_PTR("progressStep"), STR_LEN("progressStep"), STR_PTR("Starting installation job..."), STR_LEN("Starting installation job..."));
+        sa_json_object_set_string(rec, STR_PTR("logsText"), STR_LEN("logsText"), STR_PTR("[]"), STR_LEN("[]"));
+        sa_json_object_set_i64(rec, STR_PTR("createdAt"), STR_LEN("createdAt"), sa_time_unix_ms());
+        sa_json_object_set_node(doc, li_str_ptr(&job_id), job_id.len, rec);
+        li_free_doc(rec);
+    };
+    // stash {job, opts} under a fresh token for the driver thread
+    let token = li_cell_get(STR_PTR("launchinstall.jobctr"), STR_LEN("launchinstall.jobctr")) + 1;
+    li_cell_set(STR_PTR("launchinstall.jobctr"), STR_LEN("launchinstall.jobctr"), token);
+    let stash = li_stashdoc();
+    let sentry = li_parse(STR_PTR("{}"), STR_LEN("{}"));
+    if sentry != 0 {
+        sa_json_object_set_string(sentry, STR_PTR("job"), STR_LEN("job"), li_str_ptr(&job_id), job_id.len);
+        sa_json_object_set_string(sentry, STR_PTR("opts"), STR_LEN("opts"), li_text_ptr(&opts_text), opts_text.len);
+        let key = LiStr { bytes: [0u8; 8192], len: 0 };
+        li_i64_text(token as i64, &key);
+        sa_json_object_set_node(stash, li_str_ptr(&key), key.len, sentry);
+        li_free_doc(sentry);
+    };
+    state.jobsCount = state.jobsCount + 1;
+    li_lock_release(STR_PTR("launchinstall.jobslock"), STR_LEN("launchinstall.jobslock"));
+    // R9 fire-and-forget (TS: the async IIFE inside createInstallJob)
+    let handle = thread::spawn(^|| li_job_drive(token));
+}
+
+fn getInstallJob(state: &LaunchInstallState, jobId_ptr: ptr, jobId_len: u64, arena: &LiText, out: &InstallJob) -> bool {
+    li_lock_acquire(STR_PTR("launchinstall.jobslock"), STR_LEN("launchinstall.jobslock"));
+    let doc = li_jobsdoc();
+    let job = li_get(doc, jobId_ptr, jobId_len);
+    if job == 0 {
+        li_lock_release(STR_PTR("launchinstall.jobslock"), STR_LEN("launchinstall.jobslock"));
+        return false;
+    };
+    li_arena_put(arena, jobId_ptr, jobId_len, &out.id_ptr, &out.id_len);
+    let status_s = LiStr { bytes: [0u8; 8192], len: 0 };
+    li_node_string(job, STR_PTR("status"), STR_LEN("status"), &status_s);
+    out.status = 0;
+    if li_eq(li_str_ptr(&status_s), status_s.len, STR_PTR("completed"), STR_LEN("completed")) { out.status = 1; };
+    if li_eq(li_str_ptr(&status_s), status_s.len, STR_PTR("failed"), STR_LEN("failed")) { out.status = 2; };
+    let step = LiStr { bytes: [0u8; 8192], len: 0 };
+    if li_node_string(job, STR_PTR("progressStep"), STR_LEN("progressStep"), &step) {
+        li_arena_put(arena, li_str_ptr(&step), step.len, &out.progressStep_ptr, &out.progressStep_len);
+    };
+    let logs = LiStr { bytes: [0u8; 8192], len: 0 };
+    let logs_text = LiText { bytes: [0u8; 262144], len: 0 };
+    if li_node_text(job, STR_PTR("logsText"), STR_LEN("logsText"), &logs_text) {
+        li_arena_put(arena, li_text_ptr(&logs_text), logs_text.len, &out.logs_ptr, &out.logs_len);
+        let ldoc = li_parse(li_text_ptr(&logs_text), logs_text.len);
+        if ldoc != 0 {
+            let c: u64 = 0;
+            sa_json_value_count(ldoc, &c);
+            out.logsCount = c;
+            li_free_doc(ldoc);
+        };
+    };
+    out.hasResults = false;
+    let rt = LiText { bytes: [0u8; 262144], len: 0 };
+    if li_node_text(job, STR_PTR("resultsText"), STR_LEN("resultsText"), &rt) {
+        li_arena_put(arena, li_text_ptr(&rt), rt.len, &out.results_ptr, &out.results_len);
+        let rdoc = li_parse(li_text_ptr(&rt), rt.len);
+        if rdoc != 0 {
+            let c: u64 = 0;
+            sa_json_value_count(rdoc, &c);
+            out.resultsCount = c;
+            li_free_doc(rdoc);
+        };
+        out.hasResults = true;
+    };
+    out.hasAdapters = false;
+    let at = LiText { bytes: [0u8; 262144], len: 0 };
+    if li_node_text(job, STR_PTR("adaptersText"), STR_LEN("adaptersText"), &at) {
+        li_arena_put(arena, li_text_ptr(&at), at.len, &out.adapters_ptr, &out.adapters_len);
+        let adoc = li_parse(li_text_ptr(&at), at.len);
+        if adoc != 0 {
+            let arr = li_get(adoc, STR_PTR("adapters"), STR_LEN("adapters"));
+            if arr != 0 {
+                let c: u64 = 0;
+                sa_json_value_count(arr, &c);
+                out.adaptersCount = c;
+            };
+            li_free_doc(adoc);
+        };
+        out.hasAdapters = true;
+    };
+    out.hasError = false;
+    let es = LiStr { bytes: [0u8; 8192], len: 0 };
+    if li_node_string(job, STR_PTR("error"), STR_LEN("error"), &es) {
+        li_arena_put(arena, li_str_ptr(&es), es.len, &out.error_ptr, &out.error_len);
+        out.hasError = true;
+    };
+    let cnode = li_get(job, STR_PTR("createdAt"), STR_LEN("createdAt"));
+    if cnode != 0 {
+        let cv: i64 = 0;
+        if sa_json_as_i64(cnode, &cv) == 0 { out.createdAt = cv as u64; };
+    };
+    li_lock_release(STR_PTR("launchinstall.jobslock"), STR_LEN("launchinstall.jobslock"));
+    return true;
 }
