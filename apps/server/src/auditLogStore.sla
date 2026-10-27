@@ -1,84 +1,673 @@
 // Converted 1:1 from apps/server/src/auditLogStore.ts (CXU plugins @ f2cb649d). Bulk conversion pass — defects logged, not yet fixed.
+// FIX (2026-10-27, stores batch): all bodies retranslated from the TS truth.
+// Persistence: the skeleton header claimed "SQLite surface has no sa_std
+// counterpart yet" — STALE (same family as the password/uuid corrections):
+// the synchronous sa_std plugin_sqlite facade (SA_SQLITE_* macros over
+// @sa_node_plugin_sqlite_*) exists and is the landed binding; the store's
+// db field is a plugin_sqlite connection handle supplied by the wiring
+// layer (LocalDatabase unit owns opening it — host seam, registered in
+// FIX_SERVER_STORES). randomUUID -> sa_deno_random_uuid; readFile ->
+// sa_fs_read_file; join -> byte concat with single-slash guard.
+// Async adjudication: recordDangerousPermission / list /
+// migrateLegacyEvents are async in TS over synchronous surfaces only
+// (sqlite facade, fs read) -> blocking contract form 1:1 (ASYNC_MODEL).
+// The constructor's `void this.migrateLegacyEvents()` (R9 fire-and-
+// forget) lands deterministically: migration runs synchronously inside
+// AuditLogStore_new (status ignored, exactly as the TS void discards
+// the promise) and again at list() entry, as in TS.
 @import "sa_std/io/print.sai"
-// @import "./runtime/database.sla"  // RuntimeDatabase
-// @import "./localDatabase.sla"     // LocalDatabase
-// node:crypto randomUUID, node:fs/promises readFile, node:path join — DEFECT: async fs + randomUUID. [BLOCKED: body is a conversion-era comment skeleton (preset return). Awaited ops are fs/promises readFile (sa_std fs exists) and randomUUID (sa_deno_random_uuid exists); the L15 fire-and-forget migrateLegacyEvents() call (TS: void this.migrateLegacyEvents()) is R9 — host must invoke migration explicitly; no body is implemented.]
-// @codex-ui/shared DangerousPermissionAuditEvent / JsonValue — DEFECT: dynamic object -> JSON handle.
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/fmt.sai"
+@import "sa_std/time.sai"
+@import "sa_std/crypto.sai"
+@import "sa_std/env.sai"
+@import "sa_std/plugin_sqlite.sa"
+@import "../../../sdk-backend/src/dataDir.sla"
+// @import "./runtime/database.sla"  // RuntimeDatabase (db field = plugin_sqlite connection handle in the SLA build)
+// @import "./localDatabase.sla"     // LocalDatabase (dir = codexUiDataDir(); connection opening stays with that unit)
 
 struct AuditLogStore {
     file: [u8; 1024], file_len: u64, // join(database.dir, "audit-log.jsonl")
-    db: u64, // RuntimeDatabase handle
+    db: u64, // plugin_sqlite connection handle (TS: database.connection)
 }
+
+// ---- byte buffer helpers (al_ prefix; this file's private toolkit) ----
+struct AlStr {
+    bytes: [u8; 2048],
+    len: u64,
+}
+
+fn al_str_ptr(b: &AlStr) -> ptr {
+    let p: ptr = PTR_NULL();
+    PTR_BYTE_ADD(p, &b.bytes, 0);
+    return p;
+}
+
+fn al_str_assign(b: &AlStr, src: ptr, src_len: u64) -> void {
+    b.len = 0;
+    let i: u64 = 0;
+    while i < src_len && b.len < 2048 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, src, i);
+        b.bytes[b.len] = v;
+        b.len = b.len + 1;
+        i = i + 1;
+    }
+}
+
+fn al_str_append(b: &AlStr, src: ptr, src_len: u64) -> void {
+    let i: u64 = 0;
+    while i < src_len && b.len < 2048 {
+        let v: u8 = 0;
+        PTR_BYTE_AT(v, src, i);
+        b.bytes[b.len] = v;
+        b.len = b.len + 1;
+        i = i + 1;
+    }
+}
+
+fn al_bytes_eq(a: ptr, a_len: u64, b: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    let i: u64 = 0;
+    while i < a_len {
+        let x: u8 = 0;
+        let y: u8 = 0;
+        PTR_BYTE_AT(x, a, i);
+        PTR_BYTE_AT(y, b, i);
+        if x != y { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn al_lit_eq(p: ptr, len: u64, lit: ptr, lit_len: u64) -> bool {
+    return al_bytes_eq(p, len, lit, lit_len);
+}
+
+// JS String.trim() approximated by ASCII whitespace (house norm).
+fn al_trim_range(p: ptr, len: u64, lo: &u64, hi: &u64) -> void {
+    let a: u64 = 0;
+    let b: u64 = len;
+    while a < b {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, a);
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            a = a + 1;
+        } else {
+            break;
+        };
+    }
+    while b > a {
+        let c2: u8 = 0;
+        PTR_BYTE_AT(c2, p, b - 1);
+        if c2 == 32 || c2 == 9 || c2 == 10 || c2 == 13 {
+            b = b - 1;
+        } else {
+            break;
+        };
+    }
+    *lo = a;
+    *hi = b;
+}
+
+// ---- sa_json helpers (path-addressed handle norm, FIX_SAVMTOOL) ----
+fn al_jget(doc: u64, key: ptr, key_len: u64) -> u64 {
+    if doc == 0 { return 0; };
+    let node: u64 = 0;
+    let st: i32 = sa_json_object_get(doc, key, key_len, &node);
+    if st != 0 { return 0; };
+    return node;
+}
+
+fn al_jkind(node: u64) -> u32 {
+    if node == 0 { return 0; };
+    return sa_json_kind(node);
+}
+
+fn al_jstr(node: u64, out_p: &ptr, out_l: &u64) -> bool {
+    *out_l = 0;
+    if node == 0 { return false; };
+    if sa_json_kind(node) != 5 { return false; };
+    let sp: ptr = sa_json_string_ptr(node);
+    *out_p = sp;
+    *out_l = sa_json_string_len(node);
+    return true;
+}
+
+fn al_jget_str(doc: u64, key: ptr, key_len: u64, out_p: &ptr, out_l: &u64) -> bool {
+    return al_jstr(al_jget(doc, key, key_len), out_p, out_l);
+}
+
+fn al_jget_i64(doc: u64, key: ptr, key_len: u64, out_v: &i64) -> bool {
+    let node = al_jget(doc, key, key_len);
+    if node == 0 { return false; };
+    let v: i64 = 0;
+    if sa_json_as_i64(node, &v) == 0 {
+        *out_v = v;
+        return true;
+    };
+    let f: f64 = 0.0;
+    if sa_json_as_f64(node, &f) == 0 {
+        *out_v = f as i64;
+        return true;
+    };
+    return false;
+}
+
+fn al_new_obj() -> u64 {
+    return sa_json_parse(STR_PTR("{}"), STR_LEN("{}"));
+}
+
+fn al_new_arr() -> u64 {
+    return sa_json_parse(STR_PTR("[]"), STR_LEN("[]"));
+}
+
+fn al_arr_len(doc: u64) -> u64 {
+    if doc == 0 { return 0; };
+    let n: u64 = 0;
+    let st: i32 = sa_json_value_count(doc, &n);
+    if st != 0 { return 0; };
+    return n;
+}
+
+fn al_arr_at(doc: u64, idx: u64) -> u64 {
+    if doc == 0 { return 0; };
+    let node: u64 = 0;
+    let st: i32 = sa_json_array_get(doc, idx, &node);
+    if st != 0 { return 0; };
+    return node;
+}
+
+// stringValue(value): typeof string && trim() ? trimmed : undefined.
+fn al_string_value(node: u64, out: &AlStr) -> bool {
+    out.len = 0;
+    let p: ptr = PTR_NULL();
+    let l: u64 = 0;
+    if !al_jstr(node, &p, &l) { return false; };
+    let lo: u64 = 0;
+    let hi: u64 = 0;
+    al_trim_range(p, l, &lo, &hi);
+    if hi <= lo { return false; };
+    let tp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tp, p, lo);
+    al_str_assign(out, tp, hi - lo);
+    return true;
+}
+
+fn al_get_string_value(doc: u64, key: ptr, key_len: u64, out: &AlStr) -> bool {
+    return al_string_value(al_jget(doc, key, key_len), out);
+}
+
+// ---- sqlite facade wrappers (one macro per helper: macro temp names
+// are keyed on the out-variable names, so each macro appears once) ----
+fn al_exec(db: u64, sql: ptr, sql_len: u64) -> i32 {
+    let st: u64 = 0;
+    SA_SQLITE_EXEC(st, db, sql, sql_len);
+    return st as i32;
+}
+
+fn al_prepare(db: u64, sql: ptr, sql_len: u64) -> u64 {
+    let st: u64 = 0;
+    let stmt: u64 = 0;
+    SA_SQLITE_PREPARE(st, stmt, db, sql, sql_len);
+    if st != 0 { return 0; };
+    return stmt;
+}
+
+fn al_bind_text(stmt: u64, idx: u64, v: ptr, v_len: u64) -> void {
+    let st: u64 = 0;
+    SA_SQLITE_BIND_TEXT(st, stmt, idx, v, v_len);
+}
+
+fn al_bind_int(stmt: u64, idx: u64, v: u64) -> void {
+    let st: u64 = 0;
+    SA_SQLITE_BIND_INT(st, stmt, idx, v);
+}
+
+// Step once; on a row, parse its JSON text into a fresh doc the
+// caller owns. Returns false at end of rows / on error.
+fn al_step_row(stmt: u64, out_doc: &u64) -> bool {
+    *out_doc = 0;
+    let st: u64 = 0;
+    let ready: u64 = 0;
+    let rp: ptr = PTR_NULL();
+    let rl: u64 = 0;
+    SA_SQLITE_STEP_JSON(st, ready, rp, rl, stmt);
+    if ready == 0 { return false; };
+    if rp == PTR_NULL() { return false; };
+    let doc: u64 = sa_json_parse(rp, rl);
+    if doc == 0 { return false; };
+    *out_doc = doc;
+    return true;
+}
+
+fn al_finalize(stmt: u64) -> void {
+    if stmt == 0 { return; };
+    let st: u64 = 0;
+    SA_SQLITE_FINALIZE(st, stmt);
+}
+
+// ================= AuditLogStore (auditLogStore.ts) =================
 
 fn AuditLogStore_new(out: &AuditLogStore, database: u64) -> void {
     // this.db = database.connection; this.file = join(database.dir, "audit-log.jsonl")
-    // void this.migrateLegacyEvents() — DEFECT: async fire-and-forget; host must call migration explicitly. [BLOCKED: body is a conversion-era comment skeleton (preset return). Awaited ops are fs/promises readFile (sa_std fs exists) and randomUUID (sa_deno_random_uuid exists); the L15 fire-and-forget migrateLegacyEvents() call (TS: void this.migrateLegacyEvents()) is R9 — host must invoke migration explicitly; no body is implemented.]
-    // DEFECT: SQLite surface has no sa_std counterpart yet.
+    // database.dir is codexUiDataDir() by definition (localDatabase.ts);
+    // the SLA constructor receives only the connection handle, so the
+    // dir is recomputed through the SDK codexUiDataDir (registered
+    // seam: a custom LocalDatabase dir cannot be expressed here).
+    out.db = database;
+    out.file_len = 0;
+    let home_buf: u64 = sa_env_home_dir();
+    if home_buf != 0 {
+        let hp: ptr = sa_env_buffer_data(home_buf);
+        let hl: u64 = sa_env_buffer_len(home_buf);
+        let dir = PathBuf { bytes: [0u8; 4096], len: 0 };
+        let dst: i32 = codexUiDataDir(hp, hl, &dir);
+        if dst == 0 && dir.len > 0 {
+            let dp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(dp, &dir.bytes, 0);
+            let fb = AlStr { bytes: [0u8; 2048], len: 0 };
+            al_str_assign(&fb, dp, dir.len);
+            if fb.len > 0 {
+                let last: u8 = 0;
+                PTR_BYTE_AT(last, al_str_ptr(&fb), fb.len - 1);
+                if last != 47 {
+                    al_str_append(&fb, STR_PTR("/"), STR_LEN("/"));
+                };
+            };
+            al_str_append(&fb, STR_PTR("audit-log.jsonl"), STR_LEN("audit-log.jsonl"));
+            let i: u64 = 0;
+            while i < fb.len && i < 1024 {
+                out.file[i] = fb.bytes[i];
+                i = i + 1;
+            }
+            out.file_len = fb.len;
+            if out.file_len > 1024 { out.file_len = 1024; };
+        };
+    };
+    // void this.migrateLegacyEvents() — landed synchronously (see header).
+    if out.db != 0 {
+        let ig: i32 = AuditLogStore_migrateLegacyEvents(out);
+    };
 }
 
-// DEFECT: async [BLOCKED: body is a conversion-era comment skeleton (preset return). Awaited ops are fs/promises readFile (sa_std fs exists) and randomUUID (sa_deno_random_uuid exists); the L15 fire-and-forget migrateLegacyEvents() call (TS: void this.migrateLegacyEvents()) is R9 — host must invoke migration explicitly; no body is implemented.]
+// TS return: event object or null (out_found). i32: 0 ok (event or
+// null); nonzero = the insert's sqlite status (TS: insert throw ->
+// the async fn rejects; the status keeps that distinguishable).
 fn AuditLogStore_recordDangerousPermission(s: &AuditLogStore, method_ptr: ptr, method_len: u64, params: u64, has_params: bool, out_event: &u64, out_found: &bool) -> i32 {
-    // method not in {"thread/start", "turn/start"} -> null
-    // reasons = dangerousPermissionReasons(asRecord(params)); empty -> null
-    // event = { id: randomUUID(), createdAt: Date.now(), method,
-    //   severity: approvalPolicy === "never" ? "critical" : "warning", reasons,
-    //   cwd/threadId/model/approvalPolicy/sandbox via stringValue, sandboxPolicyType, inputSummary(input) }
-    // insert(event); return event
+    *out_event = 0;
+    *out_found = false;
+    if !al_lit_eq(method_ptr, method_len, STR_PTR("thread/start"), STR_LEN("thread/start")) && !al_lit_eq(method_ptr, method_len, STR_PTR("turn/start"), STR_LEN("turn/start")) {
+        return 0;
+    };
+    let record: u64 = 0;
+    asRecord(params, &record);
+    // has_params false behaves as asRecord(undefined) = {} in TS.
+    if !has_params { record = al_new_obj(); };
+    let reasons: u64 = 0;
+    let rcount: u64 = 0;
+    dangerousPermissionReasons(record, &reasons, &rcount);
+    if rcount == 0 { return 0; };
+    let event: u64 = al_new_obj();
+    if event == 0 { return 1; };
+    // id: randomUUID()
+    let uuid_buf: u64 = sa_deno_random_uuid();
+    if uuid_buf != 0 {
+        let up: ptr = sa_fmt_buffer_data(uuid_buf);
+        let ul: u64 = sa_fmt_buffer_len(uuid_buf);
+        let ust: i32 = sa_json_object_set_string(event, STR_PTR("id"), STR_LEN("id"), up, ul);
+        let uf: i32 = sa_fmt_buffer_free(uuid_buf);
+    };
+    // createdAt: Date.now()
+    let now_ms: i64 = sa_time_unix_ms();
+    let cst: i32 = sa_json_object_set_i64(event, STR_PTR("createdAt"), STR_LEN("createdAt"), now_ms);
+    // method
+    let mst: i32 = sa_json_object_set_string(event, STR_PTR("method"), STR_LEN("method"), method_ptr, method_len);
+    // severity: record.approvalPolicy === "never" ? "critical" : "warning"
+    // (raw value compare, NOT stringValue — TS reads the property directly)
+    let ap = AlStr { bytes: [0u8; 2048], len: 0 };
+    let ap_raw: ptr = PTR_NULL();
+    let ap_raw_len: u64 = 0;
+    let ap_is_str: bool = al_jget_str(record, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"), &ap_raw, &ap_raw_len);
+    if ap_is_str && al_lit_eq(ap_raw, ap_raw_len, STR_PTR("never"), STR_LEN("never")) {
+        let sst: i32 = sa_json_object_set_string(event, STR_PTR("severity"), STR_LEN("severity"), STR_PTR("critical"), STR_LEN("critical"));
+    } else {
+        let sst2: i32 = sa_json_object_set_string(event, STR_PTR("severity"), STR_LEN("severity"), STR_PTR("warning"), STR_LEN("warning"));
+    };
+    // reasons
+    let rst: i32 = sa_json_object_set_node(event, STR_PTR("reasons"), STR_LEN("reasons"), reasons);
+    // cwd / threadId / model / approvalPolicy / sandbox via stringValue (trimmed, omitted when undefined)
+    let tmp = AlStr { bytes: [0u8; 2048], len: 0 };
+    if al_get_string_value(record, STR_PTR("cwd"), STR_LEN("cwd"), &tmp) {
+        let vst: i32 = sa_json_object_set_string(event, STR_PTR("cwd"), STR_LEN("cwd"), al_str_ptr(&tmp), tmp.len);
+    };
+    if al_get_string_value(record, STR_PTR("threadId"), STR_LEN("threadId"), &tmp) {
+        let vst2: i32 = sa_json_object_set_string(event, STR_PTR("threadId"), STR_LEN("threadId"), al_str_ptr(&tmp), tmp.len);
+    };
+    if al_get_string_value(record, STR_PTR("model"), STR_LEN("model"), &tmp) {
+        let vst3: i32 = sa_json_object_set_string(event, STR_PTR("model"), STR_LEN("model"), al_str_ptr(&tmp), tmp.len);
+    };
+    if al_get_string_value(record, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"), &tmp) {
+        let vst4: i32 = sa_json_object_set_string(event, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"), al_str_ptr(&tmp), tmp.len);
+    };
+    if al_get_string_value(record, STR_PTR("sandbox"), STR_LEN("sandbox"), &tmp) {
+        let vst5: i32 = sa_json_object_set_string(event, STR_PTR("sandbox"), STR_LEN("sandbox"), al_str_ptr(&tmp), tmp.len);
+    };
+    // sandboxPolicyType
+    let spt = AlStr { bytes: [0u8; 2048], len: 0 };
+    let spt_p: ptr = PTR_NULL();
+    let spt_l: u64 = 0;
+    let spt_found: bool = false;
+    sandboxPolicyType(al_jget(record, STR_PTR("sandboxPolicy"), STR_LEN("sandboxPolicy")), &spt_p, &spt_l, &spt_found);
+    if spt_found {
+        al_str_assign(&spt, spt_p, spt_l);
+        let vst6: i32 = sa_json_object_set_string(event, STR_PTR("sandboxPolicyType"), STR_LEN("sandboxPolicyType"), al_str_ptr(&spt), spt.len);
+    };
+    // inputSummary(record.input)
+    let summary: u64 = 0;
+    let has_summary: bool = false;
+    inputSummary(al_jget(record, STR_PTR("input"), STR_LEN("input")), &summary, &has_summary);
+    if has_summary {
+        let vst7: i32 = sa_json_object_set_node(event, STR_PTR("inputSummary"), STR_LEN("inputSummary"), summary);
+    };
+    let ist: i32 = al_insert_status(s, event);
+    if ist != 0 { return ist; };
+    *out_event = event;
+    *out_found = true;
     return 0;
 }
 
-// DEFECT: async [BLOCKED: body is a conversion-era comment skeleton (preset return). Awaited ops are fs/promises readFile (sa_std fs exists) and randomUUID (sa_deno_random_uuid exists); the L15 fire-and-forget migrateLegacyEvents() call (TS: void this.migrateLegacyEvents()) is R9 — host must invoke migration explicitly; no body is implemented.]
 fn AuditLogStore_list(s: &AuditLogStore, limit: u64, out_events: &u64, out_count: &u64) -> i32 {
-    // await migrateLegacyEvents()
-    // rows = SELECT payload FROM audit_events ORDER BY created_at DESC LIMIT ?
-    // rows.map(parseAuditLine).filter(isAuditEvent)
+    *out_events = 0;
+    *out_count = 0;
+    // await this.migrateLegacyEvents()
+    let mst: i32 = AuditLogStore_migrateLegacyEvents(s);
+    if mst != 0 { return mst; };
+    let result: u64 = al_new_arr();
+    if result == 0 { return 1; };
+    if s.db != 0 {
+        let stmt: u64 = al_prepare(s.db, STR_PTR("SELECT payload FROM audit_events ORDER BY created_at DESC LIMIT ?"), STR_LEN("SELECT payload FROM audit_events ORDER BY created_at DESC LIMIT ?"));
+        if stmt != 0 {
+            al_bind_int(stmt, 1, limit);
+            let row: u64 = 0;
+            let more: bool = al_step_row(stmt, &row);
+            while more {
+                let pp: ptr = PTR_NULL();
+                let pl: u64 = 0;
+                if al_jget_str(row, STR_PTR("payload"), STR_LEN("payload"), &pp, &pl) {
+                    let ev: u64 = 0;
+                    let found: bool = false;
+                    parseAuditLine(pp, pl, &ev, &found);
+                    if found && isAuditEvent(ev, true) {
+                        let pst: i32 = sa_json_array_push_node(result, ev);
+                    };
+                };
+                more = al_step_row(stmt, &row);
+            }
+            al_finalize(stmt);
+        };
+    };
+    *out_events = result;
+    *out_count = al_arr_len(result);
+    return 0;
+}
+
+// insert with status (private landing of the TS private insert();
+// the public void form below preserves the landed signature).
+fn al_insert_status(s: &AuditLogStore, event: u64) -> i32 {
+    if s.db == 0 { return 0; };
+    if event == 0 { return 0; };
+    let stmt: u64 = al_prepare(s.db, STR_PTR("INSERT OR REPLACE INTO audit_events (id, created_at, method, severity, payload) VALUES (?, ?, ?, ?, ?)"), STR_LEN("INSERT OR REPLACE INTO audit_events (id, created_at, method, severity, payload) VALUES (?, ?, ?, ?, ?)"));
+    if stmt == 0 { return 1; };
+    let idb = AlStr { bytes: [0u8; 2048], len: 0 };
+    if al_get_string_value(event, STR_PTR("id"), STR_LEN("id"), &idb) {
+        al_bind_text(stmt, 1, al_str_ptr(&idb), idb.len);
+    } else {
+        al_bind_text(stmt, 1, STR_PTR(""), STR_LEN(""));
+    };
+    let created: i64 = 0;
+    let has_created: bool = al_jget_i64(event, STR_PTR("createdAt"), STR_LEN("createdAt"), &created);
+    al_bind_int(stmt, 2, created as u64);
+    let mb = AlStr { bytes: [0u8; 2048], len: 0 };
+    if al_get_string_value(event, STR_PTR("method"), STR_LEN("method"), &mb) {
+        al_bind_text(stmt, 3, al_str_ptr(&mb), mb.len);
+    } else {
+        al_bind_text(stmt, 3, STR_PTR(""), STR_LEN(""));
+    };
+    let sb = AlStr { bytes: [0u8; 2048], len: 0 };
+    if al_get_string_value(event, STR_PTR("severity"), STR_LEN("severity"), &sb) {
+        al_bind_text(stmt, 4, al_str_ptr(&sb), sb.len);
+    } else {
+        al_bind_text(stmt, 4, STR_PTR(""), STR_LEN(""));
+    };
+    // payload = JSON.stringify(event)
+    let buf: u64 = 0;
+    let sst: i32 = sa_json_stringify(event, &buf);
+    if sst == 0 && buf != 0 {
+        let bpp: ptr = sa_json_buffer_data(buf);
+        let bpl: u64 = sa_json_buffer_len(buf);
+        al_bind_text(stmt, 5, bpp, bpl);
+        let row2: u64 = 0;
+        let done: bool = al_step_row(stmt, &row2);
+        let bf: i32 = sa_json_buffer_free(buf);
+    };
+    al_finalize(stmt);
     return 0;
 }
 
 fn AuditLogStore_insert(s: &AuditLogStore, event: u64) -> void {
-    // INSERT OR REPLACE INTO audit_events (id, created_at, method, severity, payload) VALUES (...)
-    // payload = JSON.stringify(event)
+    let ig: i32 = al_insert_status(s, event);
 }
 
-// DEFECT: async [BLOCKED: body is a conversion-era comment skeleton (preset return). Awaited ops are fs/promises readFile (sa_std fs exists) and randomUUID (sa_deno_random_uuid exists); the L15 fire-and-forget migrateLegacyEvents() call (TS: void this.migrateLegacyEvents()) is R9 — host must invoke migration explicitly; no body is implemented.]
 fn AuditLogStore_migrateLegacyEvents(s: &AuditLogStore) -> i32 {
-    // count = SELECT COUNT(*) FROM audit_events; > 0 -> return
-    // try readFile(file): lines -> parseAuditLine -> filter isAuditEvent;
-    //   BEGIN; insert each; COMMIT; inner catch -> ROLLBACK + rethrow
-    // outer catch: fresh installs have no legacy audit log (swallowed)
+    if s.db == 0 { return 0; };
+    // existing = SELECT COUNT(*) AS count FROM audit_events (outside the TS try:
+    // a failure here rejects, so its status propagates).
+    let stmt: u64 = al_prepare(s.db, STR_PTR("SELECT COUNT(*) AS count FROM audit_events"), STR_LEN("SELECT COUNT(*) AS count FROM audit_events"));
+    if stmt == 0 { return 1; };
+    let row: u64 = 0;
+    let has_row: bool = al_step_row(stmt, &row);
+    let count: i64 = 0;
+    if has_row {
+        let hv: bool = al_jget_i64(row, STR_PTR("count"), STR_LEN("count"), &count);
+    };
+    al_finalize(stmt);
+    if count > 0 { return 0; };
+    // try { raw = await readFile(this.file, "utf8"); ... } catch { swallowed }
+    if s.file_len == 0 { return 0; };
+    let fp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(fp, &s.file, 0);
+    let handle: u64 = 0;
+    let rst: i32 = sa_std_fs_read_file(fp, s.file_len, 268435456, &handle);
+    if rst != 0 || handle == 0 { return 0; };
+    let data: ptr = sa_fs_read_buffer_data(handle);
+    let dlen: u64 = sa_fs_read_buffer_len(handle);
+    // events = raw.split(/\r?\n/).filter(Boolean).map(parseAuditLine).filter(isAuditEvent)
+    let events: u64 = al_new_arr();
+    let start: u64 = 0;
+    let i: u64 = 0;
+    while i <= dlen {
+        let at_end: bool = i == dlen;
+        let is_nl: bool = false;
+        if !at_end {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, data, i);
+            if c == 10 { is_nl = true; };
+        };
+        if at_end || is_nl {
+            let seg_len: u64 = i - start;
+            // a trailing \r belongs to the /\r?\n/ separator
+            if seg_len > 0 {
+                let lc: u8 = 0;
+                let lp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(lp, data, start + seg_len - 1);
+                PTR_BYTE_AT(lc, lp, 0);
+                if lc == 13 { seg_len = seg_len - 1; };
+            };
+            if seg_len > 0 {
+                let sp2: ptr = PTR_NULL();
+                PTR_BYTE_ADD(sp2, data, start);
+                let ev: u64 = 0;
+                let found: bool = false;
+                parseAuditLine(sp2, seg_len, &ev, &found);
+                if found && isAuditEvent(ev, true) {
+                    let pst: i32 = sa_json_array_push_node(events, ev);
+                };
+            };
+            start = i + 1;
+        };
+        i = i + 1;
+    }
+    let ff: i32 = sa_fs_read_buffer_free(handle);
+    // BEGIN; try { insert each; COMMIT } catch { ROLLBACK; throw } — the
+    // rethrow lands in the outer catch and is swallowed, as in TS.
+    let bst: i32 = al_exec(s.db, STR_PTR("BEGIN"), STR_LEN("BEGIN"));
+    let failed: bool = false;
+    let n: u64 = al_arr_len(events);
+    let k: u64 = 0;
+    while k < n {
+        let ev2: u64 = al_arr_at(events, k);
+        if ev2 != 0 {
+            let ist: i32 = al_insert_status(s, ev2);
+            if ist != 0 { failed = true; };
+        };
+        k = k + 1;
+    }
+    if failed {
+        let rst2: i32 = al_exec(s.db, STR_PTR("ROLLBACK"), STR_LEN("ROLLBACK"));
+    } else {
+        let cst: i32 = al_exec(s.db, STR_PTR("COMMIT"), STR_LEN("COMMIT"));
+    };
     return 0;
 }
 
 fn parseAuditLine(line_ptr: ptr, line_len: u64, out_event: &u64, out_found: &bool) -> void {
-    // try JSON.parse(line) as event catch -> null
+    // try { JSON.parse(line) } catch { null } — note: NOT validity
+    // filtered here; isAuditEvent is the filter (list/migrate).
+    *out_event = 0;
+    *out_found = false;
+    if line_len == 0 { return; };
+    let doc: u64 = sa_json_parse(line_ptr, line_len);
+    if doc == 0 { return; };
+    *out_event = doc;
+    *out_found = true;
 }
 
 fn dangerousPermissionReasons(record: u64, out_reasons: &u64, out_count: &u64) -> void {
-    // approvalPolicy === "never" -> "approvalPolicy=never"
-    // sandbox === "danger-full-access" -> "sandbox=danger-full-access"
-    // sandboxPolicyType(sandboxPolicy) === "dangerFullAccess" -> "sandboxPolicy=dangerFullAccess"
+    let arr: u64 = al_new_arr();
+    // record.approvalPolicy === "never" (raw compare)
+    let p: ptr = PTR_NULL();
+    let l: u64 = 0;
+    if al_jget_str(record, STR_PTR("approvalPolicy"), STR_LEN("approvalPolicy"), &p, &l) {
+        if al_lit_eq(p, l, STR_PTR("never"), STR_LEN("never")) {
+            let st: i32 = sa_json_array_push_string(arr, STR_PTR("approvalPolicy=never"), STR_LEN("approvalPolicy=never"));
+        };
+    };
+    if al_jget_str(record, STR_PTR("sandbox"), STR_LEN("sandbox"), &p, &l) {
+        if al_lit_eq(p, l, STR_PTR("danger-full-access"), STR_LEN("danger-full-access")) {
+            let st2: i32 = sa_json_array_push_string(arr, STR_PTR("sandbox=danger-full-access"), STR_LEN("sandbox=danger-full-access"));
+        };
+    };
+    let tp: ptr = PTR_NULL();
+    let tl: u64 = 0;
+    let tf: bool = false;
+    sandboxPolicyType(al_jget(record, STR_PTR("sandboxPolicy"), STR_LEN("sandboxPolicy")), &tp, &tl, &tf);
+    if tf && al_lit_eq(tp, tl, STR_PTR("dangerFullAccess"), STR_LEN("dangerFullAccess")) {
+        let st3: i32 = sa_json_array_push_string(arr, STR_PTR("sandboxPolicy=dangerFullAccess"), STR_LEN("sandboxPolicy=dangerFullAccess"));
+    };
+    *out_reasons = arr;
+    *out_count = al_arr_len(arr);
 }
 
 fn inputSummary(value: u64, out_summary: &u64, out_found: &bool) -> void {
-    // non-array -> undefined; count items by type: text/input_text, localImage/input_image, mention
-    // return { items: length, textItems, imageItems, mentionItems }
+    *out_summary = 0;
+    *out_found = false;
+    if value == 0 { return; };
+    if al_jkind(value) != 6 { return; };
+    let n: u64 = al_arr_len(value);
+    let text_items: i64 = 0;
+    let image_items: i64 = 0;
+    let mention_items: i64 = 0;
+    let i: u64 = 0;
+    while i < n {
+        let item: u64 = al_arr_at(value, i);
+        let rec: u64 = 0;
+        asRecord(item, &rec);
+        let tp: ptr = PTR_NULL();
+        let tl: u64 = 0;
+        if al_jget_str(rec, STR_PTR("type"), STR_LEN("type"), &tp, &tl) {
+            if al_lit_eq(tp, tl, STR_PTR("text"), STR_LEN("text")) || al_lit_eq(tp, tl, STR_PTR("input_text"), STR_LEN("input_text")) {
+                text_items = text_items + 1;
+            };
+            if al_lit_eq(tp, tl, STR_PTR("localImage"), STR_LEN("localImage")) || al_lit_eq(tp, tl, STR_PTR("input_image"), STR_LEN("input_image")) {
+                image_items = image_items + 1;
+            };
+            if al_lit_eq(tp, tl, STR_PTR("mention"), STR_LEN("mention")) {
+                mention_items = mention_items + 1;
+            };
+        };
+        i = i + 1;
+    }
+    let out: u64 = al_new_obj();
+    let s1: i32 = sa_json_object_set_i64(out, STR_PTR("items"), STR_LEN("items"), n as i64);
+    let s2: i32 = sa_json_object_set_i64(out, STR_PTR("textItems"), STR_LEN("textItems"), text_items);
+    let s3: i32 = sa_json_object_set_i64(out, STR_PTR("imageItems"), STR_LEN("imageItems"), image_items);
+    let s4: i32 = sa_json_object_set_i64(out, STR_PTR("mentionItems"), STR_LEN("mentionItems"), mention_items);
+    *out_summary = out;
+    *out_found = true;
 }
 
 fn isAuditEvent(value: u64, has_value: bool) -> bool {
-    // Boolean(value) && typeof id === "string" && typeof createdAt === "number" &&
-    // method in {thread/start, turn/start} && severity in {warning, critical}
-    // DEFECT: type predicate (value is T) has no SLA counterpart.
-    return false;
+    // TS type predicate; landed as a plain boolean check.
+    if !has_value || value == 0 { return false; };
+    let p: ptr = PTR_NULL();
+    let l: u64 = 0;
+    if !al_jget_str(value, STR_PTR("id"), STR_LEN("id"), &p, &l) { return false; };
+    let cnode: u64 = al_jget(value, STR_PTR("createdAt"), STR_LEN("createdAt"));
+    if cnode == 0 { return false; };
+    let ck: u32 = al_jkind(cnode);
+    if ck != 2 && ck != 3 && ck != 4 { return false; };
+    if !al_jget_str(value, STR_PTR("method"), STR_LEN("method"), &p, &l) { return false; };
+    if !al_lit_eq(p, l, STR_PTR("thread/start"), STR_LEN("thread/start")) && !al_lit_eq(p, l, STR_PTR("turn/start"), STR_LEN("turn/start")) { return false; };
+    if !al_jget_str(value, STR_PTR("severity"), STR_LEN("severity"), &p, &l) { return false; };
+    if !al_lit_eq(p, l, STR_PTR("warning"), STR_LEN("warning")) && !al_lit_eq(p, l, STR_PTR("critical"), STR_LEN("critical")) { return false; };
+    return true;
 }
 
 fn asRecord(value: u64, out_record: &u64) -> void {
-    // object && !Array ? value : {}
+    // value && typeof === "object" && !Array.isArray(value) ? value : {}
+    if value != 0 && al_jkind(value) == 7 {
+        *out_record = value;
+        return;
+    };
+    *out_record = al_new_obj();
 }
 
 fn stringValue(value: u64, out_ptr: &ptr, out_len: &u64, out_found: &bool) -> void {
-    // typeof string && trim() ? trimmed : undefined
+    // typeof string && trim() ? trimmed : undefined. The trimmed bytes
+    // point into the node's string storage (caller copies if needed).
+    *out_len = 0;
+    *out_found = false;
+    let p: ptr = PTR_NULL();
+    let l: u64 = 0;
+    if !al_jstr(value, &p, &l) { return; };
+    let lo: u64 = 0;
+    let hi: u64 = 0;
+    al_trim_range(p, l, &lo, &hi);
+    if hi <= lo { return; };
+    let tp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(tp, p, lo);
+    *out_ptr = tp;
+    *out_len = hi - lo;
+    *out_found = true;
 }
 
 fn sandboxPolicyType(value: u64, out_ptr: &ptr, out_len: &u64, out_found: &bool) -> void {
     // stringValue(asRecord(value).type)
+    let rec: u64 = 0;
+    asRecord(value, &rec);
+    stringValue(al_jget(rec, STR_PTR("type"), STR_LEN("type")), out_ptr, out_len, out_found);
 }
