@@ -651,7 +651,7 @@ struct CodeCliBridge {
     runtimeEnvSnapshot_json: JsonText,
     // readonly compactThread: ClaudeCompactionRunner (imported, opaque id).
     compactThread_id: u64,
-    // DEFECT: async — childExitPromise: Promise<void> -> exit flag + code.
+    // ASYNC-ADJ(ii): childExitPromise: Promise<void> is modeled as the childExitSettled flag + exit code; the host-fed onChildExit sink settles it and waitForExit reads it — the host-poll form (ASYNC_MODEL R7) of the exit promise.
     childExitSettled: bool,
     pendingHandshakeThreadId: OptStr,
     pendingHandshakeThreadIdIsNull: bool,
@@ -800,7 +800,7 @@ fn codeCliBridge_requiresRestartFor(self: &CodeCliBridge) -> bool { return false
 // private controlRequest(request, timeoutMs = 30_000): Promise<JsonValue> (777-798)
 // Rejects when no child; else registers pendingControls[host-<n>] with a
 // setTimeout reject, writeStdin({type:"control_request",request_id,request}).
-// DEFECT: async/Promise + setTimeout + closure capture — modelled as
+// ASYNC-ADJ(ii): TS controlRequest (L777) returns Promise<JsonValue>, resolved by the matching control_response and rejected by a setTimeout; modelled as
 // synchronous registration returning a request slot id; the matching
 // control_response is consumed in handleLine and the caller polls the slot.
 // DEFECT: timers — timeout enforced by host tick at fix stage.
@@ -818,7 +818,7 @@ fn codeCliBridge_controlRequest(self: &CodeCliBridge, request: &JsonText, timeou
 // pendingHandshakeThreadId; on model change await controlRequest(set_model);
 // on effort change await controlRequest(set_max_thinking_tokens, budget from
 // CLAUDE_EFFORT_TOKEN_BUDGETS); failures only logged, never thrown.
-// DEFECT: async/await -> sequential calls; try/catch -> status checks.
+// DEFECT: async [BLOCKED: the awaited controlRequest calls (TS L826 set_model, L838 set_max_thinking_tokens) are not implemented — the body stops after applyStartConfig + the pendingHandshake defer check. Sequential-call form (R8) is chosen, but the calls themselves are fix-stage.]
 fn codeCliBridge_applyRuntimeConfig(self: &CodeCliBridge, params: &JsonText) -> void {
     codeCliBridge_applyStartConfig(self, params);
     if self.pendingHandshakeThreadIdIsNull == false { return; };
@@ -889,7 +889,7 @@ fn codeCliBridge_resolveResumeSessionId(self: &CodeCliBridge, spawnCwd_len: u64,
 // promise + failed stage when handshake pending + invalidateChild, error /
 // stdin error -> invalidateChild, readline stdout lines -> handleLine,
 // stderr data -> sampled logging + emit stderr. Ends status ready.
-// DEFECT: async/Promise + ChildProcess event handlers (.once/.on) +
+// DEFECT: async [BLOCKED: start() body incomplete — the spawn/args/env sequence is fix-stage and the body returns -1. The ChildProcess .once/.on handlers + readline stream are remodeled as host-fed sinks (onChildExit/onChildError/onChildStderr/handleLine, present below), but nothing spawns yet.] +
 // readline createInterface line stream + closures capturing spawn locals —
 // modelled as host-driven poll: host feeds stdout lines to handleLine and
 // exit/stderr events to the matching fns below at fix stage.
@@ -931,14 +931,14 @@ fn codeCliBridge_stop(self: &CodeCliBridge) -> void {
 
 // public async waitForExit(timeoutMs = 5_000): Promise<boolean>  (1301-1316)
 // timeoutMs <= 0 -> await exit promise, true; else Promise.race(exit, timer).
-// DEFECT: async + Promise.race + timer -> host poll on childExitSettled.
+// DEFECT: async [BLOCKED: TS waitForExit (L1301) is Promise.race(childExitPromise, timer), with an indefinite await at timeoutMs<=0; this body only reads childExitSettled without waiting. A blocking spin here would deadlock the single-threaded host pump that must feed onChildExit, so the wait has to be owned by the host drive loop (index layer), not this fn.]
 fn codeCliBridge_waitForExit(self: &CodeCliBridge, timeoutMs: u64) -> bool {
     return self.childExitSettled;
 }
 
 // public async restart(): Promise<EngineStatus>  (1318-1322)
 // stop(); await waitForExit(); return start().
-// DEFECT: async -> sequential composition returning start()'s status code.
+// ASYNC-ADJ(ii): TS async restart (L1318) = stop(); await waitForExit(); return start() — the SLA body is the same sequential composition returning start()'s status code; the only async loss sits inside waitForExit and is registered at its own site above.
 fn codeCliBridge_restart(self: &CodeCliBridge) -> i32 {
     codeCliBridge_stop(self);
     let ignored: bool = codeCliBridge_waitForExit(self, 5000);
@@ -959,7 +959,7 @@ fn codeCliBridge_applyStartConfig(self: &CodeCliBridge, params: &JsonText) -> vo
 // thread/fork -> throw; no child: turn/interrupt and process-free methods go
 // straight to handleMethod, thread/start applies config, then await start();
 // still no child -> throw; else handleMethod.
-// DEFECT: async + throw -> i32 status (-7 fork unsupported, -8 not running).
+// ASYNC-ADJ(ii): TS async request (L1376) awaits start() (when a child is needed) then handleMethod; SLA: the same calls as sequential blocking calls, throw -> i32 status (-7 fork unsupported, -8 not running) (ASYNC_MODEL R8).
 fn codeCliBridge_request(self: &CodeCliBridge, method_code: u64, params: &JsonText, timeoutMs: u64, out: &JsonText) -> i32 {
     if method_code == 30 { return -7; };
     if !self.has_child {
@@ -970,7 +970,7 @@ fn codeCliBridge_request(self: &CodeCliBridge, method_code: u64, params: &JsonTe
 }
 
 // public async notify(method, params?)  (1394-1396) = handleMethod(..., 0)
-// DEFECT: async -> direct call.
+// ASYNC-ADJ(ii): TS async notify (L1394) is exactly `return this.handleMethod(...)`; the SLA direct call is 1:1.
 fn codeCliBridge_notify(self: &CodeCliBridge, method_code: u64, params: &JsonText, out: &JsonText) -> i32 {
     return codeCliBridge_handleMethod(self, method_code, params, 0, out);
 }
@@ -1062,9 +1062,10 @@ fn codeCliBridge_flushStreamedAssistantItems(self: &CodeCliBridge, session: &Cod
 //   item/permissions/requestApproval | item/commandExecution/requestApproval
 //     | item/tool/requestUserInput (2115-2118): {}.
 //   default (2120-2121): {}.
-// DEFECT: async/await (extractTurnInput) + switch on string + dynamic params
-// + randomUUID + Date.now() — dispatch on method_code, JSON via sa_json_*,
-// ids/timestamps from host at fix stage.
+// DEFECT: async [BLOCKED: per-case bodies land at fix stage — the body only
+// clears out and guards fork; the awaited extractTurnInput (turn/start case)
+// sits inside the unimplemented case bodies. Dispatch is on method_code,
+// JSON via sa_json_*, ids/timestamps from host at fix stage.]
 fn codeCliBridge_handleMethod(self: &CodeCliBridge, method_code: u64, params: &JsonText, timeoutMs: u64, out: &JsonText) -> i32 {
     out.len = 0;
     if method_code == 30 { return -7; };
@@ -1208,7 +1209,7 @@ fn codeCliBridge_scheduleGoalAutoContinuation(self: &CodeCliBridge, thread_len: 
 // maps reset, goalContinuationTurnKeys.add), emits turn/started, builds the
 // prompt via buildGoalContinuationPrompt(goal state, {count, max: 50,
 // planToolName: "TodoWrite"}) and writeStdin's it as a user message.
-// DEFECT: async + imported prompt builder -> sequential + JsonText build.
+// DEFECT: async [BLOCKED: body is empty; TS private async startGoalContinuationTurn (L2667) builds the prompt via the imported buildGoalContinuationPrompt and writeStdin's it as a user message — neither is wired here.]
 fn codeCliBridge_startGoalContinuationTurn(self: &CodeCliBridge, session: &CodeCliSession) -> void { return; }
 
 // private finishPendingParentTurn(threadId, turnId)  (2724-2733)
@@ -1330,7 +1331,7 @@ fn codeCliBridge_findThreadBySession(self: &CodeCliBridge, sessionId: &OptStr, h
 // resume id + externalSessionId, pendingCompactionSummary = summary, reset
 // usages, turn completed, persist, await start(), compaction completed, emit
 // turn/completed). Catch: turn failed + compaction failed + turn/failed emit.
-// DEFECT: async/await + injected runner closure -> sequential host calls.
+// DEFECT: async [BLOCKED: body is empty; TS private async runCompaction (L3481) awaits the injected compactThread runner (here the opaque compactThread_id host callback), then stop() / await waitForExit() / await start() — none of that sequence is implemented.]
 fn codeCliBridge_runCompaction(self: &CodeCliBridge, session: &CodeCliSession, turn_len: u64) -> void { return; }
 
 // private invalidateChild(child, message)  (3533-3598)
