@@ -2,19 +2,251 @@
 // Persisted installed-plugin set (plugin architecture Phase 4). Catalog is code;
 // installed state is JSON under the server data dir. First run seeds from the
 // manifests' defaultInstalled flags: framework plugins, relay-config and Mini only.
+//
+// BJ (2026-10-28): bodies implemented — this unit is pluginHost's persistence
+// dependency (pluginCatalog / setPluginInstalled), so the registry wiring
+// (FIX_INDEX B3 chain) needs it real. Model notes:
+// - env travels as a JSON document handle (env_json); env_json == 0 means
+//   "the process env" (the TS default parameter). CODEX_UI_DATA_DIR is read
+//   from the doc when given, else via sa_env_get.
+// - Returned strings are delivered as (ptr, len) into a JSON string node's
+//   arena (sa_json_string_ptr/len); nodes are process-lifetime values in
+//   this domain's JSON model and are not freed.
+// - The installed Set<string> is a JSON array document (string items,
+//   deduped, insertion order), per the bulk pass's approximation note.
+// - env buffers (sa_env_get / sa_env_home_dir) are read, never freed
+//   (FIX_INDEX C1: process-lifetime values; freeing them in branches
+//   traps the SAB referee).
+// - trim is the ASCII whitespace set; JS trim also covers Unicode
+//   whitespace — env path values are ASCII in practice (registered
+//   approximation, same note as index.sla's cliPluginEnabledByDefault).
+// - path.join is the POSIX form; win32 separator handling is a platform
+//   seam (same registration as the other server units).
 @import "sa_std/io/print.sai"
-// node:fs existsSync/mkdirSync/readFileSync/writeFileSync, node:os homedir, node:path —
-// DEFECT: no sa_std equivalents for several of these yet; approximated via sa_std_fs_*.
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/env.sai"
+@import "sa_std/fs.sai"
 
 // STORE_FILE = "plugins-installed.json"
 
+struct PisBuf {
+    bytes: [u8; 4096],
+    len: u64,
+}
+
+fn pis_buf_push(b: &PisBuf, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        if b.len < 4096 {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, p, i);
+            b.bytes[b.len] = c;
+            b.len = b.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn pis_buf_byte(b: &PisBuf, c: u8) -> void {
+    if b.len < 4096 {
+        b.bytes[b.len] = c;
+        b.len = b.len + 1;
+    };
+}
+
+fn pis_buf_escaped(b: &PisBuf, p: ptr, n: u64) -> void {
+    let i: u64 = 0;
+    while i < n {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, p, i);
+        if c == 34 { pis_buf_byte(b, 92); pis_buf_byte(b, 34); }
+        else if c == 92 { pis_buf_byte(b, 92); pis_buf_byte(b, 92); }
+        else if c == 10 { pis_buf_byte(b, 92); pis_buf_byte(b, 110); }
+        else if c == 13 { pis_buf_byte(b, 92); pis_buf_byte(b, 114); }
+        else if c == 9 { pis_buf_byte(b, 92); pis_buf_byte(b, 116); }
+        else if c < 32 {
+            pis_buf_byte(b, 92); pis_buf_byte(b, 117); pis_buf_byte(b, 48); pis_buf_byte(b, 48);
+            let hi: u8 = 0;
+            PTR_BYTE_AT(hi, STR_PTR("0123456789abcdef"), (c / 16) as u64);
+            let lo: u8 = 0;
+            PTR_BYTE_AT(lo, STR_PTR("0123456789abcdef"), (c % 16) as u64);
+            pis_buf_byte(b, hi);
+            pis_buf_byte(b, lo);
+        } else { pis_buf_byte(b, c); };
+        i = i + 1;
+    }
+}
+
+// Delivers the buffer's raw bytes as a JSON string node (ptr, len into the
+// node arena; the node is a process-lifetime value, not freed).
+fn pis_buf_string_node(b: &PisBuf, out_ptr: &ptr, out_len: &u64) -> void {
+    let lit = PisBuf { bytes: [0u8; 4096], len: 0 };
+    pis_buf_byte(&lit, 34);
+    let bp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp, &b.bytes, 0);
+    pis_buf_escaped(&lit, bp, b.len);
+    pis_buf_byte(&lit, 34);
+    let lp: ptr = PTR_NULL();
+    PTR_BYTE_ADD(lp, &lit.bytes, 0);
+    let node = sa_json_parse(lp, lit.len);
+    let np: ptr = sa_json_string_ptr(node);
+    *out_ptr = np;
+    *out_len = sa_json_string_len(node);
+}
+
+fn pis_bytes_eq(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    if a_len != b_len { return false; };
+    let i: u64 = 0;
+    while i < a_len {
+        let x: u8 = 0;
+        PTR_BYTE_AT(x, a_ptr, i);
+        let y: u8 = 0;
+        PTR_BYTE_AT(y, b_ptr, i);
+        if x != y { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn pis_is_ascii_ws(c: u8) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 11 || c == 12 || c == 13;
+}
+
+// Reads one env value: from the env doc when env_json != 0, else from the
+// process env. On success out (ptr, len) point at arena/buffer bytes that
+// stay valid for the process lifetime (never freed, FIX_INDEX C1).
+fn pis_env_value(env_json: u64, name_ptr: ptr, name_len: u64, out_ptr: &ptr, out_len: &u64) -> bool {
+    *out_len = 0;
+    if env_json != 0 {
+        if sa_json_kind(env_json) != 7 { return false; };
+        let child: u64 = 0;
+        let st = sa_json_object_get(env_json, name_ptr, name_len, &child);
+        if st != 0 || child == 0 { return false; };
+        if sa_json_kind(child) != 5 { return false; };
+        let jp: ptr = sa_json_string_ptr(child);
+        *out_ptr = jp;
+        *out_len = sa_json_string_len(child);
+        return true;
+    };
+    let h = sa_env_get(name_ptr, name_len);
+    if h == 0 { return false; };
+    let ep: ptr = sa_env_buffer_data(h);
+    *out_ptr = ep;
+    *out_len = sa_env_buffer_len(h);
+    return true;
+}
+
 fn resolvePluginDataDir(env_json: u64, out_ptr: &ptr, out_len: &u64) -> void {
     // configured = env.CODEX_UI_DATA_DIR?.trim(); return configured || path.join(homedir(), ".codex-ultra")
-    // DEFECT: process.env record access
+    let buf = PisBuf { bytes: [0u8; 4096], len: 0 };
+    let cp: ptr = STR_PTR("");
+    let cl: u64 = 0;
+    let got = false;
+    if pis_env_value(env_json, STR_PTR("CODEX_UI_DATA_DIR"), STR_LEN("CODEX_UI_DATA_DIR"), &cp, &cl) {
+        // trim (ASCII whitespace set)
+        let lo: u64 = 0;
+        let hi = cl;
+        let adv = true;
+        while adv && lo < hi {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, cp, lo);
+            if pis_is_ascii_ws(c) { lo = lo + 1; } else { adv = false; };
+        }
+        let adv2 = true;
+        while adv2 && hi > lo {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, cp, hi - 1);
+            if pis_is_ascii_ws(c) { hi = hi - 1; } else { adv2 = false; };
+        }
+        if hi > lo {
+            let tp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(tp, cp, lo);
+            pis_buf_push(&buf, tp, hi - lo);
+            got = true;
+        };
+    };
+    if !got {
+        let hh = sa_env_home_dir();
+        if hh != 0 {
+            let hp: ptr = sa_env_buffer_data(hh);
+            pis_buf_push(&buf, hp, sa_env_buffer_len(hh));
+        };
+        pis_buf_push(&buf, STR_PTR("/.codex-ultra"), STR_LEN("/.codex-ultra"));
+    };
+    pis_buf_string_node(&buf, out_ptr, out_len);
 }
 
 fn pluginInstallStorePath(env_json: u64, out_ptr: &ptr, out_len: &u64) -> void {
     // return path.join(resolvePluginDataDir(env), STORE_FILE)
+    let dp: ptr = STR_PTR("");
+    let dl: u64 = 0;
+    resolvePluginDataDir(env_json, &dp, &dl);
+    let buf = PisBuf { bytes: [0u8; 4096], len: 0 };
+    pis_buf_push(&buf, dp, dl);
+    pis_buf_push(&buf, STR_PTR("/plugins-installed.json"), STR_LEN("/plugins-installed.json"));
+    pis_buf_string_node(&buf, out_ptr, out_len);
+}
+
+// Builds a deduped JSON string-array doc from newline-joined defaults text.
+fn pis_defaults_doc(defaults_ptr: ptr, defaults_len: u64) -> u64 {
+    let arr = sa_json_parse(STR_PTR("[]"), STR_LEN("[]"));
+    let i: u64 = 0;
+    let start: u64 = 0;
+    while i <= defaults_len {
+        let at_end = i == defaults_len;
+        let is_nl = false;
+        if !at_end {
+            let c: u8 = 0;
+            PTR_BYTE_AT(c, defaults_ptr, i);
+            is_nl = c == 10;
+        };
+        if at_end || is_nl {
+            if i > start {
+                let lp: ptr = PTR_NULL();
+                PTR_BYTE_ADD(lp, defaults_ptr, start);
+                pis_set_push(arr, lp, i - start);
+            };
+            start = i + 1;
+        };
+        i = i + 1;
+    }
+    return arr;
+}
+
+// Set.add over a JSON string-array doc (dedup).
+fn pis_set_push(arr: u64, v_ptr: ptr, v_len: u64) -> void {
+    let cnt: u64 = 0;
+    sa_json_value_count(arr, &cnt);
+    let i: u64 = 0;
+    let found = false;
+    while i < cnt {
+        let n: u64 = 0;
+        let st = sa_json_array_get(arr, i, &n);
+        if st == 0 && n != 0 && sa_json_kind(n) == 5 {
+            let np: ptr = sa_json_string_ptr(n);
+            if pis_bytes_eq(np, sa_json_string_len(n), v_ptr, v_len) { found = true; };
+        };
+        i = i + 1;
+    }
+    if !found { sa_json_array_push_string(arr, v_ptr, v_len); };
+}
+
+fn pis_set_contains(arr: u64, v_ptr: ptr, v_len: u64) -> bool {
+    let cnt: u64 = 0;
+    sa_json_value_count(arr, &cnt);
+    let i: u64 = 0;
+    while i < cnt {
+        let n: u64 = 0;
+        let st = sa_json_array_get(arr, i, &n);
+        if st == 0 && n != 0 && sa_json_kind(n) == 5 {
+            let np: ptr = sa_json_string_ptr(n);
+            if pis_bytes_eq(np, sa_json_string_len(n), v_ptr, v_len) { return true; };
+        };
+        i = i + 1;
+    }
+    return false;
 }
 
 fn loadInstalledPluginIds(defaults_ptr: ptr, defaults_len: u64, env_json: u64, out_set: &u64) -> void {
@@ -22,11 +254,125 @@ fn loadInstalledPluginIds(defaults_ptr: ptr, defaults_len: u64, env_json: u64, o
     // try { parsed = JSON.parse(readFileSync(file, "utf8"));
     //   if Array.isArray(parsed.installed) return new Set(parsed.installed.filter(typeof === "string")) } catch {}
     // return new Set(defaults)  // corrupt store must not take the server down
-    // DEFECT: Set<string> + JSON.parse + type-guard filter -> JSON array buffer approximation
+    let path_ptr: ptr = STR_PTR("");
+    let path_len: u64 = 0;
+    pluginInstallStorePath(env_json, &path_ptr, &path_len);
+    // sa_std_fs_exists is a STATUS (0 = exists, 3 = missing), not a bool.
+    if sa_std_fs_exists(path_ptr, path_len) != 0 { *out_set = pis_defaults_doc(defaults_ptr, defaults_len); return; };
+    let fh: u64 = 0;
+    let st = sa_std_fs_read_to_string(path_ptr, path_len, 1048576, &fh);
+    if st != 0 || fh == 0 { *out_set = pis_defaults_doc(defaults_ptr, defaults_len); return; };
+    let bp: ptr = sa_fs_read_buffer_data(fh);
+    let bl: u64 = sa_fs_read_buffer_len(fh);
+    // Guard: only a JSON object text is fed to the parser (a corrupt store
+    // of arbitrary bytes must land on the defaults path, as TS's catch).
+    let k: u64 = 0;
+    let first: u8 = 0;
+    while k < bl {
+        let c: u8 = 0;
+        PTR_BYTE_AT(c, bp, k);
+        if pis_is_ascii_ws(c) { k = k + 1; } else { first = c; k = bl; };
+    }
+    if first != 123 { *out_set = pis_defaults_doc(defaults_ptr, defaults_len); return; };
+    let doc = sa_json_parse(bp, bl);
+    if doc == 0 || sa_json_kind(doc) != 7 { *out_set = pis_defaults_doc(defaults_ptr, defaults_len); return; };
+    let arr: u64 = 0;
+    let gst = sa_json_object_get(doc, STR_PTR("installed"), STR_LEN("installed"), &arr);
+    if gst != 0 || arr == 0 || sa_json_kind(arr) != 6 { *out_set = pis_defaults_doc(defaults_ptr, defaults_len); return; };
+    let out = sa_json_parse(STR_PTR("[]"), STR_LEN("[]"));
+    let cnt: u64 = 0;
+    sa_json_value_count(arr, &cnt);
+    let i: u64 = 0;
+    while i < cnt {
+        let n: u64 = 0;
+        let gst2 = sa_json_array_get(arr, i, &n);
+        if gst2 == 0 && n != 0 && sa_json_kind(n) == 5 {
+            let np: ptr = sa_json_string_ptr(n);
+            pis_set_push(out, np, sa_json_string_len(n));
+        };
+        i = i + 1;
+    }
+    *out_set = out;
 }
 
 fn saveInstalledPluginIds(ids: u64, env_json: u64) -> void {
     // file = pluginInstallStorePath(env); mkdirSync(dirname(file), { recursive: true })
     // writeFileSync(file, JSON.stringify({ installed: [...ids].sort() }, null, 2) + "\n", "utf8")
-    // DEFECT: Set iteration + sort + JSON.stringify
+    let dir_ptr: ptr = STR_PTR("");
+    let dir_len: u64 = 0;
+    resolvePluginDataDir(env_json, &dir_ptr, &dir_len);
+    sa_fs_mkdir_p(dir_ptr, dir_len);
+    let path_ptr: ptr = STR_PTR("");
+    let path_len: u64 = 0;
+    pluginInstallStorePath(env_json, &path_ptr, &path_len);
+    // Emit the exact JSON.stringify(..., null, 2) layout for a flat string
+    // array, ids sorted (byte order = code-unit order for these ASCII ids).
+    // Selection emission: repeatedly take the smallest not-yet-emitted id.
+    let cnt: u64 = 0;
+    if ids != 0 { sa_json_value_count(ids, &cnt); };
+    let buf = PisBuf { bytes: [0u8; 4096], len: 0 };
+    pis_buf_push(&buf, STR_PTR("{\n  \"installed\": ["), STR_LEN("{\n  \"installed\": ["));
+    if cnt == 0 {
+        pis_buf_push(&buf, STR_PTR("]\n}\n"), STR_LEN("]\n}\n"));
+    } else {
+        pis_buf_byte(&buf, 10);
+        let emitted: [bool; 256] = [false; 256];
+        let round: u64 = 0;
+        while round < cnt && round < 256 {
+            let best: u64 = 0;
+            let have_best = false;
+            let i: u64 = 0;
+            while i < cnt && i < 256 {
+                if !emitted[i] {
+                    let n: u64 = 0;
+                    let gst = sa_json_array_get(ids, i, &n);
+                    if gst == 0 && n != 0 && sa_json_kind(n) == 5 {
+                        if !have_best {
+                            best = i;
+                            have_best = true;
+                        } else {
+                            let bn: u64 = 0;
+                            sa_json_array_get(ids, best, &bn);
+                            let np: ptr = sa_json_string_ptr(n);
+                            let bnp: ptr = sa_json_string_ptr(bn);
+                            if pis_str_less(np, sa_json_string_len(n), bnp, sa_json_string_len(bn)) { best = i; };
+                        };
+                    };
+                };
+                i = i + 1;
+            }
+            if have_best {
+                emitted[best] = true;
+                let bn: u64 = 0;
+                sa_json_array_get(ids, best, &bn);
+                let bnp: ptr = sa_json_string_ptr(bn);
+                pis_buf_push(&buf, STR_PTR("    \""), STR_LEN("    \""));
+                pis_buf_escaped(&buf, bnp, sa_json_string_len(bn));
+                pis_buf_byte(&buf, 34);
+                if round + 1 < cnt { pis_buf_byte(&buf, 44); };
+                pis_buf_byte(&buf, 10);
+            };
+            round = round + 1;
+        }
+        pis_buf_push(&buf, STR_PTR("  ]\n}\n"), STR_LEN("  ]\n}\n"));
+    };
+    let bp2: ptr = PTR_NULL();
+    PTR_BYTE_ADD(bp2, &buf.bytes, 0);
+    sa_fs_write_file(path_ptr, path_len, bp2, buf.len);
+}
+
+// Byte-wise lexicographic less-than (JS sort() code-unit order for ASCII).
+fn pis_str_less(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    let n = a_len;
+    if b_len < n { n = b_len; };
+    let i: u64 = 0;
+    while i < n {
+        let x: u8 = 0;
+        PTR_BYTE_AT(x, a_ptr, i);
+        let y: u8 = 0;
+        PTR_BYTE_AT(y, b_ptr, i);
+        if x != y { return x < y; };
+        i = i + 1;
+    }
+    return a_len < b_len;
 }
