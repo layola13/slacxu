@@ -53,3 +53,30 @@ AF 的自动筛查只看顶层函数体，漏了类方法体与预设体。以�
 | server/freeOllama.test.ts (59, 3) | backends/relay-config/src/relay/freeOllama.sla | 主体 JSON 函数预设 `return 0`：normalizeFreeOllamaServer (L84)、eligibleFreeOllamaModels (L141)、buildFreeOllamaGroups (L180)、eligibleFreeOllamaEntries (L212)；仅 contains_ci / model_size_match 等小助手为真体 |
 | （产品条目）miniTurnSafety | backends/mini/src/runtime/miniTurnSafety.sla | observeRound 循环体全注释恒 null、isMiniSameFileReadAction 预设 false（L42 注释 DEFECT: dynamic JSON + regex 下 `return false`）、extra
 ...[truncated 4228 chars]
+
+## 5. retest 补跑（2026-10-28）
+
+- 场地：新运行时 `9fbc97515b9f`，盒上 worktree `/content/bulk-retest`（detached @ `ecf8635`，只读跑测）；工具链 restore 完成后开跑（`sa 0.1.8` + sla 插件已装）。规范 env 同文首口径（worktree 根 cwd、`SA_PLUGIN_DEV=1 SLA_NO_FRESHNESS_CACHE=1 SA_SLA_FIXTURE_DIR=/content/sa_all/sa_plugin_sla/tests/import_fixtures/ SA_STD_DIR=/content/sa_all/sci/sa_std`），开跑前清 `.sla-cache`；每文件 `timeout 1200`、严格串行、detached 落日志后回读。盒规格 8 核 / 50 GB。时间为北京时间（盒日志为 UTC，差 8 小时）。
+- 文件核对：5 个测试文件 sha256 与 §1 的 AH 备份逐一一致（miniDeepkeyChannel `2bcb2870…`、miniSecondTurnAnchoring `71d746a8…`、miniAnthropicThinking `eb9adc50…`、miniAgentInboxProgress `febb501e…`、effectiveGroupBaseUrl `85c76b98…`）；探针 `t2b_egb_probe.sla` 为 `8f0c3c85…`。
+- 跑法：首轮 6 项串行全跑；超时/被杀项随后逐个单独重试一轮（同 env、同 timeout）。两轮合计 12 次运行，**全部零测试输出**（无任何 passed/failed 行、无 panic、无 trap 文本）。
+
+| # | 文件 | 首轮 | 单独重试 | 过程采样（RSS / CPU） |
+|---|------|-------|---------|-------------------|
+| 2 | server/miniDeepkeyChannel.test.sla (3) | RC=124, 1200s | RC=124, 1201s | SAB 子进程 336–386% CPU 自旋（首轮采样累计 CPU 57 分钟）；父进程 RSS ~10 GB |
+| 3 | server/miniSecondTurnAnchoring.test.sla (3) | RC=137, 395s | RC=137, 161s | 两轮均被内核 OOM 杀死：dmesg `Out of memory: Killed process … (sa) anon-rss:52053884kB`（首轮）/ `51597312kB`（重试），total-vm 均 >100 GB |
+| 4 | server/miniAnthropicThinking.test.sla (6) | RC=124, 1201s | RC=124, 1203s | 父进程 RSS 26–28 GB + SAB 子进程 RSS ~10.5 GB、220–531% CPU 自旋 |
+| 5 | server/miniAgentInboxProgress.test.sla (6) | RC=124, 1201s | RC=124, 1202s | 父进程 RSS 17.7–19.2 GB；SAB 子进程 415–524% CPU 自旋（首轮采样累计 CPU 82 分钟） |
+| 9a | _defects/probes/t2b_egb_probe.sla (2) | RC=124, 1201s | RC=124, 1201s | SAB 子进程 126–200% CPU 自旋，零输出 |
+| 9 | server/effectiveGroupBaseUrl.test.sla (4) | RC=124, 1201s | RC=124, 1201s | 父进程 RSS ~12–13 GB；SAB 子进程 372% CPU 自旋（首轮采样） |
+
+**裁定（6 项一致）**：仍无断言裁定——通过/失败计数均为 0/0、失败名字集为空，因为没有任何一个 @test 跑完过；但 §3 的「环境无裁定（多线争用）」归因**就此推翻**：本轮严格串行、单独重试轮启动时盒内存 used 仅 7 GB，病理仍逐项复现，且过程量级（数百 % CPU、数十 CPU-分钟、十 GB 级 RSS、OOM 实锤）不可能由争用制造。性质重分类为**编译器/运行时（SAB 执行层）缺陷候选**，两种签名：(A) 执行不终止——SAB 子进程多线程高 CPU 自旋、1200 秒零输出（deepkey / anthropic / inbox / egb 本体 / egb 探针）；(B) 内存无界膨胀——anchoring 两轮 OOM 实锤（anon-rss ≈ 52 GB / 51.6 GB），其余文件的父进程 RSS 12–28 GB 属同族倾向。AH2 轮 anchoring ~411s 的 SIGKILL 现可回溯定性为同一 OOM。
+
+与既有登记的关系：
+
+- §3 的 retest owed（5 文件 + 探针）销账为「已补跑两轮、仍无断言裁定、性质已定」；后续状态 = 待编译器线修复本节签名后重跑，不再属环境待办。
+- egb 探针门：AF 登记的 `rpg_free_doc` PhiStateConflict **仍未复现、亦未证伪**——执行在自旋中耗尽 1200 秒，到不了 trap 触发点；与 §2 miniTurnCompletion 的 597s trap（RC=1）形态不同，不合并登记。
+- 对照组（AH2 轮能终止的文件）：miniSameFileGuard 105s、opencodeReview 32s、miniServerHooks 1s、agentRoster 8s trap、miniTurnCompletion ~597s trap——终止性与导入图规模相关；本节 6 项的共同点是导入 miniBridge.sla（4 文件）或 relayProtocolGateway.sla（探针 + egb 本体）的大图。
+- 产品侧无新证据：6 文件的断言从未执行，产品通过/真缺陷均无从判定；§3 的 8 个产品真失败名字集不受本轮影响。
+- 诚实边界：签名 (A) 发生在解释器执行产品代码的过程中，本层证据不能 100% 排除产品侧死循环；但父进程（编译/lowering 阶段）RSS 膨胀与跨两张无关产品图同症，指向工具链层。建议编译器线以新条目登记本签名，最小入口 = `t2b_egb_probe.sla`（仅触 rpg_jb_assign / rpg_jb_doc / rpg_free_doc）与 anchoring（OOM 最快、单独重试 161s 即爆）。
+- 环境注：同期 BA2 线在 sci 树间歇运行小作业（unit-framework 短测、RSS ≤ ~3.8 GB 级探针）；探针首轮开跑后最初数分钟盒上无其他重进程、其 SAB 子进程已呈 ~200% 自旋。dmesg 另见两笔与本批采样 RSS 不吻合的 sa OOM（47 GB / 37 GB 级，落在 deepkey 重试窗口内），不归因本批文件，仅存照。
+- 文档注：本文件在集成时于 §4 表中途截断（§3 引用的 §7 环境注不在树内版本中），属既有状态、非本轮改动；本节编号顺延为 §5。
